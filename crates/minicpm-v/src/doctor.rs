@@ -82,6 +82,10 @@ pub fn check(directory: &Path) -> DoctorReport {
     let manifest = read_manifest(directory, &mut report);
 
     let mut names: Vec<String> = REQUIRED_FILES.iter().map(|name| name.to_string()).collect();
+    // The index selects the shards, so it is verified together with them.
+    if directory.join("model.safetensors.index.json").is_file() {
+        names.push("model.safetensors.index.json".to_string());
+    }
     names.extend(weight_files(directory, &mut report));
     for name in names {
         let path = directory.join(&name);
@@ -257,7 +261,7 @@ mod tests {
             }
             let manifest = serde_json::json!({
                 "repository": "OpenBMB/MiniCPM-V-4.7-1B",
-                "revision": "19a6e190f7056249ab058a89a2bb3e6ef88341cf",
+                "revision": "fixture-revision",
                 "sha256": hashes,
             });
             fs::write(
@@ -429,6 +433,36 @@ mod tests {
             report.problems,
             vec![Problem::Missing {
                 name: "model-00002-of-00002.safetensors".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn tampered_index_fails_checksum() {
+        let fixture = Fixture::new("tampered-index");
+        for name in REQUIRED_FILES {
+            fixture.write(name, br#"{"content": true}"#);
+        }
+        fixture.write(
+            "config.json",
+            br#"{"model_type": "minicpmv4_7", "version": 4.7}"#,
+        );
+        fixture.write("model-00001-of-00002.safetensors", b"shard-one");
+        fixture.write("model-00002-of-00002.safetensors", b"shard-two");
+        fixture.write(
+            "model.safetensors.index.json",
+            br#"{"weight_map": {"layers.0.weight": "model-00001-of-00002.safetensors"}}"#,
+        );
+        fixture.write_manifest();
+        fixture.write(
+            "model.safetensors.index.json",
+            br#"{"weight_map": {"layers.9.weight": "model-00001-of-00002.safetensors"}}"#,
+        );
+        let report = check(&fixture.path);
+        assert_eq!(
+            report.problems,
+            vec![Problem::HashMismatch {
+                name: "model.safetensors.index.json".to_string()
             }]
         );
     }

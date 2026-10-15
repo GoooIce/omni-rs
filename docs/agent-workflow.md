@@ -4,9 +4,9 @@ Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` sele
 
 | Command | Coverage | Requirements |
 | --- | --- | --- |
-| `./scripts/check quick` | Manifest coverage, explicit runtime dependencies, Python tests, attention negative controls, formatting of all 10 manifests | Rust with rustfmt; no weights or device |
-| `./scripts/check cpu` | Quick checks, Clippy and library/integration tests for all 6 CPU-capable manifests | Rust with rustfmt and clippy; no weights |
-| `./scripts/check metal` | Metal tests across 8 manifests; production attention benchmark against the independent CPU f64 oracle | Real Apple Silicon Mac |
+| `./scripts/check quick` | Manifest coverage, explicit runtime dependencies, Python tests, attention negative controls, formatting of all 11 manifests | Rust with rustfmt; no weights or device |
+| `./scripts/check cpu` | Quick checks, Clippy and library/integration tests for all 7 CPU-capable manifests | Rust with rustfmt and clippy; no weights |
+| `./scripts/check metal` | Metal tests across 9 manifests; production attention benchmark against the independent CPU f64 oracle | Real Apple Silicon Mac |
 | `./scripts/check native` | Build native app and ASR harness; ASR matrix, native pause/resume, lifecycle, TTS and music checks, including long streams and muted device callbacks | Logged-in macOS desktop, local weights/recordings and an output device |
 | `./scripts/check status` | Latest five check reports and their resume commands | Existing reports |
 
