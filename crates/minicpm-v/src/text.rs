@@ -12,7 +12,7 @@ type Linear<B> = shared::Linear<B>;
 type Norm<B> = shared::Norm<B>;
 
 /// Zero-centered RMSNorm (`(1 + w)` scaling), the Qwen3.5 text convention.
-fn rms_norm<B: Backend>(
+pub(crate) fn rms_norm<B: Backend>(
     w: &impl WeightSource<B>,
     name: &str,
     width: usize,
@@ -612,7 +612,7 @@ impl<B: Backend> LinearAttention<B> {
 
 pub struct LinearLayer<B: Backend> {
     input_norm: Norm<B>,
-    attn: LinearAttention<B>,
+    pub attn: LinearAttention<B>,
     post_norm: Norm<B>,
     mlp: Mlp<B>,
 }

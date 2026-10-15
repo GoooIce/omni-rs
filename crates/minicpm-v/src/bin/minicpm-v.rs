@@ -1,6 +1,19 @@
 use clap::{Parser, Subcommand};
-use omni_minicpm_v::doctor;
-use std::{path::PathBuf, time::Instant};
+use omni_minicpm_v::{
+    chat::{self, Message, Role},
+    config::ModelDirectory,
+    doctor, generate,
+    model::TextModel,
+};
+use std::{
+    io::Write,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 #[derive(Parser)]
 #[command(version, about = "MiniCPM-V-4.7 local multimodal inference using Burn")]
@@ -16,11 +29,48 @@ enum Command {
         #[arg(long, default_value = "models/MiniCPM-V-4.7-1B")]
         model: PathBuf,
     },
+    /// Generate text from a prompt.
+    Generate(GenerateOptions),
+}
+
+#[derive(clap::Args)]
+struct GenerateOptions {
+    #[arg(long, default_value = "models/MiniCPM-V-4.7-1B")]
+    model: PathBuf,
+    #[arg(long)]
+    prompt: String,
+    #[arg(long)]
+    system: Option<String>,
+    #[arg(long)]
+    greedy: bool,
+    #[arg(long, default_value_t = 512)]
+    max_new_tokens: usize,
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f32,
+    #[arg(long, default_value_t = 20)]
+    top_k: usize,
+    #[arg(long, default_value_t = 0.6)]
+    top_p: f32,
+    #[arg(long, default_value_t = 1.0)]
+    repeat_penalty: f32,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// f16 on GPU, f32 for the CPU reference path.
+    #[arg(long, default_value = "f16")]
+    precision: String,
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Args { command } = Args::parse();
-    let Command::Doctor { model } = command;
+    match command {
+        Command::Doctor { model } => doctor_command(model),
+        Command::Generate(options) => generate_command(&options),
+    }
+}
+
+fn doctor_command(model: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     check_backend()?;
     println!("Checking {}", model.display());
     let report = doctor::check(&model);
@@ -38,40 +88,160 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-type AnyResult = Result<(), Box<dyn std::error::Error>>;
+fn generate_command(options: &GenerateOptions) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "metal")]
+    type B = burn::backend::wgpu::Metal;
+    #[cfg(all(not(feature = "metal"), feature = "webgpu"))]
+    type B = burn::backend::wgpu::WebGpu;
+    #[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
+    type B = burn::backend::NdArray;
 
-fn check_backend() -> AnyResult {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    let outcome: AnyResult = {
+    #[cfg(feature = "metal")]
+    {
         use burn::backend::wgpu::{WgpuDevice, graphics, init_setup};
         let device = WgpuDevice::default();
         let setup = init_setup::<graphics::Metal>(&device, Default::default());
         eprintln!("Metal: {:?}", setup.adapter.get_info());
-        probe::<burn::backend::wgpu::Metal>(&device)
+        run_generate::<B>(options, &device)
+    }
+    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
+    {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        run_generate::<B>(options, &device)
+    }
+}
+
+fn run_generate<B: burn::tensor::backend::Backend>(
+    options: &GenerateOptions,
+    device: &B::Device,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = ModelDirectory::new(&options.model);
+    let config = directory.config()?;
+    let tokenizer = directory.tokenizer()?;
+    let weights = omni_r2t2::weights::Weights::open(&options.model)?;
+
+    let mut messages = Vec::new();
+    if let Some(system) = &options.system {
+        messages.push(Message::text(Role::System, system.clone()));
+    }
+    messages.push(Message::text(Role::User, options.prompt.clone()));
+    let rendered = chat::render(&messages, true, None)?;
+    let prompt = tokenizer.encode(&rendered);
+
+    eprintln!(
+        "Loading {} ({} prompt tokens)",
+        options.model.display(),
+        prompt.len()
+    );
+    let start = Instant::now();
+    let precision = match options.precision.as_str() {
+        "f16" => omni_r2t2::Precision::F16,
+        "f32" => omni_r2t2::Precision::F32,
+        other => return Err(format!("precision must be f16 or f32, got {other}").into()),
     };
-    #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "webgpu"))]
-    let outcome: AnyResult = {
+    let model = TextModel::<B>::load(&weights, &config, precision, device)?;
+    B::sync(device).map_err(|e| format!("weight initialization failed: {e:?}"))?;
+    eprintln!("Weights loaded in {:.2}s", start.elapsed().as_secs_f32());
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = cancel.clone();
+    ctrlc::set_handler(move || stop.store(true, Ordering::Release))?;
+
+    let generate_options = generate::Options {
+        max_new_tokens: options.max_new_tokens,
+        temperature: if options.greedy {
+            0.0
+        } else {
+            options.temperature
+        },
+        top_k: options.top_k,
+        top_p: options.top_p,
+        repetition_penalty: options.repeat_penalty,
+        seed: options.seed,
+    };
+    let json = options.json;
+    let mut total_text = String::new();
+    let outcome = generate::generate(
+        &model,
+        &prompt,
+        generate_options,
+        &cancel,
+        |token| {
+            total_text.push_str(&token.delta);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "delta": token.delta,
+                        "text": total_text,
+                        "token_id": token.token,
+                        "step_ms": token.step_ms,
+                    })
+                );
+            } else {
+                print!("{}", token.delta);
+                let _ = std::io::stdout().flush();
+            }
+            Ok(())
+        },
+        |ids| tokenizer.decode(ids),
+    )?;
+    if !json {
+        println!();
+    }
+    eprintln!(
+        "{:.0} ms; {} tokens; finish_reason: {}",
+        outcome.compute_ms,
+        outcome.tokens.len(),
+        outcome.finish_reason.as_str()
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "done",
+                "text": outcome.text,
+                "tokens": outcome.tokens.len(),
+                "finish_reason": outcome.finish_reason.as_str(),
+                "compute_ms": outcome.compute_ms,
+                "first_token_ms": outcome.first_token_ms,
+            })
+        );
+    }
+    Ok(())
+}
+
+fn check_backend() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
         use burn::backend::wgpu::{WgpuDevice, graphics, init_setup};
         let device = WgpuDevice::default();
-        init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
-        probe::<burn::backend::wgpu::WebGpu>(&device)
-    };
+        let setup = init_setup::<graphics::Metal>(&device, Default::default());
+        eprintln!("Metal: {:?}", setup.adapter.get_info());
+        return probe::<burn::backend::wgpu::Metal>(&device);
+    }
     #[cfg(all(
         not(all(target_os = "macos", feature = "metal")),
-        not(feature = "webgpu"),
-        feature = "cpu"
+        any(feature = "webgpu", feature = "cpu")
     ))]
-    let outcome: AnyResult = probe::<burn::backend::NdArray>(&Default::default());
+    {
+        #[cfg(feature = "webgpu")]
+        type B = burn::backend::wgpu::WebGpu;
+        #[cfg(all(not(feature = "webgpu"), feature = "cpu"))]
+        type B = burn::backend::NdArray;
+        probe::<B>(&Default::default())
+    }
     #[cfg(not(any(
         all(target_os = "macos", feature = "metal"),
         feature = "webgpu",
         feature = "cpu"
     )))]
-    let outcome: AnyResult = Err("No backend enabled. Build with metal, webgpu or cpu.".into());
-    outcome
+    Err("No backend enabled. Build with metal, webgpu or cpu.".into())
 }
 
-fn probe<B: burn::tensor::backend::Backend>(device: &B::Device) -> AnyResult {
+fn probe<B: burn::tensor::backend::Backend>(
+    device: &B::Device,
+) -> Result<(), Box<dyn std::error::Error>> {
     use burn::tensor::{Tensor, TensorData};
 
     let a = Tensor::<B, 2>::from_data(

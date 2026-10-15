@@ -600,11 +600,50 @@ def export_linear_layer(processor):
     print(f"wrote {destination}: {sorted(k for k in payload if k.startswith('stage'))}")
 
 
+def export_greedy(processor):
+    """Official greedy token streams for text-only prompts (1B, CPU fp32)."""
+    import torch
+
+    model = MiniCPMV4_7ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.float32)
+    prompts = [
+        "用一句话介绍你自己。",
+        "What are the three primary colors? Answer in one short sentence.",
+        "写一首关于秋天的两行短诗。",
+        "Explain what 2 + 2 equals, in one word.",
+    ]
+    cases = {}
+    for prompt in prompts:
+        text = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = processor(text=[text], return_tensors="pt")
+        input_ids = inputs["input_ids"][0].tolist()
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=24,
+                do_sample=False,
+                eos_token_id=processor.tokenizer.eos_token_id
+                if isinstance(processor.tokenizer.eos_token_id, int)
+                else [248044, 248046],
+            )
+        generated = output[0][inputs["input_ids"].shape[1]:].tolist()
+        cases[prompt] = {
+            "rendered": text,
+            "input_ids": input_ids,
+            "generated": generated,
+        }
+        print(f"{prompt!r}: prompt {len(input_ids)} tokens, generated {len(generated)}")
+    save_json(REFERENCE / "greedy-text.json", cases)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--part",
-        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer"],
+        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy"],
         default="tokenizer-chat",
     )
     args = parser.parse_args()
@@ -618,6 +657,8 @@ def main():
         export_text_layer(processor)
     elif args.part == "linear-layer":
         export_linear_layer(processor)
+    elif args.part == "greedy":
+        export_greedy(processor)
 
 
 if __name__ == "__main__":
