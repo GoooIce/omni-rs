@@ -399,7 +399,8 @@ mod tests {
         let tensors = SafeTensors::deserialize(&bytes).unwrap();
         let mut sizes = Vec::new();
         let ts = tensors.tensor("target_sizes").unwrap();
-        let ts_data: Vec<i64> = ts.data().chunks_exact::<8>().map(le_i64).collect();
+        #[allow(clippy::chunks_exact_to_as_chunks)] // as_chunks needs newer MSRV than the workspace
+        let ts_data: Vec<i64> = ts.data().chunks_exact(8).map(le_i64).collect();
         for pair in ts_data.chunks(2) {
             sizes.push(Grid {
                 height: pair[0] as usize,
