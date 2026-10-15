@@ -303,9 +303,9 @@ pub fn rope_index(
                 }
                 let boundary_h = (k / num_cols + 1) * (slice_grid.height / merge_factor) - 1;
                 let right_edge = num_cols * (slice_grid.width / merge_factor);
-                for newline in gap_start + 1..gap_end - 1 {
-                    positions[newline][1] = origin + boundary_h as i64;
-                    positions[newline][2] = origin + right_edge as i64;
+                for position in &mut positions[gap_start + 1..gap_end - 1] {
+                    position[1] = origin + boundary_h as i64;
+                    position[2] = origin + right_edge as i64;
                 }
             }
 
