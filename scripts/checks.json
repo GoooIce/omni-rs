@@ -3,6 +3,7 @@
     {"path": "Cargo.toml", "cpu_features": "native,cpu", "target": "target", "metal": true},
     {"path": "crates/breeze-tts/Cargo.toml", "cpu_features": "cpu", "target": "target/breeze-native", "metal": true},
     {"path": "crates/hy-mt/Cargo.toml", "cpu_features": "native,cpu", "target": "target/omni-api-cpu", "strict_clippy": true, "metal": true},
+    {"path": "crates/minicpm-v/Cargo.toml", "cpu_features": "native,cpu", "target": "target/minicpm-v-cpu", "metal": true},
     {"path": "crates/qwen-image/Cargo.toml", "cpu_features": "cpu", "target": "target/qwen-image-test", "metal": true},
     {"path": "crates/omni-music/Cargo.toml", "cpu_features": "cpu", "target": "target/omni-music-cpu", "metal": true},
     {"path": "crates/omni-api/Cargo.toml", "cpu_features": "cpu", "target": "target/omni-api-cpu", "strict_clippy": true, "metal": false},
