@@ -85,7 +85,7 @@ fn group_frames(input_ids: &[u32], types: &[u8], markers: &Markers) -> Vec<Group
                 .slices
                 .push(crop);
         } else {
-            let adjacent = groups.last().is_some_and(|group| {
+            let adjacent = groups.last().is_some_and(|_group| {
                 input_ids[previous_end..crop.start.saturating_sub(1)]
                     .iter()
                     .all(|&id| is_marker(id))

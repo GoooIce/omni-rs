@@ -42,7 +42,7 @@ fn inverse_frequencies(config: &TextConfig) -> Vec<f64> {
 /// Which M-RoPE channel a frequency pair reads: pairs interleave T/H/W with
 /// period 3 until a section is exhausted, then fall back to T.
 fn channel_of(j: usize, sections: &[usize]) -> usize {
-    let section = match j % 3 {
+    match j % 3 {
         1 => {
             if j < sections[1] * 3 {
                 1
@@ -50,16 +50,9 @@ fn channel_of(j: usize, sections: &[usize]) -> usize {
                 0
             }
         }
-        2 => {
-            if j < sections[2] * 3 {
-                2
-            } else {
-                0
-            }
-        }
+        2 if j < sections[2] * 3 => 2,
         _ => 0,
-    };
-    section
+    }
 }
 
 /// Cosine/sine tables `(1, seq, rotary_dim)` in split-half pair layout for the
@@ -215,7 +208,7 @@ impl<B: Backend> FullAttention<B> {
         sin: &Tensor<B, 3>,
         cache: Option<&mut KvCache<B>>,
     ) -> Tensor<B, 3> {
-        let [_, seq, width] = x.dims();
+        let [_, seq, _width] = x.dims();
         let dtype = shared::dtype(&x);
         let projected = self.q.forward(x.clone());
         // Query and gate arrive head-interleaved: (seq, heads, 2, head_dim).
@@ -608,7 +601,9 @@ mod rope_debug {
         let view = tensors.tensor("stage_cos").unwrap();
         let official: Vec<f32> = view
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         println!("official cos rows (positions t=1: (1,1,1) etc. are at fixture indices):");
