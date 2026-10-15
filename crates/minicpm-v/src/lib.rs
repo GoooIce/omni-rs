@@ -4,5 +4,7 @@ pub mod chat;
 pub mod config;
 pub mod doctor;
 pub mod image;
+pub mod positions;
+pub mod text;
 pub mod tokenizer;
 pub mod vision;

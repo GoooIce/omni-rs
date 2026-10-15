@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from safetensors.numpy import save_file
 from transformers import AutoProcessor, AutoTokenizer, MiniCPMV4_7ForConditionalGeneration
 from safetensors.torch import load_file as load_torch
 from transformers.vision_utils import get_vision_nearest_position_ids
@@ -222,8 +223,6 @@ def export_vision(processor, dump_stages: bool):
     reference only: this product intentionally applies EXIF orientation and
     white-matte transparency, which the official PIL backend does not.
     """
-    from safetensors.numpy import save_file
-
     image_processor = processor.image_processor
     results = {}
     for name in ("small.png", "wide.png", "large.jpg", "alpha.webp", "rotated.jpg"):
@@ -319,9 +318,164 @@ def export_vision(processor, dump_stages: bool):
             hook.remove()
 
 
+def export_text_layer(processor):
+    """Canvas M-RoPE position tables and a synthetic full-attention layer.
+
+    Everything here is synthetic or configuration-driven, so the committed
+    fixtures exercise the text decoder without the checkpoint.
+    """
+    import torch
+
+    from transformers import Qwen3_5TextConfig
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as q35
+
+    model = MiniCPMV4_7ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.float32)
+
+    # ---- Canvas M-RoPE positions from the official get_rope_index ----------
+    config = model.config
+    cases = []
+    image_start, image_end = config.image_start_id, config.image_end_id
+    newline, pad = config.newline_id, config.image_token_id
+    # text + one unsliced 4x4-llm-grid image + text
+    tokens = [1, 2, 3, image_start] + [pad] * 16 + [image_end, 4, 5]
+    types = [0, 0, 0, 0] + [1] * 16 + [0, 0, 0]
+    cases.append({
+        "name": "text-image-text",
+        "input_ids": tokens,
+        "mm_token_type_ids": types,
+        "target_sizes": [[16, 16]],
+        "downsample_mode": "16x",
+    })
+    # text + sliced image: thumbnail + four slices in a 2x2 grid, the row
+    # boundary marked by a newline between the second and third slice
+    tokens = [1, image_start] + [pad] * 4 + [image_end]
+    for k in range(4):
+        tokens += [config.slice_start_id] + [pad] + [config.slice_end_id]
+        if k == 1:
+            tokens += [newline]
+    tokens += [2, 3, newline, 4]
+    types = [0, 0] + [1] * 4 + [0]
+    for k in range(4):
+        types += [0] + [1] + [0]
+        if k == 1:
+            types += [0]
+    types += [0, 0, 0, 0]
+    cases.append({
+        "name": "sliced-image",
+        "input_ids": tokens,
+        "mm_token_type_ids": types,
+        # thumbnail (8,8) patches -> 2x2 llm tokens; slices (4,4) -> 1x1
+        "target_sizes": [[8, 8], [4, 4], [4, 4], [4, 4], [4, 4]],
+        "downsample_mode": "16x",
+    })
+    cases.append({
+        "name": "text-only",
+        "input_ids": [1, 2, 3, 4, 5],
+        "mm_token_type_ids": [0, 0, 0, 0, 0],
+        "target_sizes": [],
+        "downsample_mode": "16x",
+    })
+    position_cases = {}
+    for case in cases:
+        position_ids, rope_deltas = model.model.get_rope_index(
+            torch.tensor([case["input_ids"]]),
+            mm_token_type_ids=torch.tensor([case["mm_token_type_ids"]]),
+            target_sizes=torch.tensor(case["target_sizes"], dtype=torch.long).reshape(-1, 2),
+            downsample_mode=case["downsample_mode"],
+        )
+        position_cases[case["name"]] = {
+            **case,
+            "positions": position_ids[:, 0].tolist(),  # (3, seq)
+            "rope_deltas": rope_deltas.tolist(),
+        }
+    save_json(FIXTURES / "canvas-positions.json", position_cases)
+
+    # ---- Synthetic full-attention decoder layer ----------------------------
+    torch.manual_seed(7)
+    text_config = Qwen3_5TextConfig(
+        hidden_size=96,
+        intermediate_size=224,
+        num_hidden_layers=8,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        vocab_size=256,
+        rms_norm_eps=1e-6,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
+                          "partial_rotary_factor": 0.25, "mrope_section": [3, 3, 2]},
+    )
+    layer = q35.Qwen3_5DecoderLayer(text_config, 3).to(torch.float32)
+    for parameter in layer.parameters():
+        parameter.data.normal_(0.0, 0.2)
+    layer.eval()
+
+    tokens = position_cases["text-image-text"]
+    length = len(tokens["input_ids"])
+    positions = torch.tensor(tokens["positions"]).unsqueeze(1)  # (3, 1, seq)
+    hidden = torch.randn(1, length, text_config.hidden_size)
+    rotary = q35.Qwen3_5TextRotaryEmbedding(config=text_config)
+    # Standalone modules default to eager attention which ignores is_causal;
+    # pass the causal mask explicitly like the real model does.
+    causal = torch.triu(
+        torch.full((1, 1, length, length), float("-inf")), diagonal=1
+    )
+    with torch.no_grad():
+        cos, sin = rotary(hidden, positions)
+        captured = {}
+        hooks = [
+            layer.self_attn.register_forward_hook(
+                lambda m, a, o: captured.__setitem__("attention_out", o[0].detach().float().cpu())),
+            layer.mlp.register_forward_hook(
+                lambda m, a, o: captured.__setitem__("mlp_out", o.detach().float().cpu())),
+            layer.self_attn.q_proj.register_forward_hook(
+                lambda m, a, o: captured.__setitem__("q_proj", o.detach().float().cpu())),
+        ]
+        output = layer(
+            hidden.clone(),
+            position_embeddings=(cos, sin),
+            attention_mask=causal,
+            position_ids=None,
+            past_key_values=None,
+        )
+        for hook in hooks:
+            hook.remove()
+        captured["layer_out"] = output.detach().float().cpu()
+        captured["cos"] = cos.detach().float().cpu()
+        captured["sin"] = sin.detach().float().cpu()
+        captured["hidden_in"] = hidden.float().cpu()
+
+    # Store weights with the checkpoint naming convention the Rust loader uses.
+    weights = {}
+    layer_state = {
+        "input_layernorm.weight": layer.input_layernorm.weight,
+        "post_attention_layernorm.weight": layer.post_attention_layernorm.weight,
+        "self_attn.q_proj.weight": layer.self_attn.q_proj.weight,
+        "self_attn.k_proj.weight": layer.self_attn.k_proj.weight,
+        "self_attn.v_proj.weight": layer.self_attn.v_proj.weight,
+        "self_attn.o_proj.weight": layer.self_attn.o_proj.weight,
+        "self_attn.q_norm.weight": layer.self_attn.q_norm.weight,
+        "self_attn.k_norm.weight": layer.self_attn.k_norm.weight,
+        "mlp.gate_proj.weight": layer.mlp.gate_proj.weight,
+        "mlp.up_proj.weight": layer.mlp.up_proj.weight,
+        "mlp.down_proj.weight": layer.mlp.down_proj.weight,
+    }
+    for name, tensor in layer_state.items():
+        weights[f"layers.0.{name}"] = tensor.detach().float().numpy()
+    payload = {**{k: np.ascontiguousarray(v) for k, v in weights.items()},
+               **{f"stage_{k}": np.ascontiguousarray(v.numpy()) for k, v in captured.items()}}
+    destination = FIXTURES / "full-attention-layer.safetensors"
+    save_file(payload, destination)
+    print(f"wrote {destination}: stages {sorted(captured)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--part", choices=["tokenizer-chat", "vision"], default="tokenizer-chat")
+    parser.add_argument(
+        "--part",
+        choices=["tokenizer-chat", "vision", "text-layer"],
+        default="tokenizer-chat",
+    )
     args = parser.parse_args()
     torch.manual_seed(0)
     processor = load_processor()
@@ -329,6 +483,8 @@ def main():
         export_tokenizer_chat(processor)
     elif args.part == "vision":
         export_vision(processor, dump_stages=True)
+    elif args.part == "text-layer":
+        export_text_layer(processor)
 
 
 if __name__ == "__main__":
