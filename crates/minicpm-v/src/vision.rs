@@ -615,10 +615,11 @@ mod tests {
         }
     }
 
+    // as_chunks would need a newer MSRV than the workspace
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn stage_bytes(tensors: &SafeTensors<'_>, name: &str) -> Vec<f32> {
         let view = tensors.tensor(name).unwrap();
         view.data()
-            #[allow(clippy::chunks_exact_to_as_chunks)] // as_chunks needs newer MSRV than the workspace
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect()
