@@ -503,7 +503,7 @@ impl<B: Backend> LinearAttention<B> {
         v: Tensor<B, 4>,    // (1, T, H, V) FP32
         g: Tensor<B, 3>,    // (1, T, H) FP32
         beta: Tensor<B, 3>, // (1, T, H) FP32
-        mut state: Tensor<B, 4>,
+        state: Tensor<B, 4>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let seq = q.dims()[1];
         let mut outputs = Vec::with_capacity(seq);
