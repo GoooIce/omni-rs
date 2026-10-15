@@ -1,0 +1,188 @@
+{
+ "user-only": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "你好"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "system-user": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "介绍一下杭州。"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n介绍一下杭州。<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "system-string-content": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "系统提示词"
+   },
+   {
+    "role": "user",
+    "content": "继续"
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>system\n系统提示词<|im_end|>\n<|im_start|>user\n继续<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "multi-turn": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "1+1=?"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\n简单加法。\n</think>\n\n1+1=2。"
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "再乘3呢？"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>user\n1+1=?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n1+1=2。<|im_end|>\n<|im_start|>user\n再乘3呢？<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "assistant-before-last-query-no-think": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "讲个笑话"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "好笑的笑话。"
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "再来一个"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>user\n讲个笑话<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n好笑的笑话。<|im_end|>\n<|im_start|>user\n再来一个<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "assistant-thinking-after-last-query": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "你好"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\n用户在打招呼。\n</think>\n\n你好！很高兴见到你。"
+   }
+  ],
+  "add_generation_prompt": false,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n用户在打招呼。\n</think>\n\n你好！很高兴见到你。<|im_end|>\n"
+ },
+ "image-text": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "描述这张图"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>user\n<|image_pad|>\n描述这张图<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "two-images-text": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "比较这两张图"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": null,
+  "rendered": "<|im_start|>user\n<|image_pad|>\n<|image_pad|>\n比较这两张图<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "thinking-disabled": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "直接回答：3*7"
+     }
+    ]
+   }
+  ],
+  "add_generation_prompt": true,
+  "enable_thinking": false,
+  "rendered": "<|im_start|>user\n直接回答：3*7<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ }
+}

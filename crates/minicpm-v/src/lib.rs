@@ -1,3 +1,6 @@
 //! MiniCPM-V-4.7 local multimodal inference in Rust and Burn.
 
+pub mod chat;
+pub mod config;
 pub mod doctor;
+pub mod tokenizer;
