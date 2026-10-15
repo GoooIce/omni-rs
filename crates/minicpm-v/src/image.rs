@@ -149,10 +149,10 @@ pub fn open(path: &Path) -> Result<RgbaImage, ImageError> {
         source,
     };
     let mut reader = image::ImageReader::open(path)
-        .map_err(|e| image::ImageError::IoError(e))
+        .map_err(image::ImageError::IoError)
         .map_err(decode)?
         .with_guessed_format()
-        .map_err(|e| image::ImageError::IoError(e))
+        .map_err(image::ImageError::IoError)
         .map_err(decode)?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16384);
@@ -399,7 +399,7 @@ mod tests {
         let tensors = SafeTensors::deserialize(&bytes).unwrap();
         let mut sizes = Vec::new();
         let ts = tensors.tensor("target_sizes").unwrap();
-        let ts_data: Vec<i64> = ts.data().chunks_exact(8).map(le_i64).collect();
+        let ts_data: Vec<i64> = ts.data().chunks_exact::<8>().map(le_i64).collect();
         for pair in ts_data.chunks(2) {
             sizes.push(Grid {
                 height: pair[0] as usize,

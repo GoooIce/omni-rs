@@ -572,10 +572,10 @@ impl<B: Backend> VisionTower<B> {
                     stages.after_window_merger = Some(hidden.clone());
                 }
             }
-            if let Some(slot) = probes.iter().position(|p| *p == index) {
-                if let Some(stages) = stages.as_deref_mut() {
-                    stages.encoder[slot] = Some(hidden.clone());
-                }
+            if let Some(slot) = probes.iter().position(|p| *p == index)
+                && let Some(stages) = stages.as_deref_mut()
+            {
+                stages.encoder[slot] = Some(hidden.clone());
             }
         }
         hidden = self.post_layernorm.forward(hidden, output);
@@ -618,7 +618,7 @@ mod tests {
     fn stage_bytes(tensors: &SafeTensors<'_>, name: &str) -> Vec<f32> {
         let view = tensors.tensor(name).unwrap();
         view.data()
-            .chunks_exact(4)
+            .chunks_exact::<4>()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect()
     }
