@@ -241,7 +241,7 @@ fn check_backend() -> Result<(), Box<dyn std::error::Error>> {
         let device = WgpuDevice::default();
         let setup = init_setup::<graphics::Metal>(&device, Default::default());
         eprintln!("Metal: {:?}", setup.adapter.get_info());
-        return probe::<burn::backend::wgpu::Metal>(&device);
+        probe::<burn::backend::wgpu::Metal>(&device)
     }
     #[cfg(all(
         not(all(target_os = "macos", feature = "metal")),

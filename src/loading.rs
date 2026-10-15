@@ -34,6 +34,10 @@ impl<B: Backend, W: WeightSource<B>, F: Fn(&str)> WeightSource<B> for Cancellabl
     fn contains(&self, name: &str) -> bool {
         self.weights.contains(name)
     }
+    fn raw_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        self.before(name)?;
+        self.weights.raw_bytes(name)
+    }
     fn tensor<const D: usize>(
         &self,
         name: &str,

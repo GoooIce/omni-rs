@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 pub trait WeightSource<B: Backend> {
     fn contains(&self, name: &str) -> bool;
+    /// Raw safetensors payload of one tensor (packed int4 bytes, bf16 scales).
+    fn raw_bytes(&self, name: &str) -> Result<Vec<u8>>;
     fn tensor<const D: usize>(
         &self,
         name: &str,
@@ -31,6 +33,9 @@ pub trait WeightSource<B: Backend> {
 impl<B: Backend> WeightSource<B> for Weights {
     fn contains(&self, name: &str) -> bool {
         Weights::contains(self, name)
+    }
+    fn raw_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(self.view(name)?.data().to_vec())
     }
     fn tensor<const D: usize>(
         &self,
@@ -152,6 +157,11 @@ impl<B: Backend> DeviceWeights<B> {
 impl<B: Backend> WeightSource<B> for DeviceWeights<B> {
     fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
+    }
+    fn raw_bytes(&self, _name: &str) -> Result<Vec<u8>> {
+        Err(Error::Checkpoint(
+            "raw byte access is unavailable for chunked device weights".into(),
+        ))
     }
     fn tensor<const D: usize>(
         &self,

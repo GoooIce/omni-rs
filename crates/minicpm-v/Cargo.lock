@@ -3782,8 +3782,10 @@ name = "omni-minicpm-v"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-tensor",
  "clap",
  "ctrlc",
+ "half",
  "image",
  "omni-r2t2",
  "pollster",

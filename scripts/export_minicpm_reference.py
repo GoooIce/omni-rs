@@ -679,11 +679,61 @@ def export_greedy_image(processor):
     save_json(REFERENCE / "greedy-image.json", output)
 
 
+def export_quant_fixture(processor):
+    """Synthetic pack-quantized int4 weights in llm-compressor semantics."""
+    import numpy as np
+    import torch
+
+    rng = np.random.default_rng(23)
+    out_dim, in_dim, group = 64, 256, 128
+    original = (rng.normal(0, 0.35, (out_dim, in_dim)) * 1.7).astype(np.float32)
+
+    # Symmetric group-128 int4: scale = max|w|/7 per (row, group); q in [-8, 7].
+    packed = np.zeros((out_dim, in_dim // 2), dtype=np.uint8)
+    scales = np.zeros((out_dim, in_dim // group), dtype=np.float32)
+    quants = np.zeros((out_dim, in_dim), dtype=np.int8)
+    for r in range(out_dim):
+        for g in range(in_dim // group):
+            block = original[r, g * group:(g + 1) * group]
+            scale = np.abs(block).max() / 7.0
+            scales[r, g] = scale
+            q = np.clip(np.round(block / scale), -8, 7).astype(np.int8)
+            quants[r, g * group:(g + 1) * group] = q
+            packed_row = ((q.reshape(-1, 2)[:, 0] & 0xF) | ((q.reshape(-1, 2)[:, 1] & 0xF) << 4))
+            packed[r, g * group // 2:(g + 1) * group // 2] = packed_row.astype(np.uint8)
+
+    # References use the bf16-rounded scales the checkpoint actually stores.
+    scales_bf16 = torch.from_numpy(scales).to(torch.bfloat16)
+    scales_effective = scales_bf16.to(torch.float32).numpy()
+    dequantized = (
+        quants.astype(np.float32)
+        * np.repeat(scales_effective, group, axis=1)
+    )
+    bf16_weight = (rng.normal(0, 0.3, (out_dim, in_dim))).astype(np.float32)
+    x = rng.normal(0, 1.0, (8, in_dim)).astype(np.float32)
+    quant_out = x @ dequantized.T
+    bf16_out = x @ bf16_weight.T
+
+    payload = {
+        "quant.weight": packed,
+        "quant.weight_scale": scales_bf16.view(torch.uint16).cpu().numpy(),
+        "quant.weight_original": original,
+        "quant.weight_dequantized": dequantized,
+        "bf16.layer.weight": bf16_weight,
+        "input": x,
+        "output_quant_matmul": quant_out,
+        "output_bf16_matmul": bf16_out,
+    }
+    destination = FIXTURES / "pack-quantized-int4.safetensors"
+    save_file({k: v for k, v in payload.items()}, destination)
+    print(f"wrote {destination}: out {out_dim} in {in_dim} group {group}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--part",
-        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image"],
+        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image", "quant-fixture"],
         default="tokenizer-chat",
     )
     args = parser.parse_args()
@@ -701,6 +751,8 @@ def main():
         export_greedy(processor)
     elif args.part == "greedy-image":
         export_greedy_image(processor)
+    elif args.part == "quant-fixture":
+        export_quant_fixture(processor)
 
 
 if __name__ == "__main__":

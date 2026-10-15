@@ -8,6 +8,7 @@ pub mod image;
 pub mod model;
 pub mod multimodal;
 pub mod positions;
+pub mod quant;
 pub mod text;
 pub mod tokenizer;
 pub mod vision;
