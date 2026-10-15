@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod generate;
 pub mod image;
 pub mod model;
+pub mod moe;
 pub mod multimodal;
 pub mod positions;
 pub mod quant;

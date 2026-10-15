@@ -699,6 +699,10 @@ mod tests {
                 partial_rotary_factor: 0.25,
             },
             mamba_ssm_dtype: None,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
         }
     }
 
@@ -874,6 +878,10 @@ mod rope_debug {
                 partial_rotary_factor: 0.25,
             },
             mamba_ssm_dtype: None,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
         };
         let device: burn::backend::ndarray::NdArrayDevice = Default::default();
         let positions = vec![[0i64, 0, 0], [1, 1, 1], [2, 1, 3]];
@@ -941,6 +949,10 @@ mod linear_tests {
                 partial_rotary_factor: 0.25,
             },
             mamba_ssm_dtype: None,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
         }
     }
 

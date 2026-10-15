@@ -90,6 +90,14 @@ pub struct TextConfig {
     pub rope_parameters: RopeParameters,
     #[serde(default)]
     pub mamba_ssm_dtype: Option<String>,
+    #[serde(default)]
+    pub num_experts: usize,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
 }
 
 fn default_full_interval() -> usize {

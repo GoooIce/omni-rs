@@ -729,11 +729,103 @@ def export_quant_fixture(processor):
     print(f"wrote {destination}: out {out_dim} in {in_dim} group {group}")
 
 
+def export_moe_layer(processor):
+    """Synthetic MoE block (router + grouped experts + shared expert)."""
+    import torch
+
+    from transformers import Qwen3_5MoeTextConfig
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as m35
+
+    torch.manual_seed(31)
+    config = Qwen3_5MoeTextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        num_experts=6,
+        num_experts_per_tok=2,
+        num_hidden_layers=4,
+        layer_types=["full_attention"] * 4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        vocab_size=256,
+        rms_norm_eps=1e-6,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
+                          "partial_rotary_factor": 1.0, "mrope_section": [3, 3, 2]},
+    )
+    config._experts_implementation = "eager"
+    block = m35.Qwen3_5MoeSparseMoeBlock(config).to(torch.float32)
+    for parameter in block.parameters():
+        parameter.data.normal_(0.0, 0.25)
+    block.eval()
+
+    seq = 12
+    hidden = torch.randn(1, seq, config.hidden_size)
+    with torch.no_grad():
+        captured = {}
+        def capture_router(_module, _args, output):
+            captured["router_logits"] = output[0].detach().float().cpu()
+            captured["router_scores"] = output[1].detach().float().cpu()
+            captured["router_indices"] = output[2].detach().long().cpu()
+
+        hooks = [
+            block.gate.register_forward_hook(capture_router),
+            block.shared_expert.register_forward_hook(
+                lambda m, a, o: captured.__setitem__("shared_out", o.detach().float().cpu())),
+            block.register_forward_hook(
+                lambda m, a, o: captured.__setitem__("block_out", o.detach().float().cpu())),
+        ]
+        output = block(hidden.clone())
+        for hook in hooks:
+            hook.remove()
+        captured["hidden_in"] = hidden.float().cpu()
+        captured["block_out"] = output.detach().float().cpu()
+
+    weights = {}
+    for name, tensor in block.state_dict().items():
+        weights[f"block.{name}"] = tensor.detach().float().numpy()
+
+    # One expert's gate_up also stored pack-quantized (llm-compressor layout)
+    # to prove the grouped layout feeds the int4 loader.
+    expert = 2
+    gate_up = block.experts.gate_up_proj[expert].detach().float()  # (2*I, H)
+    out_d, in_d = gate_up.shape
+    group = 128
+    pad = (-in_d) % group
+    padded = torch.nn.functional.pad(gate_up, (0, pad))
+    quants = torch.zeros_like(padded)
+    scales = torch.zeros(padded.shape[0], padded.shape[1] // group)
+    packed = np.zeros((out_d, padded.shape[1] // 2), dtype=np.uint8)
+    for r in range(out_d):
+        for g in range(padded.shape[1] // group):
+            chunk = padded[r, g * group:(g + 1) * group]
+            scale = chunk.abs().max() / 7.0
+            q = torch.clamp(torch.round(chunk / scale), -8, 7).to(torch.int8)
+            quants[r, g * group:(g + 1) * group] = q
+            scales[r, g] = scale
+            pairs = q.reshape(-1, 2)
+            packed[r, g * group // 2:(g + 1) * group // 2] = (
+                (pairs[:, 0] & 0xF) | ((pairs[:, 1] & 0xF) << 4)
+            ).numpy().astype(np.uint8)
+    weights["expert_packed.weight"] = packed
+    weights["expert_packed.weight_scale"] = (
+        scales.to(torch.bfloat16).view(torch.uint16).cpu().numpy())
+    weights["expert_padded_original"] = padded.numpy()
+    payload = {
+        **{f"moe.{k}": np.ascontiguousarray(v) for k, v in weights.items()},
+        **{f"stage_{k}": np.ascontiguousarray(v.numpy()) for k, v in captured.items()},
+    }
+    destination = FIXTURES / "moe-block.safetensors"
+    save_file(payload, destination)
+    print(f"wrote {destination}: {sorted(captured)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--part",
-        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image", "quant-fixture"],
+        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image", "quant-fixture", "moe-layer"],
         default="tokenizer-chat",
     )
     args = parser.parse_args()
@@ -753,6 +845,8 @@ def main():
         export_greedy_image(processor)
     elif args.part == "quant-fixture":
         export_quant_fixture(processor)
+    elif args.part == "moe-layer":
+        export_moe_layer(processor)
 
 
 if __name__ == "__main__":
