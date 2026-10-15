@@ -4,7 +4,7 @@ use crate::{
     config::MiniCpmConfig,
     text::{FullLayer, LinearLayer, LinearState, mrope_tables, rms_norm},
 };
-use burn::tensor::{FloatDType, Tensor, backend::Backend};
+use burn::tensor::{Tensor, backend::Backend};
 use omni_r2t2::{Precision, tensor as shared, tensor::KvCache, weights::WeightSource};
 
 /// Per-layer caches for one decode history (KV for full attention, conv +
@@ -116,13 +116,14 @@ impl<B: Backend> TextModel<B> {
         embeddings: Option<Tensor<B, 3>>,
         positions: Option<&[[i64; 3]]>,
         state: &mut DecodeState<B>,
-        output: FloatDType,
     ) -> omni_r2t2::Result<Tensor<B, 2>> {
-        let dtype = output;
+        // The activation dtype follows the loaded weights (F16 on GPU, F32 on
+        // the CPU reference path); every stage derives from `hidden`.
         let mut hidden = match embeddings {
             Some(embeddings) => embeddings,
             None => self.embed.forward(ids)?,
         };
+        let dtype = shared::dtype(&hidden);
         let tokens = hidden.dims()[1];
         let mut kv_index = 0;
         let mut linear_index = 0;

@@ -11,7 +11,7 @@ description = "MiniCPM-V-4.7 local multimodal inference in Rust and Burn"
 [features]
 default = ["native", "metal"]
 native = ["dep:clap", "dep:pollster", "dep:ctrlc"]
-metal = ["burn/metal", "burn/fusion", "burn/autotune"]
+metal = ["burn/metal", "burn/autotune"]
 webgpu = ["burn/webgpu", "burn/fusion"]
 cpu = ["burn/ndarray"]
 

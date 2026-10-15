@@ -89,6 +89,10 @@ impl<B: Backend> Multimodal<B> {
                 .map_err(|e| e.to_string())?;
         let patch = config.vision_config.patch_size;
         let width = config.vision_config.num_channels * patch * patch;
+        let output = match precision {
+            Precision::F16 => FloatDType::F16,
+            Precision::F32 => FloatDType::F32,
+        };
         let crops: Vec<Tensor<B, 2>> = preprocessed
             .crops
             .iter()
@@ -97,12 +101,9 @@ impl<B: Backend> Multimodal<B> {
                     burn::tensor::TensorData::new(values.clone(), [values.len() / width, width]),
                     device,
                 )
+                .cast(output)
             })
             .collect();
-        let output = match precision {
-            Precision::F16 => FloatDType::F16,
-            Precision::F32 => FloatDType::F32,
-        };
         let features = self
             .vision
             .forward(&crops, &preprocessed.target_sizes, output)

@@ -32,6 +32,20 @@ Makepad 直接调用 Rust/Burn 音乐模块，支持试听、停止、ABC/MIDI/J
 音乐模型默认位于 `models/`，可展开“参考音乐与乐谱”选择父目录，或设置 `MUSIC_MODELS_DIR`。
 使用方法、原生推理阶段、检查结果与权重许可见 [音乐模块文档](crates/omni-music/README.md)。
 
+## MiniCPM-V-4.7 图像理解
+
+[OpenBMB MiniCPM-V-4.7-1B](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B) 的本地多模态理解已接入
+Rust/Burn：SigLIP2 视觉塔 + 混合注意力解码器（门控 delta 网络线性注意力 + GQA 全注意力）+ canvas
+M-RoPE，单图 + 文字提示流式生成。贪心输出与官方 transformers ≥5.18 逐 token 对齐（文本与图像
+fixture 集），Metal FP16 实测解码 ≈26 ms/token。使用方法、参数与已知限制见
+[模块文档](crates/minicpm-v/README.md)，数值对照与实测见 [VALIDATION.md](VALIDATION.md)。
+
+```sh
+python3 scripts/download_minicpm_v.py
+cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
+  --model models/MiniCPM-V-4.7-1B --image photo.jpg --prompt '描述这张图' --greedy
+```
+
 ## Hy-MT2-7B 翻译与 RadixAttention
 
 [腾讯 Hy-MT2-7B](https://huggingface.co/tencent/Hy-MT2-7B) 已接入 Rust/Burn。

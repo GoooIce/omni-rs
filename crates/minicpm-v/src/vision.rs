@@ -46,12 +46,16 @@ impl<B: Backend> Attention<B> {
         let q = split(self.q.forward(x.clone()));
         let k = split(self.k.forward(x.clone()));
         let v = split(self.v.forward(x.clone()));
+        // Variable-length vision sequences trip Burn 0.21's attention
+        // autotune buckets on Metal; ImageAligned keeps unaligned lengths on
+        // the eager matmul/softmax path.
         let attended = shared::attention(
             q,
             k,
             v,
             shared::AttentionOptions {
                 causal: false,
+                kernel: shared::AttentionKernel::ImageAligned,
                 ..Default::default()
             },
         );

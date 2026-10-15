@@ -473,20 +473,24 @@ impl<B: Backend> LinearAttention<B> {
         let [_, seq, conv_dim] = mixed.dims();
         let dtype = shared::dtype(&mixed);
         let device = mixed.device();
+        let stream_dtype = dtype;
         let stream = mixed.permute([0, 2, 1]); // (1, conv, T)
-        let tail = tail.unwrap_or_else(|| Tensor::zeros([1, conv_dim, self.kernel - 1], &device));
+        let tail = tail
+            .unwrap_or_else(|| Tensor::zeros([1, conv_dim, self.kernel - 1], &device))
+            .cast(stream_dtype);
         let padded = Tensor::cat(vec![tail, stream], 2);
         let [_, _, width] = padded.dims();
         let new_tail = padded
             .clone()
             .slice([0..1, 0..conv_dim, width - (self.kernel - 1)..width]);
-        let mut output = Tensor::<B, 3>::zeros([1, conv_dim, seq], &device);
+        let mut output = Tensor::<B, 3>::zeros([1, conv_dim, seq], &device).cast(stream_dtype);
         for tap in 0..self.kernel {
             let weight = self
                 .conv_weight
                 .clone()
                 .slice([0..conv_dim, 0..1, tap..tap + 1])
-                .reshape([conv_dim, 1]);
+                .reshape([conv_dim, 1])
+                .cast(stream_dtype);
             let window = padded.clone().slice([0..1, 0..conv_dim, tap..tap + seq]);
             output = output + window * weight.unsqueeze();
         }

@@ -166,7 +166,6 @@ pub fn generate<B: Backend>(
             prompt.embeddings.clone(),
             prompt.positions.as_deref(),
             &mut state,
-            burn::tensor::FloatDType::F32,
         )
         .map_err(|e| e.to_string())?;
     for step in 0..options.max_new_tokens {
@@ -205,13 +204,7 @@ pub fn generate<B: Backend>(
             break;
         }
         logits = model
-            .forward(
-                &[token],
-                None,
-                None,
-                &mut state,
-                burn::tensor::FloatDType::F32,
-            )
+            .forward(&[token], None, None, &mut state)
             .map_err(|e| e.to_string())?;
     }
     let text = decode(&tokens);

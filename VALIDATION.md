@@ -3,6 +3,49 @@
 记录日期：2026-10-15（历史基线保留原日期）。设备：Apple M5 Max，40 核 GPU，128 GB RAM，macOS 27.0.1。
 工具链：rustc/cargo 1.99.0，Burn 0.21.0；依赖版本保存在 Cargo.lock。
 
+## 2026-10-15：MiniCPM-V-4.7 1B 接入（T1–T8）
+
+`crates/minicpm-v`：SigLIP2 视觉塔、混合注意力解码器（18 线性 + 6 全注意力）、canvas M-RoPE、
+ChatML 词表与单图端到端生成，全部 Rust/Burn。构建标识：commit `35253a8`（T7）后含 T8 修补；
+rustc 1.99.0，Burn 0.21.0（Metal 关闭 fusion，见下）。复现命令与脚本见
+[模块文档](crates/minicpm-v/README.md)；fixture 由
+`scripts/export_minicpm_reference.py --part {tokenizer-chat,vision,text-layer,linear-layer,greedy,greedy-image}`
+离线生成（transformers 5.19.0 + torch 2.14.1 CPU，PIL 图像后端）。
+
+### 数值对照（CPU FP32，`cargo test --no-default-features --features native,cpu`）
+
+| 对照 | 结果 |
+| --- | --- |
+| 词表编解码 / ChatML 渲染 / 占位符展开 | 官方快照逐 id/逐字节一致 |
+| 视觉塔 8 阶段 × 2 图（small.png 全阶段；切片 large.jpg） | PNG 各阶段 RMSE<2e-3；JPEG（解码器差异 ≤3/255）RMSE<2e-2、cosine>0.999 |
+| 全注意力层（合成权重） | cos/sin、q_proj、attention、mlp、layer 输出 RMSE<1e-4 |
+| 门控 delta 网络层（合成权重） | prefill、终止递推/卷积状态、3 步缓存解码、重置语义 RMSE<2e-4 |
+| canvas M-RoPE 位置表（3 组含分行切片） | 逐值一致 |
+| 文本贪心（4 组中英提示词，各 24 token） | 逐 token 一致（`tests/greedy_parity.rs`，~209 s CPU） |
+| 单图贪心（3 组：96×64 PNG ×2、900×1400 切片 JPEG 444 图像 token） | input_ids、模态类型、token 流全部一致（`tests/image_parity.rs`，~273 s CPU） |
+| Metal FP16 抽查 | small.png 案例逐 token 一致（`tests/metal_spot.rs`，~30 s） |
+
+需要本地权重 `models/MiniCPM-V-4.7-1B` 与 `artifacts/minicpm-reference/`；缺失时上述测试自动跳过。
+统一检查入口：`./scripts/check cpu`（CI 无权重时仅运行合成 fixture 部分）、`./scripts/check metal`。
+
+### M5 Max 实测（Metal FP16，release 构建，64 token 生成）
+
+| 场景 | 首 token | 逐步 p50 | 逐步 p95 | 峰值 RSS |
+| --- | --- | --- | --- | --- |
+| 文本提示（~30 token prompt） | 2655 ms | 26.0 ms | 397 ms | — |
+| 单图 96×64（1120 patch + 93 prompt token） | 1287 ms | 26.3 ms | 349 ms | 5.14 GB |
+| 单图 900×1400 切片（7 crop、483 prompt token） | 3777 ms | 27.3 ms | 452 ms | — |
+
+复现：`cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate --model models/MiniCPM-V-4.7-1B --image … --prompt … --greedy --json --max-new-tokens 64`。
+p95 尖峰来自周期性 GPU 同步/内核缓存，不影响 p50 解码速率（≈38 token/s）。
+
+### 已知问题
+
+- burn-cubecl-fusion 0.21 在本模型解码形状（seq=1 递推图）上代码生成崩溃（index out of bounds），
+  Metal 构建已关闭 `burn/fusion`（常规 autotune matmul 保留）；CPU 路径不受影响。
+- 官方 PIL 处理器忽略 EXIF 方向并直接丢弃透明通道；本产品按 spec 显式应用 EXIF 方向与白底合成，
+  因此 parity fixture 不含 EXIF/alpha 图（该行为由 `image::tests` 固定）。
+
 ## 2026-10-14–15：MERT2、SheetSage2、YuE2 音乐链路
 
 已实现 `crates/omni-music` 的原生 Rust/Burn 推理、CLI、三组 HTTP 任务接口和网页工作流。
