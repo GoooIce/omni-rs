@@ -11,7 +11,10 @@ use std::collections::HashMap;
 pub trait WeightSource<B: Backend> {
     fn contains(&self, name: &str) -> bool;
     /// Raw safetensors payload of one tensor (packed int4 bytes, bf16 scales).
-    fn raw_bytes(&self, name: &str) -> Result<Vec<u8>>;
+    /// Only pack-quantized loading needs it; other sources keep the default.
+    fn raw_bytes(&self, _name: &str) -> Result<Vec<u8>> {
+        Err(Error::Checkpoint("raw byte access unavailable".into()))
+    }
     fn tensor<const D: usize>(
         &self,
         name: &str,
@@ -223,6 +226,9 @@ impl AsRef<[u8]> for Storage {
 pub struct Weights {
     shards: Vec<Storage>,
     names: HashMap<String, usize>,
+    /// Parsed headers cached per shard: large checkpoints hold ~100k tensors
+    /// and re-parsing a shard header per tensor lookup is quadratic.
+    headers: std::cell::RefCell<Vec<Option<std::rc::Rc<safetensors::SafeTensors<'static>>>>>,
 }
 
 impl Weights {
@@ -231,6 +237,7 @@ impl Weights {
         for bytes in shards {
             weights.add(Storage::Bytes(bytes))?;
         }
+        *weights.headers.get_mut() = vec![None; weights.shards.len()];
         Ok(weights)
     }
 
@@ -285,6 +292,7 @@ impl Weights {
             let mapping = unsafe { memmap2::MmapOptions::new().map(&file)? };
             result.add(Storage::Mapped(mapping))?;
         }
+        *result.headers.get_mut() = vec![None; result.shards.len()];
         Ok(result)
     }
 
@@ -297,8 +305,19 @@ impl Weights {
             .names
             .get(name)
             .ok_or_else(|| Error::Checkpoint(format!("missing tensor {name}")))?;
-        let tensors = SafeTensors::deserialize(self.shards[*index].as_ref())
-            .map_err(|e| Error::Checkpoint(e.to_string()))?;
+        // Lazily parse and cache each shard header (see `headers`).
+        let tensors = {
+            let mut headers = self.headers.borrow_mut();
+            if headers[*index].is_none() {
+                let parsed = SafeTensors::deserialize(self.shards[*index].as_ref())
+                    .map_err(|e| Error::Checkpoint(e.to_string()))?;
+                // SAFETY: the parsed header borrows the mmap in `self.shards`,
+                // which is never mutated after open; the Rc outlives views.
+                let parsed: SafeTensors<'static> = unsafe { std::mem::transmute(parsed) };
+                headers[*index] = Some(std::rc::Rc::new(parsed));
+            }
+            headers[*index].as_ref().expect("header cached").clone()
+        };
         tensors
             .tensor(name)
             .map_err(|e| Error::Checkpoint(e.to_string()))

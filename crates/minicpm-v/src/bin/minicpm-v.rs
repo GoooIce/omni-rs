@@ -130,7 +130,11 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         "f32" => omni_r2t2::Precision::F32,
         other => return Err(format!("precision must be f16 or f32, got {other}").into()),
     };
-    let model = TextModel::<B>::load(&weights, &config, precision, device)?;
+    // ADR-0001: dequantize at the load point and compute in FP16. The fused
+    // int4 matmul in burn-cubecl 0.21 cannot consume a transposed quantized
+    // weight (no q_transpose); recorded in VALIDATION.
+    let quant_mode = omni_minicpm_v::quant::LoadMode::Dequantize;
+    let model = TextModel::<B>::load_with(&weights, &config, precision, device, Some(quant_mode))?;
 
     let prompt = match &options.image {
         Some(image) => {
@@ -188,6 +192,7 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         &model,
         &prompt,
         generate_options,
+        &directory.eos_ids(),
         &cancel,
         |token| {
             total_text.push_str(&token.delta);

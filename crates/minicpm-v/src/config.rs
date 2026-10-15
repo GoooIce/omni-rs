@@ -16,6 +16,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisionConfig {
     pub hidden_size: usize,
+    #[serde(default)]
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub patch_size: usize,
@@ -63,6 +64,7 @@ fn default_partial_rotary() -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TextConfig {
     pub hidden_size: usize,
+    #[serde(default)]
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub layer_types: Vec<String>,
@@ -148,6 +150,29 @@ impl ModelDirectory {
         Self {
             path: path.as_ref().to_path_buf(),
         }
+    }
+
+    /// Generation stop ids from `generation_config.json` (both eos variants).
+    pub fn eos_ids(&self) -> Vec<u32> {
+        #[derive(serde::Deserialize)]
+        struct GenerationConfig {
+            #[serde(default)]
+            eos_token_id: serde_json::Value,
+        }
+        std::fs::read(self.path.join("generation_config.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<GenerationConfig>(&bytes).ok())
+            .map(|config| match config.eos_token_id {
+                serde_json::Value::Array(ids) => ids
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|id| id as u32))
+                    .collect(),
+                serde_json::Value::Number(id) => {
+                    id.as_u64().map(|id| vec![id as u32]).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_else(|| crate::tokenizer::EOS_IDS.to_vec())
     }
 
     pub fn config(&self) -> Result<MiniCpmConfig, ConfigError> {

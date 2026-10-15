@@ -70,6 +70,7 @@ fn metal_f16_image_stream_matches_official() {
             temperature: 0.0,
             ..Default::default()
         },
+        &ModelDirectory::new(&model_dir).eos_ids(),
         &cancel,
         |_| Ok(()),
         |ids| tokenizer.decode(ids),

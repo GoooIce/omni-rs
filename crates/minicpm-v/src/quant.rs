@@ -1,12 +1,11 @@
 //! Pack-quantized int4 loading (compressed-tensors pack-quantized semantics:
 //! symmetric, group 128, two 4-bit values per byte, low nibble first).
 //!
-//! The checkpoint stays packed int4 on disk and in the read-only mmap; weights
-//! dequantize once at the load point and compute in FP16/FP32 (ADR-0001's
-//! W4A16 route: no re-quantization, no hand-written kernels). Stock
-//! burn-cubecl 0.21's fused sub-byte matmul mis-indexes per-block scales
-//! beyond the first block (verified by probe, 2026-10-15), so the in-kernel
-//! path is not used; load-point dequantization gives identical numerics.
+//! On cubecl backends the weight becomes a Burn Q4S quantized tensor — packed
+//! int4 stays resident and matmul dequantizes in kernel (W4A16, ADR-0001; no
+//! re-quantization, no hand-written kernels). The NdArray reference backend
+//! cannot hold sub-byte tensors, so it dequantizes once at the load point —
+//! identical values, reference-path memory only.
 use burn::tensor::{FloatDType, Tensor, TensorData, backend::Backend};
 use burn_tensor::quantization::{
     QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue,
@@ -17,12 +16,14 @@ use omni_r2t2::{Precision, Result, weights::WeightSource};
 pub const GROUP_SIZE: usize = 128;
 
 /// Unpack `packed` (two 4-bit values per byte, low nibble first, row-major)
-/// into sign-extended i8 values.
+/// into i8 values. compressed-tensors `pack_to_int32` stores unsigned nibbles
+/// offset by `1 << (bits-1)` — a value of 8 means zero, 0 means -8 — not
+/// two's-complement sign-extended nibbles.
 pub fn unpack_int4(packed: &[u8]) -> Vec<i8> {
     let mut out = Vec::with_capacity(packed.len() * 2);
     for byte in packed {
-        out.push(((byte & 0xF) << 4) as i8 >> 4);
-        out.push(((byte >> 4) << 4) as i8 >> 4);
+        out.push((byte & 0xF) as i8 - 8);
+        out.push((byte >> 4) as i8 - 8);
     }
     out
 }
@@ -38,17 +39,36 @@ pub fn scheme(group: usize) -> QuantScheme {
     }
 }
 
-/// A dequantized int4 weight, `[out, in]` like the checkpoint.
-pub struct PackedWeight<B: Backend>(Tensor<B, 2>);
+/// How the loaded weight participates in matmul.
+pub enum PackedWeight<B: Backend> {
+    /// GPU: packed int4 stays resident; matmul dequantizes in kernel.
+    Quantized(Tensor<B, 2>),
+    /// CPU reference: dequantized values.
+    Dequantized(Tensor<B, 2>),
+}
 
 impl<B: Backend> PackedWeight<B> {
-    /// `x @ W^T` with `W` stored `[out, in]`.
+    /// `x @ W^T` with `W` stored `[out, in]` like the checkpoint.
     pub fn matmul_transpose(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        x.matmul(self.0.clone().transpose())
+        match self {
+            PackedWeight::Quantized(weight) => x.matmul(weight.clone().transpose()),
+            PackedWeight::Dequantized(weight) => x.matmul(weight.clone().transpose()),
+        }
     }
 
-    pub fn weight(&self) -> &Tensor<B, 2> {
-        &self.0
+    /// Resident value bytes (packed payload without scales).
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            // Packed u32 storage: half a byte per value.
+            PackedWeight::Quantized(weight) => {
+                let [out, in_dim] = weight.dims();
+                out * in_dim / 2
+            }
+            PackedWeight::Dequantized(weight) => {
+                let [out, in_dim] = weight.dims();
+                out * in_dim * std::mem::size_of::<f32>()
+            }
+        }
     }
 }
 
@@ -65,15 +85,27 @@ fn bf16_scale_bytes(bytes: &[u8], count: usize) -> Vec<f32> {
 ///
 /// `quantized` selects the GPU packed representation; the CPU reference path
 /// passes false and receives exact dequantized values.
+/// How packed int4 weights should be represented after loading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    /// Packed quantized tensor (cubecl backends): int4 resident, fused
+    /// dequant matmul.
+    Packed,
+    /// One-time load-point dequantization (NdArray reference path).
+    Dequantize,
+}
+
 pub fn load_packed<B: Backend>(
     w: &impl WeightSource<B>,
     name: &str,
+    scale_name: &str,
     shape: [usize; 2],
-    group: usize,
+    mode: LoadMode,
     precision: Precision,
     device: &B::Device,
 ) -> Result<PackedWeight<B>> {
     let [out_dim, in_dim] = shape;
+    let group = GROUP_SIZE;
     let raw = w.raw_bytes(name)?;
     let values = unpack_int4(&raw);
     if values.len() != out_dim * in_dim {
@@ -82,22 +114,43 @@ pub fn load_packed<B: Backend>(
             values.len()
         )));
     }
-    let scale_bytes = w.raw_bytes(&format!("{name}_scale"))?;
+    let scale_bytes = w.raw_bytes(scale_name)?;
     let scales = bf16_scale_bytes(&scale_bytes, out_dim * in_dim.div_ceil(group));
 
-    // One-time load-point dequantization; compute proceeds at `precision`.
-    let dequantized: Vec<f32> = values
-        .chunks(group)
-        .zip(scales.iter().cycle())
-        .flat_map(|(chunk, scale)| chunk.iter().map(move |v| *v as f32 * scale))
-        .collect();
-    let dtype = match precision {
-        Precision::F16 => FloatDType::F16,
-        Precision::F32 => FloatDType::F32,
-    };
-    Ok(PackedWeight(
-        Tensor::<B, 2>::from_data(TensorData::new(dequantized, shape), device).cast(dtype),
-    ))
+    if mode == LoadMode::Packed {
+        // Packed u32 payload (little endian, first value in the lowest
+        // nibble) with f32 scales appended — cubecl's quantized layout.
+        let scheme = scheme(group);
+        let mut bytes = Vec::with_capacity(values.len() / 2 + scales.len() * 4);
+        for chunk in values.chunks(8) {
+            let mut packed = 0u32;
+            for (nibble, value) in chunk.iter().enumerate() {
+                packed |= (*value as u32 & 0xF) << (nibble * 4);
+            }
+            bytes.extend_from_slice(&packed.to_le_bytes());
+        }
+        for scale in &scales {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        let data = TensorData::from_bytes_vec(bytes, shape, burn::tensor::DType::QFloat(scheme));
+        Ok(PackedWeight::Quantized(Tensor::<B, 2>::from_data(
+            data, device,
+        )))
+    } else {
+        // Reference backend: one-time load-point dequantization.
+        let dequantized: Vec<f32> = values
+            .chunks(group)
+            .zip(scales.iter().cycle())
+            .flat_map(|(chunk, scale)| chunk.iter().map(move |v| *v as f32 * scale))
+            .collect();
+        let dtype = match precision {
+            Precision::F16 => FloatDType::F16,
+            Precision::F32 => FloatDType::F32,
+        };
+        Ok(PackedWeight::Dequantized(
+            Tensor::<B, 2>::from_data(TensorData::new(dequantized, shape), device).cast(dtype),
+        ))
+    }
 }
 
 /// Packed int4 payload size in bytes (two values per byte) plus bf16 scales.
@@ -170,8 +223,9 @@ mod tests {
         let packed = load_packed::<B>(
             &weights,
             "quant.weight",
+            "quant.weight_scale",
             [64, 256],
-            GROUP_SIZE,
+            LoadMode::Dequantize,
             Precision::F32,
             &device,
         )
@@ -225,7 +279,7 @@ mod gpu_tests {
     }
 
     #[test]
-    fn fp16_compute_matches_reference() {
+    fn fused_int4_matmul_matches_reference() {
         let bytes = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/pack-quantized-int4.safetensors"),
@@ -237,13 +291,19 @@ mod gpu_tests {
         let packed = load_packed::<Metal>(
             &weights,
             "quant.weight",
+            "quant.weight_scale",
             [64, 256],
-            GROUP_SIZE,
+            LoadMode::Packed,
             Precision::F16,
             &device,
         )
         .unwrap();
-        // Packed checkpoint footprint stays ≈1/4 of bf16 storage.
+        assert!(
+            matches!(packed, PackedWeight::Quantized(_)),
+            "expected packed representation on GPU"
+        );
+        // Resident int4 payload (without scales) is 1/4 of bf16 values.
+        assert_eq!(packed.resident_bytes(), 64 * 256 / 2);
         assert!((packed_footprint(64, 256, GROUP_SIZE) as f64) / ((64 * 256 * 2) as f64) < 0.34);
         let x_values = tensor_f32(&tensors, "input");
         let x = Tensor::<Metal, 2>::from_data(TensorData::new(x_values, [8, 256]), &device)

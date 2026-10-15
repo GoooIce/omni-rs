@@ -75,6 +75,7 @@ fn text_only_greedy_matches_official_tokens() {
                 temperature: 0.0,
                 ..Default::default()
             },
+            &ModelDirectory::new(&model_dir).eos_ids(),
             &cancel,
             |_| Ok(()),
             |token_ids| tokenizer.decode(token_ids),

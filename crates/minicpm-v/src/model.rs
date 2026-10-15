@@ -48,13 +48,25 @@ impl<B: Backend> TextModel<B> {
         p: Precision,
         d: &B::Device,
     ) -> omni_r2t2::Result<Self> {
+        Self::load_with(w, config, p, d, None)
+    }
+
+    pub fn load_with(
+        w: &impl WeightSource<B>,
+        config: &MiniCpmConfig,
+        p: Precision,
+        d: &B::Device,
+        quant: Option<crate::quant::LoadMode>,
+    ) -> omni_r2t2::Result<Self> {
         let text = &config.text_config;
         let mut layers = Vec::with_capacity(text.num_hidden_layers);
         for index in 0..text.num_hidden_layers {
             let name = format!("model.language_model.layers.{index}");
             layers.push(match text.layer_types.get(index).map(String::as_str) {
-                Some("linear_attention") => Layer::Linear(LinearLayer::load(w, &name, text, p, d)?),
-                _ => Layer::Full(FullLayer::load(w, &name, text, p, d)?),
+                Some("linear_attention") => {
+                    Layer::Linear(LinearLayer::load_with(w, &name, text, p, d, quant)?)
+                }
+                _ => Layer::Full(FullLayer::load_with(w, &name, text, p, d, quant)?),
             });
         }
         Ok(Self {

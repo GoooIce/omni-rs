@@ -689,6 +689,7 @@ def export_quant_fixture(processor):
     original = (rng.normal(0, 0.35, (out_dim, in_dim)) * 1.7).astype(np.float32)
 
     # Symmetric group-128 int4: scale = max|w|/7 per (row, group); q in [-8, 7].
+    # Packed nibbles are unsigned with a +8 offset (pack_to_int32 semantics).
     packed = np.zeros((out_dim, in_dim // 2), dtype=np.uint8)
     scales = np.zeros((out_dim, in_dim // group), dtype=np.float32)
     quants = np.zeros((out_dim, in_dim), dtype=np.int8)
@@ -699,7 +700,8 @@ def export_quant_fixture(processor):
             scales[r, g] = scale
             q = np.clip(np.round(block / scale), -8, 7).astype(np.int8)
             quants[r, g * group:(g + 1) * group] = q
-            packed_row = ((q.reshape(-1, 2)[:, 0] & 0xF) | ((q.reshape(-1, 2)[:, 1] & 0xF) << 4))
+            pairs = (q.reshape(-1, 2).astype(np.int16) + 8)
+            packed_row = (pairs[:, 0] & 0xF) | ((pairs[:, 1] & 0xF) << 4)
             packed[r, g * group // 2:(g + 1) * group // 2] = packed_row.astype(np.uint8)
 
     # References use the bf16-rounded scales the checkpoint actually stores.
@@ -804,7 +806,8 @@ def export_moe_layer(processor):
             q = torch.clamp(torch.round(chunk / scale), -8, 7).to(torch.int8)
             quants[r, g * group:(g + 1) * group] = q
             scales[r, g] = scale
-            pairs = q.reshape(-1, 2)
+            # Unsigned +8-offset nibbles (pack_to_int32 semantics).
+            pairs = q.reshape(-1, 2).to(torch.int16) + 8
             packed[r, g * group // 2:(g + 1) * group // 2] = (
                 (pairs[:, 0] & 0xF) | ((pairs[:, 1] & 0xF) << 4)
             ).numpy().astype(np.uint8)
@@ -821,11 +824,234 @@ def export_moe_layer(processor):
     print(f"wrote {destination}: {sorted(captured)}")
 
 
+def export_linear_layer_35b():
+    """Real 35B seams for the first layers of the text-only fixture prompt.
+
+    Hooks capture embeddings, per-layer residual outputs (layers 0-3), the
+    layer-0 linear-attention block, and the layer-0/1 MoE inputs/outputs plus
+    router selection — the seams that bisect a full-model divergence without
+    re-implementing layer calls.
+    """
+    import torch
+
+    from transformers import AutoTokenizer
+
+    model_dir = "models/MiniCPM-V-4.7-35B-A3B-int4"
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    fixture = json.loads((REFERENCE / "greedy-35b.json").read_text())
+    case = fixture["None|What are the three primary colors? One short sentence."]
+    ids = torch.tensor([case["input_ids"]])
+
+    model = MiniCPMV4_7ForConditionalGeneration.from_pretrained(
+        model_dir, dtype=torch.bfloat16
+    )
+    model.eval()
+    text_model = model.model.language_model
+
+    captured = {}
+
+    def first_only(name, pick):
+        def hook(module, args, output):
+            tensor = pick(args, output)
+            if tensor is not None and tensor.shape[1] == ids.shape[1] and name not in captured:
+                captured[name] = tensor.detach().float().cpu()
+        return hook
+
+    def pre_first_only(name):
+        def hook(module, args):
+            tensor = args[0] if args else None
+            if tensor is not None and tensor.shape[1] == ids.shape[1] and name not in captured:
+                captured[name] = tensor.detach().float().cpu()
+        return hook
+
+    def out_tensor(args, output):
+        return output[0] if isinstance(output, tuple) else output
+
+    hooks = []
+    for index in range(4):
+        hooks.append(text_model.layers[index].register_forward_hook(
+            first_only(f"layer{index}_out", out_tensor)))
+    hooks.append(text_model.layers[0].linear_attn.register_forward_hook(
+        first_only("attn0_out", out_tensor)))
+    for index in (0, 1):
+        hooks.append(text_model.layers[index].mlp.register_forward_hook(
+            first_only(f"mlp{index}_out", out_tensor)))
+        hooks.append(text_model.layers[index].mlp.register_forward_pre_hook(
+            pre_first_only(f"mlp{index}_in")))
+        hooks.append(text_model.layers[index].mlp.gate.register_forward_hook(
+            first_only(f"router{index}_raw",
+                       lambda a, o: o[2].long())))
+    hooks.append(text_model.embed_tokens.register_forward_hook(
+        first_only("embed_out", out_tensor)))
+
+    # Linear-attention internals for layer 0 (the first linear layer), captured
+    # by wrapping the module-level kernel functions the layer resolves at call
+    # time. First call = layer-0 prefill.
+    import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as m35
+
+    internals = {}
+    real_conv = m35.causal_conv1d_fn
+    real_chunk = m35.torch_chunk_gated_delta_rule
+
+    def conv_wrapper(mixed, weight, bias=None, activation=None, **kwargs):
+        output = real_conv(mixed, weight, bias, activation=activation, **kwargs)
+        if "conv_out" not in internals and output.shape[2] == ids.shape[1]:
+            internals["conv_out"] = output.detach().float().cpu()  # (1, conv, seq)
+        return output
+
+    def chunk_wrapper(q, k, v, **kwargs):
+        output = real_chunk(q, k, v, **kwargs)
+        if "core" not in internals and q.shape[1] == ids.shape[1]:
+            internals["q_in"] = q.detach().float().cpu()   # (1, seq, H, K) post-interleave
+            internals["k_in"] = k.detach().float().cpu()
+            internals["v_in"] = v.detach().float().cpu()
+            internals["g_in"] = kwargs["g"].detach().float().cpu()    # (1, seq, H)
+            internals["beta_in"] = kwargs["beta"].detach().float().cpu()
+            internals["core"] = output[0].detach().float().cpu()      # (1, seq, H, V)
+            internals["final_state"] = output[1].detach().float().cpu()
+        return output
+
+    m35.causal_conv1d_fn = conv_wrapper
+    m35.torch_chunk_gated_delta_rule = chunk_wrapper
+
+    def norm_hook(module, args, output):
+        if "normed0_out" not in internals and args[0].shape[0] == ids.shape[1] * 32:
+            internals["normed0_out"] = output.detach().float().cpu()
+
+    hooks.append(text_model.layers[0].linear_attn.norm.register_forward_hook(norm_hook))
+
+    with torch.no_grad():
+        model.generate(
+            input_ids=ids,
+            attention_mask=torch.ones_like(ids),
+            max_new_tokens=1, do_sample=False, eos_token_id=[248044, 248046],
+        )
+    m35.causal_conv1d_fn = real_conv
+    m35.torch_chunk_gated_delta_rule = real_chunk
+    for hook in hooks:
+        hook.remove()
+
+    # Ground truth for the int4 loader: the runtime expert-0 gate weight as
+    # transformers materializes it, plus the raw packed payload for the same
+    # tensor, so the Rust test can check unpacking against the real layout.
+    import glob as _glob
+
+    from safetensors import safe_open
+
+    experts_module = text_model.layers[0].mlp.experts
+    runtime_gate = experts_module.gate_up_proj[0, : experts_module.intermediate_dim]
+    packed_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_packed"
+    scale_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale"
+    packed_raw = scale_raw = None
+    for shard in sorted(_glob.glob(f"{model_dir}/*.safetensors")):
+        with safe_open(shard, framework="pt") as f:
+            if packed_name in f.keys():
+                packed_raw = f.get_tensor(packed_name).contiguous().view(torch.uint8).cpu()
+                scale_raw = f.get_tensor(scale_name).float().cpu()
+                break
+    if packed_raw is None:
+        raise KeyError(packed_name)
+
+    payload = {
+        f"stage_{name}": np.ascontiguousarray(tensor.detach().float().cpu().numpy())
+        for name, tensor in sorted({**captured, **internals}.items())
+    }
+    payload["dequant_expert0_gate"] = np.ascontiguousarray(
+        runtime_gate.detach().float().cpu().numpy())
+    payload["expert0_gate.weight_packed_bytes"] = packed_raw.numpy()
+    payload["expert0_gate.weight_scale"] = scale_raw.numpy()
+    payload["input_ids"] = np.asarray(case["input_ids"], dtype=np.int64)
+    destination = REFERENCE / "linear-layer-35b.safetensors"
+    save_file(payload, destination)
+    print(f"wrote {destination}: {sorted(payload)}")
+
+
+def export_greedy_35b(processor):
+    """Official greedy streams from the int4 35B (compressed-tensors)."""
+    import torch
+
+    from transformers import AutoTokenizer
+
+    model_dir = "models/MiniCPM-V-4.7-35B-A3B-int4"
+    tokenizer35 = AutoTokenizer.from_pretrained(model_dir)
+
+    class Processor35:
+        pass
+
+    processor35 = Processor35()
+    processor35.tokenizer = tokenizer35
+    processor35.apply_chat_template = lambda messages, **kw: tokenizer35.apply_chat_template(
+        messages, **kw
+    )
+
+    def process35(text, images=None):
+        image_processor = MiniCPMV4_6ImageProcessorPil.from_pretrained(model_dir)
+        if images is None:
+            return tokenizer35(text, return_tensors="pt", padding=True)
+        feature = image_processor(images)
+        # Expand the placeholder like the official processor: thumbnail tokens
+        # = grid area / 16 (single unsliced crop here).
+        counts = [int(t[0] * t[1] // 16) for t in feature["target_sizes"]]
+        expanded = []
+        for sample, count in zip(text, counts):
+            replaced = sample.replace(
+                "<|image_pad|>", "<image>" + "<|image_pad|>" * count + "</image>"
+            )
+            expanded.append(replaced)
+        encoded = tokenizer35(expanded, return_tensors="pt", padding=True)
+        types = (encoded["input_ids"] == tokenizer35.convert_tokens_to_ids("<|image_pad|>")).int()
+        merged = {**encoded, **feature, "mm_token_type_ids": types}
+        return {k: (torch.from_numpy(v.copy()) if isinstance(v, np.ndarray) else v)
+                for k, v in merged.items()}
+
+    processor35.__call__ = process35
+    model = MiniCPMV4_7ForConditionalGeneration.from_pretrained(
+        model_dir, dtype=torch.bfloat16
+    )
+    cases = [
+        (None, "What are the three primary colors? One short sentence."),
+        ("small.png", "Describe this image in one sentence."),
+    ]
+    output = {}
+    for image_name, prompt in cases:
+        text = processor35.apply_chat_template(
+            [{"role": "user", "content": (
+                [{"type": "text", "text": prompt}] if image_name is None
+                else [{"type": "image"}, {"type": "text", "text": prompt}])}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if image_name is None:
+            inputs = process35([text])
+        else:
+            image = Image.open(IMAGES / image_name).convert("RGB")
+            inputs = process35([text], images=[image])
+        input_ids = inputs["input_ids"][0].tolist()
+        generate_inputs = {
+            key: value
+            for key, value in inputs.items()
+            if key in ("input_ids", "attention_mask", "pixel_values", "target_sizes", "mm_token_type_ids")
+        }
+        with torch.no_grad():
+            generated = model.generate(
+                **generate_inputs, max_new_tokens=16, do_sample=False,
+                eos_token_id=[248044, 248046],
+            )[0][inputs["input_ids"].shape[1]:].tolist()
+        output[f"{image_name}|{prompt}"] = {
+            "image": image_name,
+            "prompt": prompt,
+            "input_ids": input_ids,
+            "generated": generated,
+        }
+        print(f"{image_name}: {len(input_ids)} prompt -> {len(generated)} tokens")
+    save_json(REFERENCE / "greedy-35b.json", output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--part",
-        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image", "quant-fixture", "moe-layer"],
+        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image", "quant-fixture", "moe-layer", "greedy-35b", "linear-layer-35b"],
         default="tokenizer-chat",
     )
     args = parser.parse_args()
@@ -847,6 +1073,10 @@ def main():
         export_quant_fixture(processor)
     elif args.part == "moe-layer":
         export_moe_layer(processor)
+    elif args.part == "greedy-35b":
+        export_greedy_35b(processor)
+    elif args.part == "linear-layer-35b":
+        export_linear_layer_35b()
 
 
 if __name__ == "__main__":

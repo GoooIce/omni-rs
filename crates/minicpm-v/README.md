@@ -1,8 +1,9 @@
 # MiniCPM-V-4.7 (omni-minicpm-v)
 
-[MiniCPM-V-4.7](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B) 的本地多模态理解：单图 + 文字提示，
-流式文本输出，全部推理在 Rust/Burn 中完成（无 Python 运行时）。默认面向 Apple Silicon 的
-Metal GPU（FP16 存储、FP32 归一化与递推状态）；`--precision f32` 提供 CPU 参考路径。
+[MiniCPM-V-4.7](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B) 与
+[MiniCPM-V-4.7-35B-A3B-int4](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-int4) 的本地多模态理解：
+单图 + 文字提示，流式文本输出，全部推理在 Rust/Burn 中完成（无 Python 运行时）。默认面向
+Apple Silicon 的 Metal GPU（FP16 存储、FP32 归一化与递推状态）；`--precision f32` 提供 CPU 参考路径。
 
 架构实现：SigLIP2 视觉塔（NaViT 变分辨率 patch、第 6 层后 2×2 窗口注意力合并、16× 混合压缩）+
 Qwen3.5 风格混合解码器（每 4 层 1 层全注意力：GQA 8Q/2KV、head_dim 256、部分旋转 0.25、
@@ -12,7 +13,8 @@ canvas M-RoPE + ChatML 模板（24.8 万词表）。
 ## 下载与检查
 
 ```sh
-python3 scripts/download_minicpm_v.py          # ModelScope 默认，--source huggingface 备选
+python3 scripts/download_minicpm_v.py          # 1B：ModelScope 默认，--source huggingface 备选
+python3 scripts/download_minicpm_v35b.py       # 35B-A3B-int4（22.65 GB，9 分片）
 cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- doctor
 ```
 
@@ -50,6 +52,10 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
   （`tests/greedy_parity.rs`、`tests/image_parity.rs`，需本地权重与
   `artifacts/minicpm-reference/`，缺失时自动跳过）；Metal FP16 抽查
   （`tests/metal_spot.rs`）在同一 fixture 上逐 token 一致。
+- 35B int4：真实第 0/1 层逐 seam（conv/递推核心/门控归一化/MoE/残差）对照 official bf16 转储
+  （`text::layer35b_tests`，需 35B 权重）；`greedy-35b.json` 文本与单图案例逐 token 一致。
+  int4 语义按 compressed-tensors `pack_to_int32`（无符号 +8 偏移 nibble）实现，
+  由合成 fixture 与运行时专家权重双重固定。
 - 实测数字与复现命令见仓库根 [VALIDATION.md](../../VALIDATION.md) 的 MiniCPM-V 小节。
 
 ## 已知限制
@@ -59,3 +65,7 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
   常规 autotune matmul 保留。
 - MTP 头不加载、不执行（检查点亦不含相应张量）。
 - 线性注意力 prefill 为逐步递推（与官方逐层语义一致，prefill 吞吐未优化）。
+- burn-cubecl 0.21 无转置权重的融合 int4 matmul（`q_transpose`）：生产路径按 ADR-0001
+  在加载点反量化（峰值 RSS ≈23.5 GiB）；BF16 计算通路在本机构建上损坏，全程 F16。
+- MoE 前向保留每层一次路由小张量回读，专家累加全 GPU；不做中途 host 上传
+  （该模式在本 burn 构建上会污染后续内核，见 VALIDATION）。

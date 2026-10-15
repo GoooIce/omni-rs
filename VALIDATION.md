@@ -3,6 +3,64 @@
 记录日期：2026-10-15（历史基线保留原日期）。设备：Apple M5 Max，40 核 GPU，128 GB RAM，macOS 27.0.1。
 工具链：rustc/cargo 1.99.0，Burn 0.21.0；依赖版本保存在 Cargo.lock。
 
+## 2026-10-16：MiniCPM-V-4.7 35B-A3B-int4 接入（T9–T11）
+
+`crates/minicpm-v` 第二阶段：compressed-tensors pack-quantized int4 权重加载（T9）、
+Qwen3.5-MoE 稀疏专家层（T10）与 35B 端到端（T11）。checkpoint 为
+`OpenBMB/MiniCPM-V-4.7-35B-A3B-int4`（pin 与 SHA256 清单见 `scripts/download_minicpm_v35b.py`，
+22.65 GB，9 分片）。官方对照：transformers 5.19.0 bf16 CPU，
+fixture 由 `scripts/export_minicpm_reference.py --part {quant-fixture,moe-layer,greedy-35b,linear-layer-35b}` 生成。
+
+### 关键语义（与 llm-compressor 源码对齐）
+
+- **int4 打包是“无符号 +8 偏移”而非补码符号扩展**：compressed-tensors `pack_to_int32`
+  打包 `q + 8 ∈ [0, 15]`，解包为 `nibble − 8`；4 bit 值在 int32 字内按 LSB 优先排列（每字节低半 nibble 在前）。
+  初版按补码 nibble 解包导致专家权重完全错误（残差流逐层放大直至溢出）。
+  合成 fixture（`quant-fixture`/`moe-layer`）与真实 checkpoint 的运行时专家权重
+  （`linear-layer-35b` 内含 `weight_packed` 原始字节与 transformers 物化结果）双重固定该语义，
+  最坏相对误差 ≤0.39%（bf16 量化舍入一步）。
+- **分组 scale 布局**为 `[out, in/128]` bf16 行主序；全零权重行的 scale 为非规格化小值，属正常现象。
+- 35B 线性注意力 32 值头/16 键头：q/k 经 L2 归一化后按 `[h0,h0,h1,h1,…]` 组间重复
+  （`repeat_interleave(dim=2)` 等价实现），与官方 `chunk_gated_delta_rule` 内核输入逐值一致。
+
+### 数值对照（Metal FP16，`tests` 内 `text::layer35b_tests`，需本地 35B 权重与 fixture）
+
+真实 35B 第 0/1 层逐 seam 对照（`artifacts/minicpm-reference/linear-layer-35b.safetensors`，
+official bf16 逐阶段转储：embeddings→各层残差输出、conv/q/k/v/g/beta/递推核心/门控归一化、MoE 出入）：
+
+| seam | RMSE |
+| --- | --- |
+| causal conv（SiLU 后）/ q_in / k_in / v_in / 递推核心 / 门控归一化 / g / beta | ≤3.5e-3 |
+| 注意力块输出 / MoE 块输出 / layer0 / layer1 残差 | ≤1.6e-2 |
+
+### 端到端（`artifacts/minicpm-reference/greedy-35b.json`，各 16 token，逐 token 一致）
+
+| 案例 | 结果 |
+| --- | --- |
+| 文本 "What are the three primary colors? One short sentence." | 16/16 一致 |
+| 单图 small.png "Describe this image in one sentence." | 16/16 一致 |
+
+### M5 Max 实测（Metal FP16，release，加载点反量化）
+
+| 指标 | 文本（21 prompt token） | 单图（90 prompt token） |
+| --- | --- | --- |
+| 权重加载 | 45–47 s | 45–47 s |
+| 首 token | 1.3 s | ~4 s |
+| 解码 | 261 ms/token | ~261 ms/token |
+| 峰值 RSS | 23.4 GiB | 23.5 GiB |
+
+### 已知问题（burn 0.21 / cubecl 0.10 限制，均已在代码内规避并留证）
+
+- **BF16 计算通路在本机构建上损坏**：任意模型以 bf16 精度运行即产生通道错位数据
+  （1B 复现：同二进制 f16 正常、bf16 乱码）。全程使用 F16；`Precision` 不再暴露 bf16。
+  checkpoint 的 bf16 权重/scale 经 f32 精确换载为 F16（无损表示范围内）。
+- **前向中途的 host 上传（`into_data`+`from_data`）会污染后续内核**（与分配布局相关、可复现）：
+  MoE 逐专家累加改为全 GPU `slice`/`slice_assign`（保留每层一次路由小张量回读），
+  生成路径不再有中途上传。
+- burn-cubecl 0.21 无 `q_transpose`：转置权重的融合 int4 matmul（W4A16 驻留）不可用，
+  生产 CLI 按 ADR-0001 在加载点反量化；非转置路径的融合算子由 `quant::gpu_tests` 固定。
+- 35B 逐 token 261 ms：路由回读 + 逐 (token, expert) 派发未做按专家批处理；后续优化空间明确。
+
 ## 2026-10-15：MiniCPM-V-4.7 1B 接入（T1–T8）
 
 `crates/minicpm-v`：SigLIP2 视觉塔、混合注意力解码器（18 线性 + 6 全注意力）、canvas M-RoPE、

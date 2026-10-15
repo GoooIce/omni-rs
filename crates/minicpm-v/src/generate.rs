@@ -1,6 +1,6 @@
 //! Greedy and sampled generation with streaming callbacks, interruption and
 //! finish-reason semantics shared by every MiniCPM-V entry point.
-use crate::{model::TextModel, multimodal::Prompt, tokenizer::EOS_IDS};
+use crate::{model::TextModel, multimodal::Prompt};
 use burn::tensor::backend::Backend;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -146,6 +146,7 @@ pub fn generate<B: Backend>(
     model: &TextModel<B>,
     prompt: &Prompt<B>,
     options: Options,
+    eos_ids: &[u32],
     cancel: &AtomicBool,
     mut emit: impl FnMut(GeneratedToken) -> Result<(), String>,
     decode: impl Fn(&[u32]) -> String,
@@ -181,7 +182,7 @@ pub fn generate<B: Backend>(
             .map_err(|e| e.to_string())?
             .to_vec();
         let token = sampler.sample(values, &history)?;
-        if EOS_IDS.contains(&token) {
+        if eos_ids.contains(&token) {
             finish = FinishReason::Stop;
             break;
         }
