@@ -639,11 +639,51 @@ def export_greedy(processor):
     save_json(REFERENCE / "greedy-text.json", cases)
 
 
+def export_greedy_image(processor):
+    """Official greedy streams for image + prompt pairs (1B, CPU fp32)."""
+    import torch
+
+    model = MiniCPMV4_7ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.float32)
+    cases = [
+        ("small.png", "Describe this image in one sentence."),
+        ("small.png", "What colors do you see? Answer briefly."),
+        ("large.jpg", "What is in this image? One sentence."),
+    ]
+    output = {}
+    for name, prompt in cases:
+        image = Image.open(IMAGES / name).convert("RGB")
+        text = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = processor(images=[image], text=[text], return_tensors="pt")
+        input_ids = inputs["input_ids"][0].tolist()
+        types = inputs["mm_token_type_ids"][0].tolist()
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=24,
+                do_sample=False,
+                eos_token_id=[248044, 248046],
+            )[0][inputs["input_ids"].shape[1]:].tolist()
+        output[f"{name}|{prompt}"] = {
+            "image": name,
+            "prompt": prompt,
+            "input_ids": input_ids,
+            "mm_token_type_ids": types,
+            "target_sizes": inputs["target_sizes"].tolist(),
+            "generated": generated,
+        }
+        print(f"{name} / {prompt!r}: {len(input_ids)} prompt tokens -> {len(generated)}")
+    save_json(REFERENCE / "greedy-image.json", output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--part",
-        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy"],
+        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer", "greedy", "greedy-image"],
         default="tokenizer-chat",
     )
     args = parser.parse_args()
@@ -659,6 +699,8 @@ def main():
         export_linear_layer(processor)
     elif args.part == "greedy":
         export_greedy(processor)
+    elif args.part == "greedy-image":
+        export_greedy_image(processor)
 
 
 if __name__ == "__main__":

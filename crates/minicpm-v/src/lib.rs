@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod generate;
 pub mod image;
 pub mod model;
+pub mod multimodal;
 pub mod positions;
 pub mod text;
 pub mod tokenizer;

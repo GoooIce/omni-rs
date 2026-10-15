@@ -8,6 +8,7 @@ use omni_minicpm_v::{
     config::ModelDirectory,
     generate::{self, FinishReason},
     model::TextModel,
+    multimodal::Prompt,
     tokenizer::MiniCpmTokenizer,
 };
 use std::sync::atomic::AtomicBool;
@@ -68,7 +69,7 @@ fn text_only_greedy_matches_official_tokens() {
         let cancel = AtomicBool::new(false);
         let outcome = generate::generate(
             &model,
-            &ids,
+            &Prompt::text(ids),
             generate::Options {
                 max_new_tokens: expected.len(),
                 temperature: 0.0,

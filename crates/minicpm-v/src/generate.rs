@@ -1,6 +1,6 @@
 //! Greedy and sampled generation with streaming callbacks, interruption and
 //! finish-reason semantics shared by every MiniCPM-V entry point.
-use crate::{model::TextModel, tokenizer::EOS_IDS};
+use crate::{model::TextModel, multimodal::Prompt, tokenizer::EOS_IDS};
 use burn::tensor::backend::Backend;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -144,14 +144,15 @@ impl Sampler {
 /// Generate from a prepared prompt, streaming deltas through `emit`.
 pub fn generate<B: Backend>(
     model: &TextModel<B>,
-    prompt: &[u32],
+    prompt: &Prompt<B>,
     options: Options,
     cancel: &AtomicBool,
     mut emit: impl FnMut(GeneratedToken) -> Result<(), String>,
     decode: impl Fn(&[u32]) -> String,
 ) -> Result<Outcome, String> {
     let mut state = model.new_state(&prompt_device::<B>());
-    let mut history: Vec<u32> = prompt.to_vec();
+    state.rope_delta = prompt.rope_delta;
+    let mut history: Vec<u32> = prompt.ids.clone();
     let mut sampler = Sampler::new(options.clone());
     let start = Instant::now();
     let mut first_token_ms = None;
@@ -160,7 +161,13 @@ pub fn generate<B: Backend>(
     let mut finish = FinishReason::Length;
 
     let mut logits = model
-        .forward(prompt, None, &mut state, burn::tensor::FloatDType::F32)
+        .forward(
+            &prompt.ids,
+            prompt.embeddings.clone(),
+            prompt.positions.as_deref(),
+            &mut state,
+            burn::tensor::FloatDType::F32,
+        )
         .map_err(|e| e.to_string())?;
     for step in 0..options.max_new_tokens {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -198,7 +205,13 @@ pub fn generate<B: Backend>(
             break;
         }
         logits = model
-            .forward(&[token], None, &mut state, burn::tensor::FloatDType::F32)
+            .forward(
+                &[token],
+                None,
+                None,
+                &mut state,
+                burn::tensor::FloatDType::F32,
+            )
             .map_err(|e| e.to_string())?;
     }
     let text = decode(&tokens);

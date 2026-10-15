@@ -86,6 +86,11 @@ impl<B: Backend> TextModel<B> {
         })
     }
 
+    /// Token embeddings `(1, tokens, hidden)` for multimodal splicing.
+    pub fn embeddings(&self, ids: &[u32]) -> omni_r2t2::Result<Tensor<B, 3>> {
+        self.embed.forward(ids)
+    }
+
     pub fn new_state(&self, device: &B::Device) -> DecodeState<B> {
         let mut kv = Vec::new();
         let mut linear = Vec::new();
@@ -109,6 +114,7 @@ impl<B: Backend> TextModel<B> {
         &self,
         ids: &[u32],
         embeddings: Option<Tensor<B, 3>>,
+        positions: Option<&[[i64; 3]]>,
         state: &mut DecodeState<B>,
         output: FloatDType,
     ) -> omni_r2t2::Result<Tensor<B, 2>> {
@@ -122,12 +128,15 @@ impl<B: Backend> TextModel<B> {
         let mut linear_index = 0;
         // Positions: text-only generation is 1-D; a multimodal prompt passes
         // its canvas table through `position_overrides`.
-        let positions: Vec<[i64; 3]> = (0..tokens)
-            .map(|offset| {
-                let base = (state.length + offset) as i64 + state.rope_delta;
-                [base, base, base]
-            })
-            .collect();
+        let positions: Vec<[i64; 3]> = match positions {
+            Some(table) => table.to_vec(),
+            None => (0..tokens)
+                .map(|offset| {
+                    let base = (state.length + offset) as i64 + state.rope_delta;
+                    [base, base, base]
+                })
+                .collect(),
+        };
         let (cos, sin) = mrope_tables::<B>(
             &self.config.text_config,
             &positions,

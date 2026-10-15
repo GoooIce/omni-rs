@@ -4,6 +4,7 @@ use omni_minicpm_v::{
     config::ModelDirectory,
     doctor, generate,
     model::TextModel,
+    multimodal::{self, Prompt},
 };
 use std::{
     io::Write,
@@ -39,6 +40,9 @@ struct GenerateOptions {
     model: PathBuf,
     #[arg(long)]
     prompt: String,
+    /// One image (PNG/JPEG/WebP) for multimodal input.
+    #[arg(long)]
+    image: Option<PathBuf>,
     #[arg(long)]
     system: Option<String>,
     #[arg(long)]
@@ -120,19 +124,6 @@ fn run_generate<B: burn::tensor::backend::Backend>(
     let tokenizer = directory.tokenizer()?;
     let weights = omni_r2t2::weights::Weights::open(&options.model)?;
 
-    let mut messages = Vec::new();
-    if let Some(system) = &options.system {
-        messages.push(Message::text(Role::System, system.clone()));
-    }
-    messages.push(Message::text(Role::User, options.prompt.clone()));
-    let rendered = chat::render(&messages, true, None)?;
-    let prompt = tokenizer.encode(&rendered);
-
-    eprintln!(
-        "Loading {} ({} prompt tokens)",
-        options.model.display(),
-        prompt.len()
-    );
     let start = Instant::now();
     let precision = match options.precision.as_str() {
         "f16" => omni_r2t2::Precision::F16,
@@ -140,6 +131,38 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         other => return Err(format!("precision must be f16 or f32, got {other}").into()),
     };
     let model = TextModel::<B>::load(&weights, &config, precision, device)?;
+
+    let prompt = match &options.image {
+        Some(image) => {
+            let vision = multimodal::Multimodal::<B>::load(&weights, &config, precision, device)?;
+            vision
+                .build_prompt(multimodal::Build::<B> {
+                    tokenizer: &tokenizer,
+                    model: &model,
+                    config: &config,
+                    model_dir: &options.model,
+                    image,
+                    prompt: &options.prompt,
+                    device,
+                    precision,
+                })
+                .map_err(|e| e.to_string())?
+        }
+        None => {
+            let mut messages = Vec::new();
+            if let Some(system) = &options.system {
+                messages.push(Message::text(Role::System, system.clone()));
+            }
+            messages.push(Message::text(Role::User, options.prompt.clone()));
+            let rendered = chat::render(&messages, true, None)?;
+            Prompt::text(tokenizer.encode(&rendered))
+        }
+    };
+    eprintln!(
+        "Loading {} ({} prompt tokens)",
+        options.model.display(),
+        prompt.ids.len()
+    );
     B::sync(device).map_err(|e| format!("weight initialization failed: {e:?}"))?;
     eprintln!("Weights loaded in {:.2}s", start.elapsed().as_secs_f32());
 
