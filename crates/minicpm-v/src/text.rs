@@ -363,6 +363,298 @@ impl<B: Backend> FullLayer<B> {
     }
 }
 
+/// Recurrent + causal-conv state carried across decode steps.
+#[derive(Clone)]
+pub struct LinearState<B: Backend> {
+    /// `(1, conv_dim, kernel - 1)` mixed QKV tail before the conv.
+    pub conv: Tensor<B, 3>,
+    /// `(1, heads, head_k, head_v)` FP32 SSM state.
+    pub recurrent: Tensor<B, 4>,
+}
+
+pub struct LinearAttention<B: Backend> {
+    qkv: Linear<B>,
+    z: Linear<B>,
+    b: Linear<B>,
+    a: Linear<B>,
+    out: Linear<B>,
+    conv_weight: Tensor<B, 3>, // (conv_dim, 1, kernel) FP32
+    a_log: Tensor<B, 1>,       // (heads,) FP32
+    dt_bias: Tensor<B, 1>,     // (heads,) FP32
+    norm_weight: Tensor<B, 1>, // (head_v,) FP32, plain scaling (no +1)
+    heads: usize,
+    head_k: usize,
+    head_v: usize,
+    kernel: usize,
+    key_dim: usize,
+    value_dim: usize,
+    eps: f64,
+}
+
+impl<B: Backend> LinearAttention<B> {
+    pub fn load(
+        w: &impl WeightSource<B>,
+        name: &str,
+        config: &TextConfig,
+        p: Precision,
+        d: &B::Device,
+    ) -> omni_r2t2::Result<Self> {
+        let heads = config.linear_num_key_heads;
+        let head_k = config.linear_key_head_dim;
+        let head_v = config.linear_value_head_dim;
+        let key_dim = heads * head_k;
+        let value_dim = config.linear_num_value_heads * head_v;
+        let kernel = config.linear_conv_kernel_dim.max(2);
+        let conv_dim = 2 * key_dim + value_dim;
+        let load = |suffix: &str, out: usize| -> omni_r2t2::Result<Linear<B>> {
+            Ok(shared::Linear::from_parts(
+                w.tensor(
+                    &format!("{name}.{suffix}.weight"),
+                    [out, config.hidden_size],
+                    p,
+                    d,
+                )?,
+                None,
+            ))
+        };
+        Ok(Self {
+            qkv: load("in_proj_qkv", conv_dim)?,
+            z: load("in_proj_z", value_dim)?,
+            b: load("in_proj_b", heads)?,
+            a: load("in_proj_a", heads)?,
+            out: shared::Linear::from_parts(
+                w.tensor(
+                    &format!("{name}.out_proj.weight"),
+                    [config.hidden_size, value_dim],
+                    p,
+                    d,
+                )?,
+                None,
+            ),
+            conv_weight: w.tensor(
+                &format!("{name}.conv1d.weight"),
+                [conv_dim, 1, kernel],
+                Precision::F32,
+                d,
+            )?,
+            a_log: w.tensor(&format!("{name}.A_log"), [heads], Precision::F32, d)?,
+            dt_bias: w.tensor(&format!("{name}.dt_bias"), [heads], Precision::F32, d)?,
+            norm_weight: w.tensor(&format!("{name}.norm.weight"), [head_v], Precision::F32, d)?,
+            heads,
+            head_k,
+            head_v,
+            kernel,
+            key_dim,
+            value_dim,
+            eps: config.rms_norm_eps,
+        })
+    }
+
+    pub fn new_state(&self, device: &B::Device) -> LinearState<B> {
+        LinearState {
+            conv: Tensor::zeros(
+                [1, 2 * self.key_dim + self.value_dim, self.kernel - 1],
+                device,
+            ),
+            recurrent: Tensor::zeros(
+                [1, self.heads, self.head_k, self.head_v],
+                (device, burn::tensor::DType::F32),
+            ),
+        }
+    }
+
+    /// Causal depthwise conv with SiLU over `(1, T, conv)` input. Returns the
+    /// activated stream and the new conv tail state.
+    fn causal_conv(
+        &self,
+        mixed: Tensor<B, 3>,
+        tail: Option<Tensor<B, 3>>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        let [_, seq, conv_dim] = mixed.dims();
+        let dtype = shared::dtype(&mixed);
+        let device = mixed.device();
+        let stream = mixed.permute([0, 2, 1]); // (1, conv, T)
+        let tail = tail.unwrap_or_else(|| Tensor::zeros([1, conv_dim, self.kernel - 1], &device));
+        let padded = Tensor::cat(vec![tail, stream], 2);
+        let [_, _, width] = padded.dims();
+        let new_tail = padded
+            .clone()
+            .slice([0..1, 0..conv_dim, width - (self.kernel - 1)..width]);
+        let mut output = Tensor::<B, 3>::zeros([1, conv_dim, seq], &device);
+        for tap in 0..self.kernel {
+            let weight = self
+                .conv_weight
+                .clone()
+                .slice([0..conv_dim, 0..1, tap..tap + 1])
+                .reshape([conv_dim, 1]);
+            let window = padded.clone().slice([0..1, 0..conv_dim, tap..tap + seq]);
+            output = output + window * weight.unsqueeze();
+        }
+        let activated = burn::tensor::activation::silu(output.cast(FloatDType::F32));
+        (activated.permute([0, 2, 1]).cast(dtype), new_tail)
+    }
+
+    /// The FP32 gated delta rule recurrence; `q`,`k` are already L2-normalized
+    /// and scaled, `g`/`beta` per head. State `(1, H, K, V)` evolves in place.
+    fn recurrence(
+        &self,
+        q: Tensor<B, 4>,    // (1, T, H, K) FP32
+        k: Tensor<B, 4>,    // (1, T, H, K) FP32
+        v: Tensor<B, 4>,    // (1, T, H, V) FP32
+        g: Tensor<B, 3>,    // (1, T, H) FP32
+        beta: Tensor<B, 3>, // (1, T, H) FP32
+        mut state: Tensor<B, 4>,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let seq = q.dims()[1];
+        let mut outputs = Vec::with_capacity(seq);
+        let mut state = state.squeeze_dim::<3>(0); // (H, K, V) FP32
+        for t in 0..seq {
+            let pick = |tensor: &Tensor<B, 4>| -> Tensor<B, 2> {
+                tensor
+                    .clone()
+                    .slice([0..1, t..t + 1])
+                    .reshape([self.heads, tensor.dims()[3]])
+            };
+            let q_t = pick(&q); // (H, K)
+            let k_t = pick(&k);
+            let v_t = pick(&v); // (H, V)
+            let decay = g
+                .clone()
+                .slice([0..1, t..t + 1])
+                .reshape([self.heads, 1, 1])
+                .exp();
+            let beta_t = beta
+                .clone()
+                .slice([0..1, t..t + 1])
+                .reshape([self.heads, 1]);
+            state = state * decay;
+            let kv = (state.clone() * k_t.clone().unsqueeze_dim(2))
+                .sum_dim(1)
+                .reshape([self.heads, self.head_v]);
+            let delta = (v_t.clone() - kv) * beta_t;
+            state = state + k_t.unsqueeze_dim(2) * delta.unsqueeze_dim(1);
+            let out = (state.clone() * q_t.unsqueeze_dim(2))
+                .sum_dim(1)
+                .reshape([self.heads, self.head_v]);
+            outputs.push(out.reshape([1, 1, self.heads, self.head_v]));
+        }
+        (Tensor::cat(outputs, 1), state.unsqueeze_dim(0)) // (1, T, H, V)
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>, state: Option<&mut LinearState<B>>) -> Tensor<B, 3> {
+        let [_, seq, _] = x.dims();
+        let dtype = shared::dtype(&x);
+        let mixed = self.qkv.forward(x.clone());
+        let (conv, new_tail) = self.causal_conv(mixed, state.as_ref().map(|s| s.conv.clone()));
+
+        let fp32 = |t: Tensor<B, 3>| t.cast(FloatDType::F32);
+        let q = fp32(conv.clone().slice([0..1, 0..seq, 0..self.key_dim])).reshape([
+            1,
+            seq,
+            self.heads,
+            self.head_k,
+        ]);
+        let k = fp32(
+            conv.clone()
+                .slice([0..1, 0..seq, self.key_dim..2 * self.key_dim]),
+        )
+        .reshape([1, seq, self.heads, self.head_k]);
+        let value_end = 2 * self.key_dim + self.value_dim;
+        let v = fp32(
+            conv.clone()
+                .slice([0..1, 0..seq, 2 * self.key_dim..value_end]),
+        )
+        .reshape([1, seq, self.heads, self.head_v]);
+        let l2 = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+            // Official FLA l2norm: x * rsqrt(sum(x^2) + eps).
+            let scale = (t.clone().square().sum_dim(3) + 1e-6).sqrt().recip();
+            t * scale
+        };
+        let q = l2(q) * (self.head_k as f32).powf(-0.5);
+        let k = l2(k);
+
+        let beta = burn::tensor::activation::sigmoid(fp32(self.b.forward(x.clone())));
+        let z = self.z.forward(x.clone()).cast(FloatDType::F32);
+        let a = fp32(self.a.forward(x.clone()));
+        // softplus(a + dt_bias) with torch's threshold at 20, then the
+        // negative decay.
+        let a = a + self.dt_bias.clone().reshape([1, 1, self.heads]);
+        let softplus = a.clone().exp().log1p();
+        let softplus = softplus.mask_where(a.clone().greater_elem(20.0), a);
+        let decay = -self.a_log.clone().reshape([1, 1, self.heads]).exp() * softplus;
+
+        let initial = state
+            .as_ref()
+            .map(|s| s.recurrent.clone())
+            .unwrap_or_else(|| {
+                Tensor::zeros(
+                    [1, self.heads, self.head_k, self.head_v],
+                    (&x.device(), burn::tensor::DType::F32),
+                )
+            });
+        let (core, recurrent) = self.recurrence(q, k, v, decay, beta, initial);
+        if let Some(state) = state {
+            state.conv = new_tail;
+            state.recurrent = recurrent;
+        }
+
+        // RMSNormGated: FP32 norm, plain weight, SiLU gate.
+        let flat = core.reshape([seq * self.heads, self.head_v]);
+        let variance = (flat.clone().square().mean_dim(1) + self.eps).sqrt();
+        let normed = flat / variance;
+        let z = z.reshape([seq * self.heads, self.head_v]);
+        let gated_norm =
+            normed * self.norm_weight.clone().unsqueeze_dim(0) * burn::tensor::activation::silu(z);
+        let out = gated_norm.reshape([1, seq, self.value_dim]).cast(dtype);
+        self.out.forward(out)
+    }
+}
+
+pub struct LinearLayer<B: Backend> {
+    input_norm: Norm<B>,
+    attn: LinearAttention<B>,
+    post_norm: Norm<B>,
+    mlp: Mlp<B>,
+}
+
+impl<B: Backend> LinearLayer<B> {
+    pub fn load(
+        w: &impl WeightSource<B>,
+        name: &str,
+        config: &TextConfig,
+        p: Precision,
+        d: &B::Device,
+    ) -> omni_r2t2::Result<Self> {
+        Ok(Self {
+            input_norm: rms_norm(
+                w,
+                &format!("{name}.input_layernorm"),
+                config.hidden_size,
+                config.rms_norm_eps,
+                d,
+            )?,
+            attn: LinearAttention::load(w, &format!("{name}.linear_attn"), config, p, d)?,
+            post_norm: rms_norm(
+                w,
+                &format!("{name}.post_attention_layernorm"),
+                config.hidden_size,
+                config.rms_norm_eps,
+                d,
+            )?,
+            mlp: Mlp::load(w, &format!("{name}.mlp"), config, p, d)?,
+        })
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>, state: Option<&mut LinearState<B>>) -> Tensor<B, 3> {
+        let dtype = shared::dtype(&x);
+        let normed = self.input_norm.forward(x.clone(), dtype);
+        let attended = self.attn.forward(normed, state);
+        let x = shared::residual(x, attended, dtype);
+        let mlp = self.mlp.forward(self.post_norm.forward(x.clone(), dtype));
+        shared::residual(x, mlp, dtype)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,5 +902,163 @@ mod rope_debug {
         for t in [0usize, 1, 4] {
             println!("  {:?}", &official[t * 16..t * 16 + 16]);
         }
+    }
+}
+
+#[cfg(test)]
+mod linear_tests {
+    use super::*;
+    use crate::config::RopeParameters;
+    use burn::backend::NdArray;
+    use safetensors::SafeTensors;
+
+    fn config() -> TextConfig {
+        TextConfig {
+            hidden_size: 96,
+            intermediate_size: 224,
+            num_hidden_layers: 8,
+            layer_types: vec!["linear_attention".into()],
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            vocab_size: 256,
+            rms_norm_eps: 1e-6,
+            attn_output_gate: true,
+            full_attention_interval: 4,
+            linear_conv_kernel_dim: 4,
+            linear_num_key_heads: 4,
+            linear_num_value_heads: 4,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            max_position_embeddings: 4096,
+            rope_parameters: RopeParameters {
+                mrope_section: vec![3, 3, 2],
+                rope_theta: 10000.0,
+                partial_rotary_factor: 0.25,
+            },
+            mamba_ssm_dtype: None,
+        }
+    }
+
+    // as_chunks would need a newer MSRV than the workspace
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    fn stage(tensors: &SafeTensors<'_>, name: &str) -> Vec<f32> {
+        tensors
+            .tensor(name)
+            .unwrap()
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    }
+
+    fn compare(label: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        let mut squared = 0f64;
+        let mut energy = 0f64;
+        for (&a, &b) in actual.iter().zip(expected) {
+            squared += (a as f64 - b as f64).powi(2);
+            energy += (b as f64).powi(2);
+        }
+        let rmse = squared.sqrt() / energy.sqrt().max(1e-12);
+        assert!(rmse < 2e-4, "{label}: RMSE {rmse:.8}");
+    }
+
+    fn values3(tensor: Tensor<NdArray, 3>) -> Vec<f32> {
+        tensor
+            .into_data()
+            .convert::<f32>()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn gated_delta_layer_matches_official_prefill_and_decode() {
+        type B = NdArray;
+        let device: burn::backend::ndarray::NdArrayDevice = Default::default();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/linear-attention-layer.safetensors");
+        let bytes = std::fs::read(&path).unwrap();
+        let tensors = SafeTensors::deserialize(&bytes).unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes.clone()]).unwrap();
+        let config = config();
+        let layer: LinearLayer<B> =
+            LinearLayer::load(&weights, "layers.0", &config, Precision::F32, &device).unwrap();
+
+        let seq = 40;
+        let hidden = stage(&tensors, "stage_hidden_in");
+        let x = Tensor::<B, 3>::from_data(
+            burn::tensor::TensorData::new(hidden, [1, seq, config.hidden_size]),
+            &device,
+        );
+        let mut state = layer.attn.new_state(&device);
+        let output = layer.forward(x, Some(&mut state));
+        compare(
+            "prefill layer_out",
+            &values3(output),
+            &stage(&tensors, "stage_layer_out"),
+        );
+        compare(
+            "final recurrent state",
+            &values4(state.recurrent.clone()),
+            &stage(&tensors, "stage_final_state"),
+        );
+        compare(
+            "final conv state",
+            &values3(state.conv.clone()),
+            &stage(&tensors, "stage_conv_state"),
+        );
+
+        // Cached decode; the fixture captures the attention-block output at
+        // this seam because the reference kernels expose the cached path there.
+        let decode_inputs = stage(&tensors, "stage_decode_inputs");
+        let decode_expected = stage(&tensors, "stage_decode_steps");
+        let expected_steps: Vec<&[f32]> = decode_expected.chunks(config.hidden_size).collect();
+        for step in 0..3 {
+            let token = Tensor::<B, 3>::from_data(
+                burn::tensor::TensorData::new(
+                    decode_inputs[step * config.hidden_size..(step + 1) * config.hidden_size]
+                        .to_vec(),
+                    [1, 1, config.hidden_size],
+                ),
+                &device,
+            );
+            let normed = layer.input_norm.forward(token, FloatDType::F32);
+            let output = layer.attn.forward(normed, Some(&mut state));
+            compare(
+                &format!("decode step {step}"),
+                &values3(output),
+                expected_steps[step],
+            );
+        }
+
+        // Reset semantics: a fresh state must not repeat carried-state outputs.
+        let token = Tensor::<B, 3>::from_data(
+            burn::tensor::TensorData::new(
+                decode_inputs[..config.hidden_size].to_vec(),
+                [1, 1, config.hidden_size],
+            ),
+            &device,
+        );
+        let mut fresh = layer.attn.new_state(&device);
+        let normed = layer.input_norm.forward(token, FloatDType::F32);
+        let fresh_output = layer.attn.forward(normed, Some(&mut fresh));
+        assert!(
+            values3(fresh_output)
+                .iter()
+                .zip(expected_steps[0].iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "fresh state must differ from carried state"
+        );
+    }
+
+    fn values4(tensor: Tensor<NdArray, 4>) -> Vec<f32> {
+        tensor
+            .into_data()
+            .convert::<f32>()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec()
     }
 }

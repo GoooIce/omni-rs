@@ -469,11 +469,142 @@ def export_text_layer(processor):
     print(f"wrote {destination}: stages {sorted(captured)}")
 
 
+def export_linear_layer(processor):
+    """Synthetic gated-delta-net layer: prefill, final state and cached decode.
+
+    Decode steps are produced with the module's own pure-torch fallbacks
+    (causal conv update + recurrent delta rule), which is the semantics the
+    Rust port implements.
+    """
+    import torch
+    import torch.nn.functional as Fn
+
+    from transformers import Qwen3_5TextConfig
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as q35
+
+    torch.manual_seed(11)
+    text_config = Qwen3_5TextConfig(
+        hidden_size=96,
+        intermediate_size=224,
+        num_hidden_layers=8,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        vocab_size=256,
+        rms_norm_eps=1e-6,
+        linear_conv_kernel_dim=4,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
+                          "partial_rotary_factor": 0.25, "mrope_section": [3, 3, 2]},
+    )
+    layer = q35.Qwen3_5DecoderLayer(text_config, 0).to(torch.float32)
+    for parameter in layer.parameters():
+        parameter.data.normal_(0.0, 0.2)
+    layer.eval()
+    attn = layer.linear_attn
+
+    seq = 40
+    hidden = torch.randn(1, seq, text_config.hidden_size)
+    with torch.no_grad():
+        captured = {}
+        hooks = [
+            attn.out_proj.register_forward_pre_hook(
+                lambda m, a: captured.__setitem__("out_proj_in", a[0].detach().float().cpu())),
+            layer.register_forward_hook(
+                lambda m, a, o: captured.__setitem__("layer_out", o.detach().float().cpu())),
+        ]
+        prefill = layer(
+            hidden.clone(),
+            position_embeddings=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+        )
+        captured["linear_out"] = prefill.detach().float().cpu()
+        for hook in hooks:
+            hook.remove()
+
+        # Rebuild the internals to extract the final recurrent + conv states.
+        # The attention block sees the input-normed stream, not the raw layer
+        # input.
+        normed = layer.input_layernorm(hidden)
+        mixed = attn.in_proj_qkv(normed).transpose(1, 2)  # (1, conv, seq)
+        conv = q35.causal_conv1d_fn(
+            mixed, attn.conv1d.weight.squeeze(1), None, activation=attn.activation)
+        conv = conv.transpose(1, 2)
+        batch = 1
+        key_dim = attn.key_dim
+        value_dim = attn.value_dim
+        q, k, v = torch.split(conv, [key_dim, key_dim, value_dim], dim=-1)
+        q = q.reshape(batch, seq, -1, attn.head_k_dim)
+        k = k.reshape(batch, seq, -1, attn.head_k_dim)
+        v = v.reshape(batch, seq, -1, attn.head_v_dim)
+        beta = attn.in_proj_b(normed).sigmoid()
+        g = -attn.A_log.float().exp() * Fn.softplus(attn.in_proj_a(normed).float() + attn.dt_bias)
+        core, final_state = q35.torch_recurrent_gated_delta_rule(
+            q, k, v, g=g, beta=beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
+        captured["final_state"] = final_state.detach().float().cpu()  # (1, H, K, V)
+        captured["conv_state"] = mixed[:, :, -3:].detach().float().cpu()  # (1, conv, 3)
+        captured["core_out"] = core.detach().float().cpu()
+
+        # Three cached decode steps using the module's own update kernels.
+        decode = []
+        state = final_state
+        conv_state = captured["conv_state"].clone()
+        for step in range(3):
+            token = torch.randn(1, 1, text_config.hidden_size)
+            hidden = torch.cat([hidden, token], dim=1)
+            token = layer.input_layernorm(token)
+            mixed_step = attn.in_proj_qkv(token).transpose(1, 2)
+            with torch.no_grad():
+                # causal_conv1d_update slides the conv state in place.
+                updated = q35.causal_conv1d_update(
+                    mixed_step, conv_state, attn.conv1d.weight.squeeze(1), None, attn.activation)
+                conv_step = updated.transpose(1, 2)
+                q_step = conv_step[..., :key_dim].reshape(batch, 1, -1, attn.head_k_dim)
+                k_step = conv_step[..., key_dim:2 * key_dim].reshape(batch, 1, -1, attn.head_k_dim)
+                v_step = conv_step[..., 2 * key_dim:].reshape(batch, 1, -1, attn.head_v_dim)
+                beta_step = attn.in_proj_b(token).sigmoid()
+                g_step = -attn.A_log.float().exp() * Fn.softplus(
+                    attn.in_proj_a(token).float() + attn.dt_bias)
+                core_step, state = q35.torch_recurrent_gated_delta_rule(
+                    q_step, k_step, v_step, g=g_step, beta=beta_step,
+                    initial_state=state, output_final_state=True, use_qk_l2norm_in_kernel=True)
+                z = attn.in_proj_z(token).reshape(1, 1, -1, attn.head_v_dim)
+                normed = attn.norm(core_step.reshape(-1, attn.head_v_dim), z.reshape(-1, attn.head_v_dim))
+                out = attn.out_proj(normed.reshape(1, 1, -1))
+            decode.append(out.detach().float().cpu().numpy())
+        captured["decode_steps"] = np.stack(decode)  # (3, 1, 1, hidden)
+        captured["hidden_in"] = torch.cat([hidden[:, :seq]], dim=1).float().cpu()
+        captured["decode_inputs"] = hidden[:, seq:].transpose(0, 1).float().cpu().numpy()  # (3, 1, hidden)
+
+    layer_state = {}
+    for name, tensor in attn.state_dict().items():
+        layer_state[f"layers.0.linear_attn.{name}"] = tensor.detach().float().numpy()
+    for name, tensor in layer.state_dict().items():
+        if name.startswith("mlp.") or "layernorm" in name:
+            layer_state[f"layers.0.{name}"] = tensor.detach().float().numpy()
+    payload = {
+        **{k: np.ascontiguousarray(v) for k, v in layer_state.items()},
+        **{f"stage_{k}": np.ascontiguousarray(v) for k, v in captured.items()
+           if isinstance(v, torch.Tensor)},
+        "stage_decode_steps": np.ascontiguousarray(captured["decode_steps"]),
+        "stage_decode_inputs": np.ascontiguousarray(captured["decode_inputs"]),
+    }
+    destination = FIXTURES / "linear-attention-layer.safetensors"
+    save_file(payload, destination)
+    print(f"wrote {destination}: {sorted(k for k in payload if k.startswith('stage'))}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--part",
-        choices=["tokenizer-chat", "vision", "text-layer"],
+        choices=["tokenizer-chat", "vision", "text-layer", "linear-layer"],
         default="tokenizer-chat",
     )
     args = parser.parse_args()
@@ -485,6 +616,8 @@ def main():
         export_vision(processor, dump_stages=True)
     elif args.part == "text-layer":
         export_text_layer(processor)
+    elif args.part == "linear-layer":
+        export_linear_layer(processor)
 
 
 if __name__ == "__main__":
