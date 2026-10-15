@@ -1,0 +1,22 @@
+Rust/Burn implementation of Breeze-TTS-2.
+
+Architecture and inference behavior adapted from:
+  Breeze TTS, https://github.com/breezeblue-ai/breeze-tts
+  Commit 58ec70ce5fa4cc361bdebf77ec40d1365da00ab2
+  Apache License 2.0
+  The Breeze model implementation includes code adapted from Transformers:
+  Copyright 2025 Sesame and The HuggingFace Inc. team. All rights reserved.
+
+The audio codec architecture is adapted from qwen-tts 0.1.1:
+  https://github.com/QwenLM/Qwen3-TTS
+  Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team.
+  All rights reserved. Apache License 2.0.
+
+The reference audio encoder is adapted from Transformers 4.57.3 Mimi:
+  https://github.com/huggingface/transformers/tree/v4.57.3/src/transformers/models/mimi
+  Copyright 2024 Kyutai, and the HuggingFace Inc. team.
+  All rights reserved. Apache License 2.0.
+
+This repository's Rust source license does not license the model weights or
+self-hosted model outputs. Those are separately governed by the BreezeBlue
+Research and Non-Commercial License distributed with the checkpoint.

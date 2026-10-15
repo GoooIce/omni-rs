@@ -1,0 +1,22 @@
+[package]
+name = "breeze-gemv-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std", "metal", "fusion", "autotune"] }
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std", "fusion", "autotune"] }
+burn-fusion = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ir = { version = "=0.21.0", default-features = false, features = ["std"] }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "stdlib", "wgpu-msl"] }
+serde_json = "1"
+
+[patch.crates-io]
+burn = { path = "../../vendor/burn" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

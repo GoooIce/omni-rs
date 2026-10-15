@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confucius4-R2T2 · WebGPU</title>
+<style>
+  body { max-width: 780px; margin: 48px auto; padding: 0 24px; font: 16px/1.65 system-ui; color: #16242c; background: #f5f8f9; }
+  h1 { font-size: 28px; }
+  label { display: block; margin: 18px 0; }
+  input, select, button { font: inherit; padding: 8px 12px; max-width: 100%; }
+  input[type=url] { width: 94%; }
+  button { cursor: pointer; }
+  button:disabled { cursor: wait; opacity: .5; }
+  progress { width: 100%; }
+  #text { background: white; border: 1px solid #d3dfe5; border-radius: 8px; min-height: 140px; padding: 20px; white-space: pre-wrap; }
+  #status { min-height: 2em; }
+</style>
+<h1>Confucius4-R2T2 · WebGPU</h1>
+<p>音频在本机浏览器中识别，文本逐块显示。模型约 4.08 GB，首次加载较慢；处理速度取决于显卡和浏览器。</p>
+<label>模型 manifest 地址
+  <input id="manifest" type="url" value="../models/web/manifest.json">
+</label>
+<label>计算精度
+  <select id="precision"><option value="f16">FP16</option><option value="f32">FP32（占用更多显存）</option></select>
+</label>
+<button id="load">加载模型</button>
+<progress id="progress" max="1" value="0" aria-label="模型加载进度"></progress>
+<label>选择音频文件 <input id="audio" type="file" accept="audio/*"></label>
+<label>识别语言
+  <select id="language"><option value="Chinese">中文</option><option value="English">English</option><option value="">自动识别</option></select>
+</label>
+<button id="transcribe" disabled>开始识别</button>
+<p id="status" role="status">请先加载模型。需要支持 WebGPU 的浏览器，通过 localhost 或 HTTPS 打开。</p>
+<div id="text" aria-label="转写文本" aria-live="polite"></div>
+<script type="module">
+  const ui = Object.fromEntries(["manifest", "precision", "load", "progress", "audio", "language", "transcribe", "status", "text"].map(id => [id, document.getElementById(id)]));
+  const worker = new Worker(new URL("./demo-worker.js", location.href), { type: "module" });
+  let ready = false;
+  const setBusy = busy => { ui.load.disabled = busy; ui.transcribe.disabled = busy || !ready; };
+  const fail = message => { ui.status.textContent = message; setBusy(false); };
+  worker.onerror = event => { ready = false; fail(`Worker 错误：${event.message}`); };
+  worker.onmessage = ({ data }) => {
+    if (data.type === "progress") {
+      ui.progress.value = data.progress;
+      ui.status.textContent = `正在加载模型：${Math.round(data.progress * 100)}%`;
+    } else if (data.type === "ready") {
+      ready = true;
+      ui.status.textContent = "模型已就绪，请选择音频。首次识别还需要编译 GPU 内核。";
+      setBusy(false);
+    } else if (data.type === "event" || data.type === "done") {
+      ui.text.textContent = data.text;
+      ui.status.textContent = `已处理 ${data.audio_seconds.toFixed(2)} 秒音频`;
+      if (data.type === "done") {
+        ui.status.textContent += `；推理 ${(data.total_compute_ms / 1000).toFixed(2)} 秒，RTF ${data.rtf.toFixed(3)}。`;
+        setBusy(false);
+      }
+    } else if (data.type === "error") fail(data.message);
+  };
+  ui.load.onclick = () => {
+    ready = false;
+    setBusy(true);
+    ui.progress.value = 0;
+    ui.status.textContent = "正在初始化 WebGPU…";
+    worker.postMessage({ type: "load", url: new URL(ui.manifest.value, location.href).href, precision: ui.precision.value });
+  };
+  ui.transcribe.onclick = async () => {
+    const file = ui.audio.files[0];
+    if (!file) return fail("请先选择音频文件。");
+    setBusy(true);
+    ui.text.textContent = "";
+    ui.status.textContent = "正在解码音频…";
+    let context;
+    try {
+      // decodeAudioData resamples into the requested 16 kHz AudioContext.
+      context = new AudioContext({ sampleRate: 16000 });
+      const audio = await context.decodeAudioData(await file.arrayBuffer());
+      const pcm = new Float32Array(audio.length);
+      for (let c = 0; c < audio.numberOfChannels; c++) {
+        const channel = audio.getChannelData(c);
+        for (let i = 0; i < pcm.length; i++) pcm[i] += channel[i] / audio.numberOfChannels;
+      }
+      worker.postMessage({ type: "transcribe", pcm, language: ui.language.value }, [pcm.buffer]);
+      ui.status.textContent = "正在流式识别…";
+    } catch (error) { fail(String(error)); }
+    finally { await context?.close(); }
+  };
+</script>
+</html>

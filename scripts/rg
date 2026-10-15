@@ -1,0 +1,4 @@
+#!/bin/sh
+# Honor the project's ignore rules even in a source snapshot without .git.
+set -eu
+exec rg --no-require-git "$@"

@@ -1,0 +1,62 @@
+[package]
+name = "r2t2-makepad"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "711521dbfaba2d04be4d88176deef367f33d9ed3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std", "fusion"] }
+hound = "3.5"
+pollster = "0.4"
+cpal = "0.16"
+omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false }
+omni-qwen-image = { path = "../../crates/qwen-image", default-features = false }
+omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["native"] }
+omni-music = { path = "../../crates/omni-music", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["metal"] }
+omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false, features = ["metal"] }
+omni-qwen-image = { path = "../../crates/qwen-image", default-features = false, features = ["metal"] }
+omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["metal"] }
+omni-music = { path = "../../crates/omni-music", default-features = false, features = ["metal"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["ane"] }
+omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false, features = ["ane"] }
+burn = { version = "=0.21.0", default-features = false, features = ["ane"] }
+burn-ane = { path = "../../crates/burn-ane", features = ["metal-shared"] }
+
+[target.'cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))'.dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["webgpu"] }
+omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false, features = ["webgpu"] }
+omni-qwen-image = { path = "../../crates/qwen-image", default-features = false, features = ["webgpu"] }
+omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["webgpu"] }
+omni-music = { path = "../../crates/omni-music", default-features = false, features = ["webgpu"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[patch.crates-io]
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }
+
+# Compile the UI separately; keep the native Burn performance profile intact.
+[profile.web]
+inherits = "release"
+lto = false
+opt-level = "s"
+strip = "debuginfo"

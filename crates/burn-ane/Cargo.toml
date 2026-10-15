@@ -1,0 +1,46 @@
+[package]
+name = "burn-ane"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "Experimental Apple Neural Engine graph backend for Burn"
+
+[features]
+metal-shared = ["dep:burn-cubecl", "dep:burn-fusion", "dep:burn-wgpu", "dep:cubecl", "dep:cubecl-common", "dep:objc2", "dep:objc2-metal", "dep:wgpu"]
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn-fusion = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn-wgpu = { version = "=0.21.0", default-features = false, features = ["std", "fusion", "metal"], optional = true }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "stdlib", "wgpu"], optional = true }
+cubecl-common = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"], optional = true }
+
+[dependencies]
+bincode = { version = "2.0.1", default-features = false, features = ["alloc", "serde"] }
+burn-backend = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ir = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-router = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-std = { version = "=0.21.0", default-features = false, features = ["std"] }
+half = "2.7"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", features = ["asm"] }
+tempfile = "3"
+
+[dev-dependencies]
+burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-nn = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-core = { version = "=0.21.0", default-features = false, features = ["std"] }
+
+
+[patch.crates-io]
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }

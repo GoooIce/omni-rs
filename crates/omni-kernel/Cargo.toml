@@ -1,0 +1,37 @@
+[package]
+name = "omni-kernel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Shared Burn Fusion and ANE adapter for model-specific GPU kernels"
+
+[features]
+ane = ["dep:burn-ane"]
+
+[dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std", "metal", "fusion"] }
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-fusion = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ir = { version = "=0.21.0", default-features = false, features = ["std"] }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+burn-ane = { path = "../burn-ane", features = ["metal-shared"], optional = true }
+
+[dev-dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+
+[workspace]
+
+[patch.crates-io]
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

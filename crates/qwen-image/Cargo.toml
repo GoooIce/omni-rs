@@ -1,0 +1,74 @@
+[package]
+name = "omni-qwen-image"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Qwen-Image-2.1-Turbo local image inference in Rust and Burn"
+
+[workspace]
+
+[features]
+default = ["metal"]
+metal = ["burn/metal", "burn/fusion", "burn/autotune", "dep:burn-cubecl", "dep:omni-kernel", "dep:cubek-attention", "dep:cubecl", "dep:cubecl-cpp", "dep:cubecl-runtime", "dep:objc2-metal", "dep:wgpu"]
+ane = ["metal", "burn/ane", "omni-kernel/ane"]
+webgpu = ["burn/webgpu", "burn/fusion"]
+cpu = ["burn/ndarray"]
+
+[dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+omni-kernel = { path = "../omni-kernel", optional = true }
+cubek-attention = { version = "=0.2.0", default-features = false, features = ["std"], optional = true }
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"], optional = true }
+cubecl-cpp = { version = "=0.10.0", default-features = false, features = ["metal"], optional = true }
+cubecl-runtime = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
+objc2-metal = { version = "0.3", optional = true }
+wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"], optional = true }
+
+[[example]]
+name = "batch-bench"
+required-features = ["metal"]
+
+[[example]]
+name = "tensorops-bench"
+required-features = ["metal"]
+
+[[example]]
+name = "rust-attention-sweep"
+required-features = ["metal"]
+
+[[example]]
+name = "attention-bench"
+required-features = ["metal"]
+
+[dev-dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+
+[patch.crates-io]
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>知音 · 本地推理</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;color:#edf5f1;background:#101d19}*{box-sizing:border-box}body{max-width:980px;margin:40px auto;padding:0 20px}h1{font-size:30px;margin-bottom:8px}p,small{color:#a1b8ae}section{background:#182724;padding:24px;border-radius:12px;margin:20px 0}h2{font-size:19px;margin-top:0}label{display:block;margin:14px 0 7px}textarea,input,select{font:inherit;background:#10221b;color:inherit;border:1px solid #3b554a;border-radius:6px;padding:10px}textarea{width:100%;min-height:100px;resize:vertical}button,a.download{font:inherit;background:#78d9bb;color:#10231b;border:0;border-radius:6px;padding:10px 16px;cursor:pointer;text-decoration:none}button:disabled{opacity:.4;cursor:default}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:12px 0}.row input{max-width:190px}.secondary{background:#29463a;color:#d7efe5}.task-status{position:sticky;top:12px;z-index:2;background:#182724;border:1px solid #3b554a;padding:12px;border-radius:8px}#status{white-space:pre-wrap;overflow-wrap:anywhere;flex:1;min-width:180px}output{display:block;white-space:pre-wrap;line-height:1.6;background:#112019;border-radius:6px;padding:14px;min-height:54px}audio{width:100%;margin-top:12px}img{max-width:100%;border-radius:8px}details{margin-top:16px}code{overflow-wrap:anywhere}button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #bbeedf;outline-offset:2px}
+</style>
+<h1>知音 / 本地创作</h1><p>语音、翻译、图像与音乐创作 · 在本机运行</p>
+<div class="row task-status"><span id="status" role="status" aria-live="polite">就绪 · 首次使用会载入模型</span><button id="cancel" class="secondary" disabled>停止当前任务</button></div>
+<section><h2>语音转写</h2><label for="wav">选择 WAV 音频</label><input id="wav" type="file" accept="audio/wav,.wav"><div class="row"><button id="asr">开始转写</button><label for="asr-language">翻译为</label><input id="asr-language" value="English" aria-label="转写译文目标语言"><button id="asr-translate" class="secondary">翻译</button></div><output id="transcript" aria-label="转写结果"></output><label>译文</label><output id="asr-translation"></output></section>
+<section><h2>语音合成</h2><label for="tts-text">要朗读的文字</label><textarea id="tts-text" placeholder="输入中文或英文"></textarea><div class="row"><label for="tts-language">翻译为</label><input id="tts-language" value="English" aria-label="朗读译文目标语言"><button id="tts-translate" class="secondary">翻译</button><button id="tts-use" class="secondary">用译文朗读</button></div><output id="tts-translation"></output><label for="instruction">声音描述（可选）</label><input id="instruction" placeholder="例如：温柔、清晰的女声"><div class="row"><button id="speak">生成语音</button><a id="audio-download" class="download" hidden download="speech.wav">保存 WAV</a></div><audio id="audio" controls hidden></audio><small>翻译支持多种语言；Breeze-TTS-2 当前支持中文和英文。</small></section>
+<section><h2>文本翻译</h2><label for="translation-text">原文</label><textarea id="translation-text" placeholder="输入要翻译的文字"></textarea><div class="row"><label for="target-language">目标语言</label><input id="target-language" value="Chinese"><button id="translate">翻译</button></div><output id="translation"></output><small>Hy-MT2-7B · 可填写 English、Chinese、Japanese 等完整语言名称</small></section>
+<section><h2>图像生成</h2><label for="prompt">画面描述</label><textarea id="prompt" placeholder="描述画面内容"></textarea><div class="row"><label for="size">尺寸</label><select id="size"><option>256</option><option selected>512</option><option>1024</option><option>2048</option></select><button id="image">生成图片</button><a id="image-download" class="download" hidden download="image.png">保存 PNG</a></div><img id="generated-image" alt="生成的图片" hidden></section>
+<section aria-labelledby="music-title"><h2 id="music-title">音乐理解 → 乐谱 → 歌曲</h2>
+<p>上传录音，用 MERT2 提取音乐特征、SheetSage2 转谱，编辑旋律后交给 YuE2 演绎。也可以直接输入风格与歌词创作。</p>
+<label for="music-source">1 · 参考音乐（WAV，转谱最长 5 分钟）</label><input id="music-source" type="file" accept="audio/wav,.wav">
+<div class="row"><button id="music-analyze" class="secondary">分析音乐 · MERT2</button><button id="music-transcribe">音频转谱 · SheetSage2</button><label for="music-harmony">乐谱内容</label><select id="music-harmony"><option value="melody">旋律 · 允许重新编配</option><option value="full">旋律与和弦</option></select></div>
+<output id="music-analysis" aria-label="音乐分析结果"></output><div class="row"><a id="music-analysis-download" class="download" hidden download="analysis.json">保存音乐特征 JSON</a></div><small>MERT2 输出可用于相似度检索的特征向量。转谱会使用同一录音和 SheetSage2 专用的编码器适配器。</small>
+<label for="music-score">2 · 查看和编辑 ABC 乐谱</label><textarea id="music-score" spellcheck="false" placeholder="转谱后在这里检查旋律、拍号和段落，也可以粘贴已有的 YuE2 双声部 ABC 乐谱。" style="min-height:180px;font-family:monospace"></textarea>
+<output id="music-score-status" aria-label="转谱状态"></output><div class="row"><label><input id="music-use-score" type="checkbox"> 用此乐谱生成歌曲</label><a id="music-abc-download" class="download" hidden download="score.abc">保存 ABC</a><a id="music-midi-download" class="download" hidden download="score.mid">保存 MIDI</a><a id="music-score-download" class="download" hidden download="score.json">音乐事件 JSON</a></div>
+<label for="music-style">3 · 歌曲风格</label><textarea id="music-style" placeholder="例如：Mandarin acoustic pop, warm female vocal, piano and acoustic guitar, hopeful, 90 BPM" style="min-height:72px"></textarea>
+<label for="music-lyrics">歌词（可用 [Verse]、[Chorus] 标明段落）</label><textarea id="music-lyrics" placeholder="[Verse]&#10;把想唱的话写在这里&#10;&#10;[Chorus]&#10;让旋律把它带向远方"></textarea>
+<div class="row"><label for="music-seconds">时长上限</label><select id="music-seconds"><option value="375">15 秒</option><option value="750">30 秒</option><option value="1500" selected>60 秒</option><option value="3000">2 分钟</option><option value="9000">6 分钟</option></select><label for="music-seed">随机种子</label><input id="music-seed" type="number" min="0" max="9007199254740991" value="831001"><button id="music-generate">生成歌曲 · YuE2</button></div>
+<audio id="music-audio" controls hidden></audio><div class="row"><a id="music-audio-download" class="download" hidden download="song.wav">保存歌曲 WAV</a><a id="music-result-download" class="download" hidden download="song.json">生成记录</a></div>
+<small>输出为 48 kHz 双声道。转谱结果可能需要修正；未勾选乐谱时，YuE2 会根据歌词和风格先创作乐谱。达到时长上限的音频会标记为截断。</small></section>
+<details><summary>HTTP 接口</summary><p>请求返回任务编号。查询 <code>GET /v1/jobs/{id}</code> 获取进度和结果，<code>DELETE /v1/jobs/{id}</code> 停止任务。</p><p><code>POST /v1/translations</code> · <code>POST /v1/audio/transcriptions</code> · <code>POST /v1/audio/speech</code> · <code>POST /v1/images/generations</code></p><p><code>POST /v1/music/analyses</code> · <code>POST /v1/music/scores</code> · <code>POST /v1/music/generations</code></p></details>
+<script type="module">
+const $=id=>document.getElementById(id);
+let active=null,busy=false;
+const status=text=>{$('status').textContent=text};
+const stages={load_mert:'加载音乐编码器',mert:'分析音乐',load_sheetsage:'加载转谱模型',score_tokens:'生成音乐事件',load_yue:'加载歌曲模型',score_plan:'创作乐谱',music_tokens:'生成歌曲',music_acoustics:'合成音乐',load_music_vae:'加载音频解码器',music_decode:'解码双声道音频'};
+function controls(){document.querySelectorAll('button').forEach(b=>b.disabled=busy);$('cancel').disabled=!active}
+async function request(url,options={}){const r=await fetch(url,options);if(!r.ok){let message=await r.text();try{message=JSON.parse(message).error||message}catch{}throw new Error(message)}return r.status===202&&options.method==='DELETE'?null:r.json()}
+async function run(path,body,target,raw=false){
+ if(busy)return;
+ busy=true;controls();status('正在提交任务…');
+ try{
+  let job=await request(path,{method:'POST',headers:{'content-type':raw?'audio/wav':'application/json'},body:raw?body:JSON.stringify(body)});
+  active=job.id;controls();
+  while(job.status==='queued'||job.status==='running'){
+   const progress=job.progress||{};
+   status(job.status==='queued'?'等待推理…':progress.message||`${stages[progress.stage]||progress.stage||'推理中'}${progress.current?` ${progress.current}/${progress.total}`:''}`);
+   if(target&&typeof progress.text==='string')$(target).textContent=progress.text;
+   await new Promise(resolve=>setTimeout(resolve,150));
+   job=await request(`/v1/jobs/${encodeURIComponent(active)}`);
+  }
+  if(job.status==='error')throw new Error(job.error||'推理失败');
+  const result=job.result||{};
+  if(target&&typeof result.text==='string')$(target).textContent=result.text;
+  status(job.status==='cancelled'?'已停止':result.score_truncated?'乐谱达到输出上限，结果未完整结束':result.finish_reason==='length'||result.reached_limit||result.truncated?'已达输出上限，结果未完整结束':`完成${result.cached_tokens?` · 复用 ${result.cached_tokens} 个前缀 token`:''}`);
+  return result;
+ }catch(error){status(error.message);return null}
+ finally{busy=false;active=null;controls()}
+}
+async function translate(source,language,target){
+ if(!source.trim()){status('请输入或先转写要翻译的文字');return}
+ return run('/v1/translations',{text:source,target_language:$(language).value},target);
+}
+$('cancel').onclick=async()=>{if(active){try{await request(`/v1/jobs/${encodeURIComponent(active)}`,{method:'DELETE'});status('正在停止…')}catch(e){status(e.message)}}};
+$('asr').onclick=async()=>{const file=$('wav').files[0];if(!file){status('请选择 WAV 音频');return}await run('/v1/audio/transcriptions',file,'transcript',true)};
+$('asr-translate').onclick=()=>translate($('transcript').textContent,'asr-language','asr-translation');
+$('tts-translate').onclick=()=>translate($('tts-text').value,'tts-language','tts-translation');
+$('tts-use').onclick=()=>{const text=$('tts-translation').textContent;if(text)$('tts-text').value=text};
+$('translate').onclick=()=>translate($('translation-text').value,'target-language','translation');
+$('speak').onclick=async()=>{if(!$('tts-text').value.trim()){status('请输入要朗读的文字');return}const result=await run('/v1/audio/speech',{text:$('tts-text').value,instruction:$('instruction').value});if(result?.audio_url){$('audio').src=result.audio_url;$('audio').hidden=false;$('audio-download').href=result.audio_url;$('audio-download').hidden=false}};
+$('image').onclick=async()=>{const result=await run('/v1/images/generations',{prompt:$('prompt').value,width:Number($('size').value),height:Number($('size').value)});if(result?.image_url){$('generated-image').src=result.image_url;$('generated-image').hidden=false;$('image-download').href=result.image_url;$('image-download').hidden=false}};
+function download(id,url){$(id).hidden=!url;if(url)$(id).href=url;else $(id).removeAttribute('href')}
+function musicSource(){const file=$('music-source').files[0];if(!file)status('请选择参考音乐 WAV');return file}
+$('music-source').onchange=()=>{$('music-use-score').checked=false;$('music-analysis').textContent='已更换录音，请重新分析或转谱。';$('music-score-status').textContent='当前编辑器和下载链接保留上次结果。'};
+$('music-harmony').onchange=()=>{$('music-use-score').checked=false;$('music-score-status').textContent='乐谱内容已切换，请重新转谱或编辑乐谱后勾选使用。'};
+$('music-analyze').onclick=async()=>{const file=musicSource();if(!file)return;const r=await run('/v1/music/analyses',file,null,true);if(r?.embedding){$('music-analysis').textContent=`${file.name} · MERT2 · ${r.audio_seconds.toFixed(2)} 秒 · ${r.frames} 帧 × ${r.dimensions} 维\n已提取该录音的音乐特征。`;download('music-analysis-download',r.result_url)}};
+$('music-transcribe').onclick=async()=>{const file=musicSource();if(!file)return;const before=$('music-score').value;const melody=$('music-harmony').value==='melody';const r=await run(`/v1/music/scores?melody_only=${melody}`,file,null,true);if(!r?.events)return;
+ const current=$('music-score').value===before&&$('music-source').files[0]===file&&($('music-harmony').value==='melody')===melody;
+ if(current){$('music-score').value=r.abc||'';$('music-use-score').checked=!!r.abc}
+ $('music-score-status').textContent=[`${file.name} · ${r.events.length} 个音乐事件`,r.abc?(current?'乐谱已就绪，请检查后生成歌曲。':'输入已改变，本次乐谱保存在下方下载链接。'):`ABC 转换未完成：${r.abc_error||'缺少有效节拍或调性'}。音乐事件与 MIDI 仍可下载。`,...(r.warnings||[])].join('\n');
+ download('music-abc-download',r.abc_url);download('music-midi-download',r.midi_url);download('music-score-download',r.result_url);
+};
+$('music-generate').onclick=async()=>{const style=$('music-style').value,lyrics=$('music-lyrics').value,abc=$('music-score').value,use=$('music-use-score').checked,seed=Number($('music-seed').value);if(!style.trim()){status('请描述歌曲风格');return}if(use&&!abc.trim()){status('请先转谱或填写 ABC 乐谱');return}if(!Number.isSafeInteger(seed)||seed<0){status('随机种子应为非负安全整数');return}
+ const r=await run('/v1/music/generations',{style,lyrics,seed,cot:use?$('music-harmony').value:'full',abc:use?abc:null,semantic_sampling:{max_tokens:Number($('music-seconds').value)}});
+ if(r?.audio_url){$('music-audio').src=r.audio_url;$('music-audio').hidden=false;download('music-audio-download',r.audio_url);download('music-result-download',r.result_url);if(!use&&r.abc&&$('music-score').value===abc){$('music-score').value=r.abc;$('music-harmony').value='full';$('music-use-score').checked=false;$('music-score-status').textContent=r.score_truncated?'乐谱创作达到上限，请补全后再勾选复用。':'YuE2 创作的乐谱，可编辑后勾选复用。';download('music-abc-download',r.abc_url);download('music-midi-download',null);download('music-score-download',null)}}
+};
+controls();
+</script></html>

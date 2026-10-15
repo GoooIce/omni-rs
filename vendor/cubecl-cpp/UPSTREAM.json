@@ -1,0 +1,84 @@
+{
+  "name": "cubecl-cpp",
+  "version": "0.10.0",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "checksum": "411af04828cbf4583ecd388579fb30cd7a644eec19a334bb8f0d9d08522e1458",
+  "dependencies": [
+    "bytemuck",
+    "cubecl-common",
+    "cubecl-core",
+    "cubecl-opt",
+    "cubecl-runtime",
+    "derive-new",
+    "half",
+    "itertools 0.14.0",
+    "log"
+  ],
+  "upstream_vcs": {
+    "git": {
+      "sha1": "7cf203735e095e640a2c03b2400d0faa03196bb4"
+    },
+    "path_in_vcs": "crates/cubecl-cpp"
+  },
+  "original_files_sha256": {
+    "Cargo.toml": "8b46b792af330bdb6db67685f082a1748d1a3db1c533bc4c0a4cc15059589a51",
+    "README.md": "3df0ed41ff4fd2c56cef0235c0fc33d6887df45d8519208e5ce5ce559fdbdbd7",
+    "Cargo.toml.orig": "bec7ff0216742e304a4e9443f0d07e0a64032175c00e764d5139523a76a01825",
+    "src/lib.rs": "cc6b70ffee27fe9650a221c810695f1610258a405707068ac040484403de24c3",
+    "src/formatter.rs": "6ecb463c61bfb4c3050eae7e35ec2205b7e619eff3642e6381a265a8e62f205f",
+    "src/metal/arch.rs": "c071b527098572c2f88ffbf18dc3d41bb217ef7323a7696a79957514f97f94f6",
+    "src/metal/dialect.rs": "54299539ada123e70f092297fc50e63c3a292d448a3dd78af8541d918188a774",
+    "src/metal/attribute.rs": "0d53559dce6530f52932213f8e6c978da948e0385b5b165378ee446593855fad",
+    "src/metal/mod.rs": "ec920b6b9604a026aba062ade206fb602eba837cdeb9967433296442360462c9",
+    "src/metal/binding.rs": "a232fda6b677560e899b0e1988c45257d4bb685aeddeb9026c35e0be7c629d4f",
+    "src/metal/extension.rs": "d6089906547cef0d1c18fc47f7393a8fb59b09ad304a5c7a43bfa3d967664f0a",
+    "src/metal/variable.rs": "1de842e936d68042b8b219567c0d8af88a1d5dd0b03ad46a5a90df85d2d01a18",
+    "src/metal/address_space.rs": "c444e107f9d21cd840feb95bd73782ec14ce4fd13dee3a46c51855e3fddbb457",
+    "src/cuda/arch.rs": "06553516416197f4dbca5fbf36f131c4a95b517496a1c82d9de3b33528c69b23",
+    "src/cuda/dialect.rs": "67c76f617ce666779bffcf7b15cdf82569f27f7c33b0cba7653a5c63c04359a9",
+    "src/cuda/convert.rs": "38ce99788e7aed2916cd9ffd2ac81a63b3bde7a485cc54a29086f08ff089c25d",
+    "src/cuda/mod.rs": "925d18b0bca7754e3bc6b1d6bc3bc626d86e5ab89f460a1b97b5f6a46c26bc34",
+    "src/cuda/processors.rs": "376209d59fedbde8b6a41f1765ef2c0715b54db6fcfb694c153b5723d053d708",
+    "src/cuda/extension.rs": "9ea4628b00daa9a702bd15b244f206bb828efa746b887e2352fce247f5e6eaf4",
+    "src/shared/element.rs": "76ffef0b8d9a9d9f447605f422d4e68b94eaab69f96ba5c5d8c01b72eab28ee1",
+    "src/shared/dialect.rs": "4d2fb74c6aaf15952397e46d13e9de72703c61a16dd0cc5dc0851a0c9916e705",
+    "src/shared/barrier.rs": "44da40aa4cf61a440642dce7d7f2ebe668afe9a7479feb2bad5db1c4435343ea",
+    "src/shared/body.rs": "c093d2ae6952b09efc131cedaf3bdc8fbd11834b72c8dda1395e8a9a49eac893",
+    "src/shared/kernel.rs": "41939123b0f5e98f83c491a3264232caea50fd185d9b28d4dcbeccbcbfa65197",
+    "src/shared/binary.rs": "261c29c2d789405f2fd06a311dec75de3c471b0848e3fcecaa146dc63d5dda2c",
+    "src/shared/base.rs": "fabec6970cebb0ab6eb22f33ae375d07e34122b90e8de768a73d4faa39a526a6",
+    "src/shared/mod.rs": "5cf7f3e77f5420c682385a79cef9e3a7be465b31c2ab8c7eb9f0604231b37c88",
+    "src/shared/item.rs": "85acd3536c2bf8a39dff59f71378b872a5f5d85605239b81c9c8645b83e84f88",
+    "src/shared/unary.rs": "b3e71e67ade58ced93484f63450374463fac138e54be6d4cc5cc1c6064f224b1",
+    "src/shared/mma.rs": "48db6b65bde8fc6729ed712a468f2654c0873c2b415a2935b045fe58eb9977df",
+    "src/shared/instruction.rs": "4c558d7bbc007a4848ca03810b1d6e344c7e7395a5ee4bea28cfa2e699c4a377",
+    "src/shared/pipeline.rs": "d3563b8a1616533636b090e0cf3c4aa0cef0a2f7ac4725cc9db323c6a826b74f",
+    "src/shared/warp.rs": "abd86cb09cf133244a26a49d9956beb17815b7614a8c2bb5481dc8a6358dd7d6",
+    "src/shared/variable.rs": "e5dfcdf55c1172f94fae1650548d9d9b918ef4b0772d772ea3eca2df67ef04c8",
+    "src/hip/arch.rs": "6df98a7b8d1efbd4ea1a918275043ee502d189c491ad9c6fa7d48954fd2bdc39",
+    "src/hip/dialect.rs": "d5dbce01292dc54f80e9969c73c2f87354341ac3ac4010398257468d9b5f3ca1",
+    "src/hip/mod.rs": "70ed1985d788b7554a4b2b1dd0ed79765a22c6c32fd1e4e73f2432ae843347ef",
+    "src/hip/processors.rs": "7fb64b9e839b8f51310062f6c0f08a2786b03315719507b7828230c972289b21",
+    "src/hip/extension.rs": "dbdf700b887abebab4982114aa76e142eb227c636bd8c2b49b81bd20becdf71c",
+    "src/cuda/ptx/copy_async.cuh": "4118a68991be5e9fddeb2e7ca9e46a4f4fb1eda693f09718c713ebaa9a951a29",
+    "src/cuda/ptx/mod.rs": "f51d1cd376232d33cc30f2c6e38c812ac2131878516e6c8367975897b5eefe24",
+    "src/cuda/ptx/mma.rs": "84ded2ebe335f5ac709c43b5e3550935710db1dfbbdc20c845a88ad4ab887ff4",
+    "src/cuda/ptx/tma_load_im2col.cuh": "29b266dc79a81aae6d10360ce71dbc683c2bb15d21bebcdd340a1be1789d1609",
+    "src/cuda/mma/ptx_wmma_compiler.rs": "084d8971e6eb4c5f61dab4a57582e2a2cf75921d604734f73949114f48e7dea8",
+    "src/cuda/mma/mod.rs": "da8e67f6e164e30d67c437e155c8741eac87a9973eae8cbaaaec1f8a8db43a20",
+    "src/cuda/mma/cuda_compiler.rs": "d86db9b166aeee4302790e6854a5f850fe43a9aff0f7aac600a3667c04da53f6",
+    "src/hip/mma/wmma_intrinsics_compiler.rs": "88ba9539bc3bd960443faedf36cf7ba710e3466c2173febf876baca2ad1821aa",
+    "src/hip/mma/mod.rs": "a0b6df653d899d26a34f1cc1a81edbd2f2903d6a7a25f7a9f27a45db28c03565",
+    "src/hip/mma/rocwmma_compiler.rs": "8960b5dca42fe2518859c1b9d4fd9390d305e6aa6789a47a658c1a3654407427"
+  },
+  "licenses": {
+    "LICENSE-MIT": {
+      "url": "https://raw.githubusercontent.com/tracel-ai/cubecl/7cf203735e095e640a2c03b2400d0faa03196bb4/LICENSE-MIT",
+      "sha256": "b3b77503e5498c5fb0a1a0b102d748d7baed9cae9f502086a3cfedad62d503a4"
+    },
+    "LICENSE-APACHE": {
+      "url": "https://raw.githubusercontent.com/tracel-ai/cubecl/7cf203735e095e640a2c03b2400d0faa03196bb4/LICENSE-APACHE",
+      "sha256": "bdd26d197850a30393da963f01e97c78e91d69245089c543903f96a5dab95930"
+    }
+  }
+}

@@ -1,0 +1,49 @@
+[package]
+name = "omni-api"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Local HTTP adapters for Omni Burn inference"
+
+[workspace]
+
+[features]
+default = ["metal"]
+metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune", "omni-hy-mt/metal", "omni-breeze-tts/metal", "omni-qwen-image/metal", "omni-music/metal"]
+webgpu = ["burn/webgpu", "burn/fusion", "omni-hy-mt/webgpu", "omni-breeze-tts/webgpu", "omni-qwen-image/webgpu", "omni-music/webgpu"]
+cpu = ["burn/ndarray", "omni-hy-mt/cpu", "omni-breeze-tts/cpu", "omni-qwen-image/cpu", "omni-music/cpu"]
+
+[dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
+omni-hy-mt = { path = "../hy-mt", default-features = false, features = ["native"] }
+omni-breeze-tts = { path = "../breeze-tts", default-features = false }
+omni-qwen-image = { path = "../qwen-image", default-features = false }
+omni-music = { path = "../omni-music", default-features = false }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive"] }
+pollster = "0.4"
+hound = "3.5"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[patch.crates-io]
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 2

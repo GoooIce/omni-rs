@@ -1,0 +1,14 @@
+/target/
+**/target/
+/models/
+/artifacts/
+/pkg/
+/.cache/
+/.venv-eval/
+/.venv-breeze/
+*.wav
+*.pcm
+*.safetensors
+.DS_Store
+__pycache__/
+/.venv*/

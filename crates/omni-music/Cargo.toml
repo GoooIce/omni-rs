@@ -1,0 +1,48 @@
+[package]
+name = "omni-music"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "MERT2, SheetSage2 and YuE2 music inference in Rust and Burn"
+
+[workspace]
+
+[features]
+default = ["metal"]
+metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune"]
+webgpu = ["burn/webgpu", "burn/fusion"]
+cpu = ["burn/ndarray"]
+
+[dependencies]
+omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pollster = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+hound = "3.5"
+base64 = "0.22"
+fancy-regex = "0.14"
+unicode-normalization = "0.1"
+rand = "0.9"
+rand_distr = "0.5"
+
+[dev-dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+
+[patch.crates-io]
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 2

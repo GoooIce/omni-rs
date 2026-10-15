@@ -1,0 +1,5 @@
+# Export only. The Rust/Swift inference runtime does not use Python.
+coremltools==9.0
+torch==2.7.0
+numpy==2.2.6
+safetensors==0.8.0

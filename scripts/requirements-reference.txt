@@ -1,0 +1,11 @@
+# Development-only numerical oracle; Rust inference does not use Python.
+# Tested with Python 3.12.15 and Qwen3-ASR 7c6daf77a2421100f5fb066495372c00129d39ff.
+torch==2.14.1
+numpy==2.5.3
+transformers==4.57.6
+safetensors==0.8.0
+librosa==1.0.0
+accelerate==1.15.0
+nagisa==0.3.0
+soynlp==0.0.493
+soundfile==0.14.0
