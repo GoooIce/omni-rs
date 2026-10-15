@@ -37,6 +37,14 @@ impl MiniCpmTokenizer {
                 .token_to_id(token)
                 .ok_or_else(|| TokenizerError::Missing(token.to_string()))
         };
+        // Byte-level BPE stores "\n" as "Ċ", so derive it from an encoding.
+        let newline = inner
+            .encode("\n", false)
+            .map_err(|e| TokenizerError::Load(e.to_string()))?
+            .get_ids()
+            .first()
+            .copied()
+            .ok_or_else(|| TokenizerError::Missing("\\n".into()))?;
         Ok(Self {
             image_pad: id(chat::IMAGE_PAD)?,
             video_pad: id(chat::VIDEO_PAD)?,
@@ -44,7 +52,7 @@ impl MiniCpmTokenizer {
             image_end: id(chat::IMAGE_END)?,
             slice_start: id(chat::SLICE_START)?,
             slice_end: id(chat::SLICE_END)?,
-            newline: id("\n")?,
+            newline,
             inner,
         })
     }
@@ -72,7 +80,9 @@ mod tests {
     use super::*;
 
     fn model_directory() -> Option<std::path::PathBuf> {
-        let directory = std::path::PathBuf::from("models/MiniCPM-V-4.7-1B");
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("models/MiniCPM-V-4.7-1B");
         if directory.join("tokenizer.json").is_file() {
             Some(directory)
         } else {

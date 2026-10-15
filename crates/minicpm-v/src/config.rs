@@ -157,7 +157,11 @@ mod tests {
     use super::*;
 
     fn model_directory() -> Option<ModelDirectory> {
-        let directory = ModelDirectory::new("models/MiniCPM-V-4.7-1B");
+        let directory = ModelDirectory::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("models/MiniCPM-V-4.7-1B"),
+        );
         if directory.path.join("config.json").is_file() {
             Some(directory)
         } else {

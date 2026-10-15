@@ -3,4 +3,6 @@
 pub mod chat;
 pub mod config;
 pub mod doctor;
+pub mod image;
 pub mod tokenizer;
+pub mod vision;
