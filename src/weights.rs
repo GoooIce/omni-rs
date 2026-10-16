@@ -296,6 +296,18 @@ impl Weights {
         Ok(result)
     }
 
+    /// Map one safetensors file. The caller keeps the checkpoint unmodified while it is open.
+    #[cfg(feature = "native")]
+    pub fn open_file(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only mapping. The checkpoint must not be modified while loading.
+        let mapping = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let mut result = Self::default();
+        result.add(Storage::Mapped(mapping))?;
+        *result.headers.get_mut() = vec![None; result.shards.len()];
+        Ok(result)
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.names.contains_key(name)
     }
@@ -411,5 +423,40 @@ impl Weights {
         };
         let dtype: burn::tensor::DType = precision.dtype().into();
         Ok(Tensor::from_data(data, (device, dtype)))
+    }
+
+    /// Host copy of one `I8` tensor. Callers pack or interpret the bytes.
+    pub fn raw_i8(&self, name: &str) -> Result<(Vec<usize>, Vec<i8>)> {
+        let view = self.view(name)?;
+        if view.dtype() != Dtype::I8 {
+            return Err(Error::Checkpoint(format!(
+                "{name}: expected I8, got {:?}",
+                view.dtype()
+            )));
+        }
+        Ok((
+            view.shape().to_vec(),
+            view.data().iter().map(|byte| *byte as i8).collect(),
+        ))
+    }
+
+    /// Host copy of one `F32` tensor, any rank.
+    pub fn raw_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
+        let view = self.view(name)?;
+        if view.dtype() != Dtype::F32 {
+            return Err(Error::Checkpoint(format!(
+                "{name}: expected F32, got {:?}",
+                view.dtype()
+            )));
+        }
+        let values = view
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect::<Vec<_>>();
+        if values.len() != view.shape().iter().product::<usize>() {
+            return Err(Error::Checkpoint(format!("{name}: truncated f32 payload")));
+        }
+        Ok((view.shape().to_vec(), values))
     }
 }

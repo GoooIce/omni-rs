@@ -104,28 +104,56 @@ impl<B: Backend> Cache<B> {
     }
 }
 
+enum Proj<B: Backend> {
+    Dense(Linear<B>),
+    Int8(crate::convrot::Int8Linear<B>),
+}
+impl<B: Backend> Proj<B> {
+    fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+        match self {
+            Self::Dense(linear) => linear.forward(x),
+            Self::Int8(linear) => linear.forward(x),
+        }
+    }
+}
+
 struct Block<B: Backend> {
-    q: Linear<B>,
-    k: Linear<B>,
-    v: Linear<B>,
-    out: Linear<B>,
+    q: Proj<B>,
+    k: Proj<B>,
+    v: Proj<B>,
+    out: Proj<B>,
     q_norm: Norm<B>,
     k_norm: Norm<B>,
-    gate: Linear<B>,
-    up: Linear<B>,
-    down: Linear<B>,
+    gate: Proj<B>,
+    up: Proj<B>,
+    down: Proj<B>,
 }
 impl<B: Backend> Block<B> {
     fn load(
         w: &impl WeightSource<B>,
         name: &str,
+        convrot: Option<&crate::convrot::ConvRotFile>,
+        hadamard: Option<&Tensor<B, 2>>,
         c: &DitConfig,
         p: Precision,
         d: &B::Device,
     ) -> Result<Self> {
         let h = c.width();
-        let linear = |s: &str, i, o| {
-            Linear::load(w, &format!("{name}.{s}"), i, o, false, p, d).map(Linear::with_tensorops)
+        let linear = |s: &str, i, o| -> Result<Proj<B>> {
+            let full = format!("{name}.{s}");
+            if let Some(file) = convrot {
+                return Ok(Proj::Int8(file.linear(
+                    &full,
+                    i,
+                    o,
+                    hadamard.unwrap(),
+                    p,
+                    d,
+                )?));
+            }
+            Ok(Proj::Dense(
+                Linear::load(w, &full, i, o, false, p, d)?.with_tensorops(),
+            ))
         };
         Ok(Self {
             q: linear("attn.to_q", h, h)?,
@@ -355,6 +383,10 @@ impl<B: Backend> Dit<B> {
         check_cancel(cancel)?;
         let weights = Weights::open_named(&root.join("transformer"), "diffusion_pytorch_model")?;
         let w = CancellableWeights::new(&weights, cancel, |_: &str| {});
+        let convrot = crate::convrot::ConvRotFile::open(root)?;
+        let hadamard = convrot
+            .as_ref()
+            .map(|_| crate::convrot::hadamard_tensor::<B>(d));
         let h = c.width();
         let linear = |s: &str, i, o| Linear::load(&w, s, i, o, false, p, d);
         let text_norm = Norm::load(
@@ -380,6 +412,8 @@ impl<B: Backend> Dit<B> {
             layers.push(Block::load(
                 &w,
                 &format!("transformer_blocks.{i}"),
+                convrot.as_ref(),
+                hadamard.as_ref(),
                 &c,
                 p,
                 d,

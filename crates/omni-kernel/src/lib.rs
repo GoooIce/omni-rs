@@ -16,11 +16,12 @@ use std::{
     fmt,
 };
 
+pub mod int8_matmul;
 pub mod paged;
 
 pub type Raw = CubeBackend<WgpuRuntime, f32, i32, u8>;
 pub type Metal = Fusion<Raw>;
-type Runtime = <Raw as FusionBackend>::FusionRuntime;
+pub(crate) type Runtime = <Raw as FusionBackend>::FusionRuntime;
 pub type RawTensor = CubeTensor<WgpuRuntime>;
 
 /// Return the actual GPU device only for supported backend and fallback policy.

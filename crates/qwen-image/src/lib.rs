@@ -1,5 +1,6 @@
 //! Native Qwen-Image-2.1-Turbo inference. Python is confined to numerical validation.
 pub mod config;
+mod convrot;
 pub mod dimensions;
 pub mod dit;
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
