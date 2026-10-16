@@ -65,7 +65,10 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
   常规 autotune matmul 保留。
 - MTP 头不加载、不执行（检查点亦不含相应张量）。
 - 线性注意力 prefill 为逐步递推（与官方逐层语义一致，prefill 吞吐未优化）。
-- burn-cubecl 0.21 无转置权重的融合 int4 matmul（`q_transpose`）：生产路径按 ADR-0001
-  在加载点反量化（峰值 RSS ≈23.5 GiB）；BF16 计算通路在本机构建上损坏，全程 F16。
+- 融合 W4A16 路由（int4 驻留、内核内反量化）为 cubecl 后端默认：vendor 补丁排除对
+  块量化操作数展开崩溃的 GEMV autotune 候选（burn-cubecl），并在 dispatch 线程兜底
+  候选 panic（cubecl-common），见各 vendor `LOCAL-CHANGES.md` 与 VALIDATION。
+  CPU 参考路径仍为加载点反量化（NdArray 不支持 sub-byte 张量）。
+- BF16 计算通路在本机构建上损坏，全程 F16。
 - MoE 前向保留每层一次路由小张量回读，专家累加全 GPU；不做中途 host 上传
   （该模式在本 burn 构建上会污染后续内核，见 VALIDATION）。

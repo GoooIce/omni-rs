@@ -93,6 +93,8 @@ burn = { version = "=0.21.0", default-features = false, features = ["std", "ndar
 pollster = "0.4"
 
 [patch.crates-io]
+burn-cubecl = { path = "vendor/burn-cubecl" }
+cubecl-common = { path = "vendor/cubecl-common" }
 burn-fusion = { path = "vendor/burn-fusion" }
 cubecl-runtime = { path = "vendor/cubecl-runtime" }
 cubecl-wgpu = { path = "vendor/cubecl-wgpu" }

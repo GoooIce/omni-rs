@@ -1246,7 +1246,7 @@ mod layer35b_tests {
             &config.text_config,
             Precision::F16,
             &device,
-            Some(crate::quant::LoadMode::Dequantize),
+            Some(crate::quant::LoadMode::Packed),
         )
         .unwrap();
 
@@ -1508,7 +1508,7 @@ mod layer35b_tests {
             &config.text_config,
             Precision::F16,
             &device,
-            Some(crate::quant::LoadMode::Dequantize),
+            Some(crate::quant::LoadMode::Packed),
         )
         .unwrap();
         let out1 = layer1.forward(out0, None);

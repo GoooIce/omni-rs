@@ -3,6 +3,51 @@
 记录日期：2026-10-15（历史基线保留原日期）。设备：Apple M5 Max，40 核 GPU，128 GB RAM，macOS 27.0.1。
 工具链：rustc/cargo 1.99.0，Burn 0.21.0；依赖版本保存在 Cargo.lock。
 
+## 2026-10-16：W4A16 融合反量化路由修复（ADR-0001 目标路径落地）
+
+T11 收口时生产路径按 ADR-0001 的降级方案走“加载点反量化”。本节记录把融合路由
+（int4 驻留、matmul 内核反量化）修通的过程与证据。
+
+### 根因（两层）
+
+1. **m=1 并非 kernel 不可用，而是 autotune 候选展开即崩溃**：块量化操作数
+   （PackedU32 存储，tune key 中 `elem_rhs = UInt`）使 `vecmat_plane_parallel` 与
+   `vecmat_unit_perpendicular` 两个 GEMV 候选在 kernel 展开（comptime cast）时
+   panic（"Cast element count must match if input is not scalar"），大形状（m=90 的
+   视觉前缀）另有候选在 blueprint 计划中除零。展开 panic 发生在 dispatch 线程，
+   上游行为是线程死亡 + 后续 `CallError`，进程随即崩溃——这正是初版“无 q_transpose”
+   结论的真实机制（`q_transpose` 本身只是元数据交换，从未缺失）。
+2. **tuner 对候选失败无兜底**：`warmup` 本已收集候选错误并跳过，但线程死亡使
+   错误以 panic 形式泄漏。
+
+### 修复（vendor 补丁，均带 LOCAL-CHANGES.md）
+
+- `vendor/burn-cubecl`（唯一改动 `kernel/matmul/tune/base.rs`）：两个 GEMV 候选在
+  任一操作数为整数存储（packed 量化）时返回 `PRIORITY_NEVER`。
+- `vendor/cubecl-common`（唯一改动 `device/handle/channel.rs` 的 `Task::run`）：
+  dispatch 线程逐任务 `catch_unwind`，panic 的候选被丢弃并以 `CallError` 呈报，
+  tuner 按既有语义跳过——其余候选（含未来未知的不兼容候选）不再具备杀伤力。
+
+### 验证
+
+- 合成回归测试 `quant::gpu_tests::fused_int4_matmul_covers_expert_shapes_and_gemv`：
+  专家形状 [512,2048]/[2048,512] × m∈{21,1}，冷 autotune 下与 f64 主机参考
+  max|delta| < 5e-2（实际 0.0000）。
+- 35B 真实 seam 测试切换到 `LoadMode::Packed`：全部 seam RMSE 与反量化路径一致
+  （mlp0_out 1.6e-2、layer0/1 7.7e-3）。
+- E2E：冷 autotune 缓存连续 5 次（文本 ×3、单图 ×2）与官方贪心流逐 token 一致，
+  stderr 0 panic。
+- 生产 CLI 在 cubecl 后端默认 `LoadMode::Packed`（CPU 参考路径仍为加载点反量化）。
+
+### M5 Max 实测（Metal FP16，Packed 融合路由，对照加载点反量化）
+
+| 指标 | 融合（int4 驻留） | 反量化（T11 记录） |
+| --- | --- | --- |
+| 权重加载 | 21.5 s | 45–47 s |
+| 首 token（文本 21 prompt） | 1.2 s | 1.3 s |
+| 解码 | 174 ms/token | 261 ms/token |
+| 峰值 RSS | ≈23.5 GiB（含 mmap 检查点驻留） | ≈23.5 GiB（footprint 73 GB，压缩后） |
+
 ## 2026-10-16：MiniCPM-V-4.7 35B-A3B-int4 接入（T9–T11）
 
 `crates/minicpm-v` 第二阶段：compressed-tensors pack-quantized int4 权重加载（T9）、

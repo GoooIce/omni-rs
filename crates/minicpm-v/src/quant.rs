@@ -278,6 +278,110 @@ mod gpu_tests {
             .collect()
     }
 
+    /// The MoE expert shapes and the single-token decode GEMV: the fused
+    /// (packed-resident) matmul must survive cold autotune and stay exact.
+    /// Regression for the vendored burn-cubecl tune fix that excludes the
+    /// plane-parallel/unit-perpendicular GEMV candidates for quantized
+    /// operands (their kernel expansion panics otherwise).
+    #[test]
+    fn fused_int4_matmul_covers_expert_shapes_and_gemv() {
+        type B = Metal;
+        let device = WgpuDevice::default();
+        // as_chunks would need a newer MSRV than the workspace
+        #[allow(clippy::chunks_exact_to_as_chunks)]
+        let synth = |out: usize, input: usize| -> (Vec<u8>, Vec<f32>) {
+            let group = GROUP_SIZE;
+            let mut header = format!(
+                concat!(
+                    "{{\"quant.weight_packed\":{{\"dtype\":\"U8\",\"shape\":[{},{}],\"data_offsets\":[0,{}]}},",
+                    "\"quant.weight_scale\":{{\"dtype\":\"BF16\",\"shape\":[{},{}],\"data_offsets\":[{},{}]}}}}"
+                ),
+                out,
+                input / 2,
+                out * input / 2,
+                out,
+                input / group,
+                out * input / 2,
+                out * input / 2 + out * input / group * 2
+            );
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes().as_ref());
+            let mut weight = vec![0f32; out * input];
+            let mut scales = vec![0f32; out * (input / group)];
+            for r in 0..out {
+                for g in 0..input / group {
+                    let scale = 0.008 + ((r * 31 + g * 7) % 17) as f32 * 0.0007;
+                    let stored = half::bf16::from_f32(scale).to_f32();
+                    bytes.extend_from_slice(&half::bf16::from_f32(scale).to_bits().to_le_bytes());
+                    scales[r * (input / group) + g] = stored;
+                    for k in 0..group {
+                        let c = g * group + k;
+                        let q = (((r * 13 + c * 5) % 15) as i32 - 7) as f32;
+                        weight[r * input + c] = q * stored;
+                    }
+                }
+            }
+            for r in 0..out {
+                for c in 0..input / 2 {
+                    let nibble = |index: usize| -> u8 {
+                        let g = index / group;
+                        ((weight[r * input + index] / scales[r * (input / group) + g]).round()
+                            + 8.0) as u8
+                    };
+                    bytes.push((nibble(c * 2) & 0xF) | ((nibble(c * 2 + 1) & 0xF) << 4));
+                }
+            }
+            (bytes, weight)
+        };
+        for (out, input, m) in [
+            (512usize, 2048usize, 21usize),
+            (2048, 512, 21),
+            (512, 2048, 1),
+        ] {
+            let (bytes, weight) = synth(out, input);
+            let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes]).unwrap();
+            let packed = load_packed::<B>(
+                &weights,
+                "quant.weight_packed",
+                "quant.weight_scale",
+                [out, input],
+                LoadMode::Packed,
+                omni_r2t2::Precision::F16,
+                &device,
+            )
+            .unwrap();
+            let x_values: Vec<f32> = (0..21 * input)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.05)
+                .collect();
+            let x = Tensor::<Metal, 2>::from_data(
+                TensorData::new(x_values.clone(), [21, input]),
+                &device,
+            )
+            .cast(FloatDType::F16)
+            .slice([0..m, 0..input]);
+            let got = packed
+                .matmul_transpose(x)
+                .into_data()
+                .convert::<f32>()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            let mut worst = 0f64;
+            for i in 0..m {
+                for j in 0..out {
+                    let mut acc = 0f64;
+                    for k in 0..input {
+                        acc += x_values[i * input + k] as f64 * weight[j * input + k] as f64;
+                    }
+                    worst = worst.max((got[i * out + j] as f64 - acc).abs());
+                }
+            }
+            // F16 activations with in-kernel dequant; exact to well under one
+            // activation ULP step at these magnitudes.
+            assert!(worst < 5e-2, "shape {out}x{input} m={m}: worst {worst}");
+        }
+    }
+
     #[test]
     fn fused_int4_matmul_matches_reference() {
         let bytes = std::fs::read(
