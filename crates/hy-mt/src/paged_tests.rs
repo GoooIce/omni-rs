@@ -1,5 +1,5 @@
 use crate::{
-    paged::{self, Batch, Segment},
+    paged::{self, Batch},
     pages::{CopyPage, PAGE_SIZE},
 };
 use burn::tensor::{FloatDType, Tensor, TensorData, backend::Backend, f16};
@@ -34,24 +34,8 @@ fn verify<B: Backend>(dim: usize, dtype: FloatDType, split_offset: usize) {
         ),
         (0, 1, vec![1]),
     ] {
-        let start = batch.ids.len();
-        let table = batch.table.len();
-        batch.table.extend(&page_ids);
-        for pos in offset..offset + count {
-            batch.ids.push(0);
-            batch.positions.push(pos);
-            batch.rows.extend([
-                pos as u32,
-                table as u32,
-                page_ids[pos / PAGE_SIZE] * 16 + (pos % 16) as u32,
-            ]);
-        }
-        batch.segments.push(Segment {
-            start,
-            count,
-            offset,
-            table,
-        });
+        let ids = vec![0; count];
+        batch.push_span(&page_ids, offset, &ids);
     }
     batch.copies.push(CopyPage {
         source: Arc::new(3),

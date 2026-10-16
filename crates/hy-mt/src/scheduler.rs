@@ -1,6 +1,6 @@
 use crate::{
     Error, Model, Request, Result, Translation, TranslationEvent, check_cancel,
-    paged::{Batch, Segment},
+    paged::Batch,
     pages::{History, PAGE_SIZE, Pages},
     sampling::Sampler,
 };
@@ -261,36 +261,15 @@ impl<B: Backend> Translator<B> {
                 .copies
                 .extend(self.pages.extend(&mut a.history, count)?);
             let offset = a.history.len;
-            let start = batch.ids.len();
-            let table = batch.table.len();
-            batch
-                .table
-                .extend(a.history.pages.iter().map(|p| **p as u32));
+            let page_ids: Vec<u32> = a.history.pages.iter().map(|page| **page as u32).collect();
             if offset < a.prompt.len() {
-                batch
-                    .ids
-                    .extend_from_slice(&a.prompt[offset..offset + count]);
+                batch.push_span(&page_ids, offset, &a.prompt[offset..offset + count]);
                 self.stats.prefill_tokens += count as u64;
             } else {
-                batch
-                    .ids
-                    .push(*a.generated.last().expect("decoder has a sampled token"));
+                let token = *a.generated.last().expect("decoder has a sampled token");
+                batch.push_span(&page_ids, offset, &[token]);
                 self.stats.decode_tokens += 1;
             }
-            for pos in offset..offset + count {
-                batch.positions.push(pos);
-                batch.rows.extend([
-                    pos as u32,
-                    table as u32,
-                    (*a.history.pages[pos / PAGE_SIZE] * PAGE_SIZE + pos % PAGE_SIZE) as u32,
-                ]);
-            }
-            batch.segments.push(Segment {
-                start,
-                count,
-                offset,
-                table,
-            });
         }
         self.stats.steps += 1;
         self.stats.batched_steps += u64::from(scheduled.len() > 1);
