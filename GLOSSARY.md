@@ -37,7 +37,7 @@ Time spent in decoding divided by the duration of audio represented in the trans
 One text-to-text generation from an immutable source-text snapshot and a target language. The translated text is separate from the source; using it as speech-synthesis input is an explicit action.
 
 **Radix prefix cache**:
-The index of completed translation token prefixes for one loaded model. Each indexed span records the KV pages that hold it, not a separate copy of the dense attention tensors. A later translation reuses the longest matching prefix. Eviction removes only pages that no active translation still holds. Audio and image embeddings cannot be identified by text tokens alone, so they are never indexed here.
+The index of completed translation token prefixes for one loaded model. Each indexed span records the KV pages that hold it, not a separate copy of the dense attention tensors. A later translation reuses the longest matching prefix and locks it until that translation finishes. Eviction drops only an unlocked leaf, and it never recycles a KV page that a translation still holds. Audio and image embeddings cannot be identified by text tokens alone, so they are never indexed here.
 _Avoid_: dense KV trie
 
 **KV page**:

@@ -213,7 +213,8 @@ impl<B: Backend> Translator<B> {
     }
     fn finish(&mut self, id: RequestId, reason: &str) -> Translation {
         let index = self.active.iter().position(|a| a.id == id).unwrap();
-        let a = self.active.remove(index);
+        let mut a = self.active.remove(index);
+        self.pages.release(&mut a.history);
         self.reserved -= a.reserved;
         Translation {
             text: a.text,
