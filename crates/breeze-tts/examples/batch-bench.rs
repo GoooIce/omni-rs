@@ -266,10 +266,12 @@ fn check_lifecycle<B: burn::tensor::backend::Backend>(
                 "depth",
                 "codes_device",
                 "codec_and_callback",
-                "audio_embedding",
-                "backbone",
             ] {
                 assert_eq!(profile.stage_seconds[name].len(), serial.frames, "{name}");
+            }
+            let continued = serial.frames - usize::from(serial.reached_limit);
+            for name in ["audio_embedding", "backbone"] {
+                assert_eq!(profile.stage_seconds[name].len(), continued, "{name}");
             }
         }
         let stop = Arc::new(AtomicBool::new(false));
