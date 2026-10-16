@@ -44,26 +44,13 @@ fn logits_parity<B: Backend>(precision: Precision) {
         let mut batch = Batch::default();
         let mut expected = Vec::new();
         for (index, ids) in &steps {
-            let h = &mut histories[*index];
-            batch.copies.extend(pages.extend(h, ids.len()).unwrap());
-            let table = batch.table.len();
-            batch.table.extend(h.pages.iter().map(|p| **p as u32));
-            batch.segments.push(Segment {
-                start: batch.ids.len(),
-                count: ids.len(),
-                offset: h.len,
-                table,
-            });
-            batch.ids.extend(ids);
-            for pos in h.len..h.len + ids.len() {
-                batch.positions.push(pos);
-                batch.rows.extend([
-                    pos as u32,
-                    table as u32,
-                    (*h.pages[pos / PAGE_SIZE] * PAGE_SIZE + pos % PAGE_SIZE) as u32,
-                ]);
-            }
-            h.len += ids.len();
+            let history = &mut histories[*index];
+            batch
+                .copies
+                .extend(pages.extend(history, ids.len()).unwrap());
+            let page_ids: Vec<u32> = history.pages.iter().map(|page| **page as u32).collect();
+            batch.push_span(&page_ids, history.len, ids);
+            history.len += ids.len();
             expected.extend(
                 model
                     .forward_tokens(ids, &mut dense[*index], &stop)
@@ -335,24 +322,10 @@ fn official_reference<B: Backend>(precision: Precision) {
         for (step, ids) in case.steps.iter().enumerate() {
             let mut batch = Batch {
                 copies: pages.extend(&mut history, ids.len()).unwrap(),
-                ids: ids.clone(),
-                table: history.pages.iter().map(|p| **p as u32).collect(),
                 ..Default::default()
             };
-            batch.segments.push(Segment {
-                start: 0,
-                count: ids.len(),
-                offset: history.len,
-                table: 0,
-            });
-            for pos in history.len..history.len + ids.len() {
-                batch.positions.push(pos);
-                batch.rows.extend([
-                    pos as u32,
-                    0,
-                    (*history.pages[pos / PAGE_SIZE] * PAGE_SIZE + pos % PAGE_SIZE) as u32,
-                ]);
-            }
+            let page_ids: Vec<u32> = history.pages.iter().map(|page| **page as u32).collect();
+            batch.push_span(&page_ids, history.len, ids);
             let actual = model
                 .forward_batch(&batch, &mut atlas, pages.capacity())
                 .unwrap()

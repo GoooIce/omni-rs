@@ -1,19 +1,19 @@
-//! Physical page ownership and a compressed token trie. Only metadata lives on
-//! the CPU; one page number addresses the same positions in every model layer.
+//! Physical page pool. The prefix tree is `omni_r2t2::tensor::RadixCache`:
+//! one page number addresses the same positions in every model layer, and the
+//! tree records those identities. This module only allocates slots and copies
+//! a shared tail page before it is written.
 use crate::{Error, Result};
-use omni_r2t2::tensor::RadixStats;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Weak},
-};
+use omni_r2t2::tensor::{PageId, RadixCache, RadixGuard, RadixStats};
+use std::sync::{Arc, Weak};
 
 pub(crate) const PAGE_SIZE: usize = 16;
-pub(crate) type Page = Arc<usize>;
+pub(crate) type Page = PageId;
 
 #[derive(Default)]
 pub(crate) struct History {
     pub pages: Vec<Page>,
     pub len: usize,
+    guard: Option<RadixGuard>,
 }
 
 pub(crate) struct CopyPage {
@@ -24,82 +24,37 @@ pub(crate) struct CopyPage {
 pub(crate) struct Pages {
     slots: Vec<Weak<usize>>,
     cursor: usize,
-    root: Node,
-    capacity: usize,
-    clock: u64,
-    stats: RadixStats,
-}
-#[derive(Default)]
-struct Node {
-    key: Vec<u32>,
-    // Snapshot of the complete path, including a possibly shared partial tail.
-    pages: Vec<Page>,
-    children: BTreeMap<u32, Node>,
-    touched: u64,
-}
-impl Node {
-    fn resident(&self, ids: &mut BTreeSet<usize>) {
-        ids.extend(self.pages.iter().map(|p| **p));
-        for child in self.children.values() {
-            child.resident(ids);
-        }
-    }
+    tree: RadixCache,
 }
 impl Pages {
     pub fn new(pool_tokens: usize, cache_tokens: usize) -> Self {
         Self {
             slots: (0..pool_tokens / PAGE_SIZE).map(|_| Weak::new()).collect(),
             cursor: 0,
-            root: Node::default(),
-            capacity: cache_tokens / PAGE_SIZE,
-            clock: 0,
-            stats: RadixStats::default(),
+            tree: RadixCache::new(PAGE_SIZE, cache_tokens / PAGE_SIZE),
         }
     }
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
     pub fn used(&self) -> usize {
-        self.slots.iter().filter(|p| p.strong_count() > 0).count()
+        self.slots
+            .iter()
+            .filter(|page| page.strong_count() > 0)
+            .count()
     }
     pub fn stats(&self) -> RadixStats {
-        self.stats
+        self.tree.stats()
     }
     pub fn clear(&mut self) {
-        self.root = Node::default();
-        self.stats = RadixStats::default();
+        self.tree.clear();
     }
-    fn resident_pages(&self) -> usize {
-        let mut ids = BTreeSet::new();
-        self.root.resident(&mut ids);
-        ids.len()
-    }
-    fn evict(&mut self) -> bool {
-        fn oldest(node: &Node, path: &mut Vec<u32>, best: &mut Option<(u64, Vec<u32>)>) {
-            for (&key, child) in &node.children {
-                path.push(key);
-                if child.children.is_empty() {
-                    if best.as_ref().is_none_or(|(time, _)| child.touched < *time) {
-                        *best = Some((child.touched, path.clone()));
-                    }
-                } else {
-                    oldest(child, path, best);
-                }
-                path.pop();
-            }
+    /// End the translation's lock on the matched prefix. Page handles it still
+    /// owns stay allocated until those handles are dropped.
+    pub fn release(&mut self, history: &mut History) {
+        if let Some(guard) = history.guard.take() {
+            self.tree.unlock(guard);
         }
-        let mut best = None;
-        oldest(&self.root, &mut Vec::new(), &mut best);
-        let Some((_, path)) = best else { return false };
-        let mut node = &mut self.root;
-        for key in &path[..path.len() - 1] {
-            node = node.children.get_mut(key).unwrap();
-        }
-        node.children.remove(path.last().unwrap());
-        let resident = self.resident_pages() * PAGE_SIZE;
-        self.stats.evicted_tokens += self.stats.resident_tokens.saturating_sub(resident) as u64;
-        self.stats.resident_tokens = resident;
-        true
     }
     fn allocate(&mut self) -> Result<Page> {
         loop {
@@ -112,7 +67,7 @@ impl Pages {
                     return Ok(page);
                 }
             }
-            if !self.evict() {
+            if !self.tree.evict_leaf() {
                 return Err(Error::Inference("paged KV pool exhausted".into()));
             }
         }
@@ -138,32 +93,13 @@ impl Pages {
         Ok(copies)
     }
     pub fn lookup(&mut self, tokens: &[u32]) -> History {
-        self.clock += 1;
-        self.stats.requests += 1;
-        let mut result = History::default();
-        let mut node = &mut self.root;
-        while let Some(token) = tokens.get(result.len) {
-            let Some(child) = node.children.get_mut(token) else {
-                break;
-            };
-            let common = tokens[result.len..]
-                .iter()
-                .zip(&child.key)
-                .take_while(|(a, b)| a == b)
-                .count();
-            result.len += common;
-            result.pages = child.pages[..result.len.div_ceil(PAGE_SIZE)].to_vec();
-            child.touched = self.clock;
-            if common < child.key.len() {
-                break;
-            }
-            node = child;
+        let hit = self.tree.match_prefix(tokens);
+        let guard = hit.guard();
+        History {
+            pages: hit.pages,
+            len: hit.tokens,
+            guard,
         }
-        if result.len > 0 {
-            self.stats.hits += 1;
-        }
-        self.stats.reused_tokens += result.len as u64;
-        result
     }
     pub fn publish(&mut self, tokens: &[u32], history: &History) {
         assert_eq!(
@@ -171,62 +107,16 @@ impl Pages {
             history.len,
             "only complete KV may enter the trie"
         );
-        let count = tokens.len().min(self.capacity * PAGE_SIZE);
-        if count == 0 {
-            return;
-        }
-        self.clock += 1;
-        fn insert(node: &mut Node, tokens: &[u32], pages: &[Page], offset: usize, clock: u64) {
-            let Some(&first) = tokens.first() else { return };
-            let Some(mut child) = node.children.remove(&first) else {
-                node.children.insert(
-                    first,
-                    Node {
-                        key: tokens.to_vec(),
-                        pages: pages[..(offset + tokens.len()).div_ceil(PAGE_SIZE)].to_vec(),
-                        children: BTreeMap::new(),
-                        touched: clock,
-                    },
-                );
-                return;
-            };
-            let common = tokens
-                .iter()
-                .zip(&child.key)
-                .take_while(|(a, b)| a == b)
-                .count();
-            if common < child.key.len() {
-                let key = child.key[..common].to_vec();
-                let prefix_pages = child.pages[..(offset + common).div_ceil(PAGE_SIZE)].to_vec();
-                child.key.drain(..common);
-                child = Node {
-                    key,
-                    pages: prefix_pages,
-                    children: BTreeMap::from([(child.key[0], child)]),
-                    touched: clock,
-                };
-            }
-            child.touched = clock;
-            insert(&mut child, &tokens[common..], pages, offset + common, clock);
-            node.children.insert(first, child);
-        }
-        insert(
-            &mut self.root,
-            &tokens[..count],
-            &history.pages,
-            0,
-            self.clock,
-        );
-        self.stats.resident_tokens = self.resident_pages() * PAGE_SIZE;
-        while self.resident_pages() > self.capacity {
-            self.evict();
-        }
+        self.tree
+            .insert(tokens, &history.pages)
+            .expect("history pages cover the published tokens");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn radix_branches_copy_shared_tails_and_pin_evicted_pages() {
         let mut pool = Pages::new(128, 64);
@@ -258,6 +148,7 @@ mod tests {
         drop(copied);
         assert_eq!(pool.used(), 0);
     }
+
     #[test]
     fn lru_eviction_reclaims_only_unpinned_pages_and_reuses_slots() {
         let mut pool = Pages::new(64, 32);
@@ -267,11 +158,11 @@ mod tests {
         let pinned_id = *pinned.pages[0];
         pool.publish(&[1; 16], &pinned);
         for token in 2..20 {
-            let mut h = History::default();
-            pool.extend(&mut h, 17).unwrap();
-            h.len = 17;
-            assert!(h.pages.iter().all(|p| **p != pinned_id));
-            pool.publish(&[token; 17], &h);
+            let mut history = History::default();
+            pool.extend(&mut history, 17).unwrap();
+            history.len = 17;
+            assert!(history.pages.iter().all(|page| **page != pinned_id));
+            pool.publish(&[token; 17], &history);
             assert!(pool.stats().resident_tokens <= 32);
         }
         assert!(pool.stats().evicted_tokens > 0);

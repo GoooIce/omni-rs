@@ -21,6 +21,36 @@ pub(crate) struct Batch {
     pub segments: Vec<Segment>,
 }
 impl Batch {
+    /// Append one causal span. `pages` is that history's block table.
+    /// Each row is `(position, table offset, physical slot)`.
+    pub(crate) fn push_span(&mut self, pages: &[u32], offset: usize, ids: &[u32]) {
+        if ids.is_empty() {
+            return;
+        }
+        let last = offset + ids.len() - 1;
+        assert!(
+            pages.len() > last / PAGE_SIZE,
+            "block table does not cover the written positions"
+        );
+        let start = self.ids.len();
+        let table = self.table.len();
+        self.table.extend_from_slice(pages);
+        self.ids.extend_from_slice(ids);
+        for pos in offset..offset + ids.len() {
+            self.positions.push(pos);
+            self.rows.extend([
+                pos as u32,
+                table as u32,
+                pages[pos / PAGE_SIZE] * PAGE_SIZE as u32 + (pos % PAGE_SIZE) as u32,
+            ]);
+        }
+        self.segments.push(Segment {
+            start,
+            count: ids.len(),
+            offset,
+            table,
+        });
+    }
     pub fn last_rows<B: Backend>(&self, device: &B::Device) -> Tensor<B, 1, Int> {
         Tensor::from_data(
             TensorData::new(

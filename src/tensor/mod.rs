@@ -16,7 +16,7 @@ mod decode_cache;
 pub use decode_cache::DecodeCache;
 pub use embedding::Embedding;
 pub use norm::{Norm, NormKind, NormReduction, layer_norm};
-pub use radix::{RadixCache, RadixMatch, RadixStats};
+pub use radix::{PageId, RadixCache, RadixGuard, RadixMatch, RadixStats};
 
 pub fn dtype<B: Backend, const D: usize>(x: &Tensor<B, D>) -> FloatDType {
     if x.dtype() == DType::F16 {

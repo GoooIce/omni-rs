@@ -37,7 +37,8 @@ Time spent in decoding divided by the duration of audio represented in the trans
 One text-to-text generation from an immutable source-text snapshot and a target language. The translated text is separate from the source; using it as speech-synthesis input is an explicit action.
 
 **Radix prefix cache**:
-A cache of completed attention histories indexed by token prefixes, allowing translations to reuse their longest common beginning within the same loaded model. Eviction removes reusable history without invalidating active translations; audio and image embeddings cannot be identified by text tokens alone.
+The index of completed translation token prefixes for one loaded model. Each indexed span records the KV pages that hold it, not a separate copy of the dense attention tensors. A later translation reuses the longest matching prefix and locks it until that translation finishes. Eviction drops only an unlocked leaf, and it never recycles a KV page that a translation still holds. Audio and image embeddings cannot be identified by text tokens alone, so they are never indexed here.
+_Avoid_: dense KV trie
 
 **KV page**:
 A fixed-size group of attention-history positions whose physical location is independent of its logical position in a translation. Shared prefix pages remain unchanged until every translation using them has finished or acquired its own writable copy.
@@ -46,7 +47,7 @@ A fixed-size group of attention-history positions whose physical location is ind
 A changing set of translations that compute their next prompt or output tokens together while retaining independent histories, sampling and cancellation. New translations can join between computation steps, and completed translations release their place immediately.
 
 **Decode history**:
-The private attention state for an autoregressive sequence. Speech recognition can rewind its uncommitted suffix; speech synthesis extends its backbone history frame by frame. Metal page storage is optional and does not imply cross-request prefix reuse.
+The private attention state for an autoregressive sequence. A translation's decode history is the KV pages that translation currently holds. Sharing those pages with later translations is the radix prefix cache, not the decode history. Speech recognition can rewind its uncommitted suffix; speech synthesis extends its backbone history frame by frame. Metal page storage is optional and does not imply cross-request prefix reuse.
 
 **Continuous transcription batch**:
 Offline audio sources sharing text-decoder steps while retaining independent resampling, audio encoding, committed transcripts and termination. A live source that blocks waiting for microphone input cannot join this executor.
