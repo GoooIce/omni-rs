@@ -56,7 +56,7 @@ Offline audio sources sharing text-decoder steps while retaining independent res
 Speech requests sharing semantic-head and depth-decoder work at a codec-frame boundary. Each request owns its backbone history, sampler, audio codec and output. Finishing one voice does not reset another voice's state.
 
 **Speech synthesis**:
-One generation of speech from a text and voice-conditioning snapshot, including its independent sampling, generated frames and delivered audio. An interruption retains audio already delivered and discards audio that has not been delivered.
+One generation of speech from a text and voice-conditioning snapshot, including its independent sampling, generated frames and delivered audio. A single request and a continuous synthesis batch stop at the same frame ceiling: pending audio is delivered, and the backbone is not continued past that frame. An interruption retains audio already delivered and discards audio that has not been delivered.
 
 **First audio latency**:
 Time from the start of speech synthesis to the beginning of its first successful audio handoff. It excludes the recipient's processing time and any delay before physical playback.

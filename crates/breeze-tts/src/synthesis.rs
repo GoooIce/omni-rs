@@ -249,7 +249,6 @@ impl<B: Backend> Synthesis<B> {
         model: &Model<B>,
         frame: Frame<B>,
         cancel: &AtomicBool,
-        serial: bool,
         emit: &mut impl FnMut(&[f32]) -> Result<()>,
     ) -> Result<Option<End>> {
         self.mark(model, "depth")?;
@@ -260,15 +259,15 @@ impl<B: Backend> Synthesis<B> {
         self.pending.push(codes);
         self.mark(model, "codes_device")?;
         let limit = self.codes.len() == self.limit;
-        if (self.pending.len() >= self.options.chunk_frames || (!serial && limit))
+        // One request and a continuous batch share this rule. The ceiling frame
+        // is delivered and not continued; that continuation would not be sampled.
+        if (self.pending.len() >= self.options.chunk_frames || limit)
             && !self.emit_pending(model, cancel, emit)?
         {
             return Ok(Some(End::Interrupted));
         }
         self.mark(model, "codec_and_callback")?;
-        // Serial profiling includes its historical final backbone continuation.
-        // Packed execution skips that unused work at the frame ceiling.
-        if !serial && limit {
+        if limit {
             return Ok(Some(End::Limit));
         }
         let embedding = Tensor::cat(frame.embeddings, 1)

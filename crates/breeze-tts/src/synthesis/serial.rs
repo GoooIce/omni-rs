@@ -23,5 +23,5 @@ pub(super) fn advance<B: Backend>(
         let scores = depth_logits(model, frame.input.clone(), cache, book);
         request.sample_depth(model, &mut frame, book, scores)?;
     }
-    request.accept_frame(model, frame, cancel, true, emit)
+    request.accept_frame(model, frame, cancel, emit)
 }

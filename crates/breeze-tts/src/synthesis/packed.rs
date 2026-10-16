@@ -96,7 +96,7 @@ pub(super) fn advance<B: Backend>(
             }
             match member
                 .request
-                .accept_frame(model, frame, member.cancel, false, &mut |pcm| emit(i, pcm))
+                .accept_frame(model, frame, member.cancel, &mut |pcm| emit(i, pcm))
             {
                 Ok(Some(end)) => ended.push((i, end)),
                 Ok(None) => {}
