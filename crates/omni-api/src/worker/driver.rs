@@ -36,34 +36,35 @@ impl Update {
 // Encoding consumes the image only after its engine borrow has ended. Returning
 // the report keeps GeneratedImage's source-path protection inside save_png.
 pub(crate) type Png = Box<dyn FnOnce(&Path) -> Result<omni_qwen_image::Report, Failure> + Send>;
-pub(crate) enum Product {
-    Music(omni_music::pipeline::Product),
-    Translation {
-        report: omni_hy_mt::Translation,
-        batch: omni_hy_mt::BatchStats,
-    },
-    Transcription {
-        report: omni_r2t2::stream::BatchReport,
-        batch: omni_r2t2::stream::BatchStats,
-    },
-    Speech {
-        report: omni_breeze_tts::SynthesisReport,
-        batch: omni_breeze_tts::BatchStats,
-    },
-    Image {
-        encode: Png,
-        batch: omni_qwen_image::BatchStats,
-    },
+type Render =
+    Box<dyn FnOnce(&crate::jobs::Context, Vec<f32>) -> Result<crate::jobs::Output, Failure> + Send>;
+/// A finished request's value and file writes. The driver builds this and does
+/// not mark the inference job terminal; Jobs publishes that once.
+pub(crate) struct Product {
+    kind: Kind,
+    render: Render,
 }
 impl Product {
-    pub fn kind(&self) -> Kind {
-        match self {
-            Self::Translation { .. } => Kind::Translation,
-            Self::Transcription { .. } => Kind::Transcription,
-            Self::Speech { .. } => Kind::Speech,
-            Self::Image { .. } => Kind::Image,
-            Self::Music(_) => Kind::Music,
+    pub(super) fn new(
+        kind: Kind,
+        render: impl FnOnce(&crate::jobs::Context, Vec<f32>) -> Result<crate::jobs::Output, Failure>
+        + Send
+        + 'static,
+    ) -> Self {
+        Self {
+            kind,
+            render: Box::new(render),
         }
+    }
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+    pub fn render(
+        self,
+        context: &crate::jobs::Context,
+        audio: Vec<f32>,
+    ) -> Result<crate::jobs::Output, Failure> {
+        (self.render)(context, audio)
     }
 }
 #[derive(Default)]
@@ -248,7 +249,7 @@ impl Driver for NativeDriver {
                         (
                             id,
                             result
-                                .map(|report| Product::Translation { report, batch })
+                                .map(|report| Product::translation(report, batch))
                                 .map_err(Failure::from),
                         )
                     })
@@ -267,7 +268,7 @@ impl Driver for NativeDriver {
                         (
                             id,
                             result
-                                .map(|report| Product::Transcription { report, batch })
+                                .map(|report| Product::transcription(report, batch))
                                 .map_err(Failure::from),
                         )
                     })
@@ -285,7 +286,7 @@ impl Driver for NativeDriver {
                         (
                             id,
                             result
-                                .map(|report| Product::Speech { report, batch })
+                                .map(|report| Product::speech(report, batch))
                                 .map_err(Failure::from),
                         )
                     })
@@ -303,12 +304,14 @@ impl Driver for NativeDriver {
                         (
                             id,
                             result
-                                .map(|image| Product::Image {
-                                    encode: Box::new(move |path| {
-                                        image.save_png(path)?;
-                                        Ok(image.report)
-                                    }),
-                                    batch,
+                                .map(|image| {
+                                    Product::image(
+                                        Box::new(move |path| {
+                                            image.save_png(path)?;
+                                            Ok(image.report)
+                                        }),
+                                        batch,
+                                    )
                                 })
                                 .map_err(Failure::from),
                         )
