@@ -136,7 +136,7 @@ impl From<std::io::Error> for Failure {
 
 mod driver;
 mod music;
-use driver::{Driver, NativeDriver, Product, Step, Update};
+use driver::{Driver, NativeDriver, Step, Update};
 
 impl driver::Progress {
     pub fn value(self) -> serde_json::Value {
@@ -259,24 +259,7 @@ impl<D: Driver> Models<D> {
             .into_iter()
             .map(|(id, result)| {
                 let job = active.members.remove(&id).unwrap();
-                let result = result.and_then(|product| match product {
-                    Product::Translation { report, batch } => {
-                        let cancelled = report.finish_reason == "cancelled";
-                        let mut value = json!(report);
-                        value["batch"] = json!(batch);
-                        Ok(Output::new(value, cancelled))
-                    }
-                    Product::Transcription { report, batch } => {
-                        let mut value = json!(report);
-                        value["batch"] = json!(batch);
-                        Ok(Output::new(value, report.cancelled))
-                    }
-                    Product::Speech { report, batch } => {
-                        speech_output(&job.context, job.audio, report, batch)
-                    }
-                    Product::Image { encode, batch } => image_output(&job.context, encode, batch),
-                    Product::Music(product) => music_output(&job.context, product),
-                });
+                let result = result.and_then(|product| product.render(&job.context, job.audio));
                 (job.context.id(), result)
             })
             .collect();
@@ -476,6 +459,49 @@ fn speech_output(
     );
     output.file = Some(file);
     Ok(output)
+}
+
+impl driver::Product {
+    pub(crate) fn translation(
+        report: omni_hy_mt::Translation,
+        batch: omni_hy_mt::BatchStats,
+    ) -> Self {
+        Self::new(Kind::Translation, move |_context, _audio| {
+            let cancelled = report.finish_reason == "cancelled";
+            let mut value = json!(report);
+            value["batch"] = json!(batch);
+            Ok(Output::new(value, cancelled))
+        })
+    }
+    pub(crate) fn transcription(
+        report: omni_r2t2::stream::BatchReport,
+        batch: omni_r2t2::stream::BatchStats,
+    ) -> Self {
+        Self::new(Kind::Transcription, move |_context, _audio| {
+            let cancelled = report.cancelled;
+            let mut value = json!(report);
+            value["batch"] = json!(batch);
+            Ok(Output::new(value, cancelled))
+        })
+    }
+    pub(crate) fn speech(
+        report: omni_breeze_tts::SynthesisReport,
+        batch: omni_breeze_tts::BatchStats,
+    ) -> Self {
+        Self::new(Kind::Speech, move |context, audio| {
+            speech_output(context, audio, report, batch)
+        })
+    }
+    pub(crate) fn image(encode: driver::Png, batch: omni_qwen_image::BatchStats) -> Self {
+        Self::new(Kind::Image, move |context, _audio| {
+            image_output(context, encode, batch)
+        })
+    }
+    pub(crate) fn music(product: omni_music::pipeline::Product) -> Self {
+        Self::new(Kind::Music, move |context, _audio| {
+            music_output(context, product)
+        })
+    }
 }
 
 #[cfg(test)]

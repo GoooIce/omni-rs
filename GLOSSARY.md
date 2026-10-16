@@ -65,7 +65,7 @@ Time from the start of speech synthesis to the beginning of its first successful
 One image request's evolving latent, timestep, conditioning and optional negative-guidance branch. Several trajectories can share DiT projections and MLPs even when their dimensions or timesteps differ; their attention histories remain separate.
 
 **Inference job**:
-One admitted HTTP request with its own progress, result and cancellation handle. Its terminal state is published once, after execution releases request resources and any result file is published. A cancellation can retain completed partial output; an execution or publication failure remains an error.
+One admitted HTTP request with its own progress, result and cancellation handle. Execution returns the result value and any files still to be written; it does not mark the job terminal. The terminal state is published once, after execution releases request resources and any result file is published. A cancellation can retain completed partial output; an execution or publication failure remains an error.
 
 **Published result**:
 A completed audio or image file made available for download. Its link remains valid while the file is retained, independently of inference-job history and application restarts.

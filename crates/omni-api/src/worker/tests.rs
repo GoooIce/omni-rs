@@ -1,5 +1,5 @@
 //! Exercise Models through the production Jobs loop and real result storage.
-use super::driver::Progress;
+use super::driver::{Product, Progress};
 use super::*;
 use crate::{
     jobs::{Jobs, View},
@@ -193,8 +193,8 @@ fn image() -> Command {
     })
 }
 fn speech_product(samples: usize, cancelled: bool) -> Product {
-    Product::Speech {
-        report: omni_breeze_tts::SynthesisReport {
+    Product::speech(
+        omni_breeze_tts::SynthesisReport {
             frames: 1,
             codes: vec![[0; 16]],
             audio_seconds: samples as f64 / 24000.0,
@@ -204,8 +204,8 @@ fn speech_product(samples: usize, cancelled: bool) -> Product {
             reached_limit: !cancelled,
             profile: None,
         },
-        batch: Default::default(),
-    }
+        Default::default(),
+    )
 }
 fn speech_step(id: u64, audio: Vec<f32>, cancelled: bool) -> Step {
     Step {
@@ -227,14 +227,14 @@ fn wav(h: &Harness, id: &str) -> Vec<i16> {
     reader.samples::<i16>().map(Result::unwrap).collect()
 }
 fn transcription() -> Product {
-    Product::Transcription {
-        report: omni_r2t2::stream::BatchReport {
+    Product::transcription(
+        omni_r2t2::stream::BatchReport {
             text: "hello".into(),
             cancelled: false,
             statistics: Default::default(),
         },
-        batch: Default::default(),
-    }
+        Default::default(),
+    )
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn music_artifacts_publish_as_one_bundle_with_stereo_sample_rate() {
             truncated: true,
         },
     };
-    h.reply(Reply::Step(done(1, Product::Music(product))));
+    h.reply(Reply::Step(done(1, Product::music(product))));
     let result = h.terminal(&id);
     assert_eq!(result.status, "done");
     let value = result.result.unwrap();
@@ -523,8 +523,8 @@ fn image_encoding_uses_staging_and_failed_encoding_cleans_up_before_retry() {
         let name = format!("{job}.png");
         h.reply(Reply::Step(done(
             id,
-            Product::Image {
-                encode: Box::new(move |path| {
+            Product::image(
+                Box::new(move |path| {
                     assert!(files.read(&name).is_err());
                     std::fs::write(path, PNG)?;
                     assert!(files.read(&name).is_err());
@@ -534,8 +534,8 @@ fn image_encoding_uses_staging_and_failed_encoding_cleans_up_before_retry() {
                     }
                     Ok(image_report())
                 }),
-                batch: Default::default(),
-            },
+                Default::default(),
+            ),
         )));
         let view = h.terminal(&job);
         if fail {
@@ -579,8 +579,8 @@ fn translation_preserves_partial_text_progress_cache_and_batch_metadata() {
         )],
         completed: vec![(
             9,
-            Ok(Product::Translation {
-                report: omni_hy_mt::Translation {
+            Ok(Product::translation(
+                omni_hy_mt::Translation {
                     text: "你好".into(),
                     target_language: "Chinese".into(),
                     prompt_tokens: 12,
@@ -591,11 +591,11 @@ fn translation_preserves_partial_text_progress_cache_and_batch_metadata() {
                     finish_reason: "cancelled".into(),
                     cache: Default::default(),
                 },
-                batch: omni_hy_mt::BatchStats {
+                omni_hy_mt::BatchStats {
                     max_batch_size: 3,
                     ..Default::default()
                 },
-            }),
+            )),
         )],
     }));
     let view = h.terminal(&job);

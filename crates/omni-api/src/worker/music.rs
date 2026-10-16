@@ -111,7 +111,7 @@ impl Music {
                 .push((id, Update::Progress(Progress::Music(p)))),
             Ok(Message::Done(result)) => {
                 r.finished = true;
-                step.completed.push((id, (*result).map(Product::Music)));
+                step.completed.push((id, (*result).map(Product::music)));
                 self.running.take();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
