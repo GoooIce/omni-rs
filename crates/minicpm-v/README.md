@@ -21,6 +21,11 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- doctor
 下载脚本钉住上游 revision（ModelScope `19a6e190…`、HF `b0918c74…`），逐文件校验大小与 SHA256，
 写入 `download-manifest.json`；`doctor` 校验目录完整性并做后端 matmul 探针。
 
+上游语义（量化打包布局、kernel 行为、模型代码）先读 `.venv-minicpm` 里的权威源码
+（transformers 5.19、compressed-tensors、flash-linear-attention 均已安装），
+不要从行为反推——例如 int4 打包是 `pack_to_int32` 的 +8 偏移无符号 nibble，
+见 `compressed_tensors/compressors/pack_quantized/helpers.py`。
+
 ## 生成
 
 ```sh

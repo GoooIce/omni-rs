@@ -1,0 +1,40 @@
+#!/bin/sh
+# Pre-commit guardrail: staged sources must compile and the quick profile
+# must pass. Keeps non-compiling commits out of history (a broken commit is
+# invisible to CI until pushed). Install with:
+#   cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+staged=$(git diff --cached --name-only)
+
+manifests=""
+add_manifest() {
+    case " $manifests " in
+        *" $1 "*) ;;
+        *) manifests="$manifests $1" ;;
+    esac
+}
+
+for path in $staged; do
+    case "$path" in
+        src/*|vendor/*|Cargo.toml|Cargo.lock) add_manifest Cargo.toml ;;
+        crates/*/*)
+            name=$(printf '%s' "$path" | cut -d/ -f2)
+            [ -f "crates/$name/Cargo.toml" ] && add_manifest "crates/$name/Cargo.toml"
+            ;;
+        prototypes/*/*)
+            name=$(printf '%s' "$path" | cut -d/ -f2)
+            [ -f "prototypes/$name/Cargo.toml" ] && add_manifest "prototypes/$name/Cargo.toml"
+            ;;
+    esac
+done
+
+for m in $manifests; do
+    echo "pre-commit: cargo check $m"
+    cargo check --quiet --locked --manifest-path "$m"
+done
+
+echo "pre-commit: ./scripts/check quick"
+./scripts/check quick
+echo "pre-commit: ok"
