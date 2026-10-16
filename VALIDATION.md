@@ -45,7 +45,7 @@ T11 收口时生产路径按 ADR-0001 的降级方案走“加载点反量化”
 | --- | --- | --- |
 | 权重加载 | 21.5 s | 45–47 s |
 | 首 token（文本 21 prompt） | 1.2 s | 1.3 s |
-| 解码 | 174 ms/token | 261 ms/token |
+| 解码 | 174 ms/token（空载）；MoE 批处理后同负载复测 528→517（见下文批处理节） | 261 ms/token |
 | 峰值 RSS | ≈23.5 GiB（含 mmap 检查点驻留） | ≈23.5 GiB（footprint 73 GB，压缩后） |
 
 ## 2026-10-16：MiniCPM-V-4.7 35B-A3B-int4 接入（T9–T11）
@@ -104,7 +104,38 @@ official bf16 逐阶段转储：embeddings→各层残差输出、conv/q/k/v/g/b
   生成路径不再有中途上传。
 - burn-cubecl 0.21 无 `q_transpose`：转置权重的融合 int4 matmul（W4A16 驻留）不可用，
   生产 CLI 按 ADR-0001 在加载点反量化；非转置路径的融合算子由 `quant::gpu_tests` 固定。
-- 35B 逐 token 261 ms：路由回读 + 逐 (token, expert) 派发未做按专家批处理；后续优化空间明确。
+- 35B 逐 token 解码在当时由路由回读 + 逐 (token, expert) 派发主导；按专家批处理已实现，
+  见下文「2026-10-16：MoE 按专家批处理」。
+
+## 2026-10-16：MoE 按专家批处理（保留单层一次路由回读）
+
+`SparseMoeBlock::forward` 双路径重写（`crates/minicpm-v/src/moe.rs`），无任何中途 host 上传：
+
+- **解码（T=1）**：去掉逐对的 slice/add/slice_assign 回程，逐 slot 单行 expert matmul +
+  顺序累加；内核序列与旧实现逐比特一致（E2E 贪心 parity 不变），每层 ~81 → ~57 内核。
+- **前缀（T>1）**：遮蔽 softmax 在设备端构造再归一化 top-k 权重矩阵
+  （`topk(k).min_dim` 阈值 + `lower`/`mask_fill(-inf)` + `softmax`；全局最大恒在 top-k 内，
+  与 host 路线代数等价，遮蔽列精确为 0），每个被触专家一次全行批处理（3 matmul）后
+  按专家升序加权累加。每层 ~10·T·k → ~9+8·E_touched 内核。NdArray 缺 argtopk/topk 内核，
+  全程仅用双后端可移植算子（无 sort/gather/scatter/one_hot/argtopk）。
+  已知理论边界：第 k 位 logit 精确并列时 `lower` 严格比较会把并列者一并保留，
+  与 host top-k 的索引决胜略有出入；f16 连续 logit 下未在 E2E parity（16/16 ×4）中触发。
+
+实测（同机同负载背靠背，M5 Max，Metal FP16，Packed）：
+
+| 指标 | 基线（逐对派发） | 批处理后 |
+| --- | --- | --- |
+| 首 token（文本 21） | 1.28–1.42 s | 1.16 s 热（冷 7.2 s，见注） |
+| 首 token（单图 90） | 3.44 s | 2.32 s 热（-33%；冷 8.5 s） |
+| 解码（ms/token，中位） | 522–542 | 507–526（≈-2%，噪声级） |
+| E2E 贪心 parity | 16/16 ×2 | 16/16 ×4（文本/单图 × 冷/热） |
+
+冷启动：新 m=T 形状触发 autotune 候选 Metal 着色器编译（一次性 +5~6 s）；macOS 着色器
+缓存命中后各进程均为热值（autotune 结果为进程内缓存）。解码收益受限原因：当前条件下
+解码下限由每层路由回读同步（40 次/token）主导，裁剪轻量内核无法越界；历史 174 ms/token
+为空载测量，同代码当日负载下复测 ≈528。数值验收：`cargo test --lib` 36/36（含 NdArray
+合成 fixture T=12 批处理路径与 Metal 35B seam T=21）。证据与复现命令：
+`artifacts/minicpm-moe-batching/`（RESULTS.md、JSON 日志、对照二进制）。
 
 ## 2026-10-15：MiniCPM-V-4.7 1B 接入（T1–T8）
 

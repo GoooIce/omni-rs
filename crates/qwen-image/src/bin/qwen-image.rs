@@ -41,12 +41,24 @@ enum Command {
         #[arg(long, conflicts_with_all = ["width", "height"],
             value_parser = clap::builder::PossibleValuesParser::new(dimensions::OFFICIAL_PRESETS.iter().map(|p| p.0)))]
         aspect_ratio: Option<String>,
-        /// Output pixels (256–2752); rounded down to a multiple of 32.
-        #[arg(long, default_value_t = dimensions::DEFAULT_SIDE)]
-        width: usize,
-        /// Output pixels (256–2752); rounded down to a multiple of 32.
-        #[arg(long, default_value_t = dimensions::DEFAULT_SIDE)]
-        height: usize,
+        /// Output pixels (256–2752); rounded down to a multiple of 32. Default 2048.
+        #[arg(long)]
+        width: Option<usize>,
+        /// Output pixels (256–2752); rounded down to a multiple of 32. Default 2048.
+        #[arg(long)]
+        height: Option<usize>,
+        /// Rewrite the prompt with the official prompt-enhancer flow first.
+        /// t2i: the rewritten prompt plus its wh_ratio pick the canvas from the
+        /// official presets. edit: ratio_follow keeps the referenced image's
+        /// framing. Any explicit --aspect-ratio/--width/--height wins over the
+        /// model's canvas decision. Requires a local rewrite backend.
+        #[arg(long)]
+        rewrite: bool,
+        /// MiniCPM-V checkpoint directory for `--rewrite` (crate feature
+        /// `rewrite`; default models/MiniCPM-V-4.7-35B-A3B-int4).
+        #[cfg(feature = "rewrite")]
+        #[arg(long = "rewrite-model", default_value = omni_qwen_image::rewrite::minicpm::DEFAULT_MODEL_DIR)]
+        rewrite_model: PathBuf,
         #[arg(long, default_value_t = 42)]
         seed: u64,
         #[arg(long, default_value = "qwen-image.png")]
@@ -122,11 +134,103 @@ fn run<B: Backend>(args: Args, device: B::Device, cancel: Arc<AtomicBool>) -> Re
             output,
             images,
             reference_resolution,
+            rewrite,
+            #[cfg(feature = "rewrite")]
+            rewrite_model,
         } => {
+            // Any explicit canvas flag fixes the canvas; the rewrite model's
+            // ratio decision only applies when the user left sizing alone.
+            let user_canvas = aspect_ratio.is_some() || width.is_some() || height.is_some();
+            let mut prompt = prompt;
+            let mut canvas: Option<(usize, usize)> = None;
+            let mut rewrite_report = Value::Null;
+            if rewrite {
+                use omni_qwen_image::rewrite::{self, RatioDecision};
+                let profile = rewrite::TaskProfile::select(!images.is_empty());
+                #[cfg(feature = "rewrite")]
+                let mut backend: Box<dyn rewrite::Rewriter> = {
+                    eprintln!(
+                        "rewrite：加载 MiniCPM-V 后端 {}（独立非 fusion 运行时）",
+                        rewrite_model.display()
+                    );
+                    // The rewriter runs on its own raw cubecl backend, not the
+                    // diffusion model's fusion wrapper — see
+                    // `rewrite::minicpm::Native`.
+                    let rewrite_device = Default::default();
+                    Box::new(
+                        rewrite::minicpm::MinicpmRewriter::<rewrite::minicpm::Native>::load(
+                            &rewrite_model,
+                            p,
+                            &rewrite_device,
+                        )?,
+                    )
+                };
+                #[cfg(not(feature = "rewrite"))]
+                let mut backend = rewrite::default_backend()?;
+                progress(Progress {
+                    stage: "rewrite",
+                    current: 0,
+                    total: 1,
+                });
+                let outcome = backend.rewrite(profile, &prompt, &images)?;
+                progress(Progress {
+                    stage: "rewrite",
+                    current: 1,
+                    total: 1,
+                });
+                let mut canvas_source = if user_canvas { "user" } else { "default" };
+                if !user_canvas {
+                    match outcome.ratio {
+                        RatioDecision::WhRatio(w, h) => {
+                            let (name, preset_w, preset_h) = rewrite::nearest_preset(w, h);
+                            eprintln!(
+                                "rewrite 画布：wh_ratio {w}:{h} → 官方预设 {name}（{preset_w}×{preset_h}）"
+                            );
+                            canvas = Some((preset_w, preset_h));
+                            canvas_source = "wh_ratio";
+                        }
+                        RatioDecision::FollowImage(index) => match images.get(index - 1) {
+                            Some(path) => {
+                                let image = omni_qwen_image::reference::open(path)?;
+                                let (canvas_w, canvas_h) =
+                                    rewrite::canvas_for_ratio(image.width(), image.height())?;
+                                eprintln!(
+                                    "rewrite 画布：跟随 <image{index}>（{}×{}）→ {canvas_w}×{canvas_h}",
+                                    image.width(),
+                                    image.height()
+                                );
+                                canvas = Some((canvas_w, canvas_h));
+                                canvas_source = "ratio_follow";
+                            }
+                            None => eprintln!(
+                                "rewrite 警告：ratio_follow 引用了 <image{index}>，但只有 {} 张参考图；画布保持默认",
+                                images.len()
+                            ),
+                        },
+                        RatioDecision::None => {}
+                    }
+                }
+                if !outcome.parse_ok {
+                    eprintln!(
+                        "rewrite 警告：改写结果未按 JSON 解析（parse_ok=false），已使用原始回答作为提示词，比例字段为空"
+                    );
+                }
+                prompt = outcome.positive_prompt.clone();
+                rewrite_report = serde_json::to_value(&outcome)?;
+                rewrite_report["canvas_source"] = json!(canvas_source);
+                rewrite_report["canvas"] = match canvas {
+                    Some((w, h)) => json!([w, h]),
+                    None => Value::Null,
+                };
+            }
             let (width, height) = aspect_ratio
                 .as_deref()
                 .and_then(dimensions::preset)
-                .unwrap_or((width, height));
+                .or(canvas)
+                .unwrap_or((
+                    width.unwrap_or(dimensions::DEFAULT_SIDE),
+                    height.unwrap_or(dimensions::DEFAULT_SIDE),
+                ));
             let options = Options {
                 prompt,
                 negative_prompt,
@@ -157,7 +261,7 @@ fn run<B: Backend>(args: Args, device: B::Device, cancel: Arc<AtomicBool>) -> Re
             result.save_png(&output)?;
             println!(
                 "{}",
-                json!({"load_seconds":load_seconds,"report":result.report,"output":output})
+                json!({"load_seconds":load_seconds,"report":result.report,"rewrite":rewrite_report,"output":output})
             );
         }
         Command::Trace {

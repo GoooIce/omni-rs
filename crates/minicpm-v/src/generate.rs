@@ -13,6 +13,12 @@ pub struct Options {
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    /// OpenAI/vLLM-style additive presence penalty: subtracted from the logit
+    /// of every token already present in the sampling history. NOTE: history
+    /// here includes the prompt tokens, whereas vLLM penalizes generated
+    /// tokens only. The default 0.0 disables it and keeps the previous
+    /// behavior bit-for-bit.
+    pub presence_penalty: f32,
     pub seed: u64,
 }
 
@@ -24,6 +30,7 @@ impl Default for Options {
             top_k: 20,
             top_p: 0.6,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
             seed: 42,
         }
     }
@@ -84,7 +91,17 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, mut logits: Vec<f32>, history: &[u32]) -> Result<u32, String> {
-        for token in history.iter().copied().collect::<HashSet<_>>() {
+        let appeared: HashSet<u32> = history.iter().copied().collect();
+        // Presence penalty first (see Options::presence_penalty for the
+        // history-includes-prompt semantics), then repetition penalty.
+        if self.options.presence_penalty != 0.0 {
+            for &token in &appeared {
+                if let Some(score) = logits.get_mut(token as usize) {
+                    *score -= self.options.presence_penalty;
+                }
+            }
+        }
+        for token in appeared {
             if let Some(score) = logits.get_mut(token as usize) {
                 *score = if *score < 0.0 {
                     *score * self.options.repetition_penalty
@@ -270,5 +287,64 @@ mod tests {
             let token = sampler.sample(logits.clone(), &[]).unwrap() as usize;
             assert!(token >= 95, "token {token} escaped top-5");
         }
+    }
+
+    #[test]
+    fn presence_penalty_subtracts_an_exact_constant() {
+        // Greedy argmax over [token0, token1] with token0 in history: the
+        // argmax flips exactly when the penalty exceeds the 1.0 logit margin.
+        let options = |presence_penalty| Options {
+            temperature: 0.0,
+            presence_penalty,
+            ..Default::default()
+        };
+        let logits = || vec![4.0, 3.0];
+        let history: &[u32] = &[0];
+        assert_eq!(
+            Sampler::new(options(0.0))
+                .sample(logits(), history)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            Sampler::new(options(0.5))
+                .sample(logits(), history)
+                .unwrap(),
+            0
+        );
+        // Exact tie at penalty == margin: the tie-break keeps the penalized
+        // token 0, pinning the "subtract exactly the constant" semantics.
+        assert_eq!(
+            Sampler::new(options(1.0))
+                .sample(logits(), history)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            Sampler::new(options(1.5))
+                .sample(logits(), history)
+                .unwrap(),
+            1
+        );
+        // Untouched tokens keep their logits: token1 wins once token0 drops
+        // below it, regardless of how often token0 repeats in history.
+        assert_eq!(
+            Sampler::new(options(1.5))
+                .sample(logits(), &[0, 0, 0])
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn presence_penalty_composes_with_repetition_penalty() {
+        // token0: 4.0 - 2.0 (presence) then / 2.0 (repetition) = 1.0 < 3.0.
+        let mut sampler = Sampler::new(Options {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            presence_penalty: 2.0,
+            ..Default::default()
+        });
+        assert_eq!(sampler.sample(vec![4.0, 3.0], &[0]).unwrap(), 1);
     }
 }

@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="440" viewBox="0 0 1200 440"
+     role="img" aria-labelledby="pipe-title pipe-desc">
+  <title id="pipe-title">omni-rs 四条本地推理流水线</title>
+  <desc id="pipe-desc">语音链：WAV 或麦克风经 Confucius4-R2T2 转写、Hy-MT2-7B 翻译、Breeze-TTS-2 合成后播放。音乐链：录音经 MERT2 提特征、SheetSage2 转谱、YuE2 生成歌曲。图像链：提示词或参考图经 Qwen-Image-2.1-Turbo 生成 PNG。理解链：图片加提问经 MiniCPM-V-4.7 流式描述。四条链共用同一 Rust/Burn 运行时与 GPU 内核，后端覆盖 Metal、ANE、WebGPU、CPU 与 Wasm。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5FCB96"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="440" rx="18" fill="#0D1412"/>
+
+  <!-- ============ 语音链 ============ -->
+  <g id="lane-speech">
+    <text x="214" y="60" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="16" fill="#5FCB96">语音链</text>
+    <text x="214" y="86" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#8BA79B">WAV / 麦克风</text>
+    <line x1="226" y1="80" x2="252" y2="80" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="asr-card">
+      <rect x="260" y="50" width="196" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="278" y="76" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">流式转写</text>
+      <text x="278" y="98" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">Confucius4-R2T2</text>
+    </g>
+    <line x1="456" y1="80" x2="482" y2="80" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="mt-card">
+      <rect x="490" y="50" width="170" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="508" y="76" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">翻译</text>
+      <text x="508" y="98" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">Hy-MT2-7B</text>
+    </g>
+    <line x1="660" y1="80" x2="686" y2="80" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="tts-card">
+      <rect x="694" y="50" width="200" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="712" y="76" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">语音合成</text>
+      <text x="712" y="98" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">Breeze-TTS-2</text>
+    </g>
+    <line x1="894" y1="80" x2="920" y2="80" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <text x="1136" y="86" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#C6DACF">边生成边播放</text>
+  </g>
+
+  <!-- ============ 音乐链 ============ -->
+  <g id="lane-music">
+    <text x="214" y="150" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="16" fill="#5FCB96">音乐链</text>
+    <text x="214" y="176" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#8BA79B">录音 WAV</text>
+    <line x1="226" y1="170" x2="252" y2="170" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g>
+      <rect x="260" y="140" width="196" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="278" y="166" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">音乐特征</text>
+      <text x="278" y="188" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">MERT2</text>
+    </g>
+    <line x1="456" y1="170" x2="482" y2="170" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g>
+      <rect x="490" y="140" width="196" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="508" y="166" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">转谱 ABC</text>
+      <text x="508" y="188" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">SheetSage2</text>
+    </g>
+    <line x1="686" y1="170" x2="712" y2="170" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g>
+      <rect x="720" y="140" width="174" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="738" y="166" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">歌曲生成</text>
+      <text x="738" y="188" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">YuE2</text>
+    </g>
+    <line x1="894" y1="170" x2="920" y2="170" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <text x="1136" y="176" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#C6DACF">48 kHz 双声道</text>
+  </g>
+
+  <!-- ============ 图像链 ============ -->
+  <g id="lane-image">
+    <text x="214" y="240" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="16" fill="#5FCB96">图像链</text>
+    <text x="214" y="266" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#8BA79B">提示词 / 参考图</text>
+    <line x1="226" y1="260" x2="252" y2="260" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g>
+      <rect x="260" y="230" width="560" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="278" y="256" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">文生图 · 指令编辑</text>
+      <text x="278" y="278" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">Qwen-Image-2.1-Turbo · 8 步 DiT + RGBA VAE</text>
+    </g>
+    <line x1="820" y1="260" x2="846" y2="260" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <text x="1136" y="266" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#C6DACF">PNG（可透明）</text>
+  </g>
+
+  <!-- ============ 理解链 ============ -->
+  <g id="lane-vlm">
+    <text x="214" y="330" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="16" fill="#5FCB96">理解链</text>
+    <text x="214" y="356" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#8BA79B">图片 + 提问</text>
+    <line x1="226" y1="350" x2="252" y2="350" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g>
+      <rect x="260" y="320" width="560" height="60" rx="12" fill="#16221D" stroke="#27392F" stroke-width="2"/>
+      <text x="278" y="346" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" font-size="20" fill="#EDF5F0">图像理解 · 流式描述</text>
+      <text x="278" y="368" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">MiniCPM-V-4.7 · SigLIP2 视觉塔 + 混合注意力解码</text>
+    </g>
+    <line x1="820" y1="350" x2="846" y2="350" stroke="#27392F" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <text x="1136" y="356" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="18" fill="#C6DACF">逐 token 文字</text>
+  </g>
+
+  <!-- ============ 运行时页脚 ============ -->
+  <g id="runtime-footer">
+    <rect x="64" y="392" width="1072" height="36" rx="10" fill="#16221D"/>
+    <text x="600" y="416" text-anchor="middle" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="17" fill="#C6DACF">同一运行时：Burn 0.21 + omni-kernel 自定义 GPU 核 · Metal FP16 默认 · ANE 实验 · WebGPU · CPU · Wasm</text>
+  </g>
+</svg>

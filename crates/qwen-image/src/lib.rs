@@ -17,6 +17,7 @@ pub mod kernels {
 mod ops;
 pub mod pipeline;
 pub mod reference;
+pub mod rewrite;
 pub mod text;
 pub mod vae;
 pub mod vision;

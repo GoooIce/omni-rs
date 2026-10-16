@@ -293,6 +293,15 @@ done
 首次 ASR 回归包含一次原有 ANE 编译失败后的 Metal 回退，转写与固定预期全文一致；
 本轮未调整该加速策略，也不把这次含编译的 ASR 耗时作为性能结论。
 
+## Prompt Rewrite（官方提示词改写）
+
+官方 `prompt_rewrite/` 流程（Qwen3.5-VL 9B 微调的 PE-T2I / PE-I2I enhancer）已按上游
+commit `ab96caa` 移植到 `crates/qwen-image/src/rewrite/`：系统提示词资产逐字节内嵌、
+任务 profile 与采样默认值、消息构造（edit 图片 `<image1>`… 按序在前）、严格 JSON 解析
+与比例决策、CLI `generate --rewrite` 接线均已落地并有无模型单元测试。本地改写后端
+（MiniCPM-V 实现 `Rewriter` trait）尚未接入，当前 `--rewrite` 会在加载生成模型前清晰
+报错，不静默透传；不带 `--rewrite` 行为不变。详见 [docs/qwen-image-rewrite.md](qwen-image-rewrite.md)。
+
 ## 来源与许可
 
 - [ModelScope 模型](https://modelscope.cn/models/Qwen/Qwen-Image-2.1-Turbo)

@@ -188,6 +188,7 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         top_k: options.top_k,
         top_p: options.top_p,
         repetition_penalty: options.repeat_penalty,
+        presence_penalty: 0.0,
         seed: options.seed,
     };
     let json = options.json;

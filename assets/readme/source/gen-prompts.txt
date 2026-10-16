@@ -1,0 +1,52 @@
+# assets/readme 生成图记录（全部由本仓库 crates/qwen-image 本地生成）
+
+## gen-calligraphy-zhiyin.png（拼版用）
+- 命令: ./target/release/qwen-image generate \
+    --prompt "极简中式海报，中央毛笔书法「知音」两个大字，浓墨笔触，米白色宣纸质感背景，右下角一枚红色方形印章，大量留白，平面设计" \
+    --width 1024 --height 1024 --seed 7 --output assets/readme/source/gen-calligraphy-zhiyin.png
+- 用途: 展示中文文字渲染能力（「知音」为 Makepad 工作台名称）
+- 生成日志: gen-calligraphy.log（load 47.7 s · 文本 5.6 s · 去噪 23.8 s · VAE 解码 116.3 s）
+
+## mascot-{1,2,3}-cfg{15,66,113}.png（拼版用，RGBA 透明）
+- 基础提示词: "Cute robot mascot holding a microphone, flat vector sticker style,
+  mint green and dark teal palette, thick clean outlines, centered, floating,
+  no ground shadow, no floor, no background elements, isolated on fully
+  transparent background"
+- 关键参数: --true-cfg-scale 2.5 --negative-prompt "opaque white background,
+  solid background, ground shadow, white clouds"
+- 命令示例: ./target/release/qwen-image generate --prompt "<基础提示词>" \
+    --width 1024 --height 1024 --seed 15 \
+    --true-cfg-scale 2.5 --negative-prompt "<负向提示词>" \
+    --output assets/readme/source/mascot-1-cfg15.png
+- 后处理: 仅按 alpha>40 包围盒裁切到主体（构图裁切，未修改任何像素的 alpha/RGB；
+  裁切脚本见本目录 bash 历史 / mascot_batch.py 的 load_rgba）
+- 用途: 展示 RGBA 透明通道输出。深色/棋盘底目检干净（seed 66 右侧有两个
+  ~2px 白点，上版尺寸不可见）。
+
+### 透明输出实验记录（共 76 个 seed + 参数对照）
+1. batch1 文档推荐提示词（isolated character, transparent background）10 seeds:
+   5 个完全不透明、5 个背景斑块状透明。0 可用。
+2. 早先 seed 42/5/7: 42 透明但紫斑；5/7 不透明或斑驳。
+3. batch2/3 贴纸提示词 30 seeds: 3 个全透明（15/66/113），命中率 ~1/10；
+   seed 15 有白色云状残留，seed 66/113 干净。
+4. batch4 贴纸提示词变姿势 30 seeds: 仅 seed 113 级别命中（同 seed 已在 batch3）。
+5. **参数对照（mascot_param_tests.py）**:
+   - 贴纸提示词 + CFG 2.5 负向引导: seed 15/66/113 全部全透明（72–79%），
+     seed 15 的白色残留被清除 → **负向引导是让透明可靠的关键参数**。
+   - 编辑路径（白底参考图 +「把背景改成透明」指令）: seed 1/2 均失败（透明 <2%）。
+6. 与 docs/qwen-image-21.md「机器人样例请求透明背景但模型仍输出了几乎不透明的
+   背景（alpha 216–255）」的记录一致；本文档补充了可行的参数组合。
+
+### 弃用文件
+- gen-mascot-s*.png/.log、gen-mascot-cfg*.png/.log、gen-mascot-white5*、
+  gen-mascot-edit*、mascot-a-66.png、mascot-b-113.png 已删除（提示词、seed 与
+  参数可完整复现）；统计数据保留在 mascot-batch.json、mascot-batch3.json、
+  mascot-batch4.json 与上述记录。
+
+## 已有产物（来自 artifacts/qwen-image-21/，验收时生成）
+- robot-1024.png — 扁平插画机器人，seed 123，1024×1024
+- teapot-512.png — 写实摄影红茶壶，seed 42，512×512
+
+## 拼版
+- board.html → proof-board.png（Chrome headless @2x，2000×1912，四角透明）
+- 板式: Makepad UI 截图（2×2）+ 实测数据条 + 书法/插画/茶壶 + 三只透明贴纸

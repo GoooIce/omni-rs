@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="360" viewBox="0 0 1200 360"
+     role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">omni-rs · 纯 Rust/Burn 的本机多模态推理套件</title>
+  <desc id="hero-desc">omni-rs 在一台 Mac 的 GPU 上运行语音转写、翻译、语音合成、图像理解、文生图与音乐生成，推理全程不调用 Python 或 PyTorch。</desc>
+
+  <defs>
+    <linearGradient id="wave-fade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5FCB96" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#5FCB96" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="360" rx="18" fill="#0D1412"/>
+
+  <g id="title-block">
+    <text x="64" y="82" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="16" letter-spacing="3" fill="#8BA79B">RUST · BURN 0.21 · APPLE SILICON</text>
+    <text x="61" y="164" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif"
+          font-size="80" font-weight="800" fill="#EDF5F0">omni<tspan fill="#5FCB96">-rs</tspan></text>
+    <text x="64" y="206" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif"
+          font-size="22" fill="#EDF5F0" opacity="0.92">纯 Rust / Burn 实现的多模态推理套件</text>
+    <text x="64" y="238" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif"
+          font-size="22" fill="#EDF5F0" opacity="0.92">推理全程在本机 GPU，不调用 Python / PyTorch</text>
+  </g>
+
+  <g id="capability-chips" font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif"
+     font-size="19" fill="#C6DACF">
+    <g>
+      <rect x="64" y="264" width="96" height="38" rx="10" fill="none" stroke="#27392F" stroke-width="2"/>
+      <text x="112" y="289" text-anchor="middle">语音转写</text>
+      <rect x="170" y="264" width="58" height="38" rx="10" fill="none" stroke="#27392F" stroke-width="2"/>
+      <text x="199" y="289" text-anchor="middle">翻译</text>
+      <rect x="238" y="264" width="96" height="38" rx="10" fill="none" stroke="#27392F" stroke-width="2"/>
+      <text x="286" y="289" text-anchor="middle">语音合成</text>
+      <rect x="344" y="264" width="96" height="38" rx="10" fill="none" stroke="#27392F" stroke-width="2"/>
+      <text x="392" y="289" text-anchor="middle">图像理解</text>
+      <rect x="450" y="264" width="77" height="38" rx="10" fill="none" stroke="#27392F" stroke-width="2"/>
+      <text x="488.5" y="289" text-anchor="middle">文生图</text>
+      <rect x="537" y="264" width="96" height="38" rx="10" fill="none" stroke="#27392F" stroke-width="2"/>
+      <text x="585" y="289" text-anchor="middle">音乐生成</text>
+    </g>
+  </g>
+
+  <g id="proof-stats" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="18">
+    <text x="64" y="336" fill="#8BA79B">RTF <tspan fill="#5FCB96">0.379</tspan> 流式转写 · <tspan fill="#5FCB96">26 ms</tspan>/token 图像理解 · <tspan fill="#5FCB96">8 步</tspan> 2K 文生图 · <tspan fill="#5FCB96">48 kHz</tspan> 歌曲</text>
+  </g>
+
+  <g id="wave-pixel-motif">
+    <g fill="url(#wave-fade)">
+      <rect x="716" y="196" width="12" height="18"  rx="4"/>
+      <rect x="736" y="180" width="12" height="34"  rx="4"/>
+      <rect x="756" y="162" width="12" height="52"  rx="4"/>
+      <rect x="776" y="140" width="12" height="74"  rx="4"/>
+      <rect x="796" y="118" width="12" height="96"  rx="4"/>
+      <rect x="816" y="96"  width="12" height="118" rx="4"/>
+      <rect x="836" y="118" width="12" height="96"  rx="4"/>
+      <rect x="856" y="140" width="12" height="74"  rx="4"/>
+      <rect x="876" y="156" width="12" height="58"  rx="4"/>
+      <rect x="896" y="134" width="12" height="80"  rx="4"/>
+      <rect x="916" y="110" width="12" height="104" rx="4"/>
+      <rect x="936" y="88"  width="12" height="126" rx="4"/>
+      <rect x="956" y="110" width="12" height="104" rx="4"/>
+      <rect x="976" y="132" width="12" height="82"  rx="4"/>
+      <rect x="996" y="150" width="12" height="64"  rx="4"/>
+    </g>
+    <g fill="#5FCB96">
+      <rect x="1026" y="118" width="16" height="16" rx="3"/>
+      <rect x="1048" y="118" width="16" height="16" rx="3"/>
+      <rect x="1070" y="118" width="16" height="16" rx="3"/>
+      <rect x="1026" y="140" width="16" height="16" rx="3"/>
+      <rect x="1048" y="140" width="16" height="16" rx="3" opacity="0.75"/>
+      <rect x="1070" y="140" width="16" height="16" rx="3" opacity="0.45"/>
+      <rect x="1026" y="162" width="16" height="16" rx="3" opacity="0.6"/>
+      <rect x="1048" y="162" width="16" height="16" rx="3" opacity="0.35"/>
+      <rect x="1070" y="162" width="16" height="16" rx="3" opacity="0.2"/>
+    </g>
+  </g>
+
+  <g id="meta" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">
+    <text x="1136" y="66" text-anchor="end">知音 · 本地创作工作台</text>
+    <text x="1136" y="92" text-anchor="end">Metal FP16 · ANE · WebGPU · CPU · Wasm</text>
+  </g>
+</svg>

@@ -220,22 +220,52 @@ impl<B: Backend> SparseMoeBlock<B> {
         let flat = x.reshape([tokens, self.hidden]);
         let (experts, weights) = self.route(&flat);
 
-        // Per-token expert accumulation stays on the device: a mid-stream
-        // host round trip (into_data + from_data) corrupts subsequent kernels
-        // in this burn-cubecl build, so contributions are gathered with
-        // slice/slice_assign instead.
-        let mut output: Tensor<B, 2> = Tensor::zeros([tokens, self.hidden], &flat.device());
-        output = output.cast(shared::dtype(&flat));
-        for (slot, (&expert, &weight)) in experts.iter().zip(&weights).enumerate() {
-            let token = slot / self.geometry.top_k;
-            let row = flat
-                .clone()
-                .slice([token..token + 1, 0..self.hidden])
-                .clone();
-            let weighted = self.expert_forward(expert, &row) * weight;
-            let updated = output.clone().slice([token..token + 1, 0..self.hidden]) + weighted;
-            output = output.slice_assign([token..token + 1, 0..self.hidden], updated);
-        }
+        // Expert accumulation stays on the device: a mid-stream host round
+        // trip (into_data + from_data) corrupts subsequent kernels in this
+        // burn-cubecl build.
+        let output = if tokens == 1 {
+            // Decode: one row, so each routed expert is already a single
+            // matmul per projection. Slot-order accumulation keeps the
+            // result bit-identical to the historical per-pair loop while
+            // dropping the per-pair slice/add/slice_assign traffic.
+            let mut acc: Option<Tensor<B, 2>> = None;
+            for slot in 0..self.geometry.top_k {
+                let weighted = self.expert_forward(experts[slot], &flat) * weights[slot];
+                acc = Some(match acc {
+                    None => weighted,
+                    Some(sum) => sum + weighted,
+                });
+            }
+            acc.unwrap_or_else(|| {
+                let zero: Tensor<B, 2> = Tensor::zeros([tokens, self.hidden], &flat.device());
+                zero.cast(shared::dtype(&flat))
+            })
+        } else {
+            // Prefill: batch each touched expert over all token rows (one
+            // matmul per projection per expert, not per (token, expert)
+            // pair) and combine with the device-side renormalized top-k
+            // weight matrix. The masked softmax equals softmax-then-
+            // renormalize over the top-k because the global logit maximum
+            // always survives the mask; masked-out columns are exact zeros.
+            let logits = flat.clone().matmul(self.router.clone().transpose());
+            let kth = logits.clone().topk(self.geometry.top_k, 1).min_dim(1);
+            let outside = logits.clone().lower(kth);
+            let masked = logits.mask_fill(outside, f32::NEG_INFINITY);
+            let weights2d = activation::softmax(masked, 1);
+
+            let mut touched = experts.clone();
+            touched.sort_unstable();
+            touched.dedup();
+
+            let mut output: Tensor<B, 2> = Tensor::zeros([tokens, self.hidden], &flat.device());
+            output = output.cast(shared::dtype(&flat));
+            for expert in touched {
+                let rows = self.expert_forward(expert, &flat);
+                let column = weights2d.clone().slice([0..tokens, expert..expert + 1]);
+                output = output + rows * column;
+            }
+            output
+        };
 
         // Shared expert with sigmoid gate.
         let shared = self.shared_down.forward(

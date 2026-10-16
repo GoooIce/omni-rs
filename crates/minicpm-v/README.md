@@ -48,6 +48,16 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
 采样参数与翻译模块同一语义：`--temperature`（`--greedy` 等价 0）、`--top-k`、`--top-p`、
 `--repeat-penalty`、`--seed`。CPU 使用 `--no-default-features --features native,cpu -- --precision f32`。
 
+## 公共 API（作为库使用）
+
+- `multimodal::Multimodal::build_prompt`：单图 + 单条用户文本（无 system 消息）。
+- `multimodal::Multimodal::build_prompt_multi`：完整消息列表（可带 system）+ 按序多图；
+  消息中第 i 个 `Part::Image` 消费 `images[i]`，展开为 `<image_id>i</image_id>` 前缀的
+  pad 占位；`enable_thinking` 透传给 ChatML 生成提示（`Some(false)` 生成空 think 块）。
+- `generate::Options::presence_penalty`（默认 0.0，默认时行为逐比特不变）：对采样 history
+  中已出现 token 的 logit 减去该常数（OpenAI/vLLM 语义）。注意本实现的 history **包含
+  prompt token**，而 vLLM 只罚已生成 token。
+
 ## 数值对照
 
 - 逐阶段官方转储（视觉 8 阶段 × 2 图、全注意力/线性注意力合成权重层、canvas 位置表、
@@ -65,7 +75,8 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
 
 ## 已知限制
 
-- 单轮单图；多轮 KV 复用、多图与视频未实现（视觉塔与 canvas 位置表已支持多 crop 切片）。
+- 单轮单图 CLI；库内 `build_prompt_multi` 已支持完整消息列表 + 按序多图，
+  多轮 KV 复用与视频未实现（视觉塔与 canvas 位置表已支持多 crop 切片）。
 - Metal 构建关闭了 Burn fusion（burn-cubecl-fusion 0.21 在本模型解码形状上代码生成崩溃）；
   常规 autotune matmul 保留。
 - MTP 头不加载、不执行（检查点亦不含相应张量）。
