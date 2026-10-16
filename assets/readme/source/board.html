@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1000px; height: 956px;
+    background: #0D1412;
+    font-family: -apple-system, 'PingFang SC', 'Segoe UI', sans-serif;
+    color: #EDF5F0;
+    padding: 26px 28px;
+    display: flex; flex-direction: column;
+  }
+  .mono { font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 16px;
+  }
+  header .l { font-size: 15px; letter-spacing: 2.5px; color: #8BA79B; }
+  header .r { font-size: 14px; color: #8BA79B; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    grid-template-rows: repeat(3, 264px);
+    gap: 12px;
+  }
+  .card {
+    background: #16221D;
+    border-radius: 12px;
+    padding: 10px;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .card .img {
+    border-radius: 8px; overflow: hidden; flex: 1;
+    background: #0D1412;
+  }
+  .card .img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cap { padding: 8px 4px 2px; }
+  .cap .t { font-size: 15px; color: #C6DACF; }
+  .cap .s { font-size: 12.5px; color: #8BA79B; margin-top: 2px; }
+  .ui { grid-column: 1 / 3; grid-row: 1 / 3; }
+  .ui .img { background: #3a3d3c; }
+  .ui .img img { object-fit: contain; }
+  .mascot .img img { object-fit: contain; }
+  .stats {
+    grid-column: 1 / 3; grid-row: 3;
+    flex-direction: row; align-items: center;
+    justify-content: space-around;
+    padding: 16px 24px;
+  }
+  .stat .v { font-size: 25px; color: #5FCB96; }
+  .stat .v small { font-size: 15px; color: #5FCB96; opacity: .85; }
+  .stat .k { font-size: 13px; color: #8BA79B; margin-top: 3px; }
+  .stat + .stat { border-left: 1px solid #27392F; padding-left: 28px; }
+  footer {
+    margin-top: 14px; padding-top: 12px;
+    border-top: 1px solid #27392F;
+    font-size: 13px; color: #8BA79B;
+  }
+</style>
+<body>
+  <header>
+    <span class="l mono">PROOF · 本机输出</span>
+    <span class="r mono">M5 MAX · METAL FP16 · RUST / BURN</span>
+  </header>
+  <div class="grid">
+    <div class="card ui">
+      <div class="img"><img src="../../../artifacts/qwen-image-21/ui-final/result.png" alt=""></div>
+      <div class="cap">
+        <div class="t">Makepad 原生「图像生成」工作台</div>
+        <div class="s mono">1024² · 文本 0.73 s · 生成 50.8 s · 解码 2.5 s（界面实测）</div>
+      </div>
+    </div>
+    <div class="card" style="grid-column:3;grid-row:1">
+      <div class="img"><img src="gen-calligraphy-zhiyin.png" alt=""></div>
+      <div class="cap">
+        <div class="t">中文文字渲染 · 毛笔书法</div>
+        <div class="s mono">seed 7 · 1024 × 1024</div>
+      </div>
+    </div>
+    <div class="card" style="grid-column:4;grid-row:1">
+      <div class="img"><img src="../../../artifacts/qwen-image-21/robot-1024.png" alt=""></div>
+      <div class="cap">
+        <div class="t">扁平插画</div>
+        <div class="s mono">seed 123 · 1024 × 1024</div>
+      </div>
+    </div>
+    <div class="card" style="grid-column:3;grid-row:2">
+      <div class="img"><img src="../../../artifacts/qwen-image-21/teapot-512.png" alt=""></div>
+      <div class="cap">
+        <div class="t">写实摄影</div>
+        <div class="s mono">seed 42 · 512 × 512</div>
+      </div>
+    </div>
+    <div class="card mascot" style="grid-column:4;grid-row:2">
+      <div class="img"><img src="mascot-1-cfg15.png" alt=""></div>
+      <div class="cap">
+        <div class="t">RGBA 透明贴纸</div>
+        <div class="s mono">seed 15 · CFG 2.5 负向引导</div>
+      </div>
+    </div>
+    <div class="card mascot" style="grid-column:3;grid-row:3">
+      <div class="img"><img src="mascot-3-cfg113.png" alt=""></div>
+      <div class="cap">
+        <div class="t">RGBA 透明贴纸</div>
+        <div class="s mono">seed 113 · CFG 2.5 负向引导</div>
+      </div>
+    </div>
+    <div class="card mascot" style="grid-column:4;grid-row:3">
+      <div class="img"><img src="mascot-2-cfg66.png" alt=""></div>
+      <div class="cap">
+        <div class="t">RGBA 透明贴纸</div>
+        <div class="s mono">seed 66 · CFG 2.5 负向引导</div>
+      </div>
+    </div>
+    <div class="card stats" style="grid-column:1/3;grid-row:3">
+      <div class="stat">
+        <div class="v mono">0.379</div>
+        <div class="k mono">流式转写 RTF（6.74 s 样本）</div>
+      </div>
+      <div class="stat">
+        <div class="v mono">26 <small>ms/token</small></div>
+        <div class="k mono">图像理解解码（Metal FP16）</div>
+      </div>
+      <div class="stat">
+        <div class="v mono">50.8 <small>s</small></div>
+        <div class="k mono">1024² 文生图 · 8 步</div>
+      </div>
+    </div>
+  </div>
+  <footer class="mono">生成图均由本仓库 crates/qwen-image 的 Rust/Burn 实现本地生成 · 提示词与 seed 见 assets/readme/source/gen-prompts.txt</footer>
+</body>
+</html>
