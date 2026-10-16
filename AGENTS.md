@@ -18,3 +18,12 @@ Default triage vocabulary: `needs-triage` / `needs-info` / `ready-for-agent` / `
 ### Domain docs
 
 Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Cursor Cloud specific instructions
+
+Cloud agents run on Linux. Metal, the Makepad desktop app, microphone capture, and the Apple Neural Engine need a logged-in Apple Silicon Mac. Model weights are not part of environment setup.
+
+- The environment install script provides Rust 1.99.0 with rustfmt and clippy, plus `uv`. `./scripts/check` uses `uv` to select Python 3.12 from `.python-version`. The image's older default Rust cannot compile `edition = "2024"`.
+- Backend smoke test without weights: `cargo run --no-default-features --features native,cpu -- doctor`. It must print `Backend OK` for an FP32 matmul.
+- Device-free checks: `./scripts/check quick`. `./scripts/check cpu` is the GitHub Actions profile and compiles every CPU-capable manifest. `metal` and `native` profiles refuse to run off Apple Silicon.
+- The HTTP API listens on `127.0.0.1:8848`: `cargo run --manifest-path crates/omni-api/Cargo.toml --no-default-features --features cpu -- --port 8848`. `/health` and `/v1/models` do not load weights; inference requests need the directories in `README.md`.
