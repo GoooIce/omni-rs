@@ -174,7 +174,7 @@ impl RadixCache {
     }
 
     /// Drop the least recently used unlocked leaf. Locked prefixes stay.
-    pub fn evict_leaf(&mut self) -> bool {
+    fn evict_leaf(&mut self) -> bool {
         self.detach_leaf().is_some()
     }
 
