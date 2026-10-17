@@ -4,7 +4,8 @@
 //! identities shared by every layer; this module does not copy dense KV tensors.
 //! `match_prefix` splits an edge when the match ends inside it, and locks the
 //! matched nodes until the caller unlocks them. LRU eviction removes only an
-//! unlocked leaf, so an active translation keeps its prefix.
+//! unlocked leaf, so an active translation keeps its prefix. Reclaim never
+//! returns a KV page the caller still holds.
 //!
 //! A partial tail page stays in the tree. The page pool copies that page before
 //! the next write. SGLang's paged tree instead omits the partial page; keeping
@@ -174,17 +175,32 @@ impl RadixCache {
 
     /// Drop the least recently used unlocked leaf. Locked prefixes stay.
     pub fn evict_leaf(&mut self) -> bool {
-        let Some(leaf) = self.oldest_unlocked_leaf() else {
-            return false;
-        };
+        self.detach_leaf().is_some()
+    }
+
+    /// Take one KV page from the oldest unlocked leaves.
+    /// A page the caller still holds stays with that caller and is not returned.
+    pub fn reclaim(&mut self) -> Option<PageId> {
+        while let Some(pages) = self.detach_leaf() {
+            for page in pages {
+                if Arc::strong_count(&page) == 1 {
+                    return Some(page);
+                }
+            }
+        }
+        None
+    }
+
+    fn detach_leaf(&mut self) -> Option<Vec<PageId>> {
+        let leaf = self.oldest_unlocked_leaf()?;
         let parent = self.nodes[leaf as usize].parent.expect("root is locked");
         let first = self.nodes[leaf as usize].key[0];
         self.nodes[parent as usize].children.remove(&first);
         // Dropping the edge releases page handles that no path still names.
-        self.nodes[leaf as usize].pages.clear();
+        let pages = std::mem::take(&mut self.nodes[leaf as usize].pages);
         self.nodes[leaf as usize].key.clear();
         self.recount();
-        true
+        Some(pages)
     }
 
     pub fn unlock(&mut self, guard: RadixGuard) {
@@ -377,6 +393,21 @@ mod tests {
         assert_eq!(tree.match_prefix(&[1, 2]).tokens, 2);
         assert_eq!(tree.match_prefix(&[1, 2, 3, 4]).tokens, 2);
         tree.unlock(hit.guard().unwrap());
+    }
+
+    #[test]
+    fn a_kv_page_still_held_is_not_reclaimed() {
+        let mut cache = RadixCache::new(1, 8);
+        let held = Arc::new(7);
+        cache.insert(&[1, 2], &[held.clone(), Arc::new(8)]).unwrap();
+        cache.insert(&[3], &[Arc::new(9)]).unwrap();
+
+        let mut reclaimed = Vec::new();
+        while let Some(page) = cache.reclaim() {
+            reclaimed.push(*page);
+        }
+        reclaimed.sort_unstable();
+        assert_eq!(reclaimed, vec![8, 9]);
     }
 
     #[test]
