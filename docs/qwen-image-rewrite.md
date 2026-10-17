@@ -105,7 +105,7 @@ pub type Native = …;
 ```
 
 - t2i：消息经 `omni_minicpm_v::chat::render` 渲染为纯文本 prompt。
-- edit：走 `omni_minicpm_v::multimodal::Multimodal::build_prompt_multi`，第 i 张图展开为
+- edit：走 `omni_minicpm_v::prompt::assemble`，第 i 张图展开为
   `<image_id>i</image_id>` 前缀的 pad 占位（即官方系统提示词里的 `<image1>`…`<imageN>`，
   顺序敏感）；视觉特征经 canvas M-RoPE 位置表拼入 token 流。
 - 每次改写在 stderr 打一行延迟：`rewrite {t2i|edit}: N tokens in Xs (first token Yms, finish=…)`。

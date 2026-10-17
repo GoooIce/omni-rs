@@ -4,10 +4,12 @@
 //! skips otherwise. The image fixtures live in `tests/fixtures/images`.
 use burn::backend::NdArray;
 use omni_minicpm_v::{
+    chat::{Message, Part, Role},
     config::ModelDirectory,
     generate,
     model::TextModel,
-    multimodal::{Build as MultimodalBuild, Multimodal},
+    multimodal::Multimodal,
+    prompt,
     tokenizer::MiniCpmTokenizer,
 };
 use std::sync::atomic::AtomicBool;
@@ -49,18 +51,23 @@ fn single_image_greedy_matches_official_tokens() {
             .join("crates/minicpm-v/tests/fixtures/images")
             .join(case["image"].as_str().unwrap());
         let prompt = case["prompt"].as_str().unwrap();
-        let built = multimodal
-            .build_prompt(MultimodalBuild {
-                tokenizer: &tokenizer,
-                model: &model,
-                config: &config,
-                model_dir: &model_dir,
-                image: &image,
-                prompt,
-                device: &device,
-                precision: omni_r2t2::Precision::F32,
-            })
-            .unwrap();
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![Part::Image, Part::Text(prompt.to_string())],
+        }];
+        let built = prompt::assemble(prompt::Request {
+            vision: Some(&multimodal),
+            tokenizer: &tokenizer,
+            model: &model,
+            config: &config,
+            model_dir: &model_dir,
+            messages: &messages,
+            images: std::slice::from_ref(&image),
+            enable_thinking: None,
+            device: &device,
+            precision: omni_r2t2::Precision::F32,
+        })
+        .unwrap();
         let expected_ids: Vec<u32> = case["input_ids"]
             .as_array()
             .unwrap()
