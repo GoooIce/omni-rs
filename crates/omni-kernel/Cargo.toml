@@ -18,8 +18,6 @@ cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wg
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 burn-ane = { path = "../burn-ane", features = ["metal-shared"], optional = true }
-cubecl-cpp = { version = "=0.10.0", default-features = false, features = ["metal"] }
-cubecl-runtime = { version = "=0.10.0", default-features = false, features = ["std"] }
 objc2-metal = "0.3"
 wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"] }
 

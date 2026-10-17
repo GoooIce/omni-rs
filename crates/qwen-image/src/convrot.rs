@@ -2,8 +2,8 @@
 //!
 //! Weights are stored per-row symmetric int8 in a group-256 Hadamard basis
 //! (`convrot_hadamard_v1`). The forward rotates activations by that Hadamard,
-//! then a Burn/CubeCL kernel quantizes each row and multiplies int8 codes.
-//! Metal TensorOps is not used.
+//! then asks the shared int8 kernel to quantize each row and multiply. Which
+//! lowering runs is decided inside that kernel.
 use crate::{Error, Precision, Result};
 use burn::tensor::{DType, Int, Tensor, TensorData, backend::Backend};
 use omni_r2t2::weights::Weights;
@@ -57,15 +57,12 @@ impl ConvRotFile {
             output,
             packed: Tensor::<B, 1, Int>::from_data(TensorData::new(packed, [words]), device),
             scale: Tensor::<B, 1>::from_data(
-                TensorData::new(scale.clone(), [output]),
+                TensorData::new(scale, [output]),
                 (device, DType::F32),
             ),
-            zero: Tensor::<B, 1, Int>::from_data(TensorData::new(zero.clone(), [output]), device),
+            zero: Tensor::<B, 1, Int>::from_data(TensorData::new(zero, [output]), device),
             hadamard: hadamard.clone(),
             precision,
-            codes,
-            scale_host: scale,
-            zero_host: zero,
         })
     }
 }
@@ -78,9 +75,6 @@ pub struct Int8Linear<B: Backend> {
     zero: Tensor<B, 1, Int>,
     hadamard: Tensor<B, 2>,
     precision: Precision,
-    codes: Vec<i8>,
-    scale_host: Vec<f32>,
-    zero_host: Vec<i32>,
 }
 
 impl<B: Backend> Int8Linear<B> {
@@ -99,26 +93,31 @@ impl<B: Backend> Int8Linear<B> {
 
     fn project(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         #[cfg(feature = "metal")]
-        if let Some(y) = omni_kernel::int8_matmul::try_int8_gemm(
-            x.clone(),
-            self.packed.clone(),
-            self.scale.clone(),
-            self.zero.clone(),
-        ) {
-            return y;
+        {
+            return omni_kernel::int8_matmul::try_int8_gemm(
+                x,
+                self.packed.clone(),
+                self.scale.clone(),
+                self.zero.clone(),
+            )
+            .expect("ConvRot int8 gemm");
         }
-        let rows = x.dims()[0];
-        let device = x.device();
-        let values = x.into_data().to_vec::<f32>().expect("ConvRot 激活回读");
-        let output = reference_gemm(
-            &values,
-            rows,
-            self.input,
-            &self.codes,
-            &self.scale_host,
-            &self.zero_host,
-        );
-        Tensor::<B, 2>::from_data(TensorData::new(output, [rows, self.output]), &device)
+        #[cfg(not(feature = "metal"))]
+        {
+            let rows = x.dims()[0];
+            let device = x.device();
+            let values = x.into_data().to_vec::<f32>().expect("ConvRot 激活回读");
+            let codes = unpack_i8(&read_i32(self.packed.clone().into_data()));
+            let scale = self
+                .scale
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("ConvRot scale 回读");
+            let zero = read_i32(self.zero.clone().into_data());
+            let output = reference_gemm(&values, rows, self.input, &codes, &scale, &zero);
+            Tensor::<B, 2>::from_data(TensorData::new(output, [rows, self.output]), &device)
+        }
     }
 }
 
@@ -179,6 +178,28 @@ fn pack_i8(codes: &[i8]) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(not(feature = "metal"))]
+fn read_i32(data: TensorData) -> Vec<i32> {
+    match data.dtype {
+        DType::I64 => data
+            .to_vec::<i64>()
+            .expect("ConvRot 权重回读")
+            .into_iter()
+            .map(|value| value as i32)
+            .collect(),
+        _ => data.to_vec::<i32>().expect("ConvRot 权重回读"),
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+fn unpack_i8(words: &[i32]) -> Vec<i8> {
+    words
+        .iter()
+        .flat_map(|word| (0..4).map(move |lane| (word >> (8 * lane)) as i8))
+        .collect()
+}
+
+#[cfg(not(feature = "metal"))]
 pub fn round_half_away(value: f32) -> i32 {
     let rounded = if value >= 0.0 {
         (value + 0.5).floor()
@@ -188,6 +209,7 @@ pub fn round_half_away(value: f32) -> i32 {
     rounded.clamp(-128.0, 127.0) as i32
 }
 
+#[cfg(not(feature = "metal"))]
 pub fn reference_gemm(
     x: &[f32],
     rows: usize,
@@ -226,6 +248,7 @@ pub fn reference_gemm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "metal"))]
     use burn::backend::NdArray;
     use burn::tensor::DType;
 
@@ -283,6 +306,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "metal"))]
     fn ndarray_linear_rotates_then_matches_the_int8_reference() {
         type Cpu = NdArray;
         let device = Default::default();
@@ -316,9 +340,6 @@ mod tests {
             ),
             hadamard: hadamard.clone(),
             precision: Precision::F32,
-            codes: weights.clone(),
-            scale_host: scale.clone(),
-            zero_host: zero.clone(),
         };
         let rotated = rotate(x.clone(), &hadamard);
         let expected = reference_gemm(
@@ -330,8 +351,101 @@ mod tests {
             &zero,
         );
         let got = linear.forward(x).into_data().to_vec::<f32>().unwrap();
+        assert_eq!(got.len(), expected.len());
         for (got, expected) in got.iter().zip(expected) {
             assert!((got - expected).abs() < 1.0e-4, "{got} != {expected}");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn dequantized(
+        x: &[f32],
+        width: usize,
+        weights: &[i8],
+        scale: &[f32],
+        zero: &[i32],
+    ) -> Vec<f32> {
+        let rows = x.len() / width;
+        let columns = scale.len();
+        let mut out = vec![0.0; rows * columns];
+        for row in 0..rows {
+            let sample = &x[row * width..(row + 1) * width];
+            let peak = sample
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            let row_scale = (peak / 127.0).max(1.0e-30);
+            for column in 0..columns {
+                let mut acc = 0.0f32;
+                for k in 0..width {
+                    let code = {
+                        let value = sample[k] / row_scale;
+                        let magnitude = value.abs();
+                        let rounded = (magnitude + 0.5).floor();
+                        let signed = if value >= 0.0 { rounded } else { -rounded };
+                        signed.clamp(-128.0, 127.0)
+                    };
+                    let weight = (i32::from(weights[column * width + k]) - zero[column]) as f32
+                        * scale[column];
+                    acc += code * row_scale * weight;
+                }
+                out[row * columns + column] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[cfg(feature = "metal")]
+    fn metal_linear_rotates_then_matches_dequantized_weights() {
+        type Gpu = omni_kernel::Metal;
+        let device = cubecl::wgpu::WgpuDevice::default();
+        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
+            &device,
+            Default::default(),
+        );
+        let hadamard = hadamard_tensor::<Gpu>(&device);
+        let input = GROUP;
+        let output = 2;
+        let rows = 2;
+        let values: Vec<f32> = (0..rows * input)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+            .collect();
+        let weights: Vec<i8> = (0..output * input)
+            .map(|i| ((i * 13) % 31) as i8 - 15)
+            .collect();
+        let scale = vec![0.05, 0.2];
+        let zero = vec![0, 2];
+        let x = Tensor::<Gpu, 2>::from_data(TensorData::new(values, [rows, input]), &device);
+        let linear = Int8Linear {
+            input,
+            output,
+            packed: Tensor::<Gpu, 1, Int>::from_data(
+                TensorData::new(pack_i8(&weights), [output * input / 4]),
+                &device,
+            ),
+            scale: Tensor::<Gpu, 1>::from_data(
+                TensorData::new(scale.clone(), [output]),
+                (&device, DType::F32),
+            ),
+            zero: Tensor::<Gpu, 1, Int>::from_data(
+                TensorData::new(zero.clone(), [output]),
+                &device,
+            ),
+            hadamard: hadamard.clone(),
+            precision: Precision::F32,
+        };
+        let rotated = rotate(x.clone(), &hadamard);
+        let expected = dequantized(
+            &rotated.into_data().to_vec::<f32>().unwrap(),
+            input,
+            &weights,
+            &scale,
+            &zero,
+        );
+        let got = linear.forward(x).into_data().to_vec::<f32>().unwrap();
+        assert_eq!(got.len(), expected.len());
+        for (got, expected) in got.iter().zip(expected) {
+            assert!((got - expected).abs() < 1.0e-3, "{got} != {expected}");
         }
     }
 }

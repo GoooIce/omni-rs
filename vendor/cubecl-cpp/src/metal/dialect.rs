@@ -1304,6 +1304,7 @@ mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
 auto accum = op.get_destination_cooperative_tensor<decltype(ta), decltype(tb), int>();
 op.run(ta, tb, accum);
 accum.store(td);
+threadgroup_barrier(mem_flags::mem_device);
 }}"
             );
         }

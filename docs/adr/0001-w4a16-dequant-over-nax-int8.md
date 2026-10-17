@@ -1,6 +1,6 @@
 # 量化推理采用 W4A16 融合解量化，暂不实现 NAX int8/fp8 计算内核
 
-MiniCPM-V 的 W4A16 路线仍然有效。int8 矩阵计算内核的冻结已由 [ADR-0002](0002-int8-matmul-kernels.md) 解除；FP8 计算内核继续冻结。
+MiniCPM-V 的 W4A16 路线仍然是当前检查点的做法。int8 矩阵计算内核的冻结已由 [ADR-0002](0002-int8-matmul-kernels.md) 解除。FP8 以及其他实现不再因本决定被封禁，同一负载上谁更快由 [ADR-0003](0003-faster-implementation-wins.md) 决定。
 
 MiniCPM-V-4.7 35B 的官方 int4 检查点（compressed-tensors W4A16、symmetric、group 128）与 Burn 0.21 的量化张量方案（Q4S + 分块 + 打包存储，matmul 融合器在加载点解量化为 FP16 计算）格式对应，直接加载即获得 int4 显存占用且无需自写内核；而 M5 的 int8/fp8 Neural Accelerator 计算只能通过自写 Metal 4 TensorOps 内核触达，且实测证据（Draw Things、llama.cpp/MLX 的生产路线）表明它只加速计算受限的 prefill，单流解码是显存带宽受限。故当时决定量化推理走 W4A16 融合解量化，NAX 量化计算冻结为独立优化专项（验收指标：prefill 吞吐提升）。
 

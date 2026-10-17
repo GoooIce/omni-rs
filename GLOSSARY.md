@@ -69,3 +69,13 @@ One admitted HTTP request with its own progress, result and cancellation handle.
 
 **Published result**:
 A completed audio or image file made available for download. Its link remains valid while the file is retained, independently of inference-job history and application restarts.
+
+## 执行位置
+
+**Neural Accelerator**:
+GPU 每个着色器核心里的矩阵单元，经 Metal 张量运算使用。
+_Avoid_: Apple Neural Engine, ANE, NAX
+
+**Apple Neural Engine**:
+独立的神经引擎，实验性 ANE 后端走它。
+_Avoid_: Neural Accelerator, NAX

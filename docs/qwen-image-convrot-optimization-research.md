@@ -4,10 +4,9 @@
 
 2026-10-17 补充：按下面「需要重新决定」里的 `int8 × int8 → int32` `matmul2d` 做了实测，差距够大，已经接到生成路径。GPU 中位时间（预热后 9 次）：256×4096×4096 为 0.171 ms，256×12288×4096 为 0.943 ms，256×4096×12288 为 0.595 ms，抽样点积与 int32 参考一致。同一茶壶请求的热机第二次：去噪 1.38 s，整段 2.47 s（此前 CubeCL 热机去噪中位数 15.9 s、整段约 17 s）。第一次含着色器编译，去噪 3.74 s。`OMNI_CONVROT_TENSOROPS=0` 可退回 CubeCL。
 范围是一次完整生成（文本编码 + 8 步去噪 + VAE），权重为 Unsloth
-`Qwen-Image-2.1-Turbo-INT8-ConvRot.safetensors`。int8 矩阵乘保持
-[ADR-0002](adr/0002-int8-matmul-kernels.md)：Burn/CubeCL、i32 累加、f32 缩放收尾。
-Metal TensorOps 只在计算必须上 ANE 时才允许；本文不把 TensorOps 写成默认计划。
-FP8 计算内核仍冻结，已有的 DiT FP16 TensorOps 路径不改。
+`Qwen-Image-2.1-Turbo-INT8-ConvRot.safetensors`。当前默认是已经测赢的 Metal `matmul2d`。
+实现禁令已由 [ADR-0003](adr/0003-faster-implementation-wins.md) 取代：CubeCL、TensorOps、Apple Neural Engine、加载点反量化、FP8 都是候选，谁在同一负载上更快，谁就是当前路径。
+下文表格里的「否决」「仍冻结」记录的是 ADR-0003 之前的约束。
 本轮没有新的模型测速，下面的「算术」都是用已有单算子时间或形状推出来的，不是新的 profile。
 
 ## 结论与实施顺序

@@ -2,9 +2,10 @@
 //!
 //! Activations are quantized per row. Weights stay packed as four little-endian
 //! int8 codes per `i32`. The dot product accumulates in `i32`, then each output
-//! is scaled in `f32`. On M5 this is Metal TensorOps `matmul2d` (`int8 × int8 →
-//! int32`). Other devices keep the CubeCL kernel. Set `OMNI_CONVROT_TENSOROPS=0`
-//! to force that kernel. Weights are not expanded to FP16.
+//! is scaled in `f32`. On Apple10 the CubeCL kernel lowers to a 64×64 int8
+//! `matmul2d`, the measured faster path. Other devices, and
+//! `OMNI_CONVROT_TENSOROPS=0`, keep the scalar CubeCL kernel. Weights stay
+//! packed and are not expanded to FP16.
 use crate::{Metal, Raw, RawTensor, Runtime};
 use burn::tensor::{
     DType, FloatDType, Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive,
@@ -20,8 +21,16 @@ use std::any::Any;
 
 /// One cube per row, 256 threads. A 4096-wide denoiser row is not scanned by one thread.
 #[cube(launch_unchecked)]
-fn quantize_rows(x: &Tensor<f32>, packed: &mut Tensor<i32>, scale: &mut Tensor<f32>, words: u32) {
+fn quantize_rows(
+    x: &Tensor<f32>,
+    packed: &mut Tensor<i32>,
+    scale: &mut Tensor<f32>,
+    sum: &mut Tensor<i32>,
+    words: u32,
+    #[comptime] write_sum: bool,
+) {
     let mut peaks = SharedMemory::<f32>::new(256usize);
+    let mut totals = SharedMemory::<i32>::new(256usize);
     let row = CUBE_POS_X as usize;
     let tx = UNIT_POS_X as usize;
     let count = words as usize;
@@ -62,6 +71,7 @@ fn quantize_rows(x: &Tensor<f32>, packed: &mut Tensor<i32>, scale: &mut Tensor<f
     }
     sync_cube();
     let row_scale = peaks[0];
+    let mut local = 0i32;
     for step in 0..word_steps {
         let word = tx + step * 256usize;
         if word < count {
@@ -70,8 +80,21 @@ fn quantize_rows(x: &Tensor<f32>, packed: &mut Tensor<i32>, scale: &mut Tensor<f
             let q1 = quantize_i8(x[base + stride1] / row_scale);
             let q2 = quantize_i8(x[base + stride1 * 2] / row_scale);
             let q3 = quantize_i8(x[base + stride1 * 3] / row_scale);
-            packed[row * count + word] =
+            let packed_word =
                 (q0 & 255) | ((q1 & 255) << 8) | ((q2 & 255) << 16) | ((q3 & 255) << 24);
+            packed[row * count + word] = packed_word;
+            local += sum4(packed_word);
+        }
+    }
+    if comptime!(write_sum) {
+        totals[tx] = local;
+        sync_cube();
+        if tx == 0usize {
+            let mut total = 0i32;
+            for i in 0..256usize {
+                total += totals[i];
+            }
+            sum[row] = total;
         }
     }
 }
@@ -133,6 +156,77 @@ fn store(
     let centered = acc - sum * w_zero[column];
     out[row * out.stride(0) + column * out.stride(1)] =
         f32::cast_from(centered) * row_scale * w_scale[column];
+}
+
+/// 64×64 device-tensor int8 `matmul2d`. `MatrixIdent::Accumulator` selects that lowering.
+#[cube]
+#[allow(unused_variables)]
+fn mma_i8_64(
+    x: &Tensor<i32>,
+    w: &Tensor<i32>,
+    y: &mut Tensor<i32>,
+    #[comptime] rows: u32,
+    #[comptime] cols: u32,
+    #[comptime] inner: u32,
+) {
+    intrinsic!(|scope| {
+        use cubecl::ir::{CoopMma, Instruction, Matrix, MatrixIdent, MatrixLayout};
+        scope.register(Instruction::new(
+            CoopMma::ExecuteManual {
+                matrix: Matrix {
+                    ident: MatrixIdent::Accumulator,
+                    m: rows as usize,
+                    n: cols as usize,
+                    k: inner as usize,
+                    storage: i32::as_type(scope).storage_type(),
+                    layout: MatrixLayout::RowMajor,
+                },
+                registers_a: *x.expand,
+                registers_b: *w.expand,
+                registers_c: *y.expand,
+            },
+            *y.expand,
+        ));
+    });
+}
+
+#[cube(launch_unchecked)]
+fn int8_dot_tile64(
+    x_packed: &Tensor<i32>,
+    w_packed: &Tensor<i32>,
+    acc: &mut Tensor<i32>,
+    x_scale: &Tensor<f32>,
+    x_sum: &Tensor<i32>,
+    w_scale: &Tensor<f32>,
+    w_zero: &Tensor<i32>,
+    out: &mut Tensor<f32>,
+    #[comptime] rows: u32,
+    #[comptime] cols: u32,
+    #[comptime] inner: u32,
+) {
+    mma_i8_64(x_packed, w_packed, acc, rows, cols, inner);
+    let rows = rows as usize;
+    let cols = cols as usize;
+    let tile_row = (CUBE_POS_Y as usize) * 64usize;
+    let tile_col = (CUBE_POS_X as usize) * 64usize;
+    let local = UNIT_POS_X as usize;
+    for step in 0..32usize {
+        let offset = local + step * 128usize;
+        let row = tile_row + offset / 64usize;
+        let col = tile_col + offset % 64usize;
+        if row < rows && col < cols {
+            store(
+                out,
+                row,
+                col,
+                acc[row * cols + col],
+                x_sum[row],
+                x_scale[row],
+                w_scale,
+                w_zero,
+            );
+        }
+    }
 }
 
 /// Eight columns per unit, two partial sums per column. The extra accumulators
@@ -290,15 +384,16 @@ fn empty_tensor(like: &RawTensor, shape: Shape, dtype: DType) -> RawTensor {
 }
 
 fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTensor) -> RawTensor {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(out) = crate::int8_tensorops::try_launch(
-        x.clone(),
-        w_packed.clone(),
-        w_scale.clone(),
-        w_zero.clone(),
-    ) {
-        return out;
-    }
+    let tile64 = {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            crate::int8_tensorops::enabled(&x)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    };
     let x_shape = x.shape();
     let rows = x_shape[0];
     let width = x_shape[1];
@@ -307,8 +402,43 @@ fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTens
     let client = x.client.clone();
     let x_packed = empty_tensor(&x, Shape::new([rows * words]), DType::I32);
     let x_scale = empty_tensor(&x, Shape::new([rows]), DType::F32);
+    let x_sum = empty_tensor(&x, Shape::new([rows]), DType::I32);
     let out = empty_tensor(&x, Shape::new([rows, columns]), DType::F32);
+    let w_packed = burn_cubecl::kernel::into_contiguous(w_packed);
+    let w_scale = burn_cubecl::kernel::into_contiguous(w_scale);
+    let w_zero = burn_cubecl::kernel::into_contiguous(w_zero);
     unsafe {
+        if tile64 {
+            quantize_rows::launch_unchecked::<WgpuRuntime>(
+                &client,
+                CubeCount::Static(rows as u32, 1, 1),
+                CubeDim::new_1d(256),
+                x.into_tensor_arg(),
+                x_packed.clone().into_tensor_arg(),
+                x_scale.clone().into_tensor_arg(),
+                x_sum.clone().into_tensor_arg(),
+                words as u32,
+                true,
+            );
+            let acc = empty_tensor(&out, Shape::new([rows * columns]), DType::I32);
+            int8_dot_tile64::launch_unchecked::<WgpuRuntime>(
+                &client,
+                CubeCount::Static((columns as u32).div_ceil(64), (rows as u32).div_ceil(64), 1),
+                CubeDim::new_1d(128),
+                x_packed.into_tensor_arg(),
+                w_packed.into_tensor_arg(),
+                acc.into_tensor_arg(),
+                x_scale.into_tensor_arg(),
+                x_sum.into_tensor_arg(),
+                w_scale.into_tensor_arg(),
+                w_zero.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                rows as u32,
+                columns as u32,
+                width as u32,
+            );
+            return out;
+        }
         quantize_rows::launch_unchecked::<WgpuRuntime>(
             &client,
             CubeCount::Static(rows as u32, 1, 1),
@@ -316,7 +446,9 @@ fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTens
             x.into_tensor_arg(),
             x_packed.clone().into_tensor_arg(),
             x_scale.clone().into_tensor_arg(),
+            x_sum.into_tensor_arg(),
             words as u32,
+            false,
         );
         int8_dot::launch_unchecked::<WgpuRuntime>(
             &out.client,
@@ -445,11 +577,14 @@ mod tests {
         rounded.clamp(-128.0, 127.0) as i32
     }
 
-    fn reference(
+    /// Dequantize the same int8 weights in f32, then dot with the row-quantized
+    /// activations. Checkpoint scales are f32. This is not the kernel's i32
+    /// accumulator.
+    fn dequantized_weight_reference(
         x: &[f32],
         rows: usize,
         width: usize,
-        w: &[i8],
+        weights: &[i8],
         scale: &[f32],
         zero: &[i32],
     ) -> Vec<f32> {
@@ -461,46 +596,33 @@ mod tests {
                 .iter()
                 .fold(0.0f32, |peak, value| peak.max(value.abs()));
             let row_scale = (peak / 127.0).max(1.0e-30);
-            let codes: Vec<i32> = sample
+            let activations: Vec<f32> = sample
                 .iter()
-                .map(|value| round_half_away(value / row_scale))
+                .map(|value| round_half_away(value / row_scale) as f32 * row_scale)
                 .collect();
             for column in 0..columns {
-                let mut acc = 0i32;
-                let mut sum = 0i32;
+                let mut acc = 0.0f32;
                 for k in 0..width {
-                    let weight = w[column * width + k] as i32;
-                    acc += codes[k] * weight;
-                    sum += codes[k];
+                    let weight = (i32::from(weights[column * width + k]) - zero[column]) as f32
+                        * scale[column];
+                    acc += activations[k] * weight;
                 }
-                out[row * columns + column] =
-                    (acc - sum * zero[column]) as f32 * row_scale * scale[column];
+                out[row * columns + column] = acc;
             }
         }
         out
     }
 
-    #[test]
-    #[ignore = "requires a Metal device"]
-    fn metal_int8_gemm_matches_the_row_scaled_reference() {
-        let device = cubecl::wgpu::WgpuDevice::default();
-        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
-            &device,
-            Default::default(),
-        );
-        let rows = 3;
-        let width = 8;
-        let columns = 2;
-        let x = vec![
-            1.0, -2.0, 0.5, 4.0, -0.25, 3.0, 0.0, -1.5, 0.2, 0.2, 0.2, 0.2, -0.2, -0.2, -0.2, -0.2,
-            8.0, 7.0, -6.0, 5.0, -4.0, 3.0, -2.0, 1.0,
-        ];
-        let weights: Vec<i8> = (0..columns * width)
-            .map(|i| ((i * 17) % 41) as i8 - 20)
-            .collect();
-        let scale = vec![0.125, 0.5];
-        let zero = vec![0, 3];
-        let expected = reference(&x, rows, width, &weights, &scale, &zero);
+    fn run_gemm(
+        device: &cubecl::wgpu::WgpuDevice,
+        x: Vec<f32>,
+        rows: usize,
+        width: usize,
+        weights: &[i8],
+        scale: Vec<f32>,
+        zero: Vec<i32>,
+    ) -> Vec<f32> {
+        let columns = scale.len();
         let packed: Vec<i32> = weights
             .chunks_exact(4)
             .map(|chunk| {
@@ -510,20 +632,81 @@ mod tests {
             })
             .collect();
         let words = packed.len();
-        let x = BurnTensor::<Metal, 2>::from_data(TensorData::new(x, [rows, width]), &device);
+        let x = BurnTensor::<Metal, 2>::from_data(TensorData::new(x, [rows, width]), device);
         let w_packed = BurnTensor::<Metal, 1, burn::tensor::Int>::from_data(
             TensorData::new(packed, [words]),
-            &device,
+            device,
         );
-        let w_scale = BurnTensor::<Metal, 1>::from_data(TensorData::new(scale, [columns]), &device);
+        let w_scale = BurnTensor::<Metal, 1>::from_data(TensorData::new(scale, [columns]), device);
         let w_zero = BurnTensor::<Metal, 1, burn::tensor::Int>::from_data(
             TensorData::new(zero, [columns]),
-            &device,
+            device,
         );
-        let output = try_int8_gemm(x, w_packed, w_scale, w_zero).expect("metal int8 gemm");
-        let got = output.into_data().to_vec::<f32>().unwrap();
+        try_int8_gemm(x, w_packed, w_scale, w_zero)
+            .expect("metal int8 gemm")
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()
+    }
+
+    fn assert_close(got: &[f32], expected: &[f32]) {
+        assert_eq!(got.len(), expected.len());
         for (got, expected) in got.iter().zip(expected) {
-            assert!((got - expected).abs() < 1.0e-4, "{got} != {expected}");
+            assert!((got - expected).abs() < 1.0e-3, "{got} != {expected}");
         }
+    }
+
+    fn tile_fixture() -> (Vec<f32>, Vec<i8>, Vec<f32>, Vec<i32>, Vec<f32>) {
+        let rows = 64;
+        let columns = 64;
+        let width = 64;
+        let mut x = vec![0.0; rows * width];
+        x[..4].copy_from_slice(&[1.0, -2.0, 0.5, 4.0]);
+        let mut weights = vec![0i8; columns * width];
+        weights[..4].copy_from_slice(&[1, -2, 3, -4]);
+        let scale = vec![0.25; columns];
+        let mut zero = vec![0; columns];
+        zero[0] = 1;
+        let expected = dequantized_weight_reference(&x, rows, width, &weights, &scale, &zero);
+        (x, weights, scale, zero, expected)
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn int8_gemm_matches_dequantized_weights_on_scalar_and_tile64() {
+        let device = cubecl::wgpu::WgpuDevice::default();
+        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
+            &device,
+            Default::default(),
+        );
+        // Hand value: codes 32, -64, 16, 127 against weights 1, -2, 3, -4, zero 1.
+        let x = vec![1.0, -2.0, 0.5, 4.0];
+        let weights = vec![1i8, -2, 3, -4];
+        let scale = vec![0.25];
+        let zero = vec![1];
+        let expected = dequantized_weight_reference(&x, 1, 4, &weights, &scale, &zero);
+        assert!((expected[0] - (-411.0 / 127.0)).abs() < 1.0e-5);
+
+        unsafe { std::env::set_var("OMNI_CONVROT_TENSOROPS", "0") };
+        let got = run_gemm(&device, x, 1, 4, &weights, scale, zero);
+        assert_close(&got, &expected);
+        assert!((got[0] + 1.0 - expected[0]).abs() >= 1.0e-3);
+        let (x, weights, scale, zero, expected) = tile_fixture();
+        let got = run_gemm(&device, x, 64, 64, &weights, scale, zero);
+        assert_close(&got, &expected);
+
+        unsafe { std::env::remove_var("OMNI_CONVROT_TENSOROPS") };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!(
+            crate::int8_tensorops::matmul2d_lowered(&device),
+            "64×64 matmul2d lowering is off"
+        );
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        panic!("64×64 matmul2d lowering is only built for Apple Silicon");
+        let (x, weights, scale, zero, expected) = tile_fixture();
+        assert!((expected[0] - (-411.0 / 127.0)).abs() < 1.0e-5);
+        let got = run_gemm(&device, x, 64, 64, &weights, scale, zero);
+        assert_close(&got, &expected);
+        assert!((got[0] + 1.0 - expected[0]).abs() >= 1.0e-3);
     }
 }
