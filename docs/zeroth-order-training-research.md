@@ -2,7 +2,7 @@
 
 2026-10-17。范围是当前 Makepad 本地版已经在跑的推理模型，以及只靠函数值、不靠反向传播的优化方法。对照的是论文、作者维护的算法页和本仓库源码。没有改推理，也没有在本机跑训练。
 
-**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户改过的译文就能当监督。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。状态表征强化学习、RLHF、DPO 和 GRPO 也不适合作为第一刀：前三者要在策略或编码器上做反向，GRPO 还要为一题采样一组完整输出再对策略求对数概率梯度。语音和音乐侧目前也没有对得上的监督和预算。图像权重不改；同一提示下按人的排序去改初始噪声，是后文的 ZO-RankSGD，不取代翻译前缀。
+**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户在一次交互里从少数几个结果中挑一个，就是一次排序，可以跨会话累加，不必先攒满论文里的 8,000 次静默前向。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。状态表征强化学习、RLHF、DPO 和 GRPO 也不适合作为第一刀：前三者要在策略或编码器上做反向，GRPO 还要为一题采样一组完整输出再对策略求对数概率梯度。语音和音乐侧目前也没有对得上的监督和预算。图像权重不改；同一提示下按人的排序去改初始噪声，是后文的 ZO-RankSGD，不取代翻译前缀。CMA-ES 的协方差更新先留在无约束子空间里；只有给搜索变量加上等式约束时，才把微扰投到切空间。
 
 ## 当前运行时实际允许什么
 
@@ -63,6 +63,30 @@ BBTv2 补上了这一档。它在每一层隐藏状态前拼 prompt，依靠残�
 5. 输入侧前缀只改嵌入拼接。BBTv2 的逐层 prompt 要动每一层前向，作为第二步，而不是第一刀。
 
 CMA-ES 维护多元正态：均值 \(\mathbf{m}\in\mathbb{R}^{d}\)、步长 \(\sigma\) 和协方差 \(\mathbf{C}\in\mathbb{R}^{d\times d}\)。BBT 写明这三项都在迭代中更新。默认实验表的种群是 20；子空间消融才把种群设为 \(\lambda=4+3\log d\)。\(d=500\) 时每一代大约二十次完整翻译前向。见 [Sun et al. 2022, arXiv:2201.03514](https://arxiv.org/abs/2201.03514) §3.2 与 Table 2。
+
+## 多轮前向可以按用户的选择累加
+
+被优化的是小向量，每次打分仍然要跑一整次大模型前向。Hy-MT2-7B 并不小。能放宽的是预算的用法：论文里的 8,000 次是带标签分类的总调用上限，不是必须在一次后台任务里跑完。
+
+用户在同一次交互里从几个结果中留下一个，给出的是排序，不是一个要手写的损失。ZO-RankSGD 的 \((m,k)\)-排序谕示就是这样：一次出示 \(m\) 个扰动点，人只返回最好的 \(k\) 个的名次。CMA-ES 也是按种群的名次更新均值和协方差，不读取梯度数值。因此一轮交互里的少数几次前向可以记成一次更新，下一轮接着用更新后的分布。音色设计里已有“换个候选”，图像已有不同种子；翻译若要走这条路，应是用户明确要求的 2 到 6 个候选，而不是一次点下去铺开种群 20。20 次 7B 前向仍会占住唯一的推理名额。2 到 6 次可以串行，并且每次都能取消。
+
+这条放宽不扩展到全参数。全参数 MeZO 的一步也是两次前向，但论文预算是万步，而且每次都改整份权重。用户挑选的是输出，不是 7B 个坐标上的一次微扰。
+
+## 切空间微扰只在有等式约束时并进 CMA-ES
+
+无约束时，一阶微扰 \(f(x+\delta x)=f(x)+\delta x^{\top}\nabla f(x)\) 对任意 \(\delta x\) 都成立。最小值要求这个线性项恒非负，只能是 \(\nabla f(x)=0\)。加上等式 \(g(x)=0\) 之后，同样的不等式只需要对满足线性化约束 \(J\delta x=0\) 的微扰成立。这些微扰的通解是切空间上的 \(\delta x=(I-J^{\dagger}J)\delta z\)。驻点条件变成投影梯度 \((I-J^{\dagger}J)\nabla f(x)=0\)。在 \(J\) 行满秩时，它和拉格朗日乘子条件 \(\nabla f(x)=J^{\top}c\)、\(g(x)=0\) 是同一组方程。球面上 \(J=x^{\top}\)，投影是 \((I-xx^{\top})\nabla f\)。Stiefel 流形 \(X^{\top}X=I\) 上，投影梯度是 \(G-X[X^{\top}G]_{\mathrm{sym}}\)。二阶项是拉格朗日函数的 Hessian 再投回切空间；这篇推导自己写明，用 Hessian 的正负定判断极值通常只有理论价值。
+
+BBT 搜索的 \(z\) 落在盒子 \([-5,5]^{d}\) 里，没有等式。此时 \(J\) 是空的，\(I-J^{\dagger}J\) 是单位阵，切空间投影不改变 CMA-ES 的高斯微扰。协方差 \(C\) 已经在这个无约束坐标系里学习哪些方向重要。再乘一次投影，只是把同一次采样做两遍。
+
+投影有用的时候，是搜索点本身被等式钉在流形上，而函数只在流形上有定义。Li、Balasubramanian 与 Ma 指出，欧氏高斯平滑会碰到流形的非线性，函数只定义在流形上时不适用；他们改在切空间上做黎曼高斯平滑，用函数值估计黎曼梯度。黎曼梯度就是欧氏梯度到切空间的投影。查询复杂度跟流形的内在维数走，不跟包住它的欧氏维数走。Stiefel 流形 \(\mathrm{St}(n,p)\) 的切空间是 \(X^{\top}Y+Y^{\top}X=0\)，内在维数是 \(np-p(p+1)/2\)。见 [Li et al. 2021, arXiv:2003.11238](https://arxiv.org/abs/2003.11238)。
+
+因此和 CMA-ES 的接法是分工，不是把投影塞进协方差公式：
+
+1. 采样仍在切坐标 \(\delta z\) 上做，分布还是 CMA-ES 的 \(\mathcal{N}(m,\sigma^{2}C)\)。
+2. 送进模型前先变成合法微扰。球面用 \(\delta x=(I-xx^{\top})\delta z\)，再归一化回到球面。Stiefel 用 \(V\leftarrow V-X[X^{\top}V]_{\mathrm{sym}}\)，再用 QR 或极分解回到 \(X^{\top}X=I\)。
+3. 名次只更新 \(m\)、\(\sigma\) 和 \(C\)。不估计 \(\nabla f\)，所以用不到“投影梯度等于零”这句驻点条件，也用不到切空间上的 Hessian 检验。
+
+球面是唯一值得先试的等式。连续前缀或扩散初始噪声若被固定到某个范数上，径向分量只改变尺度，人的排序容易被尺度差带走。切向微扰把比较留在同样长度的向量上。球面 \(S^{d-1}\) 的内在维数只比包住它的欧氏空间少 1，省不下数量级的前向，换来的是每次采样都可行。Stiefel 要等真的引入一小块正交因子再做。当前前缀没有这个因子。二阶投影 Hessian 与 HiZOO 的对角估计不是同一件东西，不放进第一版。
 
 ## 同一条前缀上，MeZO 是备选优化器
 
@@ -177,6 +201,7 @@ Botteghi 等人的综述讨论的是同一件事的无监督版本：先从观�
 - Rafailov, Rafael, et al. Direct Preference Optimization: Your Language Model is Secretly a Reward Model. arXiv:2305.18290. <https://arxiv.org/abs/2305.18290>
 - Shao, Zhihong, et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. arXiv:2402.03300. <https://arxiv.org/abs/2402.03300>
 - Tang, Zhiwei, Dmitry Rybin, and Tsung-Hui Chang. Zeroth-Order Optimization Meets Human Feedback: Provable Learning via Ranking Oracles. arXiv:2303.03751. <https://arxiv.org/abs/2303.03751>
+- Li, Jiaxiang, Krishnakumar Balasubramanian, and Shiqian Ma. Stochastic Zeroth-Order Riemannian Derivative Estimation and Optimization. arXiv:2003.11238. <https://arxiv.org/abs/2003.11238>
 
 MeZO 把“收敛随参数维数变慢”的经典下界指向 Duchi, Jordan, Wainwright, Wibisono, IEEE Trans. Inf. Theory, 2015，以及 Nesterov and Spokoiny, Foundations of Computational Mathematics, 17:527–566, 2017。本文没有打开这两篇期刊原文，只转述 MeZO 对它们的对照，不用它们的定理常数。Nesterov 的讨论稿 CORE 2011/1 在 <https://dial.uclouvain.be/pr/boreal/object/boreal:69205>，本轮没有逐条核对其中的定理。
 
