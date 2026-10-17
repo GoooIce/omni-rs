@@ -2,7 +2,7 @@
 
 2026-10-17。范围是当前 Makepad 本地版已经在跑的推理模型，以及只靠函数值、不靠反向传播的优化方法。对照的是论文、作者维护的算法页和本仓库源码。没有改推理，也没有在本机跑训练。
 
-**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户改过的译文就能当监督。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。状态表征强化学习、RLHF、DPO 和 GRPO 也不适合作为第一刀：前三者要在策略或编码器上做反向，GRPO 还要为一题采样一组完整输出再对策略求对数概率梯度。语音、图像和音乐侧目前也没有对得上的监督和预算。
+**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户改过的译文就能当监督。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。状态表征强化学习、RLHF、DPO 和 GRPO 也不适合作为第一刀：前三者要在策略或编码器上做反向，GRPO 还要为一题采样一组完整输出再对策略求对数概率梯度。语音和音乐侧目前也没有对得上的监督和预算。图像权重不改；同一提示下按人的排序去改初始噪声，是后文的 ZO-RankSGD，不取代翻译前缀。
 
 ## 当前运行时实际允许什么
 
@@ -113,7 +113,9 @@ AdaZeta 针对 MeZO-LoRA 在 Llama-2-7B 上的发散。张量列车适配器接�
 
 **音乐。** YuE2-3B 一次生成是长序列前向。SheetSage2 的适配器是这组里最小的可训面（约 5.7×10⁷ 个存储元素），但损失会是 ABC 或 MIDI 的结构化距离，打开的论文都没有这个目标。
 
-**图像。** 一次生成是固定 8 步去噪。零阶的一步至少是两条完整轨迹。README 记录 1024² 约 51 秒，默认 2K 更长。两条轨迹才能得到一个标量，而界面上没有成对的“目标图”。
+**图像。** 改扩散权重不适合。一次生成是固定 8 步去噪，README 记录 1024² 约 51 秒，默认 2K 更长。对权重做零阶估计，一步至少是两条完整轨迹，界面上也没有成对的目标图。
+
+同一条提示下改初始噪声是另一件事。ZO-RankSGD 把 Stable Diffusion 的权重留住，只优化初始噪声嵌入。论文要求采样器是确定性的 ODE，实验用 DDIM 和 DPM-solver，这样图像只由这份噪声决定。Stable Diffusion 的噪声是 \(64\times 3\times 3\)，维数 576。界面每轮出示 6 张图，人排出最好的若干张；文中例子把人的反馈设在 10 到 20 轮。参数是 \(\eta=1\)、\(\mu=0.1\)、\(\gamma=0.5\)。见 [Tang et al., arXiv:2303.03751](https://arxiv.org/abs/2303.03751) §4.3 与附录。当前 Qwen-Image 入口要求 FlowMatch Euler，并且 `stochastic_sampling` 为 false，见 [`crates/qwen-image/src/config.rs`](../crates/qwen-image/src/config.rs)。轨迹因此由初始噪声和条件固定，机制上可以只改噪声、不改权重。论文没有测这个检查点，噪声形状也不是 576。一轮 6 张在单一推理名额上只能串行，每张仍是完整的 8 步去噪。它不改模型，也不能用于转写、译文或声音。
 
 ## 建议的最小接口
 
@@ -148,7 +150,7 @@ Botteghi 等人的综述讨论的是同一件事的无监督版本：先从观�
 
 - InstructGPT 是三步：监督微调、奖励模型、再用 PPO 对奖励模型优化策略。模型规模实验是 1.3B、6B、175B。见 [Ouyang et al. 2022, arXiv:2203.02155](https://arxiv.org/abs/2203.02155) Figure 2 与 §3。
 - DPO 去掉显式奖励模型和强化学习循环，把同一偏好目标写成分类损失，提高偏好回答相对落选回答的对数概率。损失仍然穿过策略的对数概率。见 [Rafailov et al. 2023, arXiv:2305.18290](https://arxiv.org/abs/2305.18290) 摘要与 Figure 1。
-- GRPO 去掉与策略同规模的价值网络，对同一题从旧策略采样一组输出 \(\{o_1,\ldots,o_G\}\)，用组内奖励的均值和标准差做基线，再最大化带重要性比率的策略目标。DeepSeekMath 7B 上，GSM8K 从 82.9% 到 88.2%，MATH 从 46.8% 到 51.7%。见 [Shao et al. 2024, arXiv:2402.03300](https://arxiv.org/abs/2402.03300) §4.1.1。一组完整生成再加对数概率梯度，占满当前这一个推理名额，也写不进只读权重。
+- GRPO 去掉与策略同规模的价值网络，对同一题从旧策略采样一组输出 \(\{o_1,\ldots,o_G\}\)，用组内奖励的均值和标准差做基线，再最大化带重要性比率的策略目标。DeepSeekMath 的实验里每题采样 64 条输出，策略在每次探索后只更新一次。GSM8K 从 82.9% 到 88.2%，MATH 从 46.8% 到 51.7%。见 [Shao et al. 2024, arXiv:2402.03300](https://arxiv.org/abs/2402.03300) §4.1.1 与 §4.2。64 次完整生成再加对数概率梯度，占满当前这一个推理名额，也写不进只读权重。
 
 用户改过的译文可以当成偏好对。能在现有前向上使用它的做法，仍是上一节的低维前缀加 CMA-ES：模型冻结，每个候选一次前向，损失是交叉熵或一个标量。那不是状态表征学习，也不需要 PPO 的价值网络。
 
@@ -174,6 +176,7 @@ Botteghi 等人的综述讨论的是同一件事的无监督版本：先从观�
 - Ouyang, Long, et al. Training language models to follow instructions with human feedback. arXiv:2203.02155. <https://arxiv.org/abs/2203.02155>
 - Rafailov, Rafael, et al. Direct Preference Optimization: Your Language Model is Secretly a Reward Model. arXiv:2305.18290. <https://arxiv.org/abs/2305.18290>
 - Shao, Zhihong, et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. arXiv:2402.03300. <https://arxiv.org/abs/2402.03300>
+- Tang, Zhiwei, Dmitry Rybin, and Tsung-Hui Chang. Zeroth-Order Optimization Meets Human Feedback: Provable Learning via Ranking Oracles. arXiv:2303.03751. <https://arxiv.org/abs/2303.03751>
 
 MeZO 把“收敛随参数维数变慢”的经典下界指向 Duchi, Jordan, Wainwright, Wibisono, IEEE Trans. Inf. Theory, 2015，以及 Nesterov and Spokoiny, Foundations of Computational Mathematics, 17:527–566, 2017。本文没有打开这两篇期刊原文，只转述 MeZO 对它们的对照，不用它们的定理常数。Nesterov 的讨论稿 CORE 2011/1 在 <https://dial.uclouvain.be/pr/boreal/object/boreal:69205>，本轮没有逐条核对其中的定理。
 
