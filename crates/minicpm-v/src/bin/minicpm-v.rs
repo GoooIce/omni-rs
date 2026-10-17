@@ -130,15 +130,10 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         "f32" => omni_r2t2::Precision::F32,
         other => return Err(format!("precision must be f16 or f32, got {other}").into()),
     };
-    // ADR-0001 W4A16: keep int4 resident on cubecl backends and dequantize in
-    // the matmul kernel; the CPU reference path dequantizes at load (NdArray
-    // cannot hold sub-byte tensors). The vendored burn-cubecl tune fix makes
+    // ADR-0001 W4A16: the loader keeps int4 resident on cubecl backends and
+    // dequantizes at load on NdArray. The vendored burn-cubecl tune fix makes
     // the fused path safe for the expert shapes and single-token GEMV.
-    #[cfg(any(feature = "metal", feature = "webgpu"))]
-    let quant_mode = omni_minicpm_v::quant::LoadMode::Packed;
-    #[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
-    let quant_mode = omni_minicpm_v::quant::LoadMode::Dequantize;
-    let model = TextModel::<B>::load_with(&weights, &config, precision, device, Some(quant_mode))?;
+    let model = TextModel::<B>::load(&weights, &config, precision, device)?;
 
     let prompt = match &options.image {
         Some(image) => {

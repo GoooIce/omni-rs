@@ -89,14 +89,10 @@ impl<B: Backend> MinicpmRewriter<B> {
             .tokenizer()
             .map_err(|e| Error::Config(format!("rewrite：读取 {model_dir:?} 的分词器失败：{e}")))?;
         let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
-        // Mirrors the minicpm-v CLI (ADR-0001 W4A16): int4 stays packed on
-        // cubecl backends; the CPU reference path dequantizes at load.
-        #[cfg(any(feature = "metal", feature = "webgpu"))]
-        let quant = omni_minicpm_v::quant::LoadMode::Packed;
-        #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
-        let quant = omni_minicpm_v::quant::LoadMode::Dequantize;
-        let model = TextModel::<B>::load_with(&weights, &config, precision, device, Some(quant))
-            .map_err(Error::Weights)?;
+        // ADR-0001 W4A16: the MiniCPM-V loader keeps int4 resident on cubecl
+        // and dequantizes at load on NdArray.
+        let model =
+            TextModel::<B>::load(&weights, &config, precision, device).map_err(Error::Weights)?;
         let vision =
             Multimodal::<B>::load(&weights, &config, precision, device).map_err(Error::Weights)?;
         Ok(Self {
