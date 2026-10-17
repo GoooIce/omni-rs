@@ -10,7 +10,8 @@
     {"path": "crates/burn-ane/Cargo.toml", "target": "target/apple-shared-ane", "strict_clippy": true, "metal": true},
     {"path": "crates/omni-kernel/Cargo.toml", "target": "target/apple-shared-ane", "metal": true},
     {"path": "prototypes/makepad/Cargo.toml", "target": "target/makepad-native", "metal": true},
-    {"path": "prototypes/tts-gemv/Cargo.toml", "target": "target/tts-playback-checks", "metal": false, "experimental": true}
+    {"path": "prototypes/tts-gemv/Cargo.toml", "target": "target/tts-playback-checks", "metal": false, "experimental": true},
+    {"path": "prototypes/int8-gemm/Cargo.toml", "target": "target/int8-gemm", "metal": false, "experimental": true}
   ],
   "forbidden_runtime_packages": ["pyo3", "cpython", "rustpython", "rustpython-vm", "mlx-rs", "mlx-sys"]
 }

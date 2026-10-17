@@ -15,8 +15,13 @@ burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"
 burn-fusion = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-ir = { version = "=0.21.0", default-features = false, features = ["std"] }
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 burn-ane = { path = "../burn-ane", features = ["metal-shared"], optional = true }
+cubecl-cpp = { version = "=0.10.0", default-features = false, features = ["metal"] }
+cubecl-runtime = { version = "=0.10.0", default-features = false, features = ["std"] }
+objc2-metal = "0.3"
+wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"] }
 
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
@@ -25,6 +30,7 @@ burn = { version = "=0.21.0", default-features = false, features = ["std", "ndar
 
 [patch.crates-io]
 burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
 cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
 cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
 burn-router = { path = "../../vendor/burn-router" }

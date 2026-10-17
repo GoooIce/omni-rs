@@ -79,6 +79,8 @@ pub struct MmaShape<D: Dialect> {
     pub k: u32,
     /// Optional RHS transpose for explicit Metal manual MMA.
     pub transpose_b: bool,
+    /// 64×64 device-tensor `matmul2d` (`execution_simdgroups<4>`), not a register fragment.
+    pub device_tile: bool,
     _d: PhantomData<D>,
 }
 
@@ -89,11 +91,16 @@ impl<D: Dialect> MmaShape<D> {
             n,
             k,
             transpose_b: false,
+            device_tile: false,
             _d: PhantomData,
         }
     }
     pub fn with_transpose_b(mut self, transpose_b: bool) -> Self {
         self.transpose_b = transpose_b;
+        self
+    }
+    pub fn with_device_tile(mut self, device_tile: bool) -> Self {
+        self.device_tile = device_tile;
         self
     }
 

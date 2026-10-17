@@ -1,46 +1,70 @@
-//! Row-scaled int8 matrix multiply in CubeCL.
+//! Row-scaled int8 matrix multiply.
 //!
-//! Activations are quantized per row inside the kernel. Weights stay packed as
-//! four little-endian int8 codes per `i32`. The dot product accumulates in
-//! `i32`, then each output is scaled in `f32`. This is not a load-point cast
-//! of the weights to FP16, and it does not call Metal TensorOps.
+//! Activations are quantized per row. Weights stay packed as four little-endian
+//! int8 codes per `i32`. The dot product accumulates in `i32`, then each output
+//! is scaled in `f32`. On M5 this is Metal TensorOps `matmul2d` (`int8 × int8 →
+//! int32`). Other devices keep the CubeCL kernel. Set `OMNI_CONVROT_TENSOROPS=0`
+//! to force that kernel. Weights are not expanded to FP16.
 use crate::{Metal, Raw, RawTensor, Runtime};
 use burn::tensor::{
     DType, FloatDType, Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive,
     backend::Backend,
 };
 use burn_fusion::{
-    FusionBackend, FusionRuntime, FusionTensor,
+    FusionRuntime, FusionTensor,
     stream::{Operation, OperationStreams},
 };
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use cubecl::{CubeCount, CubeDim, prelude::*, wgpu::WgpuRuntime};
 use std::any::Any;
 
+/// One cube per row, 256 threads. A 4096-wide denoiser row is not scanned by one thread.
 #[cube(launch_unchecked)]
 fn quantize_rows(x: &Tensor<f32>, packed: &mut Tensor<i32>, scale: &mut Tensor<f32>, words: u32) {
-    let row = ABSOLUTE_POS;
+    let mut peaks = SharedMemory::<f32>::new(256usize);
+    let row = CUBE_POS_X as usize;
+    let tx = UNIT_POS_X as usize;
     let count = words as usize;
-    if row < x.shape(0) {
-        let width = count * 4;
-        let stride0 = x.stride(0) as usize;
-        let stride1 = x.stride(1) as usize;
-        let mut peak = 0.0f32;
-        for column in 0..width {
+    let width = count * 4;
+    let stride0 = x.stride(0) as usize;
+    let stride1 = x.stride(1) as usize;
+    let mut peak = 0.0f32;
+    let steps = (width + 255usize) / 256usize;
+    let word_steps = (count + 255usize) / 256usize;
+    for step in 0..steps {
+        let column = tx + step * 256usize;
+        if column < width {
             let value = x[row * stride0 + column * stride1];
             let magnitude = if value < 0.0 { -value } else { value };
             if magnitude > peak {
                 peak = magnitude;
             }
         }
+    }
+    peaks[tx] = peak;
+    sync_cube();
+    if tx == 0usize {
+        let mut maxp = 0.0f32;
+        for i in 0..256usize {
+            let value = peaks[i];
+            if value > maxp {
+                maxp = value;
+            }
+        }
         let floor = f32::new(1.0e-30_f32);
-        let row_scale = if peak / 127.0 > floor {
-            peak / 127.0
+        let row_scale = if maxp / 127.0 > floor {
+            maxp / 127.0
         } else {
             floor
         };
         scale[row] = row_scale;
-        for word in 0..count {
+        peaks[0] = row_scale;
+    }
+    sync_cube();
+    let row_scale = peaks[0];
+    for step in 0..word_steps {
+        let word = tx + step * 256usize;
+        if word < count {
             let base = row * stride0 + word * 4 * stride1;
             let q0 = quantize_i8(x[base] / row_scale);
             let q1 = quantize_i8(x[base + stride1] / row_scale);
@@ -70,12 +94,49 @@ fn quantize_i8(value: f32) -> i32 {
     i32::cast_from(clamped)
 }
 
+/// Sign-extend one little-endian byte. `shift` is 0, 8, 16, or 24.
 #[cube]
-fn unpack_i8(word: i32, lane: i32) -> i32 {
-    let byte = (word >> (lane * 8)) & 255;
-    if byte >= 128 { byte - 256 } else { byte }
+fn sext(word: i32, shift: i32) -> i32 {
+    let byte = (word >> shift) & 255;
+    byte - ((byte >> 7) * 256)
 }
 
+#[cube]
+fn dot4(x_word: i32, w_word: i32) -> i32 {
+    let x0 = sext(x_word, 0);
+    let x1 = sext(x_word, 8);
+    let x2 = sext(x_word, 16);
+    let x3 = sext(x_word, 24);
+    let w0 = sext(w_word, 0);
+    let w1 = sext(w_word, 8);
+    let w2 = sext(w_word, 16);
+    let w3 = sext(w_word, 24);
+    x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3
+}
+
+#[cube]
+fn sum4(word: i32) -> i32 {
+    sext(word, 0) + sext(word, 8) + sext(word, 16) + sext(word, 24)
+}
+
+#[cube]
+fn store(
+    out: &mut Tensor<f32>,
+    row: usize,
+    column: usize,
+    acc: i32,
+    sum: i32,
+    row_scale: f32,
+    w_scale: &Tensor<f32>,
+    w_zero: &Tensor<i32>,
+) {
+    let centered = acc - sum * w_zero[column];
+    out[row * out.stride(0) + column * out.stride(1)] =
+        f32::cast_from(centered) * row_scale * w_scale[column];
+}
+
+/// Eight columns per unit, two partial sums per column. The extra accumulators
+/// keep the int8 dot pipeline full on the 4096-wide denoiser projections.
 #[cube(launch_unchecked)]
 fn int8_dot(
     x_packed: &Tensor<i32>,
@@ -86,28 +147,134 @@ fn int8_dot(
     out: &mut Tensor<f32>,
     words: u32,
 ) {
-    let row = ABSOLUTE_POS_Y as usize;
-    let column = ABSOLUTE_POS_X as usize;
+    let row = (CUBE_POS_Y as usize) * 16usize + UNIT_POS_Y as usize;
+    let col0 = ((CUBE_POS_X as usize) * 16usize + UNIT_POS_X as usize) * 8usize;
     let count = words as usize;
-    if row < x_scale.shape(0) && column < w_scale.shape(0) {
-        let mut acc = 0i32;
+    let columns = w_scale.shape(0);
+    if row < x_scale.shape(0) && col0 + 7usize < columns {
+        let mut a0 = 0i32;
+        let mut a1 = 0i32;
+        let mut a2 = 0i32;
+        let mut a3 = 0i32;
+        let mut a4 = 0i32;
+        let mut a5 = 0i32;
+        let mut a6 = 0i32;
+        let mut a7 = 0i32;
+        let mut b0 = 0i32;
+        let mut b1 = 0i32;
+        let mut b2 = 0i32;
+        let mut b3 = 0i32;
+        let mut b4 = 0i32;
+        let mut b5 = 0i32;
+        let mut b6 = 0i32;
+        let mut b7 = 0i32;
+        let mut sum = 0i32;
+        let pairs = count / 2usize;
+        for pair in 0..pairs {
+            let word = pair * 2usize;
+            let x0 = x_packed[row * count + word];
+            let x1 = x_packed[row * count + word + 1usize];
+            sum += sum4(x0);
+            sum += sum4(x1);
+            a0 += dot4(x0, w_packed[col0 * count + word]);
+            b0 += dot4(x1, w_packed[col0 * count + word + 1usize]);
+            a1 += dot4(x0, w_packed[(col0 + 1usize) * count + word]);
+            b1 += dot4(x1, w_packed[(col0 + 1usize) * count + word + 1usize]);
+            a2 += dot4(x0, w_packed[(col0 + 2usize) * count + word]);
+            b2 += dot4(x1, w_packed[(col0 + 2usize) * count + word + 1usize]);
+            a3 += dot4(x0, w_packed[(col0 + 3usize) * count + word]);
+            b3 += dot4(x1, w_packed[(col0 + 3usize) * count + word + 1usize]);
+            a4 += dot4(x0, w_packed[(col0 + 4usize) * count + word]);
+            b4 += dot4(x1, w_packed[(col0 + 4usize) * count + word + 1usize]);
+            a5 += dot4(x0, w_packed[(col0 + 5usize) * count + word]);
+            b5 += dot4(x1, w_packed[(col0 + 5usize) * count + word + 1usize]);
+            a6 += dot4(x0, w_packed[(col0 + 6usize) * count + word]);
+            b6 += dot4(x1, w_packed[(col0 + 6usize) * count + word + 1usize]);
+            a7 += dot4(x0, w_packed[(col0 + 7usize) * count + word]);
+            b7 += dot4(x1, w_packed[(col0 + 7usize) * count + word + 1usize]);
+        }
+        if pairs * 2usize < count {
+            let word = pairs * 2usize;
+            let x0 = x_packed[row * count + word];
+            sum += sum4(x0);
+            a0 += dot4(x0, w_packed[col0 * count + word]);
+            a1 += dot4(x0, w_packed[(col0 + 1usize) * count + word]);
+            a2 += dot4(x0, w_packed[(col0 + 2usize) * count + word]);
+            a3 += dot4(x0, w_packed[(col0 + 3usize) * count + word]);
+            a4 += dot4(x0, w_packed[(col0 + 4usize) * count + word]);
+            a5 += dot4(x0, w_packed[(col0 + 5usize) * count + word]);
+            a6 += dot4(x0, w_packed[(col0 + 6usize) * count + word]);
+            a7 += dot4(x0, w_packed[(col0 + 7usize) * count + word]);
+        }
+        a0 += b0;
+        a1 += b1;
+        a2 += b2;
+        a3 += b3;
+        a4 += b4;
+        a5 += b5;
+        a6 += b6;
+        a7 += b7;
+        let row_scale = x_scale[row];
+        store(out, row, col0, a0, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 1usize, a1, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 2usize, a2, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 3usize, a3, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 4usize, a4, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 5usize, a5, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 6usize, a6, sum, row_scale, w_scale, w_zero);
+        store(out, row, col0 + 7usize, a7, sum, row_scale, w_scale, w_zero);
+    } else if row < x_scale.shape(0) && col0 < columns {
+        let mut a0 = 0i32;
+        let mut a1 = 0i32;
+        let mut a2 = 0i32;
+        let mut a3 = 0i32;
+        let mut a4 = 0i32;
+        let mut a5 = 0i32;
+        let mut a6 = 0i32;
         let mut sum = 0i32;
         for word in 0..count {
             let x_word = x_packed[row * count + word];
-            let w_word = w_packed[column * count + word];
-            let x0 = unpack_i8(x_word, 0);
-            let x1 = unpack_i8(x_word, 1);
-            let x2 = unpack_i8(x_word, 2);
-            let x3 = unpack_i8(x_word, 3);
-            acc += x0 * unpack_i8(w_word, 0);
-            acc += x1 * unpack_i8(w_word, 1);
-            acc += x2 * unpack_i8(w_word, 2);
-            acc += x3 * unpack_i8(w_word, 3);
-            sum += x0 + x1 + x2 + x3;
+            sum += sum4(x_word);
+            a0 += dot4(x_word, w_packed[col0 * count + word]);
+            if col0 + 1usize < columns {
+                a1 += dot4(x_word, w_packed[(col0 + 1usize) * count + word]);
+            }
+            if col0 + 2usize < columns {
+                a2 += dot4(x_word, w_packed[(col0 + 2usize) * count + word]);
+            }
+            if col0 + 3usize < columns {
+                a3 += dot4(x_word, w_packed[(col0 + 3usize) * count + word]);
+            }
+            if col0 + 4usize < columns {
+                a4 += dot4(x_word, w_packed[(col0 + 4usize) * count + word]);
+            }
+            if col0 + 5usize < columns {
+                a5 += dot4(x_word, w_packed[(col0 + 5usize) * count + word]);
+            }
+            if col0 + 6usize < columns {
+                a6 += dot4(x_word, w_packed[(col0 + 6usize) * count + word]);
+            }
         }
-        let centered = acc - sum * w_zero[column];
-        out[row * out.stride(0) + column * out.stride(1)] =
-            f32::cast_from(centered) * x_scale[row] * w_scale[column];
+        let row_scale = x_scale[row];
+        store(out, row, col0, a0, sum, row_scale, w_scale, w_zero);
+        if col0 + 1usize < columns {
+            store(out, row, col0 + 1usize, a1, sum, row_scale, w_scale, w_zero);
+        }
+        if col0 + 2usize < columns {
+            store(out, row, col0 + 2usize, a2, sum, row_scale, w_scale, w_zero);
+        }
+        if col0 + 3usize < columns {
+            store(out, row, col0 + 3usize, a3, sum, row_scale, w_scale, w_zero);
+        }
+        if col0 + 4usize < columns {
+            store(out, row, col0 + 4usize, a4, sum, row_scale, w_scale, w_zero);
+        }
+        if col0 + 5usize < columns {
+            store(out, row, col0 + 5usize, a5, sum, row_scale, w_scale, w_zero);
+        }
+        if col0 + 6usize < columns {
+            store(out, row, col0 + 6usize, a6, sum, row_scale, w_scale, w_zero);
+        }
     }
 }
 
@@ -123,6 +290,15 @@ fn empty_tensor(like: &RawTensor, shape: Shape, dtype: DType) -> RawTensor {
 }
 
 fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTensor) -> RawTensor {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(out) = crate::int8_tensorops::try_launch(
+        x.clone(),
+        w_packed.clone(),
+        w_scale.clone(),
+        w_zero.clone(),
+    ) {
+        return out;
+    }
     let x_shape = x.shape();
     let rows = x_shape[0];
     let width = x_shape[1];
@@ -135,7 +311,7 @@ fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTens
     unsafe {
         quantize_rows::launch_unchecked::<WgpuRuntime>(
             &client,
-            CubeCount::Static((rows as u32).div_ceil(256), 1, 1),
+            CubeCount::Static(rows as u32, 1, 1),
             CubeDim::new_1d(256),
             x.into_tensor_arg(),
             x_packed.clone().into_tensor_arg(),
@@ -144,7 +320,11 @@ fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTens
         );
         int8_dot::launch_unchecked::<WgpuRuntime>(
             &out.client,
-            CubeCount::Static((columns as u32).div_ceil(16), (rows as u32).div_ceil(16), 1),
+            CubeCount::Static(
+                (columns as u32).div_ceil(8).div_ceil(16),
+                (rows as u32).div_ceil(16),
+                1,
+            ),
             CubeDim::new_2d(16, 16),
             x_packed.into_tensor_arg(),
             x_scale.into_tensor_arg(),

@@ -1284,19 +1284,68 @@ impl DialectWmmaCompiler<Self> for MslDialect {
             frag_c: c,
             frag_d: d,
         } = mma;
-        if (shape.m, shape.n, shape.k) != (16, 32, 16)
+        let transpose_b = shape.transpose_b;
+        if shape.device_tile {
+            let rows = shape.m;
+            let cols = shape.n;
+            let inner = shape.k;
+            // Four SIMD groups, one 64×64 output tile, K consumed inside matmul2d.
+            return writeln!(
+                f,
+                "{{
+auto a = tensor(reinterpret_cast<device int8_t*>(const_cast<device int*>({a})), dextents<int, 2>{{{inner}, {rows}}}, array<int, 2>{{1, {inner}}});
+auto b = tensor(reinterpret_cast<device int8_t*>(const_cast<device int*>({b})), dextents<int, 2>{{{inner}, {cols}}}, array<int, 2>{{1, {inner}}});
+auto d = tensor({d}, dextents<int, 2>{{{cols}, {rows}}}, array<int, 2>{{1, {cols}}});
+auto ta = a.slice(0, int(threadgroup_pos_in_grid.y) * 64);
+auto tb = b.slice(0, int(threadgroup_pos_in_grid.x) * 64);
+auto td = d.slice(int(threadgroup_pos_in_grid.x) * 64, int(threadgroup_pos_in_grid.y) * 64);
+constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, int(dynamic_extent), false, true, false);
+mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+auto accum = op.get_destination_cooperative_tensor<decltype(ta), decltype(tb), int>();
+op.run(ta, tb, accum);
+accum.store(td);
+}}"
+            );
+        }
+        let shape_ok = (shape.m, shape.n, shape.k) == (16, 32, 16);
+        let scalar = a.item().vectorization == 1
+            && b.item().vectorization == 1
+            && c.item().vectorization == 1
+            && d.item().vectorization == 1;
+        // int8 values live in i32 registers. The calling CubeCL kernel uses the M5 lane map.
+        if shape_ok
+            && scalar
+            && a.elem() == Elem::I32
+            && b.elem() == Elem::I32
+            && c.elem() == Elem::I32
+            && d.elem() == Elem::I32
+        {
+            return writeln!(f, "{{
+constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+    16, 32, 16, false, {transpose_b}, false,
+    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+auto a = op.get_left_input_cooperative_tensor<int8_t, int8_t, int>();
+auto b = op.get_right_input_cooperative_tensor<int8_t, int8_t, int>();
+auto c = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>, metal::remove_addrspace_t<decltype(b)>, int>();
+#pragma clang loop unroll(full)
+for (ushort i = 0; i < 8; ++i) a[i] = int8_t({a}[i]);
+#pragma clang loop unroll(full)
+for (ushort i = 0; i < 16; ++i) {{ b[i] = int8_t({b}[i]); c[i] = {c}[i]; }}
+op.run(a, b, c);
+#pragma clang loop unroll(full)
+for (ushort i = 0; i < 16; ++i) {d}[i] = c[i];
+}}");
+        }
+        if !shape_ok
+            || !scalar
             || a.elem() != Elem::F16
             || b.elem() != Elem::F16
             || c.elem() != Elem::F32
             || d.elem() != Elem::F32
-            || a.item().vectorization != 1
-            || b.item().vectorization != 1
-            || c.item().vectorization != 1
-            || d.item().vectorization != 1
         {
             return f.write_str("#error unsupported Metal manual MMA shape or type\n");
         }
-        let transpose_b = shape.transpose_b;
         // Compiler lowering only. Tiling, loads, masks, softmax and accumulation
         // scheduling are expressed by the calling Rust/CubeCL kernel.
         writeln!(f, "{{

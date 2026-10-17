@@ -11,7 +11,7 @@
 
 ## Consequences
 
-- Qwen-Image-2.1-Turbo 去噪器可以加载 `Qwen-Image-2.1-Turbo-INT8-ConvRot.safetensors`，并在 group 256 Hadamard 旋转后走 Burn/CubeCL 的 int8 matmul。
-- 该 int8 内核不调用 Metal TensorOps。既有 FP16 TensorOps 大矩阵路径保持原样。若某次计算必须跑在 ANE 上，才允许改用 Metal TensorOps。
+- Qwen-Image-2.1-Turbo 去噪器可以加载 `Qwen-Image-2.1-Turbo-INT8-ConvRot.safetensors`，并在 group 256 Hadamard 旋转后走 int8 matmul。
+- 2026-10-17 的测量改写了「GPU 上不用 TensorOps」这一条。M5 上同一形状的 `matmul2d`（`int8 × int8 → int32`）GPU 时间约 0.17–0.94 ms，CubeCL 宽内核的孤立时间约 3.1–8.7 ms。256² 热机去噪从约 15.9 s 降到约 1.4 s。因此 Apple10 上的 ConvRot 点积改用这条 TensorOps，累加仍是 int32，权重仍不在加载点展开成 FP16。`OMNI_CONVROT_TENSOROPS=0` 退回 CubeCL。既有 FP16 TensorOps 路径不改。ANE 仍未参与。
 - 不把 MiniCPM-V 的官方 int4 检查点改成 int8 计算，也不因此重开 Hy-MT2、Confucius4-R2T2、Breeze-TTS-2 和音乐模型的量化。
 - 验收看 int8 矩阵乘相对同一权重的 FP16 反量化参考是否保持约定误差，以及去噪步是否真的走 int8 内核而不是加载点展开。

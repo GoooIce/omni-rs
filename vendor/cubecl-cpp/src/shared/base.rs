@@ -895,11 +895,18 @@ impl<D: Dialect> CppCompiler<D> {
             } => WmmaInstruction::ExecuteManual {
                 // Generic MmaDefinition uses ident A. An explicit ident B can
                 // describe the RHS layout for Metal's cooperative tensor op.
-                shape: MmaShape::new(matrix.m as u32, matrix.n as u32, matrix.k as u32)
-                    .with_transpose_b(
-                        matrix.ident == gpu::MatrixIdent::B
-                            && matrix.layout == gpu::MatrixLayout::ColMajor,
-                    ),
+                shape: {
+                    if matrix.ident == gpu::MatrixIdent::Accumulator {
+                        // The 64×64 tile reads threadgroup_pos_in_grid.
+                        self.flags.indexes.cube_pos_tuple = true;
+                    }
+                    MmaShape::new(matrix.m as u32, matrix.n as u32, matrix.k as u32)
+                        .with_transpose_b(
+                            matrix.ident == gpu::MatrixIdent::B
+                                && matrix.layout == gpu::MatrixLayout::ColMajor,
+                        )
+                        .with_device_tile(matrix.ident == gpu::MatrixIdent::Accumulator)
+                },
                 frag_a: self.compile_variable(registers_a),
                 frag_b: self.compile_variable(registers_b),
                 frag_c: self.compile_variable(registers_c),

@@ -17,6 +17,8 @@ use std::{
 };
 
 pub mod int8_matmul;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod int8_tensorops;
 pub mod paged;
 
 pub type Raw = CubeBackend<WgpuRuntime, f32, i32, u8>;

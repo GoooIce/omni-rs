@@ -3816,6 +3816,10 @@ dependencies = [
  "burn-fusion",
  "burn-ir",
  "cubecl",
+ "cubecl-cpp",
+ "cubecl-runtime",
+ "objc2-metal",
+ "wgpu",
 ]
 
 [[package]]
