@@ -101,19 +101,17 @@ impl<B: Backend> SparseMoeBlock<B> {
         name: &str,
         config: &TextConfig,
         p: Precision,
-        mode: quant::LoadMode,
         d: &B::Device,
     ) -> Result<Self> {
         let geo = geometry(config);
         let hidden = config.hidden_size;
         let intermediate = geo.expert_intermediate;
         let load = |expert: usize, projection: &str, shape: [usize; 2]| {
-            quant::load_packed(
+            quant::load_for_backend(
                 w,
                 &format!("{name}.experts.{expert}.{projection}.weight_packed"),
                 &format!("{name}.experts.{expert}.{projection}.weight_scale"),
                 shape,
-                mode,
                 p,
                 d,
             )

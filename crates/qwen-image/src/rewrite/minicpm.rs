@@ -5,7 +5,7 @@
 //! system prompts, message shape and sampling profiles owned by the parent
 //! module. t2i is a text-only ChatML conversation; edit assembles the same
 //! messages with the ordered source images through
-//! [`omni_minicpm_v::multimodal::Multimodal::build_prompt_multi`], where the
+//! [`omni_minicpm_v::prompt::assemble`], where the
 //! i-th image becomes the `<image_id>i</image_id>` the official edit prompt
 //! addresses as `<image1>`…`<imageN>`.
 //!
@@ -32,7 +32,8 @@ use omni_minicpm_v::{
     config::{MiniCpmConfig, ModelDirectory},
     generate,
     model::TextModel,
-    multimodal::{self, Multimodal, Prompt},
+    multimodal::Multimodal,
+    prompt::{self, Prompt},
     tokenizer::MiniCpmTokenizer,
 };
 use omni_r2t2::Precision;
@@ -89,14 +90,10 @@ impl<B: Backend> MinicpmRewriter<B> {
             .tokenizer()
             .map_err(|e| Error::Config(format!("rewrite：读取 {model_dir:?} 的分词器失败：{e}")))?;
         let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
-        // Mirrors the minicpm-v CLI (ADR-0001 W4A16): int4 stays packed on
-        // cubecl backends; the CPU reference path dequantizes at load.
-        #[cfg(any(feature = "metal", feature = "webgpu"))]
-        let quant = omni_minicpm_v::quant::LoadMode::Packed;
-        #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
-        let quant = omni_minicpm_v::quant::LoadMode::Dequantize;
-        let model = TextModel::<B>::load_with(&weights, &config, precision, device, Some(quant))
-            .map_err(Error::Weights)?;
+        // ADR-0001 W4A16: the MiniCPM-V loader keeps int4 resident on cubecl
+        // and dequantizes at load on NdArray.
+        let model =
+            TextModel::<B>::load(&weights, &config, precision, device).map_err(Error::Weights)?;
         let vision =
             Multimodal::<B>::load(&weights, &config, precision, device).map_err(Error::Weights)?;
         Ok(Self {
@@ -120,27 +117,23 @@ impl<B: Backend> MinicpmRewriter<B> {
     ) -> Result<Prompt<B>> {
         let messages = build_messages(profile, prompt, images)?;
         let chat_messages = to_chat_messages(&messages);
-        match profile {
-            TaskProfile::T2i => {
-                let rendered = chat::render(&chat_messages, true, Some(false))
-                    .map_err(|e| Error::Config(format!("rewrite：渲染 ChatML 失败：{e}")))?;
-                Ok(Prompt::text(self.tokenizer.encode(&rendered)))
-            }
-            TaskProfile::Edit => self
-                .vision
-                .build_prompt_multi(multimodal::MultiBuild {
-                    tokenizer: &self.tokenizer,
-                    model: &self.model,
-                    config: &self.config,
-                    model_dir: &self.model_dir,
-                    messages: &chat_messages,
-                    images,
-                    enable_thinking: Some(false),
-                    device: &self.device,
-                    precision: self.precision,
-                })
-                .map_err(Error::Config),
-        }
+        let image_paths: &[PathBuf] = match profile {
+            TaskProfile::T2i => &[],
+            TaskProfile::Edit => images,
+        };
+        prompt::assemble(prompt::Request {
+            vision: Some(&self.vision),
+            tokenizer: &self.tokenizer,
+            model: &self.model,
+            config: &self.config,
+            model_dir: &self.model_dir,
+            messages: &chat_messages,
+            images: image_paths,
+            enable_thinking: Some(false),
+            device: &self.device,
+            precision: self.precision,
+        })
+        .map_err(Error::Config)
     }
 }
 

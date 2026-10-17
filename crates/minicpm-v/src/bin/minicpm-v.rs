@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use omni_minicpm_v::{
-    chat::{self, Message, Role},
+    chat::{Message, Part, Role},
     config::ModelDirectory,
     doctor, generate,
     model::TextModel,
-    multimodal::{self, Prompt},
+    multimodal, prompt,
 };
 use std::{
     io::Write,
@@ -130,31 +130,30 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         "f32" => omni_r2t2::Precision::F32,
         other => return Err(format!("precision must be f16 or f32, got {other}").into()),
     };
-    // ADR-0001 W4A16: keep int4 resident on cubecl backends and dequantize in
-    // the matmul kernel; the CPU reference path dequantizes at load (NdArray
-    // cannot hold sub-byte tensors). The vendored burn-cubecl tune fix makes
+    // ADR-0001 W4A16: the loader keeps int4 resident on cubecl backends and
+    // dequantizes at load on NdArray. The vendored burn-cubecl tune fix makes
     // the fused path safe for the expert shapes and single-token GEMV.
-    #[cfg(any(feature = "metal", feature = "webgpu"))]
-    let quant_mode = omni_minicpm_v::quant::LoadMode::Packed;
-    #[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
-    let quant_mode = omni_minicpm_v::quant::LoadMode::Dequantize;
-    let model = TextModel::<B>::load_with(&weights, &config, precision, device, Some(quant_mode))?;
+    let model = TextModel::<B>::load(&weights, &config, precision, device)?;
 
     let prompt = match &options.image {
         Some(image) => {
             let vision = multimodal::Multimodal::<B>::load(&weights, &config, precision, device)?;
-            vision
-                .build_prompt(multimodal::Build::<B> {
-                    tokenizer: &tokenizer,
-                    model: &model,
-                    config: &config,
-                    model_dir: &options.model,
-                    image,
-                    prompt: &options.prompt,
-                    device,
-                    precision,
-                })
-                .map_err(|e| e.to_string())?
+            let messages = vec![Message {
+                role: Role::User,
+                content: vec![Part::Image, Part::Text(options.prompt.clone())],
+            }];
+            prompt::assemble(prompt::Request {
+                vision: Some(&vision),
+                tokenizer: &tokenizer,
+                model: &model,
+                config: &config,
+                model_dir: &options.model,
+                messages: &messages,
+                images: std::slice::from_ref(image),
+                enable_thinking: None,
+                device,
+                precision,
+            })?
         }
         None => {
             let mut messages = Vec::new();
@@ -162,8 +161,18 @@ fn run_generate<B: burn::tensor::backend::Backend>(
                 messages.push(Message::text(Role::System, system.clone()));
             }
             messages.push(Message::text(Role::User, options.prompt.clone()));
-            let rendered = chat::render(&messages, true, None)?;
-            Prompt::text(tokenizer.encode(&rendered))
+            prompt::assemble(prompt::Request {
+                vision: None,
+                tokenizer: &tokenizer,
+                model: &model,
+                config: &config,
+                model_dir: &options.model,
+                messages: &messages,
+                images: &[],
+                enable_thinking: None,
+                device,
+                precision,
+            })?
         }
     };
     eprintln!(
