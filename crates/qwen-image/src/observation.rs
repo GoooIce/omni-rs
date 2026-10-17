@@ -1,5 +1,5 @@
 use super::{Options, gaussian_noise};
-use crate::projection::{ConditionProjection, ProjectionSource};
+use crate::projection::{ConditionProjection, MiniCpm35bProjection, ProjectionSource};
 use crate::{Error, Result};
 
 /// Default Qwen-Image-2.1-Turbo schedule length. The checkpoint sigmas stay as loaded.
@@ -81,6 +81,7 @@ impl OfficialObservation {
 pub enum ObservationRow {
     Official,
     MiniCpm1b,
+    MiniCpm35b,
 }
 
 /// One trajectory inside a denoising observation. Histories are not shared.
@@ -105,6 +106,10 @@ impl Trajectory {
 
     pub fn is_minicpm_v_4_7_1b(&self) -> bool {
         self.row == ObservationRow::MiniCpm1b
+    }
+
+    pub fn is_minicpm_v_4_7_35b(&self) -> bool {
+        self.row == ObservationRow::MiniCpm35b
     }
 
     pub fn prompt(&self) -> &str {
@@ -132,11 +137,12 @@ impl Trajectory {
     }
 }
 
-/// Official text row plus the MiniCPM-V-4.7-1B projection row.
+/// Official text row, then MiniCPM-V-4.7-1B, then MiniCPM-V-4.7-35B-A3B-int4.
 pub struct DenoisingObservation {
-    trajectories: [Trajectory; 2],
-    cells: [Vec<ObservationCell>; 2],
+    trajectories: [Trajectory; 3],
+    cells: [Vec<ObservationCell>; 3],
     projection: Option<ConditionProjection>,
+    projection_35b: Option<MiniCpm35bProjection>,
 }
 
 impl DenoisingObservation {
@@ -163,16 +169,26 @@ impl DenoisingObservation {
                 },
                 Trajectory {
                     row: ObservationRow::MiniCpm1b,
+                    prompt: prompt.clone(),
+                    seed,
+                    width,
+                    height,
+                    initial_noise: noise.clone(),
+                    attention_history: 2,
+                },
+                Trajectory {
+                    row: ObservationRow::MiniCpm35b,
                     prompt,
                     seed,
                     width,
                     height,
                     initial_noise: noise,
-                    attention_history: 2,
+                    attention_history: 3,
                 },
             ],
-            cells: [Vec::new(), Vec::new()],
+            cells: [Vec::new(), Vec::new(), Vec::new()],
             projection: None,
+            projection_35b: None,
         })
     }
 
@@ -180,9 +196,10 @@ impl DenoisingObservation {
     pub fn open(
         request: ObservationRequest,
         steps: usize,
-        source: ProjectionSource<'_>,
+        minicpm_1b: ProjectionSource<'_>,
+        minicpm_35b: ProjectionSource<'_>,
     ) -> Result<Self> {
-        let projection = match source {
+        let projection = match minicpm_1b {
             ProjectionSource::Weights(path) => ConditionProjection::load(path)?,
             ProjectionSource::Untrained => {
                 return Err(Error::Config(
@@ -193,8 +210,20 @@ impl DenoisingObservation {
                 return Err(Error::Config("去噪观察不会退回 JSON 改写".into()));
             }
         };
+        let projection_35b = match minicpm_35b {
+            ProjectionSource::Weights(path) => MiniCpm35bProjection::load(path)?,
+            ProjectionSource::Untrained => {
+                return Err(Error::Config(
+                    "去噪观察不能用未训练的 MiniCPM-V-4.7-35B-A3B-int4 投影出图".into(),
+                ));
+            }
+            ProjectionSource::JsonRewrite => {
+                return Err(Error::Config("去噪观察不会退回 JSON 改写".into()));
+            }
+        };
         let mut observation = Self::begin(request, steps)?;
         observation.projection = Some(projection);
+        observation.projection_35b = Some(projection_35b);
         Ok(observation)
     }
 
@@ -206,6 +235,7 @@ impl DenoisingObservation {
         match row {
             ObservationRow::Official => &self.cells[0],
             ObservationRow::MiniCpm1b => &self.cells[1],
+            ObservationRow::MiniCpm35b => &self.cells[2],
         }
     }
 
@@ -219,6 +249,7 @@ impl DenoisingObservation {
         let cells = match row {
             ObservationRow::Official => &mut self.cells[0],
             ObservationRow::MiniCpm1b => &mut self.cells[1],
+            ObservationRow::MiniCpm35b => &mut self.cells[2],
         };
         if step != cells.len() + 1 || step > DEFAULT_TURBO_STEPS {
             return Err(Error::Config(
@@ -238,6 +269,10 @@ impl DenoisingObservation {
         self.projection.as_ref()
     }
 
+    pub fn projection_35b(&self) -> Option<&MiniCpm35bProjection> {
+        self.projection_35b.as_ref()
+    }
+
     pub fn uses_negative_guidance(&self) -> bool {
         false
     }
@@ -253,14 +288,14 @@ impl RequestKind {
     pub fn trajectories(&self) -> usize {
         match self {
             Self::Ordinary { .. } => 1,
-            Self::OfficialObservation(_) => 2,
+            Self::OfficialObservation(_) => 3,
         }
     }
 
     pub fn retained_decodes(&self) -> usize {
         match self {
             Self::Ordinary { .. } => 1,
-            Self::OfficialObservation(_) => DEFAULT_TURBO_STEPS * 2,
+            Self::OfficialObservation(_) => DEFAULT_TURBO_STEPS * 3,
         }
     }
 
@@ -272,6 +307,10 @@ impl RequestKind {
     }
 
     pub fn loads_minicpm_v(&self) -> bool {
+        matches!(self, Self::OfficialObservation(_))
+    }
+
+    pub fn loads_minicpm_35b(&self) -> bool {
         matches!(self, Self::OfficialObservation(_))
     }
 

@@ -176,6 +176,7 @@ pub struct Model<B: Backend> {
     pub vae: Vae<B>,
     vision: Option<Vision<B>>,
     minicpm_1b: Option<crate::minicpm_condition::MiniCpm1bText>,
+    minicpm_35b: Option<crate::minicpm_condition::MiniCpm35bText>,
     root: PathBuf,
     precision: Precision,
     device: B::Device,
@@ -217,6 +218,7 @@ impl<B: Backend> Model<B> {
             vae,
             vision: None,
             minicpm_1b: None,
+            minicpm_35b: None,
             root: root.to_owned(),
             precision,
             device: device.clone(),
@@ -252,9 +254,9 @@ impl<B: Backend> Model<B> {
         self.finish_generation(state, cancel, &mut progress)
     }
 
-    /// Two trajectories: official text, then the fitted MiniCPM-V-4.7-1B projection.
-    /// They share the prompt, seed, canvas and initial noise. Each keeps its own
-    /// attention cache. Guidance stays off.
+    /// Three trajectories: official text, the fitted 1B projection, then the fitted
+    /// 35B projection. They share the prompt, seed, canvas and initial noise.
+    /// Each keeps its own attention cache. Guidance stays off.
     pub fn observe(
         &mut self,
         options: &Options,
@@ -265,15 +267,17 @@ impl<B: Backend> Model<B> {
         let kind = options.request_kind()?;
         let refused = kind.negative_guidance()
             || !kind.loads_minicpm_v()
+            || !kind.loads_minicpm_35b()
             || !kind.reads_projection_weights()
-            || kind.trajectories() != 2
+            || kind.trajectories() != 3
             || !kind.decodes_after_each_step();
         let RequestKind::OfficialObservation(request) = kind else {
             return Err(Error::Config("去噪观察尚未开启".into()));
         };
         if refused {
             return Err(Error::Config(
-                "去噪观察要同时跑官方文本条件和 MiniCPM-V-4.7-1B 投影条件，且没有负向引导".into(),
+                "去噪观察要同时跑官方文本条件、MiniCPM-V-4.7-1B 投影和 MiniCPM-V-4.7-35B-A3B-int4 投影，且没有负向引导"
+                    .into(),
             ));
         }
         if self.config.sigmas.len() != DEFAULT_TURBO_STEPS {
@@ -281,12 +285,13 @@ impl<B: Backend> Model<B> {
                 "去噪观察要求默认 Turbo 的 {DEFAULT_TURBO_STEPS} 步调度"
             )));
         }
+        let weights_1b = crate::projection::default_projection_weights_path();
+        let weights_35b = crate::projection::default_35b_projection_weights_path();
         let mut observation = DenoisingObservation::open(
             request,
             self.config.sigmas.len(),
-            crate::projection::ProjectionSource::Weights(
-                &crate::projection::default_projection_weights_path(),
-            ),
+            crate::projection::ProjectionSource::Weights(&weights_1b),
+            crate::projection::ProjectionSource::Weights(&weights_35b),
         )?;
         let projection = observation.projection().cloned().ok_or_else(|| {
             Error::Config(
@@ -294,8 +299,15 @@ impl<B: Backend> Model<B> {
                     .into(),
             )
         })?;
+        let projection_35b = observation.projection_35b().cloned().ok_or_else(|| {
+            Error::Config(
+                "去噪观察缺少 MiniCPM-V-4.7-35B-A3B-int4 投影权重，不能用未训练投影出图，也不会退回 JSON 改写"
+                    .into(),
+            )
+        })?;
         let noise = observation.trajectories()[0].initial_noise().to_vec();
         let last_layer = self.minicpm_1b()?.last_layer(options.prompt.as_str())?;
+        let last_layer_35b = self.minicpm_35b()?.last_layer(options.prompt.as_str())?;
         let mut official =
             self.prepare_generation(options, cancel, &mut progress, Some(noise.clone()))?;
         if official.negative.is_some() {
@@ -304,11 +316,23 @@ impl<B: Backend> Model<B> {
         let official_length = official.text.dims()[1];
         if official.text.dims()[2] != crate::projection::CONDITION_WIDTH {
             return Err(Error::Config(
-                "官方文本条件的宽度不是 4096，无法对齐 MiniCPM-V-4.7-1B 投影".into(),
+                "官方文本条件的宽度不是 4096，无法对齐投影条件".into(),
             ));
         }
         let projected = projection.project_last_layer(&last_layer, official_length)?;
-        let mut minicpm = self.trajectory_with_condition(&official, &noise, projected.values())?;
+        let projected_35b = projection_35b.project_last_layer(&last_layer_35b, official_length)?;
+        let mut minicpm = self.trajectory_with_condition(
+            &official,
+            &noise,
+            projected.values(),
+            "MiniCPM-V-4.7-1B",
+        )?;
+        let mut minicpm_35b = self.trajectory_with_condition(
+            &official,
+            &noise,
+            projected_35b.values(),
+            "MiniCPM-V-4.7-35B-A3B-int4",
+        )?;
         while official.step < self.config.sigmas.len() {
             check_cancel(cancel)?;
             progress(Progress {
@@ -317,12 +341,17 @@ impl<B: Backend> Model<B> {
                 total: self.config.sigmas.len(),
             });
             self.advance_generations(
-                &mut [(&mut official, cancel), (&mut minicpm, cancel)],
+                &mut [
+                    (&mut official, cancel),
+                    (&mut minicpm, cancel),
+                    (&mut minicpm_35b, cancel),
+                ],
                 &mut progress,
             )?;
             for (row, state) in [
                 (crate::ObservationRow::Official, &official),
                 (crate::ObservationRow::MiniCpm1b, &minicpm),
+                (crate::ObservationRow::MiniCpm35b, &minicpm_35b),
             ] {
                 let image = self.decode_latents(
                     state.latents.clone(),
@@ -351,17 +380,26 @@ impl<B: Backend> Model<B> {
         Ok(self.minicpm_1b.as_ref().unwrap())
     }
 
+    fn minicpm_35b(&mut self) -> Result<&crate::minicpm_condition::MiniCpm35bText> {
+        if self.minicpm_35b.is_none() {
+            let dir = crate::minicpm_condition::default_minicpm_35b_dir(&self.root);
+            self.minicpm_35b = Some(crate::minicpm_condition::MiniCpm35bText::load(&dir)?);
+        }
+        Ok(self.minicpm_35b.as_ref().unwrap())
+    }
+
     fn trajectory_with_condition(
         &self,
         official: &Generation<B>,
         noise: &[f32],
         condition: &[f32],
+        label: &str,
     ) -> Result<Generation<B>> {
         let length = official.text.dims()[1];
         if condition.len() != length * crate::projection::CONDITION_WIDTH {
-            return Err(Error::Config(
-                "MiniCPM-V-4.7-1B 投影与官方文本条件长度不一致".into(),
-            ));
+            return Err(Error::Config(format!(
+                "{label} 投影与官方文本条件长度不一致"
+            )));
         }
         let text = Tensor::<B, 3>::from_data(
             TensorData::new(
@@ -1009,6 +1047,7 @@ mod tests {
         assert_eq!(kind.retained_decodes(), 1);
         assert!(kind.negative_guidance());
         assert!(!kind.loads_minicpm_v());
+        assert!(!kind.loads_minicpm_35b());
         assert!(!kind.reads_projection_weights());
         assert!(!kind.decodes_after_each_step());
 
@@ -1022,18 +1061,20 @@ mod tests {
         let kind = options.request_kind().unwrap();
         assert_eq!(kind.trajectories(), 1);
         assert!(!kind.loads_minicpm_v());
+        assert!(!kind.loads_minicpm_35b());
         assert!(!kind.reads_projection_weights());
         assert!(!kind.decodes_after_each_step());
     }
 
     #[test]
-    fn observation_adds_a_minicpm_1b_trajectory_on_the_official_noise() {
+    fn observation_runs_official_1b_and_35b_on_one_noise() {
         let options = plain_observation();
         let kind = options.request_kind().unwrap();
-        assert_eq!(kind.trajectories(), 2);
-        assert_eq!(kind.retained_decodes(), 16);
+        assert_eq!(kind.trajectories(), 3);
+        assert_eq!(kind.retained_decodes(), 24);
         assert!(!kind.negative_guidance());
         assert!(kind.loads_minicpm_v());
+        assert!(kind.loads_minicpm_35b());
         assert!(kind.reads_projection_weights());
         assert!(kind.decodes_after_each_step());
 
@@ -1043,24 +1084,35 @@ mod tests {
         )
         .unwrap();
         let trajectories = observation.trajectories();
-        assert_eq!(trajectories.len(), 2);
+        assert_eq!(trajectories.len(), 3);
         let official = &trajectories[0];
         let minicpm = &trajectories[1];
+        let large = &trajectories[2];
         assert!(official.is_official_text());
         assert!(minicpm.is_minicpm_v_4_7_1b());
+        assert!(large.is_minicpm_v_4_7_35b());
+        assert!(!official.is_minicpm_v_4_7_35b());
+        assert!(!large.is_minicpm_v_4_7_1b());
         assert_eq!(official.prompt(), "一只茶壶");
         assert_eq!(official.prompt(), minicpm.prompt());
+        assert_eq!(official.prompt(), large.prompt());
         assert_eq!(official.seed(), minicpm.seed());
+        assert_eq!(official.seed(), large.seed());
         assert_eq!(official.seed(), 7);
         assert_eq!(official.canvas(), minicpm.canvas());
+        assert_eq!(official.canvas(), large.canvas());
         assert_eq!(official.canvas(), (512, 512));
         assert!(!official.guidance_enabled());
         assert!(!minicpm.guidance_enabled());
+        assert!(!large.guidance_enabled());
         assert!(!observation.uses_negative_guidance());
         let expected = gaussian_noise(64 * (512 / 16) * (512 / 16), 7);
         assert_eq!(official.initial_noise(), expected.as_slice());
         assert_eq!(official.initial_noise(), minicpm.initial_noise());
+        assert_eq!(official.initial_noise(), large.initial_noise());
         assert_ne!(official.attention_history(), minicpm.attention_history());
+        assert_ne!(official.attention_history(), large.attention_history());
+        assert_ne!(minicpm.attention_history(), large.attention_history());
 
         let other = DenoisingObservation::begin(
             ObservationRequest::accept(&Options {
@@ -1078,6 +1130,10 @@ mod tests {
         assert_eq!(
             other.trajectories()[0].initial_noise(),
             other.trajectories()[1].initial_noise()
+        );
+        assert_eq!(
+            other.trajectories()[0].initial_noise(),
+            other.trajectories()[2].initial_noise()
         );
     }
 
@@ -1121,26 +1177,33 @@ mod tests {
     }
 
     #[test]
-    fn observation_fails_explicitly_without_fitted_1b_projection_weights() {
+    fn observation_fails_explicitly_without_either_fitted_projection() {
         use crate::projection::{
-            ConditionProjection, ProjectionSource, Sequence, text_to_image_split,
+            ConditionProjection, MiniCpm35bProjection, ProjectionSource, Sequence,
+            text_to_image_split,
         };
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let request = || ObservationRequest::accept(&plain_observation()).unwrap();
-        let missing = std::env::temp_dir().join(format!(
-            "omni-1b-missing-{}-{}.bin",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing_1b = std::env::temp_dir().join(format!(
+            "omni-1b-missing-{}-{stamp}.bin",
+            std::process::id()
         ));
-        let _ = std::fs::remove_file(&missing);
+        let missing_35b = std::env::temp_dir().join(format!(
+            "omni-35b-missing-{}-{stamp}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing_1b);
+        let _ = std::fs::remove_file(&missing_35b);
         let absent = match DenoisingObservation::open(
             request(),
             DEFAULT_TURBO_STEPS,
-            ProjectionSource::Weights(&missing),
+            ProjectionSource::Weights(&missing_1b),
+            ProjectionSource::Weights(&missing_35b),
         ) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("missing weights must not open an observation"),
@@ -1148,12 +1211,13 @@ mod tests {
         assert!(absent.contains("投影"), "{absent}");
         assert!(absent.contains("未训练"), "{absent}");
         assert!(absent.contains("改写"), "{absent}");
-        assert!(!missing.exists());
+        assert!(!missing_1b.exists());
 
         let untrained = match DenoisingObservation::open(
             request(),
             DEFAULT_TURBO_STEPS,
             ProjectionSource::Untrained,
+            ProjectionSource::Weights(&missing_35b),
         ) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("an untrained projection must not open an observation"),
@@ -1164,6 +1228,7 @@ mod tests {
             request(),
             DEFAULT_TURBO_STEPS,
             ProjectionSource::JsonRewrite,
+            ProjectionSource::Weights(&missing_35b),
         ) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("JSON rewrite must not open an observation"),
@@ -1171,8 +1236,11 @@ mod tests {
         assert!(rewrite.contains("改写"), "{rewrite}");
 
         let init = ConditionProjection::deterministic_init(4).unwrap();
-        let init_path = missing.with_extension("init.bin");
+        let init_path = missing_1b.with_extension("init.bin");
         assert!(init.save(&init_path).is_err());
+        let init_35b = MiniCpm35bProjection::deterministic_init().unwrap();
+        let init_35b_path = missing_35b.with_extension("init.bin");
+        assert!(init_35b.save(&init_35b_path).is_err());
 
         let (train_prompts, _) = text_to_image_split();
         let train: Vec<_> = (0..train_prompts.len())
@@ -1183,19 +1251,84 @@ mod tests {
             })
             .collect();
         let fitted = ConditionProjection::fit(&train).unwrap();
-        let fitted_path = missing.with_extension("fitted.bin");
+        let fitted_path = missing_1b.with_extension("fitted.bin");
         fitted.save(&fitted_path).unwrap();
+
+        let absent_35b = match DenoisingObservation::open(
+            request(),
+            DEFAULT_TURBO_STEPS,
+            ProjectionSource::Weights(&fitted_path),
+            ProjectionSource::Weights(&missing_35b),
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("missing 35B weights must not open an observation"),
+        };
+        assert!(absent_35b.contains("35B"), "{absent_35b}");
+        assert!(absent_35b.contains("投影"), "{absent_35b}");
+        assert!(absent_35b.contains("未训练"), "{absent_35b}");
+        assert!(absent_35b.contains("改写"), "{absent_35b}");
+        assert!(!missing_35b.exists());
+
+        let untrained_35b = match DenoisingObservation::open(
+            request(),
+            DEFAULT_TURBO_STEPS,
+            ProjectionSource::Weights(&fitted_path),
+            ProjectionSource::Untrained,
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("an untrained 35B projection must not open an observation"),
+        };
+        assert!(untrained_35b.contains("35B"), "{untrained_35b}");
+        assert!(untrained_35b.contains("未训练"), "{untrained_35b}");
+
+        let rewrite_35b = match DenoisingObservation::open(
+            request(),
+            DEFAULT_TURBO_STEPS,
+            ProjectionSource::Weights(&fitted_path),
+            ProjectionSource::JsonRewrite,
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("JSON rewrite must not open an observation"),
+        };
+        assert!(rewrite_35b.contains("改写"), "{rewrite_35b}");
+
+        let mixed = match DenoisingObservation::open(
+            request(),
+            DEFAULT_TURBO_STEPS,
+            ProjectionSource::Weights(&fitted_path),
+            ProjectionSource::Weights(&fitted_path),
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("1B weights must not stand in for the 35B projection"),
+        };
+        assert!(mixed.contains("35B"), "{mixed}");
+
+        let train_35b: Vec<_> = (0..train_prompts.len())
+            .map(|index| {
+                let input =
+                    Sequence::last_layer(1, MiniCpm35bProjection::HIDDEN, vec![index as f32; 2048])
+                        .unwrap();
+                let target = Sequence::last_layer(1, 4096, vec![0.2; 4096]).unwrap();
+                (input, target)
+            })
+            .collect();
+        let fitted_35b = MiniCpm35bProjection::fit(&train_35b).unwrap();
+        let fitted_35b_path = missing_35b.with_extension("fitted.bin");
+        fitted_35b.save(&fitted_35b_path).unwrap();
         let opened = match DenoisingObservation::open(
             request(),
             DEFAULT_TURBO_STEPS,
             ProjectionSource::Weights(&fitted_path),
+            ProjectionSource::Weights(&fitted_35b_path),
         ) {
             Ok(observation) => observation,
             Err(error) => panic!("fitted weights should open, got {error}"),
         };
         assert!(opened.cells(ObservationRow::Official).is_empty());
         assert!(opened.cells(ObservationRow::MiniCpm1b).is_empty());
-        assert_eq!(opened.trajectories().len(), 2);
+        assert!(opened.cells(ObservationRow::MiniCpm35b).is_empty());
+        assert_eq!(opened.trajectories().len(), 3);
         let _ = std::fs::remove_file(&fitted_path);
+        let _ = std::fs::remove_file(&fitted_35b_path);
     }
 }

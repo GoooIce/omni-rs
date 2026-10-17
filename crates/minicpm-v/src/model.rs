@@ -130,6 +130,27 @@ impl<B: Backend> TextModel<B> {
         positions: Option<&[[i64; 3]]>,
         state: &mut DecodeState<B>,
     ) -> omni_r2t2::Result<Tensor<B, 3>> {
+        self.last_layer_sequence_with(
+            ids,
+            embeddings,
+            positions,
+            state,
+            omni_r2t2::tensor::AttentionKernel::Automatic,
+        )
+    }
+
+    /// Same sequence as [`Self::last_layer_sequence`], with an explicit attention kernel.
+    ///
+    /// `ImageAligned` keeps variable prompt lengths on matmul/softmax. Eager Metal
+    /// autotune can reuse a stage size that does not divide the next prompt.
+    pub fn last_layer_sequence_with(
+        &self,
+        ids: &[u32],
+        embeddings: Option<Tensor<B, 3>>,
+        positions: Option<&[[i64; 3]]>,
+        state: &mut DecodeState<B>,
+        kernel: omni_r2t2::tensor::AttentionKernel,
+    ) -> omni_r2t2::Result<Tensor<B, 3>> {
         // The activation dtype follows the loaded weights (F16 on GPU, F32 on
         // the CPU reference path); every stage derives from `hidden`.
         let mut hidden = match embeddings {
@@ -162,7 +183,7 @@ impl<B: Backend> TextModel<B> {
                 Layer::Full(layer) => {
                     let cache = &mut state.kv[kv_index];
                     kv_index += 1;
-                    layer.forward(hidden, &cos, &sin, Some(cache))
+                    layer.forward_with_kernel(hidden, &cos, &sin, Some(cache), kernel)
                 }
                 Layer::Linear(layer) => {
                     let cache = &mut state.linear[linear_index];

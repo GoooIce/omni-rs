@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 
 type Native = burn::backend::NdArray;
 
+fn default_device<B: Backend>() -> B::Device {
+    B::Device::default()
+}
+
 struct Loaded<B: Backend> {
     model: TextModel<B>,
     tokenizer: MiniCpmTokenizer,
@@ -105,4 +109,125 @@ pub fn default_minicpm_1b_dir(qwen_root: &Path) -> PathBuf {
         .parent()
         .map(|parent| parent.join("MiniCPM-V-4.7-1B"))
         .unwrap_or_else(|| PathBuf::from("models/MiniCPM-V-4.7-1B"))
+}
+
+/// Text-only last layer of MiniCPM-V-4.7-35B-A3B-int4.
+///
+/// qwen-image's fused Metal wrapper panics when in-kernel int4 dequant and F16
+/// activations disagree on dtype, so this loader uses the raw cube backend and
+/// keeps int4 packed. A full NdArray load would dequantize those experts.
+/// Full-attention layers use the image-aligned fallback: eager Metal autotune
+/// can keep a stage size that does not divide the next prompt. This path never
+/// opens an image or the JSON rewriter.
+#[cfg(any(feature = "metal", feature = "webgpu"))]
+type MiniCpm35bBackend = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
+#[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
+type MiniCpm35bBackend = burn::backend::NdArray;
+
+pub struct MiniCpm35bText {
+    inner: Loaded<MiniCpm35bBackend>,
+}
+
+impl MiniCpm35bText {
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        if !model_dir.join("config.json").is_file() {
+            return Err(Error::Config(format!(
+                "去噪观察缺少 MiniCPM-V-4.7-35B-A3B-int4 检查点 {}，不能用未训练投影出图，也不会退回 JSON 改写",
+                model_dir.display()
+            )));
+        }
+        let directory = ModelDirectory::new(model_dir);
+        let config = directory.config().map_err(|e| {
+            Error::Config(format!(
+                "读取 MiniCPM-V-4.7-35B-A3B-int4 配置失败（{}）：{e}",
+                model_dir.display()
+            ))
+        })?;
+        if config.text_config.hidden_size != crate::projection::MiniCpm35bProjection::HIDDEN {
+            return Err(Error::Config(format!(
+                "MiniCPM-V-4.7-35B-A3B-int4 的最后一层宽度是 {}，观察要求 2048",
+                config.text_config.hidden_size
+            )));
+        }
+        let tokenizer = directory.tokenizer().map_err(|e| {
+            Error::Config(format!(
+                "读取 MiniCPM-V-4.7-35B-A3B-int4 分词器失败（{}）：{e}",
+                model_dir.display()
+            ))
+        })?;
+        let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
+        #[cfg(any(feature = "metal", feature = "webgpu"))]
+        let quant = omni_minicpm_v::quant::LoadMode::Packed;
+        #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
+        let quant = omni_minicpm_v::quant::LoadMode::Dequantize;
+        #[cfg(any(feature = "metal", feature = "webgpu"))]
+        let precision = Precision::F16;
+        #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
+        let precision = Precision::F32;
+        let device = default_device::<MiniCpm35bBackend>();
+        let model = TextModel::<MiniCpm35bBackend>::load_with(
+            &weights,
+            &config,
+            precision,
+            &device,
+            Some(quant),
+        )
+        .map_err(Error::Weights)?;
+        Ok(Self {
+            inner: Loaded {
+                model,
+                tokenizer,
+                device,
+            },
+        })
+    }
+
+    /// Last-layer sequence for a text prompt. No image and no JSON rewrite.
+    pub fn last_layer(&self, prompt: &str) -> Result<Sequence> {
+        let rendered =
+            chat::render(&[Message::text(Role::User, prompt)], false, None).map_err(|e| {
+                Error::Config(format!("MiniCPM-V-4.7-35B-A3B-int4 提示词渲染失败：{e}"))
+            })?;
+        let ids = self.inner.tokenizer.encode(&rendered);
+        let mut state = self.inner.model.new_state(&self.inner.device);
+        let hidden = self
+            .inner
+            .model
+            .last_layer_sequence_with(
+                &ids,
+                None,
+                None,
+                &mut state,
+                omni_r2t2::tensor::AttentionKernel::ImageAligned,
+            )
+            .map_err(Error::Weights)?;
+        let dims = hidden.dims();
+        if dims[2] != crate::projection::MiniCpm35bProjection::HIDDEN {
+            return Err(Error::Config(format!(
+                "MiniCPM-V-4.7-35B-A3B-int4 的最后一层宽度是 {}，观察要求 2048",
+                dims[2]
+            )));
+        }
+        MiniCpm35bBackend::sync(&self.inner.device).map_err(|e| Error::Config(e.to_string()))?;
+        let values = hidden
+            .cast(burn::tensor::FloatDType::F32)
+            .into_data()
+            .to_vec::<f32>()
+            .map_err(|e| {
+                Error::Config(format!(
+                    "读取 MiniCPM-V-4.7-35B-A3B-int4 最后一层失败：{e:?}"
+                ))
+            })?;
+        Sequence::last_layer(dims[1], dims[2], values)
+    }
+}
+
+pub fn default_minicpm_35b_dir(qwen_root: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("OMNI_MINICPM_35B") {
+        return PathBuf::from(path);
+    }
+    qwen_root
+        .parent()
+        .map(|parent| parent.join("MiniCPM-V-4.7-35B-A3B-int4"))
+        .unwrap_or_else(|| PathBuf::from("models/MiniCPM-V-4.7-35B-A3B-int4"))
 }

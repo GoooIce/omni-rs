@@ -262,6 +262,7 @@ impl Worker {
                 let name = match row {
                     ObservationRow::Official => "官方文本条件",
                     ObservationRow::MiniCpm1b => "MiniCPM-V-4.7-1B 投影",
+                    ObservationRow::MiniCpm35b => "MiniCPM-V-4.7-35B-A3B-int4 投影",
                 };
                 let mut update = Update::status(
                     "observation",
@@ -281,10 +282,11 @@ impl Worker {
         let (width, height) = observation.trajectories()[0].canvas();
         let official = observation.cells(ObservationRow::Official).len();
         let minicpm = observation.cells(ObservationRow::MiniCpm1b).len();
+        let large = observation.cells(ObservationRow::MiniCpm35b).len();
         let mut update = Update::status(
             "done",
             format!(
-                "去噪观察完成 · 官方 {official} 格 · MiniCPM-V-4.7-1B {minicpm} 格 · {width} × {height}"
+                "去噪观察完成 · 官方 {official} 格 · MiniCPM-V-4.7-1B {minicpm} 格 · MiniCPM-V-4.7-35B-A3B-int4 {large} 格 · {width} × {height}"
             ),
         );
         update.progress = 1.0;

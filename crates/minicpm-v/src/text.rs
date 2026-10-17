@@ -227,6 +227,17 @@ impl<B: Backend> FullAttention<B> {
         sin: &Tensor<B, 3>,
         cache: Option<&mut KvCache<B>>,
     ) -> Tensor<B, 3> {
+        self.forward_with_kernel(x, cos, sin, cache, shared::AttentionKernel::Automatic)
+    }
+
+    pub fn forward_with_kernel(
+        &self,
+        x: Tensor<B, 3>,
+        cos: &Tensor<B, 3>,
+        sin: &Tensor<B, 3>,
+        cache: Option<&mut KvCache<B>>,
+        kernel: shared::AttentionKernel,
+    ) -> Tensor<B, 3> {
         let [_, seq, _width] = x.dims();
         let dtype = shared::dtype(&x);
         let projected = self.q.forward(x.clone());
@@ -281,6 +292,7 @@ impl<B: Backend> FullAttention<B> {
             AttentionOptions {
                 causal: true,
                 offset,
+                kernel,
                 ..Default::default()
             },
         );
@@ -384,9 +396,22 @@ impl<B: Backend> FullLayer<B> {
         sin: &Tensor<B, 3>,
         cache: Option<&mut KvCache<B>>,
     ) -> Tensor<B, 3> {
+        self.forward_with_kernel(x, cos, sin, cache, shared::AttentionKernel::Automatic)
+    }
+
+    pub fn forward_with_kernel(
+        &self,
+        x: Tensor<B, 3>,
+        cos: &Tensor<B, 3>,
+        sin: &Tensor<B, 3>,
+        cache: Option<&mut KvCache<B>>,
+        kernel: shared::AttentionKernel,
+    ) -> Tensor<B, 3> {
         let dtype = shared::dtype(&x);
         let normed = self.input_norm.forward(x.clone(), dtype);
-        let attended = self.attn.forward(normed, cos, sin, cache);
+        let attended = self
+            .attn
+            .forward_with_kernel(normed, cos, sin, cache, kernel);
         let x = shared::residual(x, attended, dtype);
         let mlp = self
             .feed_forward

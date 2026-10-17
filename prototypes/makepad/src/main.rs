@@ -581,6 +581,18 @@ script_mod! {
                                                     image_1b_step_7 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
                                                     image_1b_step_8 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
                                                 }
+                                                image_35b_caption := MutedLabel{text: "MiniCPM-V-4.7-35B-A3B-int4 投影"}
+                                                image_35b_steps := View{
+                                                    width: Fill height: Fill flow: Right spacing: 4
+                                                    image_35b_step_1 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_2 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_3 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_4 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_5 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_6 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_7 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                    image_35b_step_8 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                }
                                             }
                                         }
                                         image_settings_toggle := QuietButton{text: "尺寸与更多参数" height: 32}

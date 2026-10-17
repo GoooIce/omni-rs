@@ -25,15 +25,15 @@ pub mod text;
 pub mod vae;
 pub mod vision;
 pub use config::Config;
-pub use minicpm_condition::MiniCpm1bText;
+pub use minicpm_condition::{MiniCpm1bText, MiniCpm35bText};
 pub use pipeline::{
     BatchStats, DEFAULT_TURBO_STEPS, DenoisingObservation, GeneratedImage, ImageBatch, Model,
     ObservationCell, ObservationRequest, ObservationRow, OfficialObservation, Options, Report,
     RequestKind, Trajectory,
 };
 pub use projection::{
-    CONDITION_WIDTH, ConditionProjection, Sequence, default_projection_weights_path,
-    text_to_image_split,
+    CONDITION_WIDTH, ConditionProjection, MiniCpm35bProjection, Sequence,
+    default_35b_projection_weights_path, default_projection_weights_path, text_to_image_split,
 };
 
 pub use omni_r2t2::Precision;

@@ -315,6 +315,177 @@ fn missing_projection() -> Error {
     )
 }
 
+/// Linear map from a MiniCPM-V-4.7-35B-A3B-int4 last layer onto the official condition.
+///
+/// The local checkpoint's text hidden size is 2048. Fitting reuses
+/// [`ConditionProjection`]; this type only fixes that width and its own weight file.
+#[derive(Clone)]
+pub struct MiniCpm35bProjection {
+    inner: ConditionProjection,
+}
+
+impl MiniCpm35bProjection {
+    /// Hidden size of the local MiniCPM-V-4.7-35B-A3B-int4 text tower.
+    pub const HIDDEN: usize = 2048;
+
+    pub fn from_linear(weight: &[f32], bias: &[f32]) -> Result<Self> {
+        let inner = ConditionProjection::from_linear(weight, bias)?;
+        if inner.in_width != Self::HIDDEN {
+            return Err(Error::Config(
+                "MiniCPM-V-4.7-35B-A3B-int4 投影的输入宽度必须是 2048".into(),
+            ));
+        }
+        Ok(Self { inner })
+    }
+
+    pub fn project_last_layer(
+        &self,
+        sequence: &Sequence,
+        official_length: usize,
+    ) -> Result<Sequence> {
+        if sequence.width() != Self::HIDDEN {
+            return Err(Error::Config(
+                "最后一层序列的宽度与 MiniCPM-V-4.7-35B-A3B-int4 投影不一致，应为 2048".into(),
+            ));
+        }
+        self.inner.project_last_layer(sequence, official_length)
+    }
+
+    pub fn project_image(&self, _image: &[u8], _official_length: usize) -> Result<Sequence> {
+        Err(Error::Config(
+            "MiniCPM-V-4.7-35B-A3B-int4 的投影条件不读图像".into(),
+        ))
+    }
+
+    pub fn project_json_rewrite(
+        &self,
+        _rewritten: &str,
+        _official_length: usize,
+    ) -> Result<Sequence> {
+        Err(Error::Config(
+            "MiniCPM-V-4.7-35B-A3B-int4 的投影条件不调用 JSON 改写".into(),
+        ))
+    }
+
+    /// All-zero 2048→4096 map, before any of the shared training prompts update it.
+    pub fn deterministic_init() -> Result<Self> {
+        Ok(Self {
+            inner: ConditionProjection::deterministic_init(Self::HIDDEN)?,
+        })
+    }
+
+    /// Fit on the shared text-to-image pairs. Inputs must already be width 2048.
+    pub fn fit(train: &[(Sequence, Sequence)]) -> Result<Self> {
+        if train.iter().any(|(input, _)| input.width() != Self::HIDDEN) {
+            return Err(Error::Config(
+                "MiniCPM-V-4.7-35B-A3B-int4 投影拟合的最后一层宽度必须是 2048".into(),
+            ));
+        }
+        Ok(Self {
+            inner: ConditionProjection::fit(train)?,
+        })
+    }
+
+    pub fn mean_squared_error(&self, pairs: &[(Sequence, Sequence)]) -> Result<f32> {
+        self.inner.mean_squared_error(pairs)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if !self.inner.fitted {
+            return Err(Error::Config(
+                "去噪观察不能用未训练的 MiniCPM-V-4.7-35B-A3B-int4 投影出图".into(),
+            ));
+        }
+        if self.inner.in_width != Self::HIDDEN {
+            return Err(Error::Config(
+                "MiniCPM-V-4.7-35B-A3B-int4 投影的输入宽度必须是 2048".into(),
+            ));
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut bytes =
+            Vec::with_capacity(20 + (self.inner.weight.len() + self.inner.bias.len()) * 4);
+        bytes.extend_from_slice(b"OM35");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(self.inner.in_width as u32).to_le_bytes());
+        bytes.extend_from_slice(&(CONDITION_WIDTH as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        for value in self.inner.weight.iter().chain(self.inner.bias.iter()) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Err(missing_35b_projection());
+        }
+        let bytes = std::fs::read(path)?;
+        let mut cursor = 0usize;
+        let mut take = |len: usize| -> Result<&[u8]> {
+            let end = cursor + len;
+            let slice = bytes.get(cursor..end).ok_or_else(|| {
+                Error::Config("MiniCPM-V-4.7-35B-A3B-int4 投影权重无法读取".into())
+            })?;
+            cursor = end;
+            Ok(slice)
+        };
+        if take(4)? != b"OM35" {
+            return Err(Error::Config(
+                "MiniCPM-V-4.7-35B-A3B-int4 投影权重无法读取".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        let in_width = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let out_width = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let fitted = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        if version != 1 || out_width != CONDITION_WIDTH || in_width != Self::HIDDEN {
+            return Err(Error::Config(
+                "MiniCPM-V-4.7-35B-A3B-int4 投影权重无法读取".into(),
+            ));
+        }
+        if fitted != 1 {
+            return Err(Error::Config(
+                "去噪观察不能用未训练的 MiniCPM-V-4.7-35B-A3B-int4 投影出图".into(),
+            ));
+        }
+        let mut weight = vec![0.0; in_width * CONDITION_WIDTH];
+        let mut bias = vec![0.0; CONDITION_WIDTH];
+        for value in weight.iter_mut().chain(bias.iter_mut()) {
+            *value = f32::from_le_bytes(take(4)?.try_into().unwrap());
+        }
+        if cursor != bytes.len() {
+            return Err(Error::Config(
+                "MiniCPM-V-4.7-35B-A3B-int4 投影权重无法读取".into(),
+            ));
+        }
+        Self::from_linear(&weight, &bias).map(|mut projection| {
+            projection.inner.fitted = true;
+            projection
+        })
+    }
+}
+
+pub fn default_35b_projection_weights_path() -> PathBuf {
+    std::env::var_os("OMNI_35B_PROJECTION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("artifacts/minicpm-v-4.7-35b-a3b/text-condition-projection.bin")
+        })
+}
+
+fn missing_35b_projection() -> Error {
+    Error::Config(
+        "去噪观察缺少 MiniCPM-V-4.7-35B-A3B-int4 投影权重，不能用未训练投影出图，也不会退回 JSON 改写"
+            .into(),
+    )
+}
+
 fn ridge_fit(
     inputs: &[f32],
     targets: &[f32],
@@ -449,6 +620,98 @@ mod tests {
         }
         let target = Sequence::last_layer(length, CONDITION_WIDTH, target).unwrap();
         (input, target)
+    }
+
+    #[test]
+    fn minicpm_35b_projection_matches_the_official_condition_shape() {
+        const HIDDEN: usize = 2048;
+        assert_eq!(MiniCpm35bProjection::HIDDEN, HIDDEN);
+
+        let mut weight = vec![0.0; HIDDEN * CONDITION_WIDTH];
+        weight[0] = 2.0;
+        let mut bias = vec![0.0; CONDITION_WIDTH];
+        bias[0] = 1.0;
+        let projection = MiniCpm35bProjection::from_linear(&weight, &bias).unwrap();
+        assert!(
+            MiniCpm35bProjection::from_linear(
+                &vec![0.0; 1024 * CONDITION_WIDTH],
+                &vec![0.0; CONDITION_WIDTH],
+            )
+            .is_err()
+        );
+
+        let mut aligned_values = vec![0.0; 2 * HIDDEN];
+        aligned_values[0] = 3.0;
+        aligned_values[HIDDEN] = 4.0;
+        let aligned = Sequence::last_layer(2, HIDDEN, aligned_values).unwrap();
+        let same_length = projection.project_last_layer(&aligned, 2).unwrap();
+        assert_eq!(same_length.length(), 2);
+        assert_eq!(same_length.width(), CONDITION_WIDTH);
+        assert_eq!(same_length.get(0, 0), 7.0);
+        assert_eq!(same_length.get(1, 0), 9.0);
+        assert_eq!(same_length.get(0, 1), 0.0);
+
+        let mut stretched_values = vec![0.0; 2 * HIDDEN];
+        stretched_values[HIDDEN] = 10.0;
+        let stretched = Sequence::last_layer(2, HIDDEN, stretched_values).unwrap();
+        let output = projection.project_last_layer(&stretched, 3).unwrap();
+        assert_eq!(output.length(), 3);
+        assert_eq!(output.width(), CONDITION_WIDTH);
+        assert_eq!(output.get(0, 0), 1.0);
+        assert_eq!(output.get(1, 0), 11.0);
+        assert_eq!(output.get(2, 0), 21.0);
+        assert_eq!(output.get(2, 4095), 0.0);
+
+        let narrow = Sequence::last_layer(1, 1024, vec![0.0; 1024]).unwrap();
+        let mismatch = projection
+            .project_last_layer(&narrow, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("2048"), "{mismatch}");
+
+        let image = projection
+            .project_image(&[9, 9, 9], 3)
+            .unwrap_err()
+            .to_string();
+        assert!(image.contains("图像"), "{image}");
+        let rewritten = projection
+            .project_json_rewrite("{\"rewritten_prompt\":\"一只茶壶\"}", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(rewritten.contains("改写"), "{rewritten}");
+    }
+
+    #[test]
+    fn minicpm_35b_holdout_condition_error_beats_its_untrained_init() {
+        let (train_prompts, holdout_prompts) = text_to_image_split();
+        assert_eq!(train_prompts.len(), 16);
+        assert_eq!(holdout_prompts, HOLDOUT);
+        assert_eq!(train_prompts[0], "一只白瓷茶壶放在木桌上，窗边有柔和的晨光");
+        assert_eq!(train_prompts[15], "渔港清晨的木船，筐里是银色的鱼");
+        assert!(train_prompts.iter().all(|prompt| !HOLDOUT.contains(prompt)));
+
+        let hidden = MiniCpm35bProjection::HIDDEN;
+        let train: Vec<_> = (0..train_prompts.len())
+            .map(|index| synthetic_pair(index, hidden))
+            .collect();
+        let holdout: Vec<_> = (0..holdout_prompts.len())
+            .map(|index| synthetic_pair(16 + index, hidden))
+            .collect();
+        let init = MiniCpm35bProjection::deterministic_init().unwrap();
+        let fitted = MiniCpm35bProjection::fit(&train).unwrap();
+        let init_mse = init.mean_squared_error(&holdout).unwrap();
+        let fitted_mse = fitted.mean_squared_error(&holdout).unwrap();
+        assert!(
+            fitted_mse < init_mse,
+            "fitted {fitted_mse} vs init {init_mse}"
+        );
+        let pixels = Sequence::last_layer(1, 3, vec![1.0, 2.0, 3.0]).unwrap();
+        assert!(
+            fitted
+                .mean_squared_error(&[(holdout[0].0.clone(), pixels)])
+                .is_err()
+        );
+        assert!(MiniCpm35bProjection::fit(&[synthetic_pair(0, 4)]).is_err());
     }
 
     #[test]

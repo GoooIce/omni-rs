@@ -380,7 +380,9 @@ impl App {
                         let (width, height) = i.observation_board.canvas();
                         let official = i.observation_board.rows()[0].cells().len();
                         let minicpm = i.observation_board.rows()[1].cells().len();
-                        (official + minicpm > 0).then_some((official, minicpm, width, height))
+                        let large = i.observation_board.rows()[2].cells().len();
+                        (official + minicpm + large > 0)
+                            .then_some((official, minicpm, large, width, height))
                     } else {
                         None
                     };
@@ -445,11 +447,11 @@ impl App {
                             .set_text(cx, "图像预览");
                         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
                     }
-                    if let Some((official, minicpm, width, height)) = observed {
+                    if let Some((official, minicpm, large, width, height)) = observed {
                         self.ui.label(cx, ids!(image_metrics)).set_text(
                             cx,
                             &format!(
-                                "官方 {official} 格 · MiniCPM-V-4.7-1B {minicpm} 格 · 解码 {width}×{height}"
+                                "官方 {official} 格 · MiniCPM-V-4.7-1B {minicpm} 格 · MiniCPM-V-4.7-35B-A3B-int4 {large} 格 · 解码 {width}×{height}"
                             ),
                         );
                     }
@@ -834,7 +836,7 @@ impl App {
             self.image_status(
                 cx,
                 if observing {
-                    "开始去噪观察 · 官方文本条件在上，1B 投影在下 · 八步都会留下"
+                    "开始去噪观察 · 官方、1B、35B 三行 · 八步都会留下"
                 } else {
                     "开始生成 · 首次运行需编译 GPU 算子…"
                 },
@@ -926,6 +928,7 @@ impl OfficialRow {
 struct ObservationBoard {
     official: OfficialRow,
     minicpm_1b: OfficialRow,
+    minicpm_35b: OfficialRow,
 }
 
 impl ObservationBoard {
@@ -933,18 +936,20 @@ impl ObservationBoard {
         Self {
             official: OfficialRow::new(canvas_width, canvas_height),
             minicpm_1b: OfficialRow::new(canvas_width, canvas_height),
+            minicpm_35b: OfficialRow::new(canvas_width, canvas_height),
         }
     }
 
-    fn row_order(&self) -> [omni_qwen_image::ObservationRow; 2] {
+    fn row_order(&self) -> [omni_qwen_image::ObservationRow; 3] {
         [
             omni_qwen_image::ObservationRow::Official,
             omni_qwen_image::ObservationRow::MiniCpm1b,
+            omni_qwen_image::ObservationRow::MiniCpm35b,
         ]
     }
 
-    fn rows(&self) -> [&OfficialRow; 2] {
-        [&self.official, &self.minicpm_1b]
+    fn rows(&self) -> [&OfficialRow; 3] {
+        [&self.official, &self.minicpm_1b, &self.minicpm_35b]
     }
 
     fn canvas(&self) -> (u32, u32) {
@@ -966,6 +971,9 @@ impl ObservationBoard {
             omni_qwen_image::ObservationRow::MiniCpm1b => {
                 self.minicpm_1b.show(step, width, height, pixels)
             }
+            omni_qwen_image::ObservationRow::MiniCpm35b => {
+                self.minicpm_35b.show(step, width, height, pixels)
+            }
         }
     }
 }
@@ -973,7 +981,7 @@ impl ObservationBoard {
 impl App {
     fn paint_observation(&mut self, cx: &mut Cx) {
         let order = self.image.as_ref().unwrap().observation_board.row_order();
-        let painted: [Vec<Option<(u32, u32, Vec<u32>)>>; 2] = {
+        let painted: [Vec<Option<(u32, u32, Vec<u32>)>>; 3] = {
             let board = &self.image.as_ref().unwrap().observation_board;
             std::array::from_fn(|row| {
                 (0..8)
@@ -1009,6 +1017,9 @@ impl App {
                     omni_qwen_image::ObservationRow::MiniCpm1b => {
                         self.set_minicpm_step(cx, index + 1, texture);
                     }
+                    omni_qwen_image::ObservationRow::MiniCpm35b => {
+                        self.set_35b_step(cx, index + 1, texture);
+                    }
                 }
             }
         }
@@ -1029,6 +1040,10 @@ impl App {
         self.ui.label(cx, ids!(image_1b_caption)).set_text(
             cx,
             &format!("MiniCPM-V-4.7-1B 投影 · 解码 {width}×{height}{scale}"),
+        );
+        self.ui.label(cx, ids!(image_35b_caption)).set_text(
+            cx,
+            &format!("MiniCPM-V-4.7-35B-A3B-int4 投影 · 解码 {width}×{height}{scale}"),
         );
         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
     }
@@ -1057,6 +1072,20 @@ impl App {
             6 => self.ui.image(cx, ids!(image_1b_step_6)),
             7 => self.ui.image(cx, ids!(image_1b_step_7)),
             _ => self.ui.image(cx, ids!(image_1b_step_8)),
+        };
+        image.set_texture(cx, texture);
+    }
+
+    fn set_35b_step(&mut self, cx: &mut Cx, step: usize, texture: Option<Texture>) {
+        let image = match step {
+            1 => self.ui.image(cx, ids!(image_35b_step_1)),
+            2 => self.ui.image(cx, ids!(image_35b_step_2)),
+            3 => self.ui.image(cx, ids!(image_35b_step_3)),
+            4 => self.ui.image(cx, ids!(image_35b_step_4)),
+            5 => self.ui.image(cx, ids!(image_35b_step_5)),
+            6 => self.ui.image(cx, ids!(image_35b_step_6)),
+            7 => self.ui.image(cx, ids!(image_35b_step_7)),
+            _ => self.ui.image(cx, ids!(image_35b_step_8)),
         };
         image.set_texture(cx, texture);
     }
@@ -1126,7 +1155,11 @@ mod tests {
         let mut board = ObservationBoard::new(320, 240);
         assert_eq!(
             board.row_order(),
-            [ObservationRow::Official, ObservationRow::MiniCpm1b]
+            [
+                ObservationRow::Official,
+                ObservationRow::MiniCpm1b,
+                ObservationRow::MiniCpm35b,
+            ]
         );
         for step in 1..=8 {
             board
@@ -1151,10 +1184,10 @@ mod tests {
             assert_eq!(rows[1].slots()[0].unwrap().width, 320);
             assert_eq!(rows[1].slots()[0].unwrap().height, 240);
         }
-        assert!(board
-            .rows()
+        assert!(board.rows()[..2]
             .iter()
             .all(|row| row.slots().iter().all(|slot| slot.is_some())));
+        assert!(board.rows()[2].cells().is_empty());
         assert!(board
             .show(ObservationRow::MiniCpm1b, 1, 320, 240, &paint(99))
             .is_err());
@@ -1164,6 +1197,76 @@ mod tests {
             .show(ObservationRow::MiniCpm1b, 9, 64, 64, &vec![0; 64 * 64 * 4],)
             .is_err());
         assert_eq!(board.rows()[1].canvas(), (320, 240));
+        assert_eq!(board.rows()[1].slots()[7].unwrap().pixels[0], 18);
+    }
+
+    #[test]
+    fn minicpm_35b_decodes_stay_under_the_1b_row() {
+        let mut board = ObservationBoard::new(320, 240);
+        assert_eq!(
+            board.row_order(),
+            [
+                ObservationRow::Official,
+                ObservationRow::MiniCpm1b,
+                ObservationRow::MiniCpm35b,
+            ]
+        );
+        for step in 1..=8 {
+            board
+                .show(ObservationRow::Official, step, 320, 240, &paint(step as u8))
+                .unwrap();
+            board
+                .show(
+                    ObservationRow::MiniCpm1b,
+                    step,
+                    320,
+                    240,
+                    &paint(step as u8 + 10),
+                )
+                .unwrap();
+            board
+                .show(
+                    ObservationRow::MiniCpm35b,
+                    step,
+                    320,
+                    240,
+                    &paint(step as u8 + 20),
+                )
+                .unwrap();
+            let rows = board.rows();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].cells().len(), step);
+            assert_eq!(rows[1].cells().len(), step);
+            assert_eq!(rows[2].cells().len(), step);
+            assert_eq!(rows[0].slots()[0].unwrap().pixels[0], 1);
+            assert_eq!(rows[1].slots()[0].unwrap().pixels[0], 11);
+            assert_eq!(rows[2].slots()[0].unwrap().pixels[0], 21);
+            assert_eq!(rows[2].slots()[0].unwrap().width, 320);
+            assert_eq!(rows[2].slots()[0].unwrap().height, 240);
+        }
+        assert_eq!(
+            board
+                .rows()
+                .iter()
+                .map(|row| row.cells().len())
+                .sum::<usize>(),
+            24
+        );
+        assert!(board
+            .rows()
+            .iter()
+            .all(|row| row.slots().iter().all(|slot| slot.is_some())));
+        assert!(board
+            .show(ObservationRow::MiniCpm35b, 1, 320, 240, &paint(99))
+            .is_err());
+        assert_eq!(board.rows()[2].cells().len(), 8);
+        assert_eq!(board.rows()[2].slots()[0].unwrap().pixels[0], 21);
+        assert!(board
+            .show(ObservationRow::MiniCpm35b, 9, 64, 64, &vec![0; 64 * 64 * 4],)
+            .is_err());
+        assert_eq!(board.rows()[2].canvas(), (320, 240));
+        assert_eq!(board.rows()[2].slots()[7].unwrap().pixels[0], 28);
+        assert_eq!(board.rows()[0].slots()[7].unwrap().pixels[0], 8);
         assert_eq!(board.rows()[1].slots()[7].unwrap().pixels[0], 18);
     }
 }
