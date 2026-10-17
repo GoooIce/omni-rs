@@ -1,0 +1,44 @@
+# omni-rs
+
+> 纯 Rust / Burn 0.21 的本地多模态推理套件。在 Apple Silicon 上跑流式语音识别、翻译、语音合成、图像理解、文生图与音乐生成。推理不调用 Python 或远程服务。默认后端是 Metal。
+
+权重不在仓库里。数值、耗时和未通过的验收以 VALIDATION.md 为准，不要从 README 的摘要外推。
+
+## 先读
+
+- [README](README.md)：能力、第一条命令、API 与后端选择
+- [VALIDATION](VALIDATION.md)：M5 Max 上的数值对照、RTF 和范围
+- [开发工作流](docs/agent-workflow.md)：`./scripts/check` 的 quick / cpu / metal / native，以及 worktree 共用的编译目录
+- [术语](GLOSSARY.md)：仓库里的领域用词
+
+## 模型入口
+
+- [Confucius4-R2T2 转写](README.md#流式语音识别--confucius4-r2t2)：`cargo run --release -- transcribe`，默认模型目录 `models/Confucius4-R2T2`
+- [Hy-MT2-7B 翻译](README.md#翻译--hy-mt2-7b)：`crates/hy-mt`，Radix 前缀缓存与连续批处理
+- [Breeze-TTS-2](docs/breeze-tts.md)：Makepad 里的流式合成、音色设计与声音克隆；权重是研究/非商业许可
+- [MiniCPM-V-4.7](crates/minicpm-v/README.md)：单图理解；贪心输出与官方 transformers 逐 token 对齐
+- [Qwen-Image-2.1-Turbo](docs/qwen-image-21.md)：8 步文生图与参考图编辑；透明背景需要负向引导
+- [提示词改写](docs/qwen-image-rewrite.md)：生成前用本仓库的 MiniCPM-V 扩写提示词
+- [音乐](crates/omni-music/README.md)：MERT2 → SheetSage2 → YuE2，48 kHz 双声道
+
+## 后端
+
+- [ANE 后端](crates/burn-ane/README.md)：实验路径。长流 RTF 未过验收，原生界面默认仍是 Metal
+- [ANE 优化目标](docs/ane-optimization-goal.md)：版本选择和未通过的长流标准
+- [ANE 调研](docs/ane-backend-research.md)：MIL、状态模型与设备缓存
+- [Qwen 注意力](docs/qwen-image-rust-attention.md)：Rust 注意力实现与数值
+- [Qwen TensorOps](docs/qwen-image-tensorops.md)：M5 上的 TensorOps 记录
+- [ConvRot 调研](docs/qwen-image-convrot-optimization-research.md)：int8×int8→int32 的实测
+- [本地流水线](docs/native-pipeline-optimization.md)：ASR / TTS 的调度与尾部策略
+
+## 界面
+
+- [Makepad](prototypes/makepad/README.md)：原生桌面应用的入口、回归与选型
+- [Web 加载](web/load-model.js)：浏览器 module worker 里的转写会话
+- [HTTP API](README.md#本地-web-api)：`127.0.0.1:8848` 的任务、转写、合成、图像与音乐
+
+## 给代理的约束
+
+- [编码标准](CODING_STANDARDS.md)：评审时的判断，不是实现步骤
+- [决策记录](docs/adr/)：W4A16、int8 matmul 内核，以及更快实现胜出
+- 各 manifest 是独立 Cargo 工程，登记在 `scripts/checks.json`。worktree 里先运行 `python3 scripts/share-target.py`，编译产物进主检出目录的登记路径
