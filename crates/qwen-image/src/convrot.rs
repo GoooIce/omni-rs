@@ -9,10 +9,6 @@ use burn::tensor::{DType, Int, Tensor, TensorData, backend::Backend};
 use omni_r2t2::weights::Weights;
 use std::path::Path;
 
-#[cfg(not(feature = "metal"))]
-#[path = "../../omni-kernel/src/int8_host.rs"]
-mod int8_host;
-
 pub const GROUP: usize = 256;
 const FILE_NAME: &str = "Qwen-Image-2.1-Turbo-INT8-ConvRot.safetensors";
 
@@ -96,33 +92,13 @@ impl<B: Backend> Int8Linear<B> {
     }
 
     fn project(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        #[cfg(feature = "metal")]
-        {
-            return omni_kernel::int8_matmul::try_int8_gemm(
-                x,
-                self.packed.clone(),
-                self.scale.clone(),
-                self.zero.clone(),
-            )
-            .expect("ConvRot int8 gemm");
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            let rows = x.dims()[0];
-            let width = self.input;
-            let device = x.device();
-            let values = x.into_data().to_vec::<f32>().expect("ConvRot 激活回读");
-            let weights = int8_host::unpack_i8(&read_i32(self.packed.clone().into_data()));
-            let scale = self
-                .scale
-                .clone()
-                .into_data()
-                .to_vec::<f32>()
-                .expect("ConvRot scale 回读");
-            let zero = read_i32(self.zero.clone().into_data());
-            let output = int8_host::gemm(&values, rows, width, &weights, &scale, &zero);
-            Tensor::<B, 2>::from_data(TensorData::new(output, [rows, self.output]), &device)
-        }
+        omni_kernel::int8_matmul::try_int8_gemm(
+            x,
+            self.packed.clone(),
+            self.scale.clone(),
+            self.zero.clone(),
+        )
+        .expect("ConvRot int8 gemm")
     }
 }
 
@@ -181,19 +157,6 @@ fn pack_i8(codes: &[i8]) -> Vec<i32> {
             })
         })
         .collect()
-}
-
-#[cfg(not(feature = "metal"))]
-fn read_i32(data: TensorData) -> Vec<i32> {
-    match data.dtype {
-        DType::I64 => data
-            .to_vec::<i64>()
-            .expect("ConvRot 权重回读")
-            .into_iter()
-            .map(|value| value as i32)
-            .collect(),
-        _ => data.to_vec::<i32>().expect("ConvRot 权重回读"),
-    }
 }
 
 #[cfg(test)]
