@@ -972,6 +972,7 @@ impl ObservationBoard {
 
 impl App {
     fn paint_observation(&mut self, cx: &mut Cx) {
+        let order = self.image.as_ref().unwrap().observation_board.row_order();
         let painted: [Vec<Option<(u32, u32, Vec<u32>)>>; 2] = {
             let board = &self.image.as_ref().unwrap().observation_board;
             std::array::from_fn(|row| {
@@ -1001,10 +1002,13 @@ impl App {
                         },
                     )
                 });
-                if row == 0 {
-                    self.set_official_step(cx, index + 1, texture);
-                } else {
-                    self.set_minicpm_step(cx, index + 1, texture);
+                match order[row] {
+                    omni_qwen_image::ObservationRow::Official => {
+                        self.set_official_step(cx, index + 1, texture);
+                    }
+                    omni_qwen_image::ObservationRow::MiniCpm1b => {
+                        self.set_minicpm_step(cx, index + 1, texture);
+                    }
                 }
             }
         }
