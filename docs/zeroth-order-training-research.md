@@ -2,7 +2,7 @@
 
 2026-10-17。范围是当前 Makepad 本地版已经在跑的推理模型，以及只靠函数值、不靠反向传播的优化方法。对照的是论文、作者维护的算法页和本仓库源码。没有改推理，也没有在本机跑训练。
 
-**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户改过的译文就能当监督。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。语音、图像和音乐侧目前也没有对得上的监督和预算。
+**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户改过的译文就能当监督。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。状态表征强化学习、RLHF、DPO 和 GRPO 也不适合作为第一刀：前三者要在策略或编码器上做反向，GRPO 还要为一题采样一组完整输出再对策略求对数概率梯度。语音、图像和音乐侧目前也没有对得上的监督和预算。
 
 ## 当前运行时实际允许什么
 
@@ -126,6 +126,32 @@ AdaZeta 针对 MeZO-LoRA 在 Llama-2-7B 上的发散。张量列车适配器接�
 
 层数、隐藏维和 prompt 的具体形状以该检查点的 `config.json` 为准。仓库内没有把 Hy-MT2-7B 的隐藏维写进文档，本文不假设一个数。
 
+## 表征强化学习
+
+这个词在一手文献里指的是状态表征学习：从高维观测学一个低维状态，再在这个状态上学策略或价值函数。它不是零阶优化，也不是给冻结语言模型加一段前缀。
+
+Lesort 等人把状态表征学习定义成：学到的特征维数低、随时间变化、并且受智能体动作影响，用来刻画动作在环境里造成的变化。形式是 \(s_t=\phi(o_{1:t})\)，可选地再吃进动作和奖励。综述覆盖的是与环境交互的方法，实验主要在仿真控制里，少量在真实机器人上。前向模型的做法是用 \(s_t\) 和 \(a_t\) 预测下一状态，预测误差经转移模型和编码器反向传播。见 [Lesort et al. 2018, arXiv:1802.04181](https://arxiv.org/abs/1802.04181) 摘要、§2.1 与 “Learning a forward model”。
+
+Echchahed 与 Castro 的综述把范围限定在无模型、在线的深度强化学习。问题仍是马尔可夫决策过程 \((\mathcal{S},\mathcal{A},P,R,\gamma)\)，策略 \(\pi\) 把状态映到动作分布，目标是折扣回报。他们把表征方法分成六类：度量、辅助任务、数据增强、对比、非对比、注意力。编码器 \(\phi\) 的产物交给策略或价值网络。文中点名的价值方法是 DQN，策略梯度方法是 REINFORCE，以及 actor-critic。见 [Echchahed and Castro 2025, arXiv:2506.17518](https://arxiv.org/abs/2506.17518) §2 与 Table 2。
+
+Botteghi 等人的综述讨论的是同一件事的无监督版本：先从观测流里学低维状态，再用它学策略。应用对象是动力系统和控制，例如摆。见 [Botteghi et al., arXiv:2208.14226](https://arxiv.org/abs/2208.14226)。
+
+中文综述《基于表征学习的离线强化学习方法研究综述》把设定收成离线：策略只从历史经验学习，不再在线与环境交互。表征把离线数据压成低维向量，再拿这些向量训练离线强化学习模型。文中的应用是工业、推荐系统和智能驾驶。见 [王雪松、王荣荣、程玉虎，《自动化学报》](https://aas.net.cn/cn/article/doi/10.16383/j.aas.c230546)。离线只是去掉在线采样，价值函数或策略网络的训练还在。
+
+这和当前桌面对不上，有三条独立的原因：
+
+1. Makepad 没有 \((s,a,r,s')\)。转写、翻译、合成、出图都是一次前向任务。用户改正译文是句对或一个标量，不是动作改变环境之后的下一状态。
+2. 上面打开的表征方法都把误差送回编码器或策略。Lesort 对前向模型写了反向传播。Echchahed 与 Castro 依赖 DQN、REINFORCE 或 actor-critic。当前 Burn 0.21 桌面路径没有启用自动微分。
+3. 已有的“表征”是冻结检查点的一部分：Breeze 的参考编码器、MERT 的 1,024 维帧特征、图像的 VAE 隐变量。它们在推理时被读取，不是用奖励现学的状态编码器。
+
+若把“表征”理解成语言模型对齐里的策略，而不是控制里的状态编码器，打开的三篇仍然要梯度：
+
+- InstructGPT 是三步：监督微调、奖励模型、再用 PPO 对奖励模型优化策略。模型规模实验是 1.3B、6B、175B。见 [Ouyang et al. 2022, arXiv:2203.02155](https://arxiv.org/abs/2203.02155) Figure 2 与 §3。
+- DPO 去掉显式奖励模型和强化学习循环，把同一偏好目标写成分类损失，提高偏好回答相对落选回答的对数概率。损失仍然穿过策略的对数概率。见 [Rafailov et al. 2023, arXiv:2305.18290](https://arxiv.org/abs/2305.18290) 摘要与 Figure 1。
+- GRPO 去掉与策略同规模的价值网络，对同一题从旧策略采样一组输出 \(\{o_1,\ldots,o_G\}\)，用组内奖励的均值和标准差做基线，再最大化带重要性比率的策略目标。DeepSeekMath 7B 上，GSM8K 从 82.9% 到 88.2%，MATH 从 46.8% 到 51.7%。见 [Shao et al. 2024, arXiv:2402.03300](https://arxiv.org/abs/2402.03300) §4.1.1。一组完整生成再加对数概率梯度，占满当前这一个推理名额，也写不进只读权重。
+
+用户改过的译文可以当成偏好对。能在现有前向上使用它的做法，仍是上一节的低维前缀加 CMA-ES：模型冻结，每个候选一次前向，损失是交叉熵或一个标量。那不是状态表征学习，也不需要 PPO 的价值网络。
+
 ## 引用
 
 - Spall, J. C. 维护的 SPSA 说明，Johns Hopkins APL。<https://www.jhuapl.edu/SPSA/>。同时扰动每步两次测量、有限差分每步 \(2p\) 次，以及局部收敛指向 Spall, 1992。
@@ -141,6 +167,13 @@ AdaZeta 针对 MeZO-LoRA 在 Llama-2-7B 上的发散。张量列车适配器接�
 - Liu, Yong, et al. Sparse MeZO: Less Parameters for Better Performance in Zeroth-Order LLM Fine-Tuning. arXiv:2402.15751. <https://arxiv.org/abs/2402.15751>
 - Chen, Yiming, et al. Enhancing Zeroth-Order Fine-Tuning for Language Models with Low-Rank Structures. arXiv:2410.07698. <https://arxiv.org/abs/2410.07698>
 - Burn 0.21.0 autodiff README. <https://github.com/tracel-ai/burn/blob/v0.21.0/crates/burn-autodiff/README.md>
+- Lesort, Timothée, et al. State Representation Learning for Control: An Overview. arXiv:1802.04181. <https://arxiv.org/abs/1802.04181>
+- Echchahed, Ayoub, and Pablo Samuel Castro. A Survey of State Representation Learning for Deep Reinforcement Learning. arXiv:2506.17518. <https://arxiv.org/abs/2506.17518>
+- Botteghi, Nicolò, Mannes Poel, and Christoph Brune. Unsupervised Representation Learning in Deep Reinforcement Learning: A Review. arXiv:2208.14226. <https://arxiv.org/abs/2208.14226>
+- 王雪松、王荣荣、程玉虎. 基于表征学习的离线强化学习方法研究综述. 自动化学报. <https://aas.net.cn/cn/article/doi/10.16383/j.aas.c230546>
+- Ouyang, Long, et al. Training language models to follow instructions with human feedback. arXiv:2203.02155. <https://arxiv.org/abs/2203.02155>
+- Rafailov, Rafael, et al. Direct Preference Optimization: Your Language Model is Secretly a Reward Model. arXiv:2305.18290. <https://arxiv.org/abs/2305.18290>
+- Shao, Zhihong, et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. arXiv:2402.03300. <https://arxiv.org/abs/2402.03300>
 
 MeZO 把“收敛随参数维数变慢”的经典下界指向 Duchi, Jordan, Wainwright, Wibisono, IEEE Trans. Inf. Theory, 2015，以及 Nesterov and Spokoiny, Foundations of Computational Mathematics, 17:527–566, 2017。本文没有打开这两篇期刊原文，只转述 MeZO 对它们的对照，不用它们的定理常数。Nesterov 的讨论稿 CORE 2011/1 在 <https://dial.uclouvain.be/pr/boreal/object/boreal:69205>，本轮没有逐条核对其中的定理。
 
