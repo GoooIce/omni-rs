@@ -1,44 +1,90 @@
-# omni-rs
+# omni-rs HTTP API
 
-> 纯 Rust / Burn 0.21 的本地多模态推理套件。在 Apple Silicon 上跑流式语音识别、翻译、语音合成、图像理解、文生图与音乐生成。推理不调用 Python 或远程服务。默认后端是 Metal。
+> 别的 agent 调用本机推理服务的约定。基址是 `http://127.0.0.1:8848`。这不是仓库导览。
 
-权重不在仓库里。数值、耗时和未通过的验收以 VALIDATION.md 为准，不要从 README 的摘要外推。
+服务只听回环地址。模型按需载入，第一次调用会变慢。提交成功返回 **202** 和一个任务；结果要轮询，不要把 202 当成完成。
 
-## 先读
+## 调用
 
-- [README](README.md)：能力、第一条命令、API 与后端选择
-- [VALIDATION](VALIDATION.md)：M5 Max 上的数值对照、RTF 和范围
-- [开发工作流](docs/agent-workflow.md)：`./scripts/check` 的 quick / cpu / metal / native，以及 worktree 共用的编译目录
-- [术语](GLOSSARY.md)：仓库里的领域用词
+1. `POST` 对应端点。
+2. 响应体是任务：`id`、`status`、`progress`、`result`、`error`。此时 `status` 为 `queued` 或 `running`。
+3. `GET /v1/jobs/{id}` 直到 `status` 为 `done`、`cancelled` 或 `error`。
+4. `result` 里的 `image_url`、`audio_url`、`midi_url`、`abc_url`、`result_url` 是站内路径。用同一基址 `GET` 下载。
+5. 取消用 `DELETE /v1/jobs/{id}`，返回 **202** 且没有 JSON。再轮询到终态。取消不是立刻停掉当前 GPU 步。
 
-## 模型入口
+`progress` 在运行中更新，终态看 `result` 或 `error`。未知或过期任务、以及不存在的文件，返回 **404**，体为 `{"error":"..."}`。等待队列长度为 4，满了返回 **503** 和同样的 `error` 对象。校验失败返回 **400**。
 
-- [Confucius4-R2T2 转写](README.md#流式语音识别--confucius4-r2t2)：`cargo run --release -- transcribe`，默认模型目录 `models/Confucius4-R2T2`
-- [Hy-MT2-7B 翻译](README.md#翻译--hy-mt2-7b)：`crates/hy-mt`，Radix 前缀缓存与连续批处理
-- [Breeze-TTS-2](docs/breeze-tts.md)：Makepad 里的流式合成、音色设计与声音克隆；权重是研究/非商业许可
-- [MiniCPM-V-4.7](crates/minicpm-v/README.md)：单图理解；贪心输出与官方 transformers 逐 token 对齐
-- [Qwen-Image-2.1-Turbo](docs/qwen-image-21.md)：8 步文生图与参考图编辑；透明背景需要负向引导
-- [提示词改写](docs/qwen-image-rewrite.md)：生成前用本仓库的 MiniCPM-V 扩写提示词
-- [音乐](crates/omni-music/README.md)：MERT2 → SheetSage2 → YuE2，48 kHz 双声道
+JSON 请求拒绝未知字段。不要多送键。
 
-## 后端
+## 存活与模型
 
-- [ANE 后端](crates/burn-ane/README.md)：实验路径。长流 RTF 未过验收，原生界面默认仍是 Metal
-- [ANE 优化目标](docs/ane-optimization-goal.md)：版本选择和未通过的长流标准
-- [ANE 调研](docs/ane-backend-research.md)：MIL、状态模型与设备缓存
-- [Qwen 注意力](docs/qwen-image-rust-attention.md)：Rust 注意力实现与数值
-- [Qwen TensorOps](docs/qwen-image-tensorops.md)：M5 上的 TensorOps 记录
-- [ConvRot 调研](docs/qwen-image-convrot-optimization-research.md)：int8×int8→int32 的实测
-- [本地流水线](docs/native-pipeline-optimization.md)：ASR / TTS 的调度与尾部策略
+- `GET /health` → `{"status":"ok"}`
+- `GET /v1/models` → `{"models":[...]}`，列出服务能加载的模型名，不表示权重已经在内存里
 
-## 界面
+## 翻译
 
-- [Makepad](prototypes/makepad/README.md)：原生桌面应用的入口、回归与选型
-- [Web 加载](web/load-model.js)：浏览器 module worker 里的转写会话
-- [HTTP API](README.md#本地-web-api)：`127.0.0.1:8848` 的任务、转写、合成、图像与音乐
+`POST /v1/translations`，`Content-Type: application/json`
 
-## 给代理的约束
+```json
+{"text":"你好，世界！","target_language":"English"}
+```
 
-- [编码标准](CODING_STANDARDS.md)：评审时的判断，不是实现步骤
-- [决策记录](docs/adr/)：W4A16、int8 matmul 内核，以及更快实现胜出
-- 各 manifest 是独立 Cargo 工程，登记在 `scripts/checks.json`。worktree 里先运行 `python3 scripts/share-target.py`，编译产物进主检出目录的登记路径
+`target_language` 用语言全名，例如 `English`、`Chinese`。不要用空串、换行或尖括号。`text` 不能为空，最长 1 MB。
+
+可选 `options`：`max_new_tokens`（默认 512）、`max_context_tokens`（8192）、`temperature`（0.7）、`top_k`（20）、`top_p`（0.6）、`repetition_penalty`（1.05）、`seed`（42）、`use_cache`（true）。`max_new_tokens` 必须小于 `max_context_tokens`。
+
+完成后 `result.text` 是译文。`result.finish_reason` 为 `length` 表示触到输出上限，不是失败。`result.cached_tokens` 是前缀缓存命中的 token 数。
+
+## 转写
+
+`POST /v1/audio/transcriptions`
+
+请求体是 **WAV 字节**，不是 JSON。`Content-Type: audio/wav`。可选查询参数 `language`（最长 64）和 `context`（最长 32768）。服务不接受本机文件路径。
+
+完成后 `result.text` 是整段转写。没有麦克风、没有流式分块接口。
+
+## 语音合成
+
+`POST /v1/audio/speech`，JSON。
+
+```json
+{"text":"你好，欢迎使用本地语音合成。"}
+```
+
+`text` 必填，最长 32768。可选 `instruction`（最长 8192，默认空）、`seed`（42）、`max_frames`（1–1500，默认 750）、`guidance_scale`（1–10，默认 1）。
+
+完成后 `result.audio_url` 指向 WAV。`result.cancelled` 为真表示提前停下但已有音频；`result.reached_limit` 为真表示碰到帧数上限。这个端点不能做参考声音克隆。
+
+## 文生图
+
+`POST /v1/images/generations`，JSON。
+
+```json
+{"prompt":"清晨的山谷，写实摄影","width":1024,"height":1024,"seed":42}
+```
+
+`prompt` 必填，最长 32768，不能含 `<|`。未传宽高时默认 **512×512**，不是 CLI 的 2048。宽和高须在 256–2752，总像素不超过 4300800，会向下对齐到 32 的倍数。
+
+可选 `negative_prompt`、`true_cfg_scale`（1–20，默认 1）。负向引导只在 `true_cfg_scale > 1` 且提供了 `negative_prompt` 时开启。要透明背景时，负向提示词写 `opaque white background, solid background`，`true_cfg_scale` 用 2.5。
+
+完成后 `result.image_url` 指向 PNG，`result.report` 含实际宽高、步数和各阶段秒数。这个端点没有参考图字段，不能做图像编辑。
+
+## 音乐
+
+分析：`POST /v1/music/analyses`，WAV 字节，最长 360 秒。`result` 是 MERT2 特征。
+
+转谱：`POST /v1/music/scores`，WAV 字节，最长 300 秒。查询参数 `melody_only` 默认 `true`。`result.midi_url` 指向 MIDI；有 ABC 时还有 `result.abc_url`。
+
+生成：`POST /v1/music/generations`，JSON。`style` 必填（最长 8192），`lyrics` 最长 32768。
+
+```json
+{"style":"acoustic folk","lyrics":"[verse]\nhello","cot":"full"}
+```
+
+`cot` 为 `off`、`melody` 或 `full`，默认 `full`。可传 `abc`（仅当 `cot` 不是 `off`）、`seed`（默认 831001，且小于 2^63）、`ode_steps`（1–128，默认 32）。完成后 `result.audio_url` 是 48 kHz 双声道 WAV。`result.truncated` 为真表示乐谱或音频被截断。
+
+音乐三个端点的 `result.result_url` 是同一结果的 JSON 文件。
+
+## 不要调用的能力
+
+HTTP 没有麦克风、声音克隆、参考图编辑、WebSocket，也没有逐词时间戳。这些在原生界面里，不在这组路由上。

@@ -212,7 +212,7 @@ for event in run.finish().await? {
 ./scripts/check status
 ```
 
-检查范围与中断恢复见 [开发工作流](docs/agent-workflow.md)。FP32/FP16、长流和浏览器结果在 [VALIDATION.md](VALIDATION.md)；这些是回归，不是完整语料的 WER/CER。给语言模型的仓库地图是 [llms.txt](llms.txt)。
+检查范围与中断恢复见 [开发工作流](docs/agent-workflow.md)。FP32/FP16、长流和浏览器结果在 [VALIDATION.md](VALIDATION.md)；这些是回归，不是完整语料的 WER/CER。别的 agent 调本机 HTTP 的约定在 [llms.txt](llms.txt)。
 
 官方小模型对照需要 Python 3.12+ 与 `scripts/requirements-reference.txt`，推理本身不依赖它们：
 
