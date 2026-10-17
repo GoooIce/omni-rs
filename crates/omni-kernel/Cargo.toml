@@ -23,6 +23,7 @@ wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "st
 
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+half = "=2.7.1"
 
 [workspace]
 

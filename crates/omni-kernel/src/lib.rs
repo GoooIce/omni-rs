@@ -16,6 +16,7 @@ use std::{
     fmt,
 };
 
+mod int8_host;
 pub mod int8_matmul;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod int8_tensorops;

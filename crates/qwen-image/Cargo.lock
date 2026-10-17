@@ -3849,6 +3849,7 @@ dependencies = [
  "cubecl-cpp",
  "cubecl-runtime",
  "cubek-attention",
+ "half",
  "image",
  "objc2-metal",
  "omni-kernel",

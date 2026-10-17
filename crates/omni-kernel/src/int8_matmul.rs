@@ -505,8 +505,9 @@ fn fusion_tensor<B: Backend>(primitive: impl Any) -> Option<FusionTensor<Runtime
 /// `x @ W^T` after per-row symmetric int8 quantization of `x`.
 ///
 /// `w_packed` holds `n * (k / 4)` little-endian int8 groups. `w_scale` and
-/// `w_zero` are per output row. Returns `None` when this backend is not the
-/// Metal fusion runtime.
+/// `w_zero` are per output row. Metal fusion runs the CubeCL kernel. Any other
+/// backend runs the host integer gemm in this module. Returns `None` when the
+/// shapes disagree.
 pub fn try_int8_gemm<B: Backend>(
     x: BurnTensor<B, 2>,
     w_packed: BurnTensor<B, 1, burn::tensor::Int>,
@@ -517,6 +518,9 @@ pub fn try_int8_gemm<B: Backend>(
     let columns = w_scale.dims()[0];
     if width % 4 != 0 || w_packed.dims()[0] != columns * width / 4 || w_zero.dims()[0] != columns {
         return None;
+    }
+    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>() {
+        return host_gemm(x, w_packed, w_scale, w_zero);
     }
     let x = x.cast(FloatDType::F32);
     let w_scale = w_scale.cast(FloatDType::F32);
@@ -555,6 +559,41 @@ pub fn try_int8_gemm<B: Backend>(
     )))
 }
 
+fn host_gemm<B: Backend>(
+    x: BurnTensor<B, 2>,
+    w_packed: BurnTensor<B, 1, burn::tensor::Int>,
+    w_scale: BurnTensor<B, 1>,
+    w_zero: BurnTensor<B, 1, burn::tensor::Int>,
+) -> Option<BurnTensor<B, 2>> {
+    let [rows, width] = x.dims();
+    let columns = w_scale.dims()[0];
+    let device = x.device();
+    let values = x.cast(FloatDType::F32).into_data().to_vec::<f32>().ok()?;
+    let words = read_i32(w_packed.into_data())?;
+    let scale = w_scale
+        .cast(FloatDType::F32)
+        .into_data()
+        .to_vec::<f32>()
+        .ok()?;
+    let zero = read_i32(w_zero.into_data())?;
+    let weights = crate::int8_host::unpack_i8(&words);
+    let output = crate::int8_host::gemm(&values, rows, width, &weights, &scale, &zero);
+    Some(BurnTensor::from_data(
+        burn::tensor::TensorData::new(output, [rows, columns]),
+        &device,
+    ))
+}
+
+fn read_i32(data: burn::tensor::TensorData) -> Option<Vec<i32>> {
+    match data.dtype {
+        DType::I64 => data
+            .to_vec::<i64>()
+            .ok()
+            .map(|values| values.into_iter().map(|value| value as i32).collect()),
+        _ => data.to_vec::<i32>().ok(),
+    }
+}
+
 fn fusion_out<B: Backend>(tensor: FusionTensor<Runtime>) -> Option<B::FloatTensorPrimitive> {
     let tensor: Box<dyn Any> = Box::new(tensor);
     tensor
@@ -577,9 +616,8 @@ mod tests {
         rounded.clamp(-128.0, 127.0) as i32
     }
 
-    /// Dequantize the same int8 weights in f32, then dot with the row-quantized
-    /// activations. Checkpoint scales are f32. This is not the kernel's i32
-    /// accumulator.
+    /// Dequantize the same int8 weights through FP16, then dot in f32 with the
+    /// row-quantized activations. This is not the kernel's i32 accumulator.
     fn dequantized_weight_reference(
         x: &[f32],
         rows: usize,
@@ -603,8 +641,11 @@ mod tests {
             for column in 0..columns {
                 let mut acc = 0.0f32;
                 for k in 0..width {
-                    let weight = (i32::from(weights[column * width + k]) - zero[column]) as f32
-                        * scale[column];
+                    let weight = half::f16::from_f32(
+                        (i32::from(weights[column * width + k]) - zero[column]) as f32
+                            * scale[column],
+                    )
+                    .to_f32();
                     acc += activations[k] * weight;
                 }
                 out[row * columns + column] = acc;
@@ -654,6 +695,40 @@ mod tests {
         for (got, expected) in got.iter().zip(expected) {
             assert!((got - expected).abs() < 1.0e-3, "{got} != {expected}");
         }
+    }
+
+    #[test]
+    fn ndarray_int8_gemm_matches_f16_dequantized_weights() {
+        type Cpu = burn::backend::NdArray;
+        let device = Default::default();
+        let x = vec![1.0f32, -2.0, 0.5, 4.0];
+        let weights = vec![1i8, -2, 3, -4];
+        let scale = vec![0.25f32];
+        let zero = vec![1i32];
+        let expected = dequantized_weight_reference(&x, 1, 4, &weights, &scale, &zero);
+        assert!((expected[0] - (-411.0 / 127.0)).abs() < 1.0e-4);
+        let packed: Vec<i32> = weights
+            .chunks_exact(4)
+            .map(|chunk| {
+                chunk.iter().enumerate().fold(0i32, |word, (lane, code)| {
+                    word | i32::from(*code as u8) << (8 * lane)
+                })
+            })
+            .collect();
+        let x = BurnTensor::<Cpu, 2>::from_data(TensorData::new(x, [1, 4]), &device);
+        let w_packed = BurnTensor::<Cpu, 1, burn::tensor::Int>::from_data(
+            TensorData::new(packed, [1]),
+            &device,
+        );
+        let w_scale = BurnTensor::<Cpu, 1>::from_data(TensorData::new(scale, [1]), &device);
+        let w_zero =
+            BurnTensor::<Cpu, 1, burn::tensor::Int>::from_data(TensorData::new(zero, [1]), &device);
+        let got = try_int8_gemm(x, w_packed, w_scale, w_zero)
+            .expect("host int8 gemm")
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_close(&got, &expected);
     }
 
     fn tile_fixture() -> (Vec<f32>, Vec<i8>, Vec<f32>, Vec<i32>, Vec<f32>) {

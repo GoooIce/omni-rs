@@ -3656,6 +3656,7 @@ dependencies = [
  "burn-fusion",
  "burn-ir",
  "cubecl",
+ "half",
  "objc2-metal",
  "wgpu",
 ]

@@ -61,6 +61,7 @@ required-features = ["metal"]
 
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+half = "=2.7.1"
 
 [patch.crates-io]
 cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
