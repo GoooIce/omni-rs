@@ -95,6 +95,28 @@ pub enum LoadMode {
     Dequantize,
 }
 
+/// Load one packed int4 weight without the caller choosing a representation.
+///
+/// NdArray cannot store the packed tensor, so this dequantizes once at load.
+pub(crate) fn load_for_backend<B: Backend>(
+    w: &impl WeightSource<B>,
+    name: &str,
+    scale_name: &str,
+    shape: [usize; 2],
+    precision: Precision,
+    device: &B::Device,
+) -> Result<PackedWeight<B>> {
+    load_packed(
+        w,
+        name,
+        scale_name,
+        shape,
+        LoadMode::Dequantize,
+        precision,
+        device,
+    )
+}
+
 pub fn load_packed<B: Backend>(
     w: &impl WeightSource<B>,
     name: &str,
@@ -230,6 +252,47 @@ mod tests {
             &device,
         )
         .unwrap();
+        let x_values = tensor_f32(&tensors, "input");
+        let x = Tensor::<B, 2>::from_data(TensorData::new(x_values, [8, 256]), &device);
+        let output = packed.matmul_transpose(x);
+        let actual = output
+            .into_data()
+            .convert::<f32>()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let expected = tensor_f32(&tensors, "output_quant_matmul");
+        let mut relative = 0f64;
+        for (a, b) in actual.iter().zip(&expected) {
+            relative = relative.max((a - b).abs() as f64 / b.abs().max(1e-3) as f64);
+        }
+        assert!(relative < 1e-5, "worst relative {relative}");
+    }
+
+    #[test]
+    fn ndarray_dequantizes_int4_at_load() {
+        type B = NdArray;
+        let bytes = fixture();
+        let tensors = SafeTensors::deserialize(&bytes).unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes.clone()]).unwrap();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let packed = load_for_backend::<B>(
+            &weights,
+            "quant.weight",
+            "quant.weight_scale",
+            [64, 256],
+            Precision::F32,
+            &device,
+        )
+        .unwrap();
+        assert!(
+            matches!(packed, PackedWeight::Dequantized(_)),
+            "NdArray holds dequantized weights"
+        );
+        assert_eq!(
+            packed.resident_bytes(),
+            64 * 256 * std::mem::size_of::<f32>()
+        );
         let x_values = tensor_f32(&tensors, "input");
         let x = Tensor::<B, 2>::from_data(TensorData::new(x_values, [8, 256]), &device);
         let output = packed.matmul_transpose(x);
