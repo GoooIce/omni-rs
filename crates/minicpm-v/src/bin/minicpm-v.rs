@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use omni_minicpm_v::{
-    chat::{self, Message, Role},
+    chat::{Message, Part, Role},
     config::ModelDirectory,
     doctor, generate,
     model::TextModel,
-    multimodal::{self, Prompt},
+    multimodal, prompt,
 };
 use std::{
     io::Write,
@@ -143,18 +143,22 @@ fn run_generate<B: burn::tensor::backend::Backend>(
     let prompt = match &options.image {
         Some(image) => {
             let vision = multimodal::Multimodal::<B>::load(&weights, &config, precision, device)?;
-            vision
-                .build_prompt(multimodal::Build::<B> {
-                    tokenizer: &tokenizer,
-                    model: &model,
-                    config: &config,
-                    model_dir: &options.model,
-                    image,
-                    prompt: &options.prompt,
-                    device,
-                    precision,
-                })
-                .map_err(|e| e.to_string())?
+            let messages = vec![Message {
+                role: Role::User,
+                content: vec![Part::Image, Part::Text(options.prompt.clone())],
+            }];
+            prompt::assemble(prompt::Request {
+                vision: Some(&vision),
+                tokenizer: &tokenizer,
+                model: &model,
+                config: &config,
+                model_dir: &options.model,
+                messages: &messages,
+                images: std::slice::from_ref(image),
+                enable_thinking: None,
+                device,
+                precision,
+            })?
         }
         None => {
             let mut messages = Vec::new();
@@ -162,8 +166,18 @@ fn run_generate<B: burn::tensor::backend::Backend>(
                 messages.push(Message::text(Role::System, system.clone()));
             }
             messages.push(Message::text(Role::User, options.prompt.clone()));
-            let rendered = chat::render(&messages, true, None)?;
-            Prompt::text(tokenizer.encode(&rendered))
+            prompt::assemble(prompt::Request {
+                vision: None,
+                tokenizer: &tokenizer,
+                model: &model,
+                config: &config,
+                model_dir: &options.model,
+                messages: &messages,
+                images: &[],
+                enable_thinking: None,
+                device,
+                precision,
+            })?
         }
     };
     eprintln!(

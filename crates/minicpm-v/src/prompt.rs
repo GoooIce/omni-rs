@@ -12,7 +12,6 @@ use crate::{
     config::MiniCpmConfig,
     image,
     model::TextModel,
-    multimodal,
     positions::{self, Markers},
     tokenizer::MiniCpmTokenizer,
 };
@@ -224,7 +223,13 @@ fn canvas_factors(config: &MiniCpmConfig) -> (usize, usize) {
 }
 
 fn markers(config: &MiniCpmConfig) -> Markers {
-    multimodal::markers(config)
+    Markers {
+        image_start: config.image_start_id,
+        image_end: config.image_end_id,
+        slice_start: config.slice_start_id,
+        slice_end: config.slice_end_id,
+        newline: config.newline_id,
+    }
 }
 
 fn image_replacements(prepared: &[image::Preprocessed], divisor: usize) -> Vec<String> {
@@ -419,6 +424,7 @@ mod tests {
                 ("<think>", 1003),
                 ("<image_id>", 1004),
                 ("</image_id>", 1005),
+                ("</think>", 1006),
                 ("<|image_pad|>", 248056),
                 ("</image>", 248079),
                 ("<image>", 248078),
@@ -764,10 +770,13 @@ mod tests {
                 slice_grid: (0, 0),
             },
         ];
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![Part::Image, Part::Image, Part::Text("Q".to_string())],
-        }];
+        let messages = vec![
+            Message::text(Role::System, "SYS"),
+            Message {
+                role: Role::User,
+                content: vec![Part::Image, Part::Image, Part::Text("Q".to_string())],
+            },
+        ];
         let prompt = assemble_prepared(
             &vision,
             &tokenizer,
@@ -791,6 +800,11 @@ mod tests {
             .position(|w| w == [1004, 49, 1005])
             .unwrap();
         assert!(first < second, "image 0 is expanded before image 1");
+        assert_eq!(
+            &prompt.ids[..13],
+            &[1001, 115, 121, 115, 116, 101, 109, 10, 83, 89, 83, 1002, 10]
+        );
+        assert!(prompt.ids.ends_with(&[1003, 10, 10, 1006, 10, 10]));
         let positions = prompt.positions.expect("canvas");
         assert_eq!(positions.len(), prompt.ids.len());
         let values = prompt

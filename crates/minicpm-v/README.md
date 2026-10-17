@@ -50,10 +50,9 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
 
 ## 公共 API（作为库使用）
 
-- `multimodal::Multimodal::build_prompt`：单图 + 单条用户文本（无 system 消息）。
-- `multimodal::Multimodal::build_prompt_multi`：完整消息列表（可带 system）+ 按序多图；
-  消息中第 i 个 `Part::Image` 消费 `images[i]`，展开为 `<image_id>i</image_id>` 前缀的
-  pad 占位；`enable_thinking` 透传给 ChatML 生成提示（`Some(false)` 生成空 think 块）。
+- `prompt::assemble`：一次装配请求得到 `Prompt`（`ids`、`embeddings`、`positions`、
+  `rope_delta`）。无图时只有 token ids，画布字段为空；有图时在模块内部完成切片、
+  占位展开、canvas M-RoPE 和视觉特征 splice。CLI 与 Qwen-Image rewriter 都走这一个请求。
 - `generate::Options::presence_penalty`（默认 0.0，默认时行为逐比特不变）：对采样 history
   中已出现 token 的 logit 减去该常数（OpenAI/vLLM 语义）。注意本实现的 history **包含
   prompt token**，而 vLLM 只罚已生成 token。
@@ -75,7 +74,7 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
 
 ## 已知限制
 
-- 单轮单图 CLI；库内 `build_prompt_multi` 已支持完整消息列表 + 按序多图，
+- 单轮单图 CLI；`prompt::assemble` 已支持完整消息列表 + 按序多图，
   多轮 KV 复用与视频未实现（视觉塔与 canvas 位置表已支持多 crop 切片）。
 - Metal 构建关闭了 Burn fusion（burn-cubecl-fusion 0.21 在本模型解码形状上代码生成崩溃）；
   常规 autotune matmul 保留。

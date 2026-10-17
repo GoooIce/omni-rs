@@ -5,7 +5,12 @@
 
 use burn::backend::wgpu::{Metal, WgpuDevice};
 use omni_minicpm_v::{
-    config::ModelDirectory, generate, model::TextModel, multimodal::Multimodal,
+    chat::{Message, Part, Role},
+    config::ModelDirectory,
+    generate,
+    model::TextModel,
+    multimodal::Multimodal,
+    prompt,
     tokenizer::MiniCpmTokenizer,
 };
 use std::sync::atomic::AtomicBool;
@@ -43,18 +48,26 @@ fn metal_f16_image_stream_matches_official() {
     let image = root
         .join("crates/minicpm-v/tests/fixtures/images")
         .join(case["image"].as_str().unwrap());
-    let built = multimodal
-        .build_prompt(omni_minicpm_v::multimodal::Build {
-            tokenizer: &tokenizer,
-            model: &model,
-            config: &config,
-            model_dir: &model_dir,
-            image: &image,
-            prompt: case["prompt"].as_str().unwrap(),
-            device: &device,
-            precision: omni_r2t2::Precision::F16,
-        })
-        .unwrap();
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![
+            Part::Image,
+            Part::Text(case["prompt"].as_str().unwrap().to_string()),
+        ],
+    }];
+    let built = prompt::assemble(prompt::Request {
+        vision: Some(&multimodal),
+        tokenizer: &tokenizer,
+        model: &model,
+        config: &config,
+        model_dir: &model_dir,
+        messages: &messages,
+        images: std::slice::from_ref(&image),
+        enable_thinking: None,
+        device: &device,
+        precision: omni_r2t2::Precision::F16,
+    })
+    .unwrap();
     let expected: Vec<u32> = case["generated"]
         .as_array()
         .unwrap()
