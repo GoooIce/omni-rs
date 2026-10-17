@@ -149,27 +149,30 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_reclaims_only_unpinned_pages_and_reuses_slots() {
+    fn slot_reuse_and_pool_exhaustion_follow_live_holders() {
         let mut pool = Pages::new(64, 32);
-        let mut pinned = History::default();
-        pool.extend(&mut pinned, 16).unwrap();
-        pinned.len = 16;
-        let pinned_id = *pinned.pages[0];
-        pool.publish(&[1; 16], &pinned);
-        for token in 2..20 {
+        let mut held = Vec::new();
+        for _ in 0..pool.capacity() {
             let mut history = History::default();
-            pool.extend(&mut history, 17).unwrap();
-            history.len = 17;
-            assert!(history.pages.iter().all(|page| **page != pinned_id));
-            pool.publish(&[token; 17], &history);
+            pool.extend(&mut history, PAGE_SIZE).unwrap();
+            assert_eq!(pool.used(), held.len() + 1);
+            held.push(history);
         }
-        pool.clear();
-        assert_eq!(pool.used(), 1);
-        let mut full = History::default();
-        pool.extend(&mut full, 48).unwrap();
-        assert!(pool.extend(&mut full, 64).is_err());
-        drop(full);
-        drop(pinned);
+        let mut blocked = History::default();
+        assert!(pool.extend(&mut blocked, PAGE_SIZE).is_err());
+        assert_eq!(pool.used(), pool.capacity());
+
+        let released = held.pop().unwrap();
+        let freed_slot = *released.pages[0];
+        drop(released);
+        assert_eq!(pool.used(), pool.capacity() - 1);
+
+        pool.extend(&mut blocked, PAGE_SIZE).unwrap();
+        assert_eq!(*blocked.pages[0], freed_slot);
+        assert_eq!(pool.used(), pool.capacity());
+
+        drop(held);
+        drop(blocked);
         assert_eq!(pool.used(), 0);
     }
 }

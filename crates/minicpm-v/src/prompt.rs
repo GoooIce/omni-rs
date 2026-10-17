@@ -94,6 +94,17 @@ pub trait VisionEmbed<B: Backend> {
 pub fn assemble<B: Backend, T: Tokens, E: TokenEmbed<B>>(
     request: Request<'_, B, T, E>,
 ) -> Result<Prompt<B>, String> {
+    if request.images.is_empty() {
+        let rendered = chat::render(request.messages, true, request.enable_thinking)
+            .map_err(|e| e.to_string())?;
+        return Ok(Prompt::text(request.tokenizer.encode(&rendered)));
+    }
+    assemble_images(request)
+}
+
+fn assemble_images<B: Backend, T: Tokens, E: TokenEmbed<B>>(
+    request: Request<'_, B, T, E>,
+) -> Result<Prompt<B>, String> {
     let Request {
         vision,
         tokenizer,
@@ -106,36 +117,6 @@ pub fn assemble<B: Backend, T: Tokens, E: TokenEmbed<B>>(
         device,
         precision,
     } = request;
-    if images.is_empty() {
-        let rendered = chat::render(messages, true, enable_thinking).map_err(|e| e.to_string())?;
-        return Ok(Prompt::text(tokenizer.encode(&rendered)));
-    }
-    assemble_images(
-        vision,
-        tokenizer,
-        model,
-        config,
-        model_dir,
-        messages,
-        images,
-        enable_thinking,
-        device,
-        precision,
-    )
-}
-
-fn assemble_images<B: Backend, T: Tokens, E: TokenEmbed<B>>(
-    vision: Option<&dyn VisionEmbed<B>>,
-    tokenizer: &T,
-    model: &E,
-    config: &MiniCpmConfig,
-    model_dir: &Path,
-    messages: &[Message],
-    images: &[std::path::PathBuf],
-    enable_thinking: Option<bool>,
-    device: &B::Device,
-    precision: Precision,
-) -> Result<Prompt<B>, String> {
     let vision = vision.ok_or_else(|| "image prompt needs a vision tower".to_string())?;
     let image_parts = messages
         .iter()
@@ -659,9 +640,12 @@ mod tests {
             value: 3.0,
         };
         let device = Default::default();
+        // A text part after the image is joined with a newline, and that token
+        // is the canvas newline, so it stays in the frame and moves rope_delta
+        // off the fixture. The image alone is the official sliced sequence.
         let messages = vec![Message {
             role: Role::User,
-            content: vec![Part::Image, Part::Text("Q".to_string())],
+            content: vec![Part::Image],
         }];
         let prepared = vec![image::Preprocessed {
             crops: vec![Vec::new(); target_sizes.len()],
@@ -682,6 +666,8 @@ mod tests {
         )
         .unwrap();
 
+        let official_delta = case["rope_deltas"][0][0].as_i64().unwrap();
+        assert_eq!(prompt.rope_delta, official_delta);
         let positions = prompt.positions.expect("canvas table");
         let image_start = 248_078u32;
         let our_start = prompt.ids.iter().position(|id| *id == image_start).unwrap();
@@ -698,12 +684,12 @@ mod tests {
         }
         // `<image>` through the last `</slice>`: thumbnail, four detail crops, row break.
         assert_eq!(matched, 19, "official image span");
-        let shift = positions[our_start][0] - official_positions[their_start][0];
         for step in 0..matched {
             for channel in 0..3 {
                 assert_eq!(
-                    positions[our_start + step][channel] - shift,
-                    official_positions[their_start + step][channel],
+                    positions[our_start + step][channel] - positions[our_start][channel],
+                    official_positions[their_start + step][channel]
+                        - official_positions[their_start][channel],
                     "token {step} channel {channel}"
                 );
             }
