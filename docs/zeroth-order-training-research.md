@@ -2,13 +2,13 @@
 
 2026-10-17。范围是当前 Makepad 本地版已经在跑的推理模型，以及只靠函数值、不靠反向传播的优化方法。对照的是论文、作者维护的算法页和本仓库源码。没有改推理，也没有在本机跑训练。
 
-**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存，优化器状态是几百到几千个数，用户改过的译文就能当监督。全参数 MeZO、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。语音、图像和音乐侧目前也没有对得上的监督和预算。
+**结论：先只在 Hy-MT2-7B 上做低维连续前缀，用 CMA-ES 在随机子空间里优化，权重保持冻结。** 这一路和现有前向推理同内存。优化器状态是 \(d\) 维均值、步长和 \(d\times d\) 协方差；\(d=500\) 时协方差有 25 万个数，相对 7B 权重仍然很小。用户改过的译文就能当监督。全参数 MeZO、Sparse-MeZO、LOZO、ZO-Adam、对角 Hessian、张量列车适配器、进化策略种群、有限差分、前向梯度（JVP）和 Forward-Forward 都不适合作为第一刀。语音、图像和音乐侧目前也没有对得上的监督和预算。
 
 ## 当前运行时实际允许什么
 
 Makepad 是推理界面。模型加载和推理共用一个执行名额，停止靠原子标志，当前运算结束后返回。见 [Makepad 说明](../prototypes/makepad/README.md)。
 
-桌面端依赖的 Burn 是 0.21，特性是 `std` 与 `fusion`；macOS 上是 Metal / ANE，其他原生平台是 WebGPU。[`prototypes/makepad/Cargo.toml`](../prototypes/makepad/Cargo.toml) 没有打开 `autodiff` 或 `train`。本仓库 Burn 0.21 的说明把 Autodiff 定义成包住另一个后端的装饰器，用法是 `backward()`。[vendor/burn/README.md](../vendor/burn/README.md) 在供应商源码里搜不到 `jvp` 或 forward-mode。因此现成能力是前向求值和采样，没有可以打开的前向模式自动微分。
+桌面端依赖的 Burn 是 0.21，特性是 `std` 与 `fusion`；macOS 上是 Metal / ANE，其他原生平台是 WebGPU。[`prototypes/makepad/Cargo.toml`](../prototypes/makepad/Cargo.toml) 没有打开 `autodiff` 或 `train`。本仓库 Burn 0.21 的说明把 Autodiff 定义成包住另一个后端的装饰器，用法是 `backward()`。[vendor/burn/README.md](../vendor/burn/README.md) 在供应商源码里搜不到 `jvp` 或 forward-mode。Burn 0.21.0 的 `burn-autodiff` README 原句是 “For now only first order reverse mode autodiff is supported.” 见 [该标签下的 README](https://github.com/tracel-ai/burn/blob/v0.21.0/crates/burn-autodiff/README.md)。因此现成能力是前向求值和采样，没有可以打开的前向模式自动微分。
 
 权重从 safetensors 读入后变成设备上的 FP16 / FP32 张量再做前向。翻译路径每步已经把词表 logits 读回主机再采样，见 [`crates/hy-mt/src/scheduler.rs`](../crates/hy-mt/src/scheduler.rs) 与 [`crates/hy-mt/src/sampling.rs`](../crates/hy-mt/src/sampling.rs)。交叉熵可以加在这份已经读回的向量上，不必为了损失再做一次反向。
 
@@ -36,7 +36,10 @@ Radix 前缀缓存按文本 token 前缀索引 KV 页，见 [GLOSSARY.md](../GLO
 | MeZO | 用随机种子就地重放扰动，把 ZO-SGD 的内存压到推理水平 | 2（\(n\)-SPSA 为 \(2n\)，默认 \(n=1\)） | 推理内存；按矩阵扰动时再加最大矩阵 | 350M–66B；也测了 LoRA 和 prefix | 否 | 全参数不适合交互；prefix 可作备选 |
 | HiZOO / HiZOO-L | 用第三次前向估计对角 Hessian，当作预条件 | 3 | 全对角是 \(O(d)\)；HiZOO-L 比 MeZO 多不到 10% 内存 | 同样到 66B | 否 | 全参数的对角状态放不下；步数收益换不来桌面交互 |
 | AdaZeta | 张量列车适配器缩小可训维数，再按 epoch 增加查询次数 | 每查询 2 次，查询数随 epoch 增加 | Llama-2-7B 的 SST-2 峰值 14 GB | 适配器参数比普通矩阵少 80 倍以上 | 要在每层注意力和 FFN 后插入新模块 | 工程量大，留到前缀方案不够用时 |
-| BBT | 冻结模型，CMA-ES 只优化随机投影后的连续 prompt | 每个候选 1 次 | 子空间默认 \(d=500\)，种群 \(\lambda=4+3\log d\) | 默认预算 8,000 次调用；prompt 长 50 | 输入侧拼一段嵌入 | **第一选择** |
+| ZO-Adam | 用随机梯度估计替换 Adam 的梯度，保留矩估计 | 2（查询数 \(q=1\)） | 全参数 OPT-13B、MultiRC、batch 4：峰值 158 GB、2 张 A100；同表 ZO-SGD 为 64 GB、1 张 | 全参数微调，20,000 步对一阶 625 步 | 否 | 矩状态比推理内存更大 |
+| Sparse-MeZO | 只扰动幅度落在稀疏掩码里的权重，掩码在前向时现算 | 2 | 高效实现与 MeZO 同量级；LLaMA-7B MultiRC 上 14.6 GB，全参数微调 158.6 GB | 已有浮点权重的子集；稀疏度 0.5–0.8，文中 0.8 通常更好 | 否 | 仍是整模型前向，步数仍是数千 |
+| LOZO | 用低秩扰动矩阵做两点差分，同一子空间连用若干步 | 2 | 存储与 MeZO 相同；动量只留低秩因子 | 更新的是全参数矩阵，估计秩为 \(r\)；实验到 OPT-66B | 否 | 步数大约减半，仍是大模型监督微调 |
+| BBT | 冻结模型，CMA-ES 只优化随机投影后的连续 prompt | 每个候选 1 次 | 子空间默认 \(d=500\)；状态含 \(d\times d\) 协方差。Table 2 种群 20，消融用 \(\lambda=4+3\log d\) | 默认预算 8,000 次调用；prompt 长 50 | 输入侧拼一段嵌入 | **第一选择** |
 | BBTv2 | 每一层拼一段 deep prompt，逐层轮流做 CMA-ES | 每个候选 1 次 | 每层一个 \(d=500\) 的 CMA-ES；RoBERTa-large 为 24 层 × 50 token | 同样 8,000 次、种群 20；CPM-2 上可训参数表记为 4.8K | 每层前向都要拼 prompt | 输入侧前缀不够时的下一档 |
 | 前向梯度 | 一次前向模式 JVP 得到无偏的方向梯度 | 1 次带切向量的前向 | 切向量与最大激活；MeZO 认为要存 \(z\)，内存略高于两倍推理 | 论文示例是较小网络 | 每个算子都要 JVP | 当前 Burn 路径没有这个算子 |
 | Forward-Forward | 正样本、负样本各一次前向，每层用活动平方和当 goodness | 2，但是逐层局部目标 | 要改每一层的目标 | MNIST 一级的小网络 | 要改网络结构 | 排除 |
@@ -59,7 +62,7 @@ BBTv2 补上了这一档。它在每一层隐藏状态前拼 prompt，依靠残�
 4. 子空间维数有现成的消融。BBT 在 \(\{100,200,500,1000\}\) 里看到 \(d=100\) 盖不住好解、\(d=1000\) 泛化变差。BBTv2 看到 \(d>100\) 后收益变平。第一版固定 \(d=100\) 或 \(d=500\)，不要扫全参数。
 5. 输入侧前缀只改嵌入拼接。BBTv2 的逐层 prompt 要动每一层前向，作为第二步，而不是第一刀。
 
-CMA-ES 本身维护一个多元正态和协方差。BBT 引用 Hansen & Ostermeier (2001) 与 Hansen et al. (2003)，并把种群设为 \(\lambda=4+3\log d\)。\(d=500\) 时这是二十个量级的候选，每个候选一次完整翻译前向。
+CMA-ES 维护多元正态：均值 \(\mathbf{m}\in\mathbb{R}^{d}\)、步长 \(\sigma\) 和协方差 \(\mathbf{C}\in\mathbb{R}^{d\times d}\)。BBT 写明这三项都在迭代中更新。默认实验表的种群是 20；子空间消融才把种群设为 \(\lambda=4+3\log d\)。\(d=500\) 时每一代大约二十次完整翻译前向。见 [Sun et al. 2022, arXiv:2201.03514](https://arxiv.org/abs/2201.03514) §3.2 与 Table 2。
 
 ## 同一条前缀上，MeZO 是备选优化器
 
@@ -67,8 +70,9 @@ MeZO 把 SPSA 估计做成就地更新。随机种子 \(s\) 重放 \(z\sim\mathc
 
 论文里的预算说明它不能直接拿来做交互式全参数训练：
 
+- 预备实验写明：MeZO 只有在使用 prompt 时才优化得动。下文实验都带 prompt。见该文 §3 与 Appendix A。
 - RoBERTa-large（350M）跑 100,000 步，Adam 微调跑 1,000 步。
-- OPT-13B / 30B / 66B 跑 20,000 步，对照微调是 5 个 epoch（文中按 625 步计）。一步 MeZO 比一步 Adam 快，30B 的总 GPU 时大约是 Adam 的一半，但那是在 A100 上对一千条例子训练。
+- OPT-13B / 30B / 66B 跑 20,000 步，对照微调是 5 个 epoch（文中按 625 步计）。Appendix F.6 对 OPT-30B 的墙钟拆开写：MeZO 步数是标准微调的 32 倍，每步快 7.74 倍，GPU 数少 8 倍，总 GPU 时大约一半。这是 A100 上的实现对比，论文同时写明墙钟优势取决于实现。
 - OPT-13B 上，MeZO 在 11 项里有 7 项落在 Adam 微调的 1% 以内。生成任务 SQuAD、DROP 用 teacher forcing 训练、贪心解码评估，MeZO 能超过零样本、上下文学习和线性探测。
 - 全参数、LoRA、prefix 三者性能接近，收敛速度也接近。理论把减速因子放在损失 Hessian 的局部有效秩 \(r\) 上，而不是参数个数 \(d\)（Assumption 1、Theorem 1）。因此把 MeZO 从全参数换成 prefix，**不会**按论文结论把 20,000 步收成几百步。prefix 的价值是扰动和检查点都落在小张量上。
 - 不可微目标成立：分类直接优化准确率，SQuAD 的 prefix 版优化 F1。用户的“改对了 / 没改对”可以做成标量，不必可微。
@@ -81,9 +85,17 @@ HiZOO 在 MeZO 的两次前向之外再加一次未扰动前向来估计对角 H
 
 AdaZeta 针对 MeZO-LoRA 在 Llama-2-7B 上的发散。张量列车适配器接在每个块的注意力和 FFN 之后，层归一化冻结，可训参数减少 80 倍以上；查询次数按 epoch 次线性增加，中等模型上查询数固定为 1。Llama-2-7B 的 SST-2 峰值内存 14 GB，相对全参数微调大约 8 倍下降。一条曲线上，MeZO-LoRA 约 6,000 步到达损失 0.4，AdaZeta 不到 1,000 步。见 [Yang et al. 2024, arXiv:2406.18060](https://arxiv.org/abs/2406.18060) 与 Table 2。它证明“可训维数”在他们的分析里仍然进入收敛界，这和 MeZO 的有效秩观点并列，两篇都只覆盖带提示的分类和抽取式问答。张量列车要新的收缩内核，不该先于一段普通前缀。
 
+后补的三篇全参数变体也没有把第一选择从低维前缀上挪开。
+
+[ZO-Bench](https://arxiv.org/abs/2402.11592) 在全参数 OPT-13B、MultiRC、batch 4、平均上下文 400 上测峰值内存：ZO-SGD 64 GB、1 张 A100；Forward-Grad 134 GB、2 张；ZO-Adam 158 GB、2 张；FO-Adam 245 GB、4 张。ZO 跑 20,000 步，一阶跑 625 步。ZO-Adam 的矩估计把零阶的内存优势吃掉，还高于同表的 FO-SGD（148 GB）。查询预算消融是另一组设置：LoRA 微调 OPT-1.3B 的 SST-2 上，\(q>500\) 时 Forward-Grad 比 ZO-SGD 高 1 到 2 个点，计算随 \(q\) 线性增加。
+
+[Sparse-MeZO](https://arxiv.org/abs/2402.15751) 把扰动限制在动态稀疏掩码上。1-bit 存掩码会多占内存，所以掩码在前向时现算。LLaMA-7B 的 MultiRC 上，高效实现 14.6 GB，全参数微调 158.6 GB。收敛图的一个例子是约 5,000 步到 70% 准确率，MeZO 要 17,500 步；文中接着给出 RTE 约 3.5 倍、BoolQ 约 3 倍加速。稀疏度从 0.5 到 0.8 有收益，多数任务上 0.8 更好。这仍然是对整份浮点权重做两次前向，而且要写回被掩住的坐标。
+
+[LOZO](https://arxiv.org/abs/2410.07698) 用低秩因子 \(U,V\) 构造扰动，使梯度估计保持低秩，存储开销与 MeZO 相同。OPT-66B 的 WIC 上，达到同一训练损失大约用 MeZO 一半的 epoch。更新对象仍是全参数矩阵，实验协议仍是 13B–66B 的有标签微调。
+
 ## 明确排除
 
-**前向梯度。** Baydin 等人定义 \(g(\theta)=(\nabla f(\theta)\cdot v)\,v\)，由一次前向模式的 Jacobian-vector product 得到，证明无偏。他们估计前向模式代价大约是原函数的 1–3 倍，反向模式大约 5–10 倍，并在一些网络上看到相对反向传播最多约 2 倍的墙钟加速。见 [Baydin et al. 2022, arXiv:2202.08587](https://arxiv.org/abs/2202.08587)。这是自动微分的前向模式，不是零阶。MeZO 第 2 节写明：同一估计若用 JVP 实现，必须存下 \(z\)，内存略高于两倍推理，而且既有 JVP 训练的经验效果有限。当前 Metal / ANE 内核没有切向量版本。
+**前向梯度。** Baydin 等人定义 \(g(\theta)=(\nabla f(\theta)\cdot v)\,v\)，由一次前向模式的 Jacobian-vector product 得到，证明无偏。他们估计前向模式代价大约是原函数的 1–3 倍，反向模式大约 5–10 倍，并在一些网络上看到相对反向传播最多约 2 倍的墙钟加速。见 [Baydin et al. 2022, arXiv:2202.08587](https://arxiv.org/abs/2202.08587)。这是自动微分的前向模式，不是零阶。MeZO 第 2 节写明：同一估计若用 JVP 实现，必须存下 \(z\)，内存略高于两倍推理，而且既有 JVP 训练的经验效果有限。ZO-Bench 把这件事量到了 OPT-13B：全参数 Forward-Grad 峰值 134 GB，要 2 张 A100。Burn 0.21 只有一阶反向模式，当前 Metal / ANE 内核也没有切向量版本。
 
 **Forward-Forward。** Hinton 用两次前向替换反向：正数据提高每层 goodness，负数据降低它。goodness 可以是整流活动的平方和。论文的对象是皮层模型和低功耗模拟硬件，并写明在所测小问题上比反向传播慢、泛化也差一点，电力充足时不会取代反向传播。文中同时指出，靠扰动权重再关联回报的强化学习，学习率要随被扰动变量数成反比，无法和反向传播在数百万到数十亿参数上竞争。见 [Hinton 2022, arXiv:2212.13345](https://arxiv.org/abs/2212.13345)。接入现有 Transformer、扩散和 codec 都要重写层次目标。
 
@@ -125,13 +137,18 @@ AdaZeta 针对 MeZO-LoRA 在 Llama-2-7B 上的发散。张量列车适配器接�
 - Baydin, Atılım Güneş, et al. Gradients without Backpropagation. arXiv:2202.08587. <https://arxiv.org/abs/2202.08587>
 - Hinton, Geoffrey. The Forward-Forward Algorithm: Some Preliminary Investigations. arXiv:2212.13345. <https://arxiv.org/abs/2212.13345>
 - Salimans, Tim, et al. Evolution Strategies as a Scalable Alternative to Reinforcement Learning. arXiv:1703.03864. <https://arxiv.org/abs/1703.03864>
+- Zhang, Yihua, et al. Revisiting Zeroth-Order Optimization for Memory-Efficient LLM Fine-Tuning: A Benchmark. arXiv:2402.11592. <https://arxiv.org/abs/2402.11592>
+- Liu, Yong, et al. Sparse MeZO: Less Parameters for Better Performance in Zeroth-Order LLM Fine-Tuning. arXiv:2402.15751. <https://arxiv.org/abs/2402.15751>
+- Chen, Yiming, et al. Enhancing Zeroth-Order Fine-Tuning for Language Models with Low-Rank Structures. arXiv:2410.07698. <https://arxiv.org/abs/2410.07698>
+- Burn 0.21.0 autodiff README. <https://github.com/tracel-ai/burn/blob/v0.21.0/crates/burn-autodiff/README.md>
 
-MeZO 把“收敛随参数维数变慢”的经典下界指向 Duchi, Jordan, Wainwright, Wibisono, IEEE Trans. Inf. Theory, 2015，以及 Nesterov and Spokoiny, Foundations of Computational Mathematics, 17:527–566, 2017。本文没有打开这两篇原文，只转述 MeZO 对它们的对照，不用它们的定理细节。
+MeZO 把“收敛随参数维数变慢”的经典下界指向 Duchi, Jordan, Wainwright, Wibisono, IEEE Trans. Inf. Theory, 2015，以及 Nesterov and Spokoiny, Foundations of Computational Mathematics, 17:527–566, 2017。本文没有打开这两篇期刊原文，只转述 MeZO 对它们的对照，不用它们的定理常数。Nesterov 的讨论稿 CORE 2011/1 在 <https://dial.uclouvain.be/pr/boreal/object/boreal:69205>，本轮没有逐条核对其中的定理。
 
 ## 没有打开的来源
 
-- Nesterov & Spokoiny 2017 的 FoCM 原文。用题名在 arXiv 上检索时，返回的不是这篇。
+- Nesterov & Spokoiny 2017 的 FoCM 期刊 PDF。按题名在 arXiv 上检索时返回的不是这篇。CORE 2011/1 的条目能定位，本轮没有重读定理。
 - Duchi et al. 2015 的 IEEE 原文。
-- Spall 1992 的 IEEE Transactions on Automatic Control 论文页。两次测量这一操作事实来自作者维护的 SPSA 页。
+- Spall 1992 的 IEEE 排版页。作者站点提供了 PDF：<https://www.jhuapl.edu/spsa/pdf-spsa/spall_tac92.pdf>。本轮没有重读引理。两次测量这一操作事实来自作者维护的 SPSA 页。
 - Salimans et al. 2017 的 PDF 正文。arXiv HTML/PDF 转换没有给出正文，种群与通信事实来自 arXiv API 摘要和官方仓库 README。
-- Sparse-MeZO 原文。表中的 Sparse-MeZO 数字只出现在 AdaZeta 的对照表里。
+- DPZero（arXiv:2310.09639）只在检索结果里见过摘要，没有打开正文。
+- QuZO（arXiv:2502.12346）只作为 Sparse-MeZO 参考文献里的一条出现，没有打开。因此本文不声称量化权重上的零阶微调不存在，只说明上面已打开的微调论文没有 INT4、INT8 或 FP8 权重实验。Sparse-MeZO 里的 1-bit 讨论的是掩码存储，而且该方案被放弃。
