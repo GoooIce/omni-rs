@@ -6,7 +6,14 @@
 //! ```
 use burn::tensor::{Tensor, TensorData};
 use int8_gemm::{Kernel, Metal, transpose_packed, try_int8_gemm_times};
-use std::{env, io::Write, time::Instant};
+use std::{
+    env,
+    io::Write,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
+
+static SHADER_ERROR: AtomicBool = AtomicBool::new(false);
 
 struct StderrLog;
 
@@ -15,9 +22,25 @@ impl log::Log for StderrLog {
         true
     }
     fn log(&self, record: &log::Record<'_>) {
+        let text = format!("{}", record.args());
+        if is_shader_failure(&text) {
+            SHADER_ERROR.store(true, Ordering::Relaxed);
+        }
         let _ = writeln!(std::io::stderr(), "{} {}", record.level(), record.args());
     }
     fn flush(&self) {}
+}
+
+fn is_shader_failure(text: &str) -> bool {
+    text.contains("Shader error")
+}
+
+/// A shader failure is logged on the device thread and does not fail this process.
+fn refuse_shader_failure() {
+    if SHADER_ERROR.load(Ordering::Relaxed) {
+        eprintln!("shader compilation failed; refusing numeric comparison");
+        std::process::exit(1);
+    }
 }
 
 fn main() {
@@ -238,7 +261,7 @@ fn run_times(
         TensorData::new(zero.to_vec(), [columns]),
         device,
     );
-    try_int8_gemm_times(
+    let values = try_int8_gemm_times(
         kernel,
         x,
         w_packed,
@@ -250,7 +273,9 @@ fn run_times(
     .expect("metal int8 gemm")
     .into_data()
     .to_vec::<f32>()
-    .unwrap()
+    .unwrap();
+    refuse_shader_failure();
+    values
 }
 
 fn reference(
@@ -295,4 +320,15 @@ fn round_half_away(value: f32) -> i32 {
         (value - 0.5).ceil()
     };
     rounded.clamp(-128.0, 127.0) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_shader_failure;
+
+    #[test]
+    fn shader_failure_matches_the_wgpu_log_line() {
+        assert!(is_shader_failure("Shader error: MSL: NSError"));
+        assert!(!is_shader_failure("gemm 0.2 ms"));
+    }
 }
