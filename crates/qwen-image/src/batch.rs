@@ -59,7 +59,7 @@ impl<B: Backend> ImageBatch<B> {
         }
         let state = self
             .model
-            .prepare_generation(options, &cancel, &mut progress)?;
+            .prepare_generation(options, &cancel, &mut progress, None)?;
         let id = self.next;
         self.next += 1;
         self.active.push(Active { id, state, cancel });

@@ -542,15 +542,30 @@ script_mod! {
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
                                             image_generate := PrimaryButton{text: "生成图像" height: 38}
+                                            image_observe_toggle := QuietButton{text: "去噪观察 · 关闭" height: 38}
                                             image_stop := QuietButton{text: "停止" height: 38}
                                             image_save := QuietButton{text: "保存 PNG…" height: 38}
                                         }
                                         image_preview_group := RoundedView{
-                                            width: Fill height: 208 padding: 10 flow: Down spacing: 6
+                                            width: Fill height: 248 padding: 10 flow: Down spacing: 6
                                             draw_bg.color: #121a15 draw_bg.border_radius: 5
                                             draw_bg.border_color: #344137 draw_bg.border_size: 1
-                                            MutedLabel{text: "图像预览"}
-                                            image_preview := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                            image_preview_caption := MutedLabel{text: "图像预览"}
+                                            image_preview_single := View{
+                                                width: Fill height: Fill
+                                                image_preview := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                            }
+                                            image_observation := View{
+                                                visible: false width: Fill height: Fill flow: Right spacing: 4
+                                                image_step_1 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_2 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_3 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_4 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_5 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_6 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_7 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                                image_step_8 := Image{width: Fill height: Fill fit: ImageFit.Smallest}
+                                            }
                                         }
                                         image_settings_toggle := QuietButton{text: "尺寸与更多参数" height: 32}
                                         image_advanced := View{

@@ -30,6 +30,9 @@ pub struct Options {
     pub images: Vec<PathBuf>,
     #[serde(default = "default_reference_resolution")]
     pub reference_resolution: usize,
+    /// Desktop denoising observation. Ordinary generation leaves this off.
+    #[serde(default)]
+    pub observation: bool,
 }
 fn default_cfg_scale() -> f32 {
     1.0
@@ -48,6 +51,7 @@ impl Default for Options {
             seed: 42,
             images: Vec::new(),
             reference_resolution: default_reference_resolution(),
+            observation: false,
         }
     }
 }
@@ -223,7 +227,17 @@ impl<B: Backend> Model<B> {
         cancel: &AtomicBool,
         mut progress: impl FnMut(Progress),
     ) -> Result<GeneratedImage> {
-        let mut state = self.prepare_generation(options, cancel, &mut progress)?;
+        let kind = options.request_kind()?;
+        if kind.decodes_after_each_step()
+            || kind.loads_minicpm_v()
+            || kind.reads_projection_weights()
+            || kind.trajectories() != 1
+        {
+            return Err(Error::Config(
+                "普通生成只加载官方文本塔，只跑一条扩散轨迹，并只在结束时解码一次".into(),
+            ));
+        }
+        let mut state = self.prepare_generation(options, cancel, &mut progress, None)?;
         while state.step < self.config.sigmas.len() {
             check_cancel(cancel)?;
             progress(Progress {
@@ -235,11 +249,72 @@ impl<B: Backend> Model<B> {
         }
         self.finish_generation(state, cancel, &mut progress)
     }
+
+    /// Official-text observation: one trajectory, no negative branch, one retained decode per step.
+    pub fn observe(
+        &mut self,
+        options: &Options,
+        cancel: &AtomicBool,
+        mut progress: impl FnMut(Progress),
+        mut on_cell: impl FnMut(usize, &image::RgbaImage),
+    ) -> Result<OfficialObservation> {
+        let kind = options.request_kind()?;
+        let refused = kind.negative_guidance()
+            || kind.loads_minicpm_v()
+            || kind.reads_projection_weights()
+            || kind.trajectories() != 1
+            || !kind.decodes_after_each_step();
+        let RequestKind::OfficialObservation(request) = kind else {
+            return Err(Error::Config("去噪观察尚未开启".into()));
+        };
+        if refused {
+            return Err(Error::Config(
+                "官方文本条件的去噪观察不加载 MiniCPM-V，不读取投影权重，也没有负向引导".into(),
+            ));
+        }
+        if self.config.sigmas.len() != DEFAULT_TURBO_STEPS {
+            return Err(Error::Config(format!(
+                "去噪观察要求默认 Turbo 的 {DEFAULT_TURBO_STEPS} 步调度"
+            )));
+        }
+        let mut row = OfficialObservation::begin(request, self.config.sigmas.len())?;
+        let noise = row.initial_noise().to_vec();
+        let mut state = self.prepare_generation(options, cancel, &mut progress, Some(noise))?;
+        if state.negative.is_some() {
+            return Err(Error::Config("去噪观察没有负向条件分支".into()));
+        }
+        while state.step < self.config.sigmas.len() {
+            check_cancel(cancel)?;
+            progress(Progress {
+                stage: "step",
+                current: state.step + 1,
+                total: self.config.sigmas.len(),
+            });
+            self.advance_generations(&mut [(&mut state, cancel)], &mut progress)?;
+            let image = self.decode_latents(
+                state.latents.clone(),
+                state.width,
+                state.height,
+                state.h,
+                state.w,
+                state.channels,
+                cancel,
+                &mut progress,
+            )?;
+            let step = state.step;
+            row.retain(step, image)?;
+            let cell = &row.cells()[step - 1];
+            on_cell(cell.step, &cell.image);
+        }
+        Ok(row)
+    }
+
     fn prepare_generation(
         &mut self,
         options: &Options,
         cancel: &AtomicBool,
         mut progress: &mut impl FnMut(Progress),
+        noise: Option<Vec<f32>>,
     ) -> Result<Generation<B>> {
         options.validate()?;
         let (width, height) = options.output_dimensions()?;
@@ -362,8 +437,15 @@ impl<B: Backend> Model<B> {
         let h = height / 16;
         let w = width / 16;
         let channels = self.config.vae.z_dim;
-        // Start with channel-major noise, matching the official latent packing.
-        let noise = gaussian_noise(channels * h * w, options.seed);
+        // Channel-major noise. Observation passes this same vector back in so the
+        // official trajectory and any later one start from identical samples.
+        let noise = match noise {
+            Some(noise) => noise,
+            None => observation::latent_noise(channels, height, width, options.seed),
+        };
+        if noise.len() != channels * h * w {
+            return Err(Error::Config("初始噪声长度与画布不一致".into()));
+        }
         let latents =
             Tensor::<B, 3>::from_data(TensorData::new(noise, [1, channels, h * w]), &self.device)
                 .swap_dims(1, 2)
@@ -395,7 +477,7 @@ impl<B: Backend> Model<B> {
         &self,
         state: Generation<B>,
         cancel: &AtomicBool,
-        mut progress: &mut impl FnMut(Progress),
+        progress: &mut impl FnMut(Progress),
     ) -> Result<GeneratedImage> {
         let Generation {
             options,
@@ -417,8 +499,43 @@ impl<B: Backend> Model<B> {
         let denoise_seconds = denoise_start.elapsed().as_secs_f64();
         drop(cache);
         drop(negative);
-        check_cancel(cancel)?;
         let decode_start = Instant::now();
+        let image =
+            self.decode_latents(latents, width, height, h, w, channels, cancel, progress)?;
+        let decode_seconds = decode_start.elapsed().as_secs_f64();
+        Ok(GeneratedImage {
+            image,
+            source_images: options.images.clone(),
+            report: Report {
+                width,
+                height,
+                seed: options.seed,
+                steps: self.config.sigmas.len(),
+                reference_count: options.images.len(),
+                reference_resolution: options.reference_resolution,
+                guidance_enabled: guided,
+                true_cfg_scale: options.true_cfg_scale,
+                reference_seconds,
+                text_seconds,
+                denoise_seconds,
+                decode_seconds,
+                elapsed_seconds: start.elapsed().as_secs_f64(),
+            },
+        })
+    }
+
+    fn decode_latents(
+        &self,
+        latents: Tensor<B, 3>,
+        width: usize,
+        height: usize,
+        h: usize,
+        w: usize,
+        channels: usize,
+        cancel: &AtomicBool,
+        progress: &mut impl FnMut(Progress),
+    ) -> Result<image::RgbaImage> {
+        check_cancel(cancel)?;
         let latents = latents.swap_dims(1, 2).reshape([1, channels, h, w]);
         let mean = Tensor::<B, 4>::from_data(
             TensorData::new(self.config.vae.latents_mean.clone(), [1, channels, 1, 1]),
@@ -430,9 +547,7 @@ impl<B: Backend> Model<B> {
             &self.device,
         )
         .cast(self.precision.dtype());
-        let rgba = self
-            .vae
-            .decode(latents * std + mean, cancel, &mut progress)?;
+        let rgba = self.vae.decode(latents * std + mean, cancel, progress)?;
         let shape = rgba.dims();
         if shape != [1, 4, height, width] {
             return Err(Error::Config(format!("VAE 输出尺寸异常：{shape:?}")));
@@ -455,27 +570,9 @@ impl<B: Backend> Model<B> {
                     .round_ties_even() as u8;
             }
         }
-        let decode_seconds = decode_start.elapsed().as_secs_f64();
-        Ok(GeneratedImage {
-            image,
-            source_images: options.images.clone(),
-            report: Report {
-                width,
-                height,
-                seed: options.seed,
-                steps: self.config.sigmas.len(),
-                reference_count: options.images.len(),
-                reference_resolution: options.reference_resolution,
-                guidance_enabled: guided,
-                true_cfg_scale: options.true_cfg_scale,
-                reference_seconds,
-                text_seconds,
-                denoise_seconds,
-                decode_seconds,
-                elapsed_seconds: start.elapsed().as_secs_f64(),
-            },
-        })
+        Ok(image)
     }
+
     fn advance_generations(
         &self,
         work: &mut [(&mut Generation<B>, &AtomicBool)],
@@ -636,6 +733,11 @@ struct Generation<B: Backend> {
 #[path = "batch.rs"]
 mod batch;
 pub use batch::{BatchStats, ImageBatch};
+#[path = "observation.rs"]
+mod observation;
+pub use observation::{
+    DEFAULT_TURBO_STEPS, ObservationCell, ObservationRequest, OfficialObservation, RequestKind,
+};
 
 #[cfg(test)]
 mod tests {
@@ -688,5 +790,147 @@ mod tests {
             o.true_cfg_scale = value;
             assert!(o.validate().is_err());
         }
+    }
+
+    fn plain_observation() -> Options {
+        Options {
+            prompt: "一只茶壶".into(),
+            width: 512,
+            height: 512,
+            seed: 7,
+            observation: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn observation_accepts_plain_text_with_guidance_off_and_refuses_the_other_inputs() {
+        let request = ObservationRequest::accept(&plain_observation()).unwrap();
+        assert_eq!(request.prompt(), "一只茶壶");
+        assert_eq!(request.canvas(), (512, 512));
+        assert_eq!(request.seed(), 7);
+        assert!(!request.guidance_enabled());
+
+        let mut with_reference = plain_observation();
+        with_reference.images.push("ref.png".into());
+        let error = ObservationRequest::accept(&with_reference)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("参考图"), "{error}");
+
+        let mut with_negative = plain_observation();
+        with_negative.negative_prompt = Some(String::new());
+        let error = ObservationRequest::accept(&with_negative)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("负向"), "{error}");
+
+        let mut with_guidance = plain_observation();
+        with_guidance.true_cfg_scale = 2.0;
+        let error = ObservationRequest::accept(&with_guidance)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("引导"), "{error}");
+
+        // These inputs stay valid for an ordinary request.
+        for mut ordinary in [with_reference, with_negative, with_guidance] {
+            ordinary.observation = false;
+            assert!(ordinary.validate().is_ok());
+        }
+        let mut guided = plain_observation();
+        guided.observation = false;
+        guided.negative_prompt = Some("模糊".into());
+        guided.true_cfg_scale = 2.0;
+        assert!(guided.guidance_enabled());
+        assert!(guided.validate().is_ok());
+    }
+
+    #[test]
+    fn official_observation_retains_one_canvas_decode_per_default_turbo_step() {
+        assert_eq!(DEFAULT_TURBO_STEPS, 8);
+        let request = ObservationRequest::accept(&plain_observation()).unwrap();
+        let mut row = OfficialObservation::begin(request, DEFAULT_TURBO_STEPS).unwrap();
+        assert_eq!(row.trajectories(), 1);
+        assert!(!row.uses_negative_guidance());
+        assert!(row.is_official_text());
+        let expected = gaussian_noise(64 * (512 / 16) * (512 / 16), 7);
+        assert_eq!(row.initial_noise(), expected.as_slice());
+        assert!(
+            OfficialObservation::begin(
+                ObservationRequest::accept(&plain_observation()).unwrap(),
+                7,
+            )
+            .is_err()
+        );
+
+        for step in 1..=8 {
+            let image =
+                image::RgbaImage::from_pixel(512, 512, image::Rgba([step as u8, 9, 8, 255]));
+            row.retain(step, image).unwrap();
+            assert_eq!(row.cells().len(), step);
+            assert_eq!(row.cells()[0].image.get_pixel(0, 0).0, [1, 9, 8, 255]);
+        }
+        assert_eq!(
+            row.cells().iter().map(|cell| cell.step).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        for cell in row.cells() {
+            assert_eq!(cell.image.dimensions(), (512, 512));
+        }
+        let replacement = image::RgbaImage::from_pixel(512, 512, image::Rgba([99, 0, 0, 255]));
+        assert!(row.retain(1, replacement).is_err());
+        assert_eq!(row.cells().len(), 8);
+        assert_eq!(row.cells()[0].image.get_pixel(0, 0).0[0], 1);
+
+        let shrunk = image::RgbaImage::from_pixel(256, 256, image::Rgba([0, 0, 0, 255]));
+        assert!(row.retain(9, shrunk).is_err());
+        assert_eq!(row.cells()[7].image.dimensions(), (512, 512));
+
+        let other = OfficialObservation::begin(
+            ObservationRequest::accept(&Options {
+                seed: 8,
+                ..plain_observation()
+            })
+            .unwrap(),
+            8,
+        )
+        .unwrap();
+        assert_ne!(row.initial_noise(), other.initial_noise());
+    }
+
+    #[test]
+    fn ordinary_generation_keeps_one_trajectory_and_one_final_decode() {
+        let mut options = Options {
+            prompt: "一只茶壶".into(),
+            width: 512,
+            height: 320,
+            seed: 3,
+            negative_prompt: Some("模糊".into()),
+            true_cfg_scale: 2.0,
+            images: vec!["ref.png".into()],
+            observation: false,
+            ..Default::default()
+        };
+        let kind = options.request_kind().unwrap();
+        assert_eq!(kind.trajectories(), 1);
+        assert_eq!(kind.retained_decodes(), 1);
+        assert!(kind.negative_guidance());
+        assert!(!kind.loads_minicpm_v());
+        assert!(!kind.reads_projection_weights());
+        assert!(!kind.decodes_after_each_step());
+
+        options.observation = true;
+        assert!(options.request_kind().is_err());
+
+        options.images.clear();
+        options.negative_prompt = None;
+        options.true_cfg_scale = 1.0;
+        let kind = options.request_kind().unwrap();
+        assert_eq!(kind.trajectories(), 1);
+        assert_eq!(kind.retained_decodes(), 8);
+        assert!(!kind.negative_guidance());
+        assert!(!kind.loads_minicpm_v());
+        assert!(!kind.reads_projection_weights());
+        assert!(kind.decodes_after_each_step());
     }
 }

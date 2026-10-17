@@ -1,5 +1,6 @@
 use omni_qwen_image::{Config, Error, GeneratedImage, Model, Options, Precision, Progress};
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -25,6 +26,13 @@ pub struct ReferencePreview {
     pub pixels: Vec<u32>,
 }
 
+pub struct ObservationPreview {
+    pub step: usize,
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+}
+
 #[derive(serde::Serialize)]
 pub struct Update {
     pub kind: &'static str,
@@ -34,6 +42,8 @@ pub struct Update {
     pub image: Option<Arc<GeneratedImage>>,
     #[serde(skip)]
     pub reference: Option<Arc<ReferencePreview>>,
+    #[serde(skip)]
+    pub observation: Option<ObservationPreview>,
 }
 impl Update {
     fn status(kind: &'static str, message: impl Into<String>) -> Self {
@@ -43,6 +53,7 @@ impl Update {
             progress: 0.0,
             image: None,
             reference: None,
+            observation: None,
         }
     }
 }
@@ -194,104 +205,18 @@ impl crate::engine_harness::Adapter for Worker {
                 Ok(update)
             }
             Command::Generate(options) => {
+                if options.observation {
+                    return self.observe(options, context);
+                }
                 let model = self
                     .model
                     .as_mut()
                     .ok_or_else(|| Error::Config("图像模型尚未载入".into()))?;
                 let total = model.config.sigmas.len();
-                let branches = if options.guidance_enabled() { 2.0 } else { 1.0 };
-                let mut step = 0;
                 let editing = !options.images.is_empty();
-                let base = if editing { 0.25 } else { 0.0 };
-                let mut fraction_seen = 0.0f64;
-                let mut reference_index = 0;
+                let mut track = ProgressTrack::default();
                 let generated = Arc::new(model.generate(&options, &stop, |p: Progress| {
-                    let (fraction, message) = match p.stage {
-                        "load_vision" => (
-                            0.04 * p.current as f64 / p.total as f64,
-                            format!("首次加载视觉编码器 · {} / {}", p.current, p.total),
-                        ),
-                        "reference" => {
-                            reference_index = p.current;
-                            (0.04, format!("理解参考图片 · {} / {}", p.current, p.total))
-                        }
-                        "vision" | "vae_encode" => {
-                            let portion = if p.stage == "vision" { 0.0 } else { 0.5 };
-                            let fraction = 0.04
-                                + 0.21
-                                    * ((reference_index.saturating_sub(1)) as f64
-                                        + portion
-                                        + 0.5 * p.current as f64 / p.total as f64)
-                                    / options.images.len().max(1) as f64;
-                            (
-                                fraction,
-                                format!(
-                                    "{}参考图 {} · {} / {}",
-                                    if p.stage == "vision" {
-                                        "理解"
-                                    } else {
-                                        "编码"
-                                    },
-                                    reference_index,
-                                    p.current,
-                                    p.total
-                                ),
-                            )
-                        }
-                        "text" | "negative_text" => (
-                            base + 0.08
-                                * (if p.stage == "negative_text" { 1.0 } else { 0.0 }
-                                    + p.current as f64 / p.total as f64)
-                                / branches,
-                            format!(
-                                "理解{} · {} / {}",
-                                if p.stage == "negative_text" {
-                                    "负向提示词"
-                                } else {
-                                    "图片描述"
-                                },
-                                p.current,
-                                p.total
-                            ),
-                        ),
-                        "step" => {
-                            step = p.current;
-                            (
-                                base + 0.08 + (0.82 - base) * (step - 1) as f64 / total as f64,
-                                format!("生成图像 · 第 {step} / {total} 步"),
-                            )
-                        }
-                        "denoise_layer" | "negative_denoise_layer" => (
-                            base + 0.08
-                                + (0.82 - base)
-                                    * ((step - 1) as f64
-                                        + (if p.stage == "negative_denoise_layer" {
-                                            1.0
-                                        } else {
-                                            0.0
-                                        } + p.current as f64 / p.total as f64)
-                                            / branches)
-                                    / total as f64,
-                            format!(
-                                "生成图像 · 第 {step} / {total} 步 · {}{} / {}",
-                                if p.stage == "negative_denoise_layer" {
-                                    "负向 "
-                                } else {
-                                    ""
-                                },
-                                p.current,
-                                p.total
-                            ),
-                        ),
-                        _ => (
-                            0.90 + 0.10 * p.current as f64 / p.total as f64,
-                            format!("解码图像 · {} / {}", p.current, p.total),
-                        ),
-                    };
-                    let mut u = Update::status("progress", message);
-                    fraction_seen = fraction_seen.max(fraction);
-                    u.progress = fraction_seen;
-                    context.updates.publish(u);
+                    report_progress(context, &options, total, &mut track, p);
                 })?);
                 let mut update = Update::status(
                     "done",
@@ -309,4 +234,179 @@ impl crate::engine_harness::Adapter for Worker {
             }
         }
     }
+}
+
+impl Worker {
+    fn observe(
+        &mut self,
+        options: Options,
+        context: &crate::engine_harness::Context<Update>,
+    ) -> omni_qwen_image::Result<Update> {
+        let stop = &context.stop;
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| Error::Config("图像模型尚未载入".into()))?;
+        let total = model.config.sigmas.len();
+        let track = RefCell::new(ProgressTrack::default());
+        let row = model.observe(
+            &options,
+            stop,
+            |p: Progress| {
+                report_progress(context, &options, total, &mut track.borrow_mut(), p);
+            },
+            |step, image| {
+                let mut update = Update::status(
+                    "observation",
+                    format!("去噪观察 · 官方文本条件 · 第 {step} / {total} 步"),
+                );
+                update.progress = track.borrow().fraction_seen;
+                update.observation = Some(ObservationPreview {
+                    step,
+                    width: image.width() as usize,
+                    height: image.height() as usize,
+                    rgba: image.as_raw().to_vec(),
+                });
+                context.updates.publish(update);
+            },
+        )?;
+        let (width, height) = row.canvas();
+        let mut update = Update::status(
+            "done",
+            format!(
+                "去噪观察完成 · 官方文本条件 · {} 格 · {width} × {height}",
+                row.cells().len()
+            ),
+        );
+        update.progress = 1.0;
+        Ok(update)
+    }
+}
+
+#[derive(Default)]
+struct ProgressTrack {
+    step: usize,
+    fraction_seen: f64,
+    reference_index: usize,
+}
+
+fn report_progress(
+    context: &crate::engine_harness::Context<Update>,
+    options: &Options,
+    total: usize,
+    track: &mut ProgressTrack,
+    p: Progress,
+) {
+    let branches = if options.guidance_enabled() { 2.0 } else { 1.0 };
+    let editing = !options.images.is_empty();
+    let base = if editing { 0.25 } else { 0.0 };
+    let (fraction, message) = match p.stage {
+        "load_vision" => (
+            0.04 * p.current as f64 / p.total as f64,
+            format!("首次加载视觉编码器 · {} / {}", p.current, p.total),
+        ),
+        "reference" => {
+            track.reference_index = p.current;
+            (0.04, format!("理解参考图片 · {} / {}", p.current, p.total))
+        }
+        "vision" | "vae_encode" => {
+            let portion = if p.stage == "vision" { 0.0 } else { 0.5 };
+            let fraction = 0.04
+                + 0.21
+                    * ((track.reference_index.saturating_sub(1)) as f64
+                        + portion
+                        + 0.5 * p.current as f64 / p.total as f64)
+                    / options.images.len().max(1) as f64;
+            (
+                fraction,
+                format!(
+                    "{}参考图 {} · {} / {}",
+                    if p.stage == "vision" {
+                        "理解"
+                    } else {
+                        "编码"
+                    },
+                    track.reference_index,
+                    p.current,
+                    p.total
+                ),
+            )
+        }
+        "text" | "negative_text" => (
+            base + 0.08
+                * (if p.stage == "negative_text" { 1.0 } else { 0.0 }
+                    + p.current as f64 / p.total as f64)
+                / branches,
+            format!(
+                "理解{} · {} / {}",
+                if p.stage == "negative_text" {
+                    "负向提示词"
+                } else {
+                    "图片描述"
+                },
+                p.current,
+                p.total
+            ),
+        ),
+        "step" => {
+            track.step = p.current;
+            (
+                base + 0.08 + (0.82 - base) * (track.step - 1) as f64 / total as f64,
+                format!(
+                    "{} · 第 {} / {total} 步",
+                    if options.observation {
+                        "去噪观察"
+                    } else {
+                        "生成图像"
+                    },
+                    track.step
+                ),
+            )
+        }
+        "denoise_layer" | "negative_denoise_layer" => (
+            base + 0.08
+                + (0.82 - base)
+                    * ((track.step - 1) as f64
+                        + (if p.stage == "negative_denoise_layer" {
+                            1.0
+                        } else {
+                            0.0
+                        } + p.current as f64 / p.total as f64)
+                            / branches)
+                    / total as f64,
+            format!(
+                "{} · 第 {} / {total} 步 · {}{} / {}",
+                if options.observation {
+                    "去噪观察"
+                } else {
+                    "生成图像"
+                },
+                track.step,
+                if p.stage == "negative_denoise_layer" {
+                    "负向 "
+                } else {
+                    ""
+                },
+                p.current,
+                p.total
+            ),
+        ),
+        _ if options.observation => (
+            base + 0.08 + (0.92 - base) * track.step.max(1) as f64 / total.max(1) as f64,
+            format!(
+                "解码官方条件 · 第 {} / {total} 步 · {} / {}",
+                track.step.max(1),
+                p.current,
+                p.total
+            ),
+        ),
+        _ => (
+            0.90 + 0.10 * p.current as f64 / p.total as f64,
+            format!("解码图像 · {} / {}", p.current, p.total),
+        ),
+    };
+    let mut update = Update::status("progress", message);
+    track.fraction_seen = track.fraction_seen.max(fraction);
+    update.progress = track.fraction_seen;
+    context.updates.publish(update);
 }

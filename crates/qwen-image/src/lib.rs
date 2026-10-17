@@ -23,7 +23,10 @@ pub mod text;
 pub mod vae;
 pub mod vision;
 pub use config::Config;
-pub use pipeline::{BatchStats, GeneratedImage, ImageBatch, Model, Options, Report};
+pub use pipeline::{
+    BatchStats, DEFAULT_TURBO_STEPS, GeneratedImage, ImageBatch, Model, ObservationCell,
+    ObservationRequest, OfficialObservation, Options, Report, RequestKind,
+};
 
 pub use omni_r2t2::Precision;
 use std::sync::atomic::{AtomicBool, Ordering};

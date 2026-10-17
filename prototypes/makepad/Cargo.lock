@@ -4705,6 +4705,25 @@ dependencies = [
  "burn-fusion",
  "burn-ir",
  "cubecl",
+ "objc2-metal",
+ "wgpu",
+]
+
+[[package]]
+name = "omni-minicpm-v"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
+ "half",
+ "image",
+ "omni-r2t2",
+ "safetensors 0.6.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokenizers",
 ]
 
 [[package]]
@@ -4741,6 +4760,7 @@ dependencies = [
  "image",
  "objc2-metal",
  "omni-kernel",
+ "omni-minicpm-v",
  "omni-r2t2",
  "serde",
  "serde_json",

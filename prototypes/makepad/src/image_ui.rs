@@ -29,7 +29,21 @@ pub struct State {
     has_image: bool,
     advanced: bool,
     cfg_enabled: bool,
-    controls: Option<(bool, bool, bool, bool, bool, bool, bool, bool, bool, bool)>,
+    observation: bool,
+    official_row: OfficialRow,
+    controls: Option<(
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    )>,
 }
 impl State {
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
@@ -63,6 +77,8 @@ impl State {
             has_image: false,
             advanced: false,
             cfg_enabled: false,
+            observation: false,
+            official_row: OfficialRow::new(0, 0),
             controls: None,
         }
     }
@@ -180,6 +196,7 @@ impl App {
             self.workspace.creative(),
             self.workspace.language(),
             i.picking || i.saving || i.picking_reference,
+            i.observation,
         );
         if i.controls == Some(state) {
             return;
@@ -207,6 +224,7 @@ impl App {
             ids!(image_reference_choose),
             ids!(image_settings_toggle),
             ids!(image_cfg_toggle),
+            ids!(image_observe_toggle),
             ids!(image_random_seed),
             ids!(image_size_square),
             ids!(image_size_portrait),
@@ -223,7 +241,9 @@ impl App {
             .set_action_enabled(cx, idle && !i.references.is_empty());
         self.ui.button(cx, ids!(image_generate)).set_text(
             cx,
-            if i.references.is_empty() {
+            if i.observation {
+                "观察去噪"
+            } else if i.references.is_empty() {
                 "生成图像"
             } else {
                 "编辑图像"
@@ -323,10 +343,40 @@ impl App {
                     i.needs_directory = true;
                     self.image_status(cx, &update.message);
                 }
+                "observation" => {
+                    let rejected = update.observation.as_ref().and_then(|cell| {
+                        i.official_row
+                            .show(cell.step, cell.width as u32, cell.height as u32, &cell.rgba)
+                            .err()
+                    });
+                    let stopping = i.stopping;
+                    if !stopping {
+                        self.image_status(cx, &update.message);
+                    }
+                    self.image_progress(cx, update.progress);
+                    if let Some(error) = rejected {
+                        self.image_status(cx, &error);
+                    } else if update.observation.is_some() {
+                        self.ui
+                            .view(cx, ids!(image_preview_single))
+                            .set_visible(cx, false);
+                        self.ui
+                            .view(cx, ids!(image_observation))
+                            .set_visible(cx, true);
+                        self.paint_official_row(cx);
+                    }
+                }
                 "done" => {
                     i.busy = false;
                     i.stopping = false;
                     i.has_image = true;
+                    let observed = if update.image.is_none() {
+                        let (width, height) = i.official_row.canvas();
+                        let count = i.official_row.cells().len();
+                        (count > 0).then_some((count, width, height))
+                    } else {
+                        None
+                    };
                     if let Some(result) = update.image {
                         i.output = Some(result.clone());
                         let r = &result.report;
@@ -377,7 +427,22 @@ impl App {
                         self.ui
                             .image(cx, ids!(image_preview))
                             .set_texture(cx, Some(texture));
+                        self.ui
+                            .view(cx, ids!(image_observation))
+                            .set_visible(cx, false);
+                        self.ui
+                            .view(cx, ids!(image_preview_single))
+                            .set_visible(cx, true);
+                        self.ui
+                            .label(cx, ids!(image_preview_caption))
+                            .set_text(cx, "图像预览");
                         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
+                    }
+                    if let Some((count, width, height)) = observed {
+                        self.ui.label(cx, ids!(image_metrics)).set_text(
+                            cx,
+                            &format!("官方文本条件 · {count} 格 · 解码 {width}×{height}"),
+                        );
                     }
                     self.ui
                         .view(cx, ids!(image_progress))
@@ -517,6 +582,32 @@ impl App {
             );
             return;
         }
+        if self
+            .ui
+            .button(cx, ids!(image_observe_toggle))
+            .clicked(actions)
+        {
+            i.observation = !i.observation;
+            i.controls = None;
+            let observation = i.observation;
+            self.ui.button(cx, ids!(image_observe_toggle)).set_text(
+                cx,
+                if observation {
+                    "去噪观察 · 开启"
+                } else {
+                    "去噪观察 · 关闭"
+                },
+            );
+            self.image_status(
+                cx,
+                if observation {
+                    "去噪观察已开启 · 仅纯文本，且引导关闭"
+                } else {
+                    "去噪观察已关闭 · 只在结束时解码"
+                },
+            );
+            return;
+        }
         if self.ui.button(cx, ids!(image_cfg_toggle)).clicked(actions) {
             i.cfg_enabled = !i.cfg_enabled;
             self.ui.button(cx, ids!(image_cfg_toggle)).set_text(
@@ -632,6 +723,7 @@ impl App {
                     negative_prompt: i
                         .cfg_enabled
                         .then(|| self.ui.text_input(cx, ids!(image_negative_prompt)).text()),
+                    observation: i.observation,
                     true_cfg_scale: if i.cfg_enabled {
                         let value: f32 = self
                             .ui
@@ -701,6 +793,9 @@ impl App {
                     }
                 }
                 o.validate().map_err(|e| e.to_string())?;
+                if o.observation {
+                    omni_qwen_image::ObservationRequest::accept(&o).map_err(|e| e.to_string())?;
+                }
                 Ok(o)
             })();
             let options = match options {
@@ -717,15 +812,221 @@ impl App {
             self.ui
                 .text_input(cx, ids!(image_height))
                 .set_text(cx, &options.height.to_string());
+            let observing = options.observation;
+            let canvas = (options.width as u32, options.height as u32);
+            if observing {
+                i.output = None;
+                i.has_image = false;
+                i.official_row = OfficialRow::new(canvas.0, canvas.1);
+            }
             i.busy = true;
             i.stopping = false;
             let result = i.engine.submit(Command::Generate(options));
-            self.image_status(cx, "开始生成 · 首次运行需编译 GPU 算子…");
+            self.image_status(
+                cx,
+                if observing {
+                    "开始去噪观察 · 官方文本条件 · 八步都会留下"
+                } else {
+                    "开始生成 · 首次运行需编译 GPU 算子…"
+                },
+            );
+            if observing {
+                self.ui
+                    .view(cx, ids!(image_preview_single))
+                    .set_visible(cx, false);
+                self.ui
+                    .view(cx, ids!(image_observation))
+                    .set_visible(cx, true);
+                self.paint_official_row(cx);
+            }
             self.ui.view(cx, ids!(image_progress)).set_visible(cx, true);
             self.image_progress(cx, 0.0);
             if let Err(e) = result {
                 self.image_error(cx, &e.to_string(), false);
             }
         }
+    }
+}
+
+const PREVIEW_EDGE: u32 = 160;
+
+struct ShownCell {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+struct OfficialRow {
+    canvas_width: u32,
+    canvas_height: u32,
+    cells: Vec<ShownCell>,
+}
+
+impl OfficialRow {
+    fn new(canvas_width: u32, canvas_height: u32) -> Self {
+        Self {
+            canvas_width,
+            canvas_height,
+            cells: Vec::new(),
+        }
+    }
+
+    fn canvas(&self) -> (u32, u32) {
+        (self.canvas_width, self.canvas_height)
+    }
+
+    /// Longest edge used when the preview scales a cell down. The stored decode stays at canvas size.
+    fn display_edge(&self) -> u32 {
+        self.canvas_width.max(self.canvas_height).min(PREVIEW_EDGE)
+    }
+
+    fn cells(&self) -> &[ShownCell] {
+        &self.cells
+    }
+
+    fn slots(&self) -> [Option<&ShownCell>; 8] {
+        let mut slots = [None, None, None, None, None, None, None, None];
+        for (index, cell) in self.cells.iter().enumerate() {
+            slots[index] = Some(cell);
+        }
+        slots
+    }
+
+    fn show(&mut self, step: usize, width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
+        if width != self.canvas_width || height != self.canvas_height {
+            return Err(format!(
+                "观察格须按请求画布 {}×{} 解码",
+                self.canvas_width, self.canvas_height
+            ));
+        }
+        if pixels.len() != width as usize * height as usize * 4 {
+            return Err("观察格像素与画布不一致".into());
+        }
+        if step == 0 || step > 8 || step != self.cells.len() + 1 {
+            return Err("去噪观察按步留下格子，不能替换已经出现的画面".into());
+        }
+        self.cells.push(ShownCell {
+            width,
+            height,
+            pixels: pixels.to_vec(),
+        });
+        Ok(())
+    }
+}
+
+impl App {
+    fn paint_official_row(&mut self, cx: &mut Cx) {
+        let painted: Vec<Option<(u32, u32, Vec<u32>)>> = {
+            let row = &self.image.as_ref().unwrap().official_row;
+            (0..8)
+                .map(|index| {
+                    row.slots()[index].map(|cell| {
+                        (
+                            cell.width,
+                            cell.height,
+                            preview_pixels(cell.width, cell.height, &cell.pixels),
+                        )
+                    })
+                })
+                .collect()
+        };
+        for (index, cell) in painted.into_iter().enumerate() {
+            let texture = cell.map(|(width, height, pixels)| {
+                Texture::new_with_format(
+                    cx,
+                    TextureFormat::VecBGRAu8_32 {
+                        width: width as usize,
+                        height: height as usize,
+                        data: Some(pixels),
+                        updated: TextureUpdated::Full,
+                    },
+                )
+            });
+            self.set_official_step(cx, index + 1, texture);
+        }
+        let (width, height) = self.image.as_ref().unwrap().official_row.canvas();
+        let edge = self.image.as_ref().unwrap().official_row.display_edge();
+        let caption = if edge < width.max(height) {
+            format!("官方文本条件 · 解码 {width}×{height} · 画面已缩小")
+        } else {
+            format!("官方文本条件 · 解码 {width}×{height}")
+        };
+        self.ui
+            .label(cx, ids!(image_preview_caption))
+            .set_text(cx, &caption);
+        self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
+    }
+
+    fn set_official_step(&mut self, cx: &mut Cx, step: usize, texture: Option<Texture>) {
+        let image = match step {
+            1 => self.ui.image(cx, ids!(image_step_1)),
+            2 => self.ui.image(cx, ids!(image_step_2)),
+            3 => self.ui.image(cx, ids!(image_step_3)),
+            4 => self.ui.image(cx, ids!(image_step_4)),
+            5 => self.ui.image(cx, ids!(image_step_5)),
+            6 => self.ui.image(cx, ids!(image_step_6)),
+            7 => self.ui.image(cx, ids!(image_step_7)),
+            _ => self.ui.image(cx, ids!(image_step_8)),
+        };
+        image.set_texture(cx, texture);
+    }
+}
+
+fn preview_pixels(width: u32, height: u32, rgba: &[u8]) -> Vec<u32> {
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let index = ((y * width + x) * 4) as usize;
+            let matte = if ((x / 16) + (y / 16)) % 2 == 0 {
+                225u32
+            } else {
+                195
+            };
+            let alpha = rgba[index + 3] as u32;
+            let mix = |value: u8| (value as u32 * alpha + matte * (255 - alpha) + 127) / 255;
+            pixels.push(
+                0xff000000
+                    | (mix(rgba[index]) << 16)
+                    | (mix(rgba[index + 1]) << 8)
+                    | mix(rgba[index + 2]),
+            );
+        }
+    }
+    pixels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OfficialRow;
+
+    fn paint(step: u8) -> Vec<u8> {
+        let mut pixels = vec![0u8; 320 * 240 * 4];
+        pixels[0] = step;
+        pixels[3] = 255;
+        pixels
+    }
+
+    #[test]
+    fn official_row_keeps_earlier_cells_as_later_steps_arrive() {
+        let mut row = OfficialRow::new(320, 240);
+        assert!(row.show(1, 64, 64, &vec![0; 64 * 64 * 4]).is_err());
+        assert!(row.cells().is_empty());
+
+        for step in 1..=8 {
+            row.show(step, 320, 240, &paint(step as u8)).unwrap();
+            assert_eq!(row.cells().len(), step);
+            assert_eq!(row.slots()[0].unwrap().pixels[0], 1);
+            assert_eq!(row.slots()[0].unwrap().width, 320);
+            assert_eq!(row.slots()[0].unwrap().height, 240);
+        }
+        let slots = row.slots();
+        assert!(slots.iter().all(|slot| slot.is_some()));
+        assert_eq!(slots[7].unwrap().pixels[0], 8);
+        assert_eq!(row.canvas(), (320, 240));
+        assert_eq!(row.display_edge(), 160);
+
+        assert!(row.show(1, 320, 240, &paint(9)).is_err());
+        assert_eq!(row.cells().len(), 8);
+        assert_eq!(row.slots()[0].unwrap().pixels[0], 1);
     }
 }

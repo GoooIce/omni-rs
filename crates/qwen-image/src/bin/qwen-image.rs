@@ -240,6 +240,7 @@ fn run<B: Backend>(args: Args, device: B::Device, cancel: Arc<AtomicBool>) -> Re
                 seed,
                 images,
                 reference_resolution,
+                observation: false,
             };
             options.validate()?;
             let resolved = options.output_dimensions()?;
