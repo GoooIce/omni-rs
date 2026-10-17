@@ -3,6 +3,7 @@
 - Start with [README.md](README.md) for entry points and [CODING_STANDARDS.md](CODING_STANDARDS.md) for design decisions.
 - Use [docs/agent-workflow.md](docs/agent-workflow.md) for checks, compilation directories, bounded searches and interruption recovery. The manifests in [scripts/checks.json](scripts/checks.json) are independent Cargo projects; a root Cargo command does not cover all of them.
 - Native behavior and existing regression commands live in [prototypes/makepad/README.md](prototypes/makepad/README.md). Numerical and hardware evidence lives in [VALIDATION.md](VALIDATION.md) and the relevant module document under `docs/`.
+- ConvRot int8 matmul lives in [crates/omni-kernel/src/int8_matmul.rs](crates/omni-kernel/src/int8_matmul.rs). CubeCL's Metal lowering of manual MMA and the 64×64 device-tensor `matmul2d` is [vendor/cubecl-cpp/src/metal/dialect.rs](vendor/cubecl-cpp/src/metal/dialect.rs). The dtype matrix is the local SDK header `MPPTensorOpsMatMul2d.h`. `cubecl-ir` in the cargo registry stays read-only.
 - Continue within the user's approved scope. Preserve accepted recommendations and completed checks across turns; ask only when an unresolved choice changes that scope or observable behavior.
 
 ## Agent skills
