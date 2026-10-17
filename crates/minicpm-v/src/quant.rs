@@ -81,21 +81,57 @@ fn bf16_scale_bytes(bytes: &[u8], count: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Load one `name`/`name_scale` pair as a packed int4 weight `[out, in]`.
+/// Representation of a packed int4 weight after loading.
 ///
-/// `quantized` selects the GPU packed representation; the CPU reference path
-/// passes false and receives exact dequantized values.
-/// How packed int4 weights should be represented after loading.
+/// The loader picks this from the backend. It is not part of the caller's
+/// interface.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LoadMode {
-    /// Packed quantized tensor (cubecl backends): int4 resident, fused
-    /// dequant matmul.
+pub(crate) enum LoadMode {
+    /// Packed quantized tensor: int4 stays resident, matmul dequantizes.
     Packed,
-    /// One-time load-point dequantization (NdArray reference path).
+    /// One-time load-point dequantization.
     Dequantize,
 }
 
-pub fn load_packed<B: Backend>(
+/// Load one packed int4 weight the way `B` can store it.
+///
+/// Cubecl backends keep the packed tensor resident and dequantize inside
+/// matmul. NdArray cannot hold a sub-byte tensor, so it dequantizes once at
+/// load. Callers do not choose.
+pub(crate) fn load_for_backend<B: Backend>(
+    w: &impl WeightSource<B>,
+    name: &str,
+    scale_name: &str,
+    shape: [usize; 2],
+    precision: Precision,
+    device: &B::Device,
+) -> Result<PackedWeight<B>> {
+    let mode = if keeps_resident_int4::<B>() {
+        LoadMode::Packed
+    } else {
+        LoadMode::Dequantize
+    };
+    load_packed(w, name, scale_name, shape, mode, precision, device)
+}
+
+/// One build can contain both NdArray and a cubecl backend, so the cargo
+/// feature cannot decide. Cubecl wgpu backends share `WgpuDevice`; every
+/// other device takes the load-point path.
+fn keeps_resident_int4<B: Backend>() -> bool {
+    let _backend = std::any::TypeId::of::<B>();
+    #[cfg(any(feature = "metal", feature = "webgpu"))]
+    {
+        return std::any::TypeId::of::<B::Device>()
+            == std::any::TypeId::of::<burn::backend::wgpu::WgpuDevice>();
+    }
+    #[cfg(not(any(feature = "metal", feature = "webgpu")))]
+    {
+        false
+    }
+}
+
+/// Load one `name`/`name_scale` pair as a packed int4 weight `[out, in]`.
+pub(crate) fn load_packed<B: Backend>(
     w: &impl WeightSource<B>,
     name: &str,
     scale_name: &str,
@@ -230,6 +266,47 @@ mod tests {
             &device,
         )
         .unwrap();
+        let x_values = tensor_f32(&tensors, "input");
+        let x = Tensor::<B, 2>::from_data(TensorData::new(x_values, [8, 256]), &device);
+        let output = packed.matmul_transpose(x);
+        let actual = output
+            .into_data()
+            .convert::<f32>()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let expected = tensor_f32(&tensors, "output_quant_matmul");
+        let mut relative = 0f64;
+        for (a, b) in actual.iter().zip(&expected) {
+            relative = relative.max((a - b).abs() as f64 / b.abs().max(1e-3) as f64);
+        }
+        assert!(relative < 1e-5, "worst relative {relative}");
+    }
+
+    #[test]
+    fn ndarray_dequantizes_int4_at_load() {
+        type B = NdArray;
+        let bytes = fixture();
+        let tensors = SafeTensors::deserialize(&bytes).unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes.clone()]).unwrap();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let packed = load_for_backend::<B>(
+            &weights,
+            "quant.weight",
+            "quant.weight_scale",
+            [64, 256],
+            Precision::F32,
+            &device,
+        )
+        .unwrap();
+        assert!(
+            matches!(packed, PackedWeight::Dequantized(_)),
+            "NdArray holds dequantized weights"
+        );
+        assert_eq!(
+            packed.resident_bytes(),
+            64 * 256 * std::mem::size_of::<f32>()
+        );
         let x_values = tensor_f32(&tensors, "input");
         let x = Tensor::<B, 2>::from_data(TensorData::new(x_values, [8, 256]), &device);
         let output = packed.matmul_transpose(x);
@@ -426,6 +503,48 @@ mod gpu_tests {
         }
         // FP16 storage and accumulation over 256-element dots vs the f32
         // reference: bounded by a few percent at the smallest magnitudes.
+        assert!(worst < 5e-2, "worst relative {worst}");
+    }
+
+    #[test]
+    fn cubecl_keeps_int4_resident() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pack-quantized-int4.safetensors"),
+        )
+        .unwrap();
+        let tensors = SafeTensors::deserialize(&bytes).unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes.clone()]).unwrap();
+        let device = WgpuDevice::default();
+        let packed = load_for_backend::<Metal>(
+            &weights,
+            "quant.weight",
+            "quant.weight_scale",
+            [64, 256],
+            Precision::F16,
+            &device,
+        )
+        .unwrap();
+        assert!(
+            matches!(packed, PackedWeight::Quantized(_)),
+            "cubecl keeps packed int4 resident"
+        );
+        assert_eq!(packed.resident_bytes(), 64 * 256 / 2);
+        let x_values = tensor_f32(&tensors, "input");
+        let x = Tensor::<Metal, 2>::from_data(TensorData::new(x_values, [8, 256]), &device)
+            .cast(FloatDType::F16);
+        let output = packed.matmul_transpose(x);
+        let actual = output
+            .into_data()
+            .convert::<f32>()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let expected = tensor_f32(&tensors, "output_quant_matmul");
+        let mut worst = 0f64;
+        for (a, b) in actual.iter().zip(&expected) {
+            worst = worst.max((a - b).abs() as f64 / b.abs().max(0.1) as f64);
+        }
         assert!(worst < 5e-2, "worst relative {worst}");
     }
 }
