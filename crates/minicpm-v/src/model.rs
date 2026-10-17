@@ -120,15 +120,16 @@ impl<B: Backend> TextModel<B> {
         }
     }
 
-    /// Run `ids` (already in the history) plus optional multimodal embeddings,
-    /// advancing the decode state. Returns the last position's logits.
-    pub fn forward(
+    /// Full last-layer sequence for `ids`, before the final RMSNorm.
+    ///
+    /// Text-only callers pass `embeddings: None`. That path does not read an image.
+    pub fn last_layer_sequence(
         &self,
         ids: &[u32],
         embeddings: Option<Tensor<B, 3>>,
         positions: Option<&[[i64; 3]]>,
         state: &mut DecodeState<B>,
-    ) -> omni_r2t2::Result<Tensor<B, 2>> {
+    ) -> omni_r2t2::Result<Tensor<B, 3>> {
         // The activation dtype follows the loaded weights (F16 on GPU, F32 on
         // the CPU reference path); every stage derives from `hidden`.
         let mut hidden = match embeddings {
@@ -171,6 +172,21 @@ impl<B: Backend> TextModel<B> {
             };
         }
         state.length += tokens;
+        Ok(hidden)
+    }
+
+    /// Run `ids` (already in the history) plus optional multimodal embeddings,
+    /// advancing the decode state. Returns the last position's logits.
+    pub fn forward(
+        &self,
+        ids: &[u32],
+        embeddings: Option<Tensor<B, 3>>,
+        positions: Option<&[[i64; 3]]>,
+        state: &mut DecodeState<B>,
+    ) -> omni_r2t2::Result<Tensor<B, 2>> {
+        let hidden = self.last_layer_sequence(ids, embeddings, positions, state)?;
+        let dtype = shared::dtype(&hidden);
+        let tokens = hidden.dims()[1];
         let last = self
             .norm
             .forward(hidden, dtype)

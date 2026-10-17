@@ -15,17 +15,25 @@ pub mod kernels {
     pub use crate::metal_attention::try_attention;
     pub use crate::metal_tensorops::try_linear;
 }
+mod minicpm_condition;
 mod ops;
 pub mod pipeline;
+pub mod projection;
 pub mod reference;
 pub mod rewrite;
 pub mod text;
 pub mod vae;
 pub mod vision;
 pub use config::Config;
+pub use minicpm_condition::MiniCpm1bText;
 pub use pipeline::{
-    BatchStats, DEFAULT_TURBO_STEPS, GeneratedImage, ImageBatch, Model, ObservationCell,
-    ObservationRequest, OfficialObservation, Options, Report, RequestKind,
+    BatchStats, DEFAULT_TURBO_STEPS, DenoisingObservation, GeneratedImage, ImageBatch, Model,
+    ObservationCell, ObservationRequest, ObservationRow, OfficialObservation, Options, Report,
+    RequestKind, Trajectory,
+};
+pub use projection::{
+    CONDITION_WIDTH, ConditionProjection, Sequence, default_projection_weights_path,
+    text_to_image_split,
 };
 
 pub use omni_r2t2::Precision;

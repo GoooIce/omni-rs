@@ -30,7 +30,7 @@ pub struct State {
     advanced: bool,
     cfg_enabled: bool,
     observation: bool,
-    official_row: OfficialRow,
+    observation_board: ObservationBoard,
     controls: Option<(
         bool,
         bool,
@@ -78,7 +78,7 @@ impl State {
             advanced: false,
             cfg_enabled: false,
             observation: false,
-            official_row: OfficialRow::new(0, 0),
+            observation_board: ObservationBoard::new(0, 0),
             controls: None,
         }
     }
@@ -345,8 +345,14 @@ impl App {
                 }
                 "observation" => {
                     let rejected = update.observation.as_ref().and_then(|cell| {
-                        i.official_row
-                            .show(cell.step, cell.width as u32, cell.height as u32, &cell.rgba)
+                        i.observation_board
+                            .show(
+                                cell.row,
+                                cell.step,
+                                cell.width as u32,
+                                cell.height as u32,
+                                &cell.rgba,
+                            )
                             .err()
                     });
                     let stopping = i.stopping;
@@ -363,7 +369,7 @@ impl App {
                         self.ui
                             .view(cx, ids!(image_observation))
                             .set_visible(cx, true);
-                        self.paint_official_row(cx);
+                        self.paint_observation(cx);
                     }
                 }
                 "done" => {
@@ -371,9 +377,10 @@ impl App {
                     i.stopping = false;
                     i.has_image = true;
                     let observed = if update.image.is_none() {
-                        let (width, height) = i.official_row.canvas();
-                        let count = i.official_row.cells().len();
-                        (count > 0).then_some((count, width, height))
+                        let (width, height) = i.observation_board.canvas();
+                        let official = i.observation_board.rows()[0].cells().len();
+                        let minicpm = i.observation_board.rows()[1].cells().len();
+                        (official + minicpm > 0).then_some((official, minicpm, width, height))
                     } else {
                         None
                     };
@@ -438,10 +445,12 @@ impl App {
                             .set_text(cx, "图像预览");
                         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
                     }
-                    if let Some((count, width, height)) = observed {
+                    if let Some((official, minicpm, width, height)) = observed {
                         self.ui.label(cx, ids!(image_metrics)).set_text(
                             cx,
-                            &format!("官方文本条件 · {count} 格 · 解码 {width}×{height}"),
+                            &format!(
+                                "官方 {official} 格 · MiniCPM-V-4.7-1B {minicpm} 格 · 解码 {width}×{height}"
+                            ),
                         );
                     }
                     self.ui
@@ -817,7 +826,7 @@ impl App {
             if observing {
                 i.output = None;
                 i.has_image = false;
-                i.official_row = OfficialRow::new(canvas.0, canvas.1);
+                i.observation_board = ObservationBoard::new(canvas.0, canvas.1);
             }
             i.busy = true;
             i.stopping = false;
@@ -825,7 +834,7 @@ impl App {
             self.image_status(
                 cx,
                 if observing {
-                    "开始去噪观察 · 官方文本条件 · 八步都会留下"
+                    "开始去噪观察 · 官方文本条件在上，1B 投影在下 · 八步都会留下"
                 } else {
                     "开始生成 · 首次运行需编译 GPU 算子…"
                 },
@@ -837,7 +846,7 @@ impl App {
                 self.ui
                     .view(cx, ids!(image_observation))
                     .set_visible(cx, true);
-                self.paint_official_row(cx);
+                self.paint_observation(cx);
             }
             self.ui.view(cx, ids!(image_progress)).set_visible(cx, true);
             self.image_progress(cx, 0.0);
@@ -914,46 +923,109 @@ impl OfficialRow {
     }
 }
 
-impl App {
-    fn paint_official_row(&mut self, cx: &mut Cx) {
-        let painted: Vec<Option<(u32, u32, Vec<u32>)>> = {
-            let row = &self.image.as_ref().unwrap().official_row;
-            (0..8)
-                .map(|index| {
-                    row.slots()[index].map(|cell| {
-                        (
-                            cell.width,
-                            cell.height,
-                            preview_pixels(cell.width, cell.height, &cell.pixels),
-                        )
-                    })
-                })
-                .collect()
-        };
-        for (index, cell) in painted.into_iter().enumerate() {
-            let texture = cell.map(|(width, height, pixels)| {
-                Texture::new_with_format(
-                    cx,
-                    TextureFormat::VecBGRAu8_32 {
-                        width: width as usize,
-                        height: height as usize,
-                        data: Some(pixels),
-                        updated: TextureUpdated::Full,
-                    },
-                )
-            });
-            self.set_official_step(cx, index + 1, texture);
+struct ObservationBoard {
+    official: OfficialRow,
+    minicpm_1b: OfficialRow,
+}
+
+impl ObservationBoard {
+    fn new(canvas_width: u32, canvas_height: u32) -> Self {
+        Self {
+            official: OfficialRow::new(canvas_width, canvas_height),
+            minicpm_1b: OfficialRow::new(canvas_width, canvas_height),
         }
-        let (width, height) = self.image.as_ref().unwrap().official_row.canvas();
-        let edge = self.image.as_ref().unwrap().official_row.display_edge();
-        let caption = if edge < width.max(height) {
-            format!("官方文本条件 · 解码 {width}×{height} · 画面已缩小")
+    }
+
+    fn row_order(&self) -> [omni_qwen_image::ObservationRow; 2] {
+        [
+            omni_qwen_image::ObservationRow::Official,
+            omni_qwen_image::ObservationRow::MiniCpm1b,
+        ]
+    }
+
+    fn rows(&self) -> [&OfficialRow; 2] {
+        [&self.official, &self.minicpm_1b]
+    }
+
+    fn canvas(&self) -> (u32, u32) {
+        self.official.canvas()
+    }
+
+    fn show(
+        &mut self,
+        row: omni_qwen_image::ObservationRow,
+        step: usize,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<(), String> {
+        match row {
+            omni_qwen_image::ObservationRow::Official => {
+                self.official.show(step, width, height, pixels)
+            }
+            omni_qwen_image::ObservationRow::MiniCpm1b => {
+                self.minicpm_1b.show(step, width, height, pixels)
+            }
+        }
+    }
+}
+
+impl App {
+    fn paint_observation(&mut self, cx: &mut Cx) {
+        let painted: [Vec<Option<(u32, u32, Vec<u32>)>>; 2] = {
+            let board = &self.image.as_ref().unwrap().observation_board;
+            std::array::from_fn(|row| {
+                (0..8)
+                    .map(|index| {
+                        board.rows()[row].slots()[index].map(|cell| {
+                            (
+                                cell.width,
+                                cell.height,
+                                preview_pixels(cell.width, cell.height, &cell.pixels),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+        };
+        for (row, cells) in painted.into_iter().enumerate() {
+            for (index, cell) in cells.into_iter().enumerate() {
+                let texture = cell.map(|(width, height, pixels)| {
+                    Texture::new_with_format(
+                        cx,
+                        TextureFormat::VecBGRAu8_32 {
+                            width: width as usize,
+                            height: height as usize,
+                            data: Some(pixels),
+                            updated: TextureUpdated::Full,
+                        },
+                    )
+                });
+                if row == 0 {
+                    self.set_official_step(cx, index + 1, texture);
+                } else {
+                    self.set_minicpm_step(cx, index + 1, texture);
+                }
+            }
+        }
+        let board = &self.image.as_ref().unwrap().observation_board;
+        let (width, height) = board.canvas();
+        let edge = board.rows()[0].display_edge();
+        let scale = if edge < width.max(height) {
+            " · 画面已缩小"
         } else {
-            format!("官方文本条件 · 解码 {width}×{height}")
+            ""
         };
         self.ui
             .label(cx, ids!(image_preview_caption))
-            .set_text(cx, &caption);
+            .set_text(cx, "去噪观察");
+        self.ui
+            .label(cx, ids!(image_official_caption))
+            .set_text(cx, &format!("官方文本条件 · 解码 {width}×{height}{scale}"));
+        self.ui.label(cx, ids!(image_1b_caption)).set_text(
+            cx,
+            &format!("MiniCPM-V-4.7-1B 投影 · 解码 {width}×{height}{scale}"),
+        );
         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
     }
 
@@ -967,6 +1039,20 @@ impl App {
             6 => self.ui.image(cx, ids!(image_step_6)),
             7 => self.ui.image(cx, ids!(image_step_7)),
             _ => self.ui.image(cx, ids!(image_step_8)),
+        };
+        image.set_texture(cx, texture);
+    }
+
+    fn set_minicpm_step(&mut self, cx: &mut Cx, step: usize, texture: Option<Texture>) {
+        let image = match step {
+            1 => self.ui.image(cx, ids!(image_1b_step_1)),
+            2 => self.ui.image(cx, ids!(image_1b_step_2)),
+            3 => self.ui.image(cx, ids!(image_1b_step_3)),
+            4 => self.ui.image(cx, ids!(image_1b_step_4)),
+            5 => self.ui.image(cx, ids!(image_1b_step_5)),
+            6 => self.ui.image(cx, ids!(image_1b_step_6)),
+            7 => self.ui.image(cx, ids!(image_1b_step_7)),
+            _ => self.ui.image(cx, ids!(image_1b_step_8)),
         };
         image.set_texture(cx, texture);
     }
@@ -997,7 +1083,8 @@ fn preview_pixels(width: u32, height: u32, rgba: &[u8]) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::OfficialRow;
+    use super::{ObservationBoard, OfficialRow};
+    use omni_qwen_image::ObservationRow;
 
     fn paint(step: u8) -> Vec<u8> {
         let mut pixels = vec![0u8; 320 * 240 * 4];
@@ -1028,5 +1115,51 @@ mod tests {
         assert!(row.show(1, 320, 240, &paint(9)).is_err());
         assert_eq!(row.cells().len(), 8);
         assert_eq!(row.slots()[0].unwrap().pixels[0], 1);
+    }
+
+    #[test]
+    fn minicpm_1b_decodes_stay_under_the_official_row() {
+        let mut board = ObservationBoard::new(320, 240);
+        assert_eq!(
+            board.row_order(),
+            [ObservationRow::Official, ObservationRow::MiniCpm1b]
+        );
+        for step in 1..=8 {
+            board
+                .show(ObservationRow::Official, step, 320, 240, &paint(step as u8))
+                .unwrap();
+            board
+                .show(
+                    ObservationRow::MiniCpm1b,
+                    step,
+                    320,
+                    240,
+                    &paint(step as u8 + 10),
+                )
+                .unwrap();
+            let rows = board.rows();
+            assert_eq!(rows[0].cells().len(), step);
+            assert_eq!(rows[1].cells().len(), step);
+            assert_eq!(rows[0].slots()[0].unwrap().pixels[0], 1);
+            assert_eq!(rows[0].slots()[0].unwrap().width, 320);
+            assert_eq!(rows[0].slots()[0].unwrap().height, 240);
+            assert_eq!(rows[1].slots()[0].unwrap().pixels[0], 11);
+            assert_eq!(rows[1].slots()[0].unwrap().width, 320);
+            assert_eq!(rows[1].slots()[0].unwrap().height, 240);
+        }
+        assert!(board
+            .rows()
+            .iter()
+            .all(|row| row.slots().iter().all(|slot| slot.is_some())));
+        assert!(board
+            .show(ObservationRow::MiniCpm1b, 1, 320, 240, &paint(99))
+            .is_err());
+        assert_eq!(board.rows()[1].cells().len(), 8);
+        assert_eq!(board.rows()[1].slots()[0].unwrap().pixels[0], 11);
+        assert!(board
+            .show(ObservationRow::MiniCpm1b, 9, 64, 64, &vec![0; 64 * 64 * 4],)
+            .is_err());
+        assert_eq!(board.rows()[1].canvas(), (320, 240));
+        assert_eq!(board.rows()[1].slots()[7].unwrap().pixels[0], 18);
     }
 }

@@ -1,4 +1,6 @@
-use omni_qwen_image::{Config, Error, GeneratedImage, Model, Options, Precision, Progress};
+use omni_qwen_image::{
+    Config, Error, GeneratedImage, Model, ObservationRow, Options, Precision, Progress,
+};
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
@@ -27,6 +29,7 @@ pub struct ReferencePreview {
 }
 
 pub struct ObservationPreview {
+    pub row: ObservationRow,
     pub step: usize,
     pub width: usize,
     pub height: usize,
@@ -249,19 +252,24 @@ impl Worker {
             .ok_or_else(|| Error::Config("图像模型尚未载入".into()))?;
         let total = model.config.sigmas.len();
         let track = RefCell::new(ProgressTrack::default());
-        let row = model.observe(
+        let observation = model.observe(
             &options,
             stop,
             |p: Progress| {
                 report_progress(context, &options, total, &mut track.borrow_mut(), p);
             },
-            |step, image| {
+            |row, step, image| {
+                let name = match row {
+                    ObservationRow::Official => "官方文本条件",
+                    ObservationRow::MiniCpm1b => "MiniCPM-V-4.7-1B 投影",
+                };
                 let mut update = Update::status(
                     "observation",
-                    format!("去噪观察 · 官方文本条件 · 第 {step} / {total} 步"),
+                    format!("去噪观察 · {name} · 第 {step} / {total} 步"),
                 );
                 update.progress = track.borrow().fraction_seen;
                 update.observation = Some(ObservationPreview {
+                    row,
                     step,
                     width: image.width() as usize,
                     height: image.height() as usize,
@@ -270,12 +278,13 @@ impl Worker {
                 context.updates.publish(update);
             },
         )?;
-        let (width, height) = row.canvas();
+        let (width, height) = observation.trajectories()[0].canvas();
+        let official = observation.cells(ObservationRow::Official).len();
+        let minicpm = observation.cells(ObservationRow::MiniCpm1b).len();
         let mut update = Update::status(
             "done",
             format!(
-                "去噪观察完成 · 官方文本条件 · {} 格 · {width} × {height}",
-                row.cells().len()
+                "去噪观察完成 · 官方 {official} 格 · MiniCPM-V-4.7-1B {minicpm} 格 · {width} × {height}"
             ),
         );
         update.progress = 1.0;
@@ -394,7 +403,7 @@ fn report_progress(
         _ if options.observation => (
             base + 0.08 + (0.92 - base) * track.step.max(1) as f64 / total.max(1) as f64,
             format!(
-                "解码官方条件 · 第 {} / {total} 步 · {} / {}",
+                "解码观察格 · 第 {} / {total} 步 · {} / {}",
                 track.step.max(1),
                 p.current,
                 p.total
