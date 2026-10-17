@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 
+from target_layout import primary_checkout
+
 ROOT = Path(__file__).resolve().parents[1]
 SKIP = {".git", ".cache", "target", "artifacts", "models", "pkg", "dist", "node_modules", "__pycache__"}
 
@@ -52,7 +54,11 @@ def environment():
 
 def plan(root, profile, output):
     config = json.loads((root / "scripts/checks.json").read_text())
+    primary = primary_checkout(root)
     steps = []
+
+    def cargo_target(relative):
+        return str(primary / relative)
 
     def add(name, command, timeout=1800, stdout=None):
         step = {"id": name, "command": command, "timeout": timeout}
@@ -79,7 +85,7 @@ def plan(root, profile, output):
             manifest = row["path"]
             name = Path(manifest).parent.name if "/" in manifest else "root"
             flags = ["--locked", "--manifest-path", manifest, "--no-default-features",
-                     "--features", row["cpu_features"], "--target-dir", row["target"]]
+                     "--features", row["cpu_features"], "--target-dir", cargo_target(row["target"])]
             add("clippy-" + name, ["cargo", "clippy", *flags, "--lib", "--tests"] +
                 (["--", "-D", "warnings"] if row.get("strict_clippy") else []))
             add("test-" + name, ["cargo", "test", *flags, "--lib", "--tests"])
@@ -88,7 +94,7 @@ def plan(root, profile, output):
             if not row["metal"]:
                 continue
             name = Path(row["path"]).parent.name if "/" in row["path"] else "root"
-            flags = ["--locked", "--manifest-path", row["path"], "--target-dir", row["target"]]
+            flags = ["--locked", "--manifest-path", row["path"], "--target-dir", cargo_target(row["target"])]
             if name == "burn-ane":
                 flags += ["--features", "metal-shared"]
             targets = ["--tests"] if name == "makepad" else ["--lib", "--tests"]
@@ -96,13 +102,14 @@ def plan(root, profile, output):
             ignored = ["--include-ignored"] if name in ("breeze-tts", "omni-kernel") else []
             add("test-" + name, ["cargo", "test", *flags, *targets, "--", "--test-threads=1", *ignored])
         add("attention-oracle", ["cargo", "run", "--locked", "--release", "--manifest-path",
-                                 "crates/qwen-image/Cargo.toml", "--target-dir", "target/qwen-image",
+                                 "crates/qwen-image/Cargo.toml", "--target-dir", cargo_target("target/qwen-image"),
                                  "--example", "attention-bench"], stdout=output / "attention.jsonl")
         add("attention-report", [python, "scripts/check_attention.py", str(output / "attention.jsonl")], 60)
     elif profile == "native":
         add("build-native", [python, "prototypes/makepad/build-native.py"])
         add("build-asr-regression", ["cargo", "build", "--locked", "--release", "--manifest-path",
-                                    "prototypes/makepad/Cargo.toml", "--target-dir", "target/makepad-native",
+                                    "prototypes/makepad/Cargo.toml", "--target-dir",
+                                    cargo_target("target/makepad-native"),
                                     "--example", "asr-regression"])
         for name, script in [("asr-matrix", "validate-asr.py"), ("pause", "validate-pause.py"),
                              ("lifecycle", "validate-lifecycle.py"),

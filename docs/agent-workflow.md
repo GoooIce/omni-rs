@@ -12,6 +12,12 @@ Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` sele
 
 Use `--list` to inspect a profile without executing it. CPU checks run in GitHub Actions on pushes and pull requests once this directory is hosted in a GitHub repository. Metal and native checks run locally on real hardware; their output is not inferred from CI. The experimental `tts-gemv` prototype is formatted but is not part of the supported CPU/runtime matrix. The registry is `scripts/checks.json`; adding a crate without registering it fails the quick check. `scripts/pre-commit` (install into `.git/hooks/pre-commit`) runs `cargo check --locked` for every manifest with staged files plus the quick profile, keeping non-compiling commits out of history.
 
+## Compilation directories
+
+Each manifest in `scripts/checks.json` has one `target` directory. Those directories live in the primary checkout, the parent of `git rev-parse --git-common-dir`. A linked worktree uses that same tree.
+
+`./scripts/check` passes the absolute path. Before any other Cargo command in a new worktree, run `python3 scripts/share-target.py` from that worktree. It points the worktree's `target` entry at the primary `target`, and points each manifest's default output directory at the registered path. The command finishes when every printed link resolves inside the primary checkout. A real directory already named `target` is left untouched; remove that directory by hand, then run the command again.
+
 The Metal profile explicitly includes the normally ignored Breeze tensor and shared-kernel tests. Makepad's audible output-device unit test stays ignored there; the native profile exercises device timing, drain and cancellation through the existing muted TTS suite.
 
 Clippy is strict for `hy-mt` and `omni-api`, whose existing checks enforce warning-free code. Other packages still have existing style warnings; those warnings remain visible in logs. `check_repo.py` catches named Python/MLX Cargo dependencies, aliases and literal subprocess launches in production source. It does not prove the absence of every possible FFI or indirect runtime path; review that boundary using `CODING_STANDARDS.md`.
