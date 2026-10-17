@@ -9,6 +9,7 @@ pub mod model;
 pub mod moe;
 pub mod multimodal;
 pub mod positions;
+pub mod prompt;
 pub mod quant;
 pub mod text;
 pub mod tokenizer;
