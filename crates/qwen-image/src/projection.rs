@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 
 pub const CONDITION_WIDTH: usize = 4096;
 const TRAIN_PROMPTS: usize = 16;
-/// Shrinks the linear map toward the deterministic zero init. The bias stays free.
-const RIDGE_SCALE: f64 = 10_000.0;
+/// Diagonal penalty, as a fraction of the mean feature energy.
+/// 10_000 left weights near zero, so every prompt became the training-set mean
+/// and denoised to the same picture. 1 keeps the input able to move the condition.
+const RIDGE_SCALE: f64 = 1.0;
 
 /// Twenty-four pure text-to-image prompts. The first sixteen update the projection.
 const TEXT_TO_IMAGE_PROMPTS: [&str; 24] = [
