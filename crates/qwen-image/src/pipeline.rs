@@ -175,8 +175,6 @@ pub struct Model<B: Backend> {
     pub dit: Dit<B>,
     pub vae: Vae<B>,
     vision: Option<Vision<B>>,
-    minicpm_1b: Option<crate::minicpm_condition::MiniCpm1bText>,
-    minicpm_35b: Option<crate::minicpm_condition::MiniCpm35bText>,
     root: PathBuf,
     precision: Precision,
     device: B::Device,
@@ -217,8 +215,6 @@ impl<B: Backend> Model<B> {
             dit,
             vae,
             vision: None,
-            minicpm_1b: None,
-            minicpm_35b: None,
             root: root.to_owned(),
             precision,
             device: device.clone(),
@@ -256,7 +252,8 @@ impl<B: Backend> Model<B> {
 
     /// Three trajectories: official text, the fitted 1B projection, then the fitted
     /// 35B projection. They share the prompt, seed, canvas and initial noise.
-    /// Each keeps its own attention cache. Guidance stays off.
+    /// One trajectory is denoised at a time, and each MiniCPM is dropped after its
+    /// last-layer sequence is taken. Guidance stays off.
     pub fn observe(
         &mut self,
         options: &Options,
@@ -276,7 +273,7 @@ impl<B: Backend> Model<B> {
         };
         if refused {
             return Err(Error::Config(
-                "去噪观察要同时跑官方文本条件、MiniCPM-V-4.7-1B 投影和 MiniCPM-V-4.7-35B-A3B-int4 投影，且没有负向引导"
+                "去噪观察要跑官方文本条件、MiniCPM-V-4.7-1B 投影和 MiniCPM-V-4.7-35B-A3B-int4 投影，一次一条，且没有负向引导"
                     .into(),
             ));
         }
@@ -306,8 +303,7 @@ impl<B: Backend> Model<B> {
             )
         })?;
         let noise = observation.trajectories()[0].initial_noise().to_vec();
-        let last_layer = self.minicpm_1b()?.last_layer(options.prompt.as_str())?;
-        let last_layer_35b = self.minicpm_35b()?.last_layer(options.prompt.as_str())?;
+        let prompt = options.prompt.clone();
         let mut official =
             self.prepare_generation(options, cancel, &mut progress, Some(noise.clone()))?;
         if official.negative.is_some() {
@@ -319,84 +315,102 @@ impl<B: Backend> Model<B> {
                 "官方文本条件的宽度不是 4096，无法对齐投影条件".into(),
             ));
         }
-        let projected = projection.project_last_layer(&last_layer, official_length)?;
-        let projected_35b = projection_35b.project_last_layer(&last_layer_35b, official_length)?;
+        let canvas = ObservedCanvas::from_generation(&official, official_length);
+        self.denoise_observed_row(
+            &mut official,
+            crate::ObservationRow::Official,
+            &mut observation,
+            cancel,
+            &mut progress,
+            &mut on_cell,
+        )?;
+        drop(official);
+        let projected = projection
+            .project_last_layer(&self.minicpm_1b_last_layer(&prompt)?, official_length)?;
         let mut minicpm = self.trajectory_with_condition(
-            &official,
+            &canvas,
             &noise,
             projected.values(),
             "MiniCPM-V-4.7-1B",
         )?;
+        self.denoise_observed_row(
+            &mut minicpm,
+            crate::ObservationRow::MiniCpm1b,
+            &mut observation,
+            cancel,
+            &mut progress,
+            &mut on_cell,
+        )?;
+        drop(minicpm);
+        let projected_35b = projection_35b
+            .project_last_layer(&self.minicpm_35b_last_layer(&prompt)?, official_length)?;
         let mut minicpm_35b = self.trajectory_with_condition(
-            &official,
+            &canvas,
             &noise,
             projected_35b.values(),
             "MiniCPM-V-4.7-35B-A3B-int4",
         )?;
-        while official.step < self.config.sigmas.len() {
-            check_cancel(cancel)?;
-            progress(Progress {
-                stage: "step",
-                current: official.step + 1,
-                total: self.config.sigmas.len(),
-            });
-            self.advance_generations(
-                &mut [
-                    (&mut official, cancel),
-                    (&mut minicpm, cancel),
-                    (&mut minicpm_35b, cancel),
-                ],
-                &mut progress,
-            )?;
-            for (row, state) in [
-                (crate::ObservationRow::Official, &official),
-                (crate::ObservationRow::MiniCpm1b, &minicpm),
-                (crate::ObservationRow::MiniCpm35b, &minicpm_35b),
-            ] {
-                let image = self.decode_latents(
-                    state.latents.clone(),
-                    state.width,
-                    state.height,
-                    state.h,
-                    state.w,
-                    state.channels,
-                    cancel,
-                    &mut progress,
-                )?;
-                let step = state.step;
-                observation.retain(row, step, image)?;
-                let cell = &observation.cells(row)[step - 1];
-                on_cell(row, cell.step, &cell.image);
-            }
-        }
+        self.denoise_observed_row(
+            &mut minicpm_35b,
+            crate::ObservationRow::MiniCpm35b,
+            &mut observation,
+            cancel,
+            &mut progress,
+            &mut on_cell,
+        )?;
         Ok(observation)
     }
 
-    fn minicpm_1b(&mut self) -> Result<&crate::minicpm_condition::MiniCpm1bText> {
-        if self.minicpm_1b.is_none() {
-            let dir = crate::minicpm_condition::default_minicpm_1b_dir(&self.root);
-            self.minicpm_1b = Some(crate::minicpm_condition::MiniCpm1bText::load(&dir)?);
-        }
-        Ok(self.minicpm_1b.as_ref().unwrap())
+    /// Load the 1B checkpoint, read the last layer, then drop the checkpoint.
+    fn minicpm_1b_last_layer(&self, prompt: &str) -> Result<crate::projection::Sequence> {
+        let dir = crate::minicpm_condition::default_minicpm_1b_dir(&self.root);
+        crate::minicpm_condition::MiniCpm1bText::load(&dir)?.last_layer(prompt)
     }
 
-    fn minicpm_35b(&mut self) -> Result<&crate::minicpm_condition::MiniCpm35bText> {
-        if self.minicpm_35b.is_none() {
-            let dir = crate::minicpm_condition::default_minicpm_35b_dir(&self.root);
-            self.minicpm_35b = Some(crate::minicpm_condition::MiniCpm35bText::load(&dir)?);
+    /// Load the 35B checkpoint, read the last layer, then drop the checkpoint.
+    fn minicpm_35b_last_layer(&self, prompt: &str) -> Result<crate::projection::Sequence> {
+        let dir = crate::minicpm_condition::default_minicpm_35b_dir(&self.root);
+        crate::minicpm_condition::MiniCpm35bText::load(&dir)?.last_layer(prompt)
+    }
+
+    fn denoise_observed_row(
+        &mut self,
+        state: &mut Generation<B>,
+        row: crate::ObservationRow,
+        observation: &mut crate::DenoisingObservation,
+        cancel: &AtomicBool,
+        progress: &mut impl FnMut(Progress),
+        on_cell: &mut impl FnMut(crate::ObservationRow, usize, &image::RgbaImage),
+    ) -> Result<()> {
+        while state.step < self.config.sigmas.len() {
+            check_cancel(cancel)?;
+            progress(Progress {
+                stage: "step",
+                current: state.step + 1,
+                total: self.config.sigmas.len(),
+            });
+            self.advance_generations(&mut [(state, cancel)], progress)?;
+            let latents = state.latents.clone();
+            let (width, height, h, w, channels) =
+                (state.width, state.height, state.h, state.w, state.channels);
+            let image =
+                self.decode_latents(latents, width, height, h, w, channels, cancel, progress)?;
+            let step = state.step;
+            observation.retain(row, step, image)?;
+            let cell = &observation.cells(row)[step - 1];
+            on_cell(row, cell.step, &cell.image);
         }
-        Ok(self.minicpm_35b.as_ref().unwrap())
+        Ok(())
     }
 
     fn trajectory_with_condition(
         &self,
-        official: &Generation<B>,
+        canvas: &ObservedCanvas,
         noise: &[f32],
         condition: &[f32],
         label: &str,
     ) -> Result<Generation<B>> {
-        let length = official.text.dims()[1];
-        if condition.len() != length * crate::projection::CONDITION_WIDTH {
+        if condition.len() != canvas.length * crate::projection::CONDITION_WIDTH {
             return Err(Error::Config(format!(
                 "{label} 投影与官方文本条件长度不一致"
             )));
@@ -404,26 +418,23 @@ impl<B: Backend> Model<B> {
         let text = Tensor::<B, 3>::from_data(
             TensorData::new(
                 condition.to_vec(),
-                [1, length, crate::projection::CONDITION_WIDTH],
+                [1, canvas.length, crate::projection::CONDITION_WIDTH],
             ),
             &self.device,
         )
         .cast(self.precision.dtype());
         let latents = Tensor::<B, 3>::from_data(
-            TensorData::new(
-                noise.to_vec(),
-                [1, official.channels, official.h * official.w],
-            ),
+            TensorData::new(noise.to_vec(), [1, canvas.channels, canvas.h * canvas.w]),
             &self.device,
         )
         .swap_dims(1, 2)
         .cast(self.precision.dtype());
         Ok(Generation {
-            options: official.options.clone(),
-            start: official.start,
-            reference_seconds: official.reference_seconds,
-            text_seconds: official.text_seconds,
-            denoise_start: official.denoise_start,
+            options: canvas.options.clone(),
+            start: canvas.start,
+            reference_seconds: canvas.reference_seconds,
+            text_seconds: canvas.text_seconds,
+            denoise_start: canvas.denoise_start,
             latents,
             text,
             references: Vec::new(),
@@ -431,11 +442,11 @@ impl<B: Backend> Model<B> {
             negative: None,
             cache: Cache::new(self.config.dit.num_layers),
             step: 0,
-            width: official.width,
-            height: official.height,
-            h: official.h,
-            w: official.w,
-            channels: official.channels,
+            width: canvas.width,
+            height: canvas.height,
+            h: canvas.h,
+            w: canvas.w,
+            channels: canvas.channels,
         })
     }
 
@@ -839,6 +850,40 @@ pub fn gaussian_noise(count: usize, seed: u64) -> Vec<f32> {
         }
     }
     output
+}
+
+/// Canvas and timing copied from the official trajectory so later rows can start
+/// after that trajectory, and its attention cache, have been dropped.
+struct ObservedCanvas {
+    options: Options,
+    start: Instant,
+    reference_seconds: f64,
+    text_seconds: f64,
+    denoise_start: Instant,
+    width: usize,
+    height: usize,
+    h: usize,
+    w: usize,
+    channels: usize,
+    length: usize,
+}
+
+impl ObservedCanvas {
+    fn from_generation<B: Backend>(official: &Generation<B>, length: usize) -> Self {
+        Self {
+            options: official.options.clone(),
+            start: official.start,
+            reference_seconds: official.reference_seconds,
+            text_seconds: official.text_seconds,
+            denoise_start: official.denoise_start,
+            width: official.width,
+            height: official.height,
+            h: official.h,
+            w: official.w,
+            channels: official.channels,
+            length,
+        }
+    }
 }
 
 struct Generation<B: Backend> {
