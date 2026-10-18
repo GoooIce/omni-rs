@@ -96,7 +96,8 @@ impl<B: Backend> SparseMoeBlock<B> {
 
     /// 35B int4 layout: per-expert `{name}.experts.{e}.{gate,up,down}_proj`
     /// with `.weight_packed` payloads and `.weight_scale` group scales.
-    pub fn load_quantized(
+    /// Residence is chosen by `ExpertResidence` at checkpoint load.
+    pub(crate) fn load_quantized(
         w: &impl WeightSource<B>,
         name: &str,
         config: &TextConfig,
