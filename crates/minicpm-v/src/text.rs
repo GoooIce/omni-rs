@@ -357,18 +357,10 @@ impl<B: Backend> FullLayer<B> {
         config: &TextConfig,
         p: Precision,
         d: &B::Device,
-    ) -> omni_r2t2::Result<Self> {
-        Self::load_with(w, name, config, p, d, None)
-    }
-
-    pub fn load_with(
-        w: &impl WeightSource<B>,
-        name: &str,
-        config: &TextConfig,
-        p: Precision,
-        d: &B::Device,
-        quant: Option<crate::quant::LoadMode>,
-    ) -> omni_r2t2::Result<Self> {
+    ) -> omni_r2t2::Result<Self>
+    where
+        B: crate::quant::ExpertResidence,
+    {
         Ok(Self {
             input_norm: rms_norm(
                 w,
@@ -385,7 +377,7 @@ impl<B: Backend> FullLayer<B> {
                 config.rms_norm_eps,
                 d,
             )?,
-            feed_forward: load_feed_forward(w, &format!("{name}.mlp"), config, p, d, quant)?,
+            feed_forward: load_feed_forward(w, &format!("{name}.mlp"), config, p, d)?,
         })
     }
 
@@ -720,18 +712,10 @@ impl<B: Backend> LinearLayer<B> {
         config: &TextConfig,
         p: Precision,
         d: &B::Device,
-    ) -> omni_r2t2::Result<Self> {
-        Self::load_with(w, name, config, p, d, None)
-    }
-
-    pub fn load_with(
-        w: &impl WeightSource<B>,
-        name: &str,
-        config: &TextConfig,
-        p: Precision,
-        d: &B::Device,
-        quant: Option<crate::quant::LoadMode>,
-    ) -> omni_r2t2::Result<Self> {
+    ) -> omni_r2t2::Result<Self>
+    where
+        B: crate::quant::ExpertResidence,
+    {
         Ok(Self {
             input_norm: rms_norm(
                 w,
@@ -748,7 +732,7 @@ impl<B: Backend> LinearLayer<B> {
                 config.rms_norm_eps,
                 d,
             )?,
-            feed_forward: load_feed_forward(w, &format!("{name}.mlp"), config, p, d, quant)?,
+            feed_forward: load_feed_forward(w, &format!("{name}.mlp"), config, p, d)?,
         })
     }
 
@@ -766,18 +750,16 @@ impl<B: Backend> LinearLayer<B> {
 
 /// Load the layer's feed-forward block: dense MLP, or MoE (optionally with
 /// pack-quantized expert weights) when the config declares experts.
-fn load_feed_forward<B: Backend>(
+fn load_feed_forward<B: Backend + crate::quant::ExpertResidence>(
     w: &impl WeightSource<B>,
     name: &str,
     config: &TextConfig,
     p: Precision,
     d: &B::Device,
-    quant: Option<crate::quant::LoadMode>,
 ) -> omni_r2t2::Result<FeedForward<B>> {
     if config.num_experts > 0 {
-        let mode = quant.unwrap_or(crate::quant::LoadMode::Dequantize);
         return Ok(FeedForward::Sparse(
-            crate::moe::SparseMoeBlock::load_quantized(w, name, config, p, mode, d)?,
+            crate::moe::SparseMoeBlock::load_quantized(w, name, config, p, B::load_mode(), d)?,
         ));
     }
     Ok(FeedForward::Dense(Mlp::load(w, name, config, p, d)?))
@@ -1265,13 +1247,12 @@ mod layer35b_tests {
         let device = WgpuDevice::default();
         let config = ModelDirectory::new(&model_dir).config().unwrap();
         let weights = omni_r2t2::weights::Weights::open(&model_dir).unwrap();
-        let layer: LinearLayer<B> = LinearLayer::load_with(
+        let layer: LinearLayer<B> = LinearLayer::load(
             &weights,
             "model.language_model.layers.0",
             &config.text_config,
             Precision::F16,
             &device,
-            Some(crate::quant::LoadMode::Packed),
         )
         .unwrap();
 
@@ -1527,13 +1508,12 @@ mod layer35b_tests {
             "layer 0 residual diverges"
         );
 
-        let layer1: LinearLayer<B> = LinearLayer::load_with(
+        let layer1: LinearLayer<B> = LinearLayer::load(
             &weights,
             "model.language_model.layers.1",
             &config.text_config,
             Precision::F16,
             &device,
-            Some(crate::quant::LoadMode::Packed),
         )
         .unwrap();
         let out1 = layer1.forward(out0, None);

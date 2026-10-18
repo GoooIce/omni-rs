@@ -3825,6 +3825,8 @@ name = "omni-minicpm-v"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-cubecl",
+ "burn-fusion",
  "burn-tensor",
  "half",
  "image",

@@ -78,7 +78,10 @@ pub struct MinicpmRewriter<B: Backend> {
 
 impl<B: Backend> MinicpmRewriter<B> {
     /// Load text + vision towers from a MiniCPM-V checkpoint directory.
-    pub fn load(model_dir: &Path, precision: Precision, device: &B::Device) -> Result<Self> {
+    pub fn load(model_dir: &Path, precision: Precision, device: &B::Device) -> Result<Self>
+    where
+        B: omni_minicpm_v::quant::ExpertResidence,
+    {
         let directory = ModelDirectory::new(model_dir);
         let config = directory.config().map_err(|e| {
             Error::Config(format!(
@@ -89,14 +92,8 @@ impl<B: Backend> MinicpmRewriter<B> {
             .tokenizer()
             .map_err(|e| Error::Config(format!("rewrite：读取 {model_dir:?} 的分词器失败：{e}")))?;
         let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
-        // Mirrors the minicpm-v CLI (ADR-0001 W4A16): int4 stays packed on
-        // cubecl backends; the CPU reference path dequantizes at load.
-        #[cfg(any(feature = "metal", feature = "webgpu"))]
-        let quant = omni_minicpm_v::quant::LoadMode::Packed;
-        #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
-        let quant = omni_minicpm_v::quant::LoadMode::Dequantize;
-        let model = TextModel::<B>::load_with(&weights, &config, precision, device, Some(quant))
-            .map_err(Error::Weights)?;
+        let model =
+            TextModel::<B>::load(&weights, &config, precision, device).map_err(Error::Weights)?;
         let vision =
             Multimodal::<B>::load(&weights, &config, precision, device).map_err(Error::Weights)?;
         Ok(Self {

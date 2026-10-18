@@ -132,8 +132,8 @@ pub type Native = …;
   history **包含 prompt token**（vLLM 只罚已生成 token）——即系统/用户提示中出现过的
   token 也会被同样扣减。
 - **min_p**：上游 `min_p=0.0` 本为空操作过滤器，`generate::Options` 没有该字段，不构成差异。
-- **int4 加载**：Metal/WebGPU 上 int4 保持打包（W4A16 内核内反量化），CPU 参考路径加载点
-  反量化（与 minicpm-v CLI 一致）。
+- **int4 加载**：Checkpoint 加载按 Backend 选定表示。改写器使用裸 Cube，所以 Metal 与 WebGPU
+  构建都保持 int4 打包（W4A16 内核内反量化）。NdArray 在加载点反量化。
 - **独立非 fusion 运行时**：qwen-image 的 `metal`/`webgpu` feature 为扩散模型开启
   `burn/fusion`，但 burn-fusion 的 IR 构造器要求二元算子两侧 dtype 完全一致，会把 int4
   内核内反量化 matmul 的输出记为量化参数的 F32 dtype，与外围 F16 激活冲突——35B int4 的

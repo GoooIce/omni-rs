@@ -11,13 +11,15 @@ description = "MiniCPM-V-4.7 local multimodal inference in Rust and Burn"
 [features]
 default = ["native", "metal"]
 native = ["dep:clap", "dep:pollster", "dep:ctrlc"]
-metal = ["burn/metal", "burn/autotune", "burn/ndarray"]
-webgpu = ["burn/webgpu", "burn/fusion"]
+metal = ["burn/metal", "burn/autotune", "burn/ndarray", "dep:burn-fusion", "dep:burn-cubecl"]
+webgpu = ["burn/webgpu", "burn/fusion", "dep:burn-fusion", "dep:burn-cubecl"]
 cpu = ["burn/ndarray"]
 
 [dependencies]
 omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-fusion = { version = "=0.21.0", optional = true }
+burn-cubecl = { version = "=0.21.0", optional = true, features = ["fusion"] }
 burn-tensor = "=0.21.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

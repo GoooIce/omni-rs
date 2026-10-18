@@ -28,7 +28,7 @@ struct Loaded<B: Backend> {
     device: B::Device,
 }
 
-impl<B: Backend> Loaded<B> {
+impl<B: Backend + omni_minicpm_v::quant::ExpertResidence> Loaded<B> {
     fn load(model_dir: &Path) -> Result<Self> {
         if !model_dir.join("config.json").is_file() {
             return Err(Error::Config(format!(
@@ -50,13 +50,10 @@ impl<B: Backend> Loaded<B> {
             ))
         })?;
         let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
-        // NdArray cannot hold packed int4. This 1B checkpoint is dense; dequantize
-        // is the CPU reference path either way.
-        let quant = omni_minicpm_v::quant::LoadMode::Dequantize;
         let precision = Precision::F32;
         let device = B::Device::default();
-        let model = TextModel::<B>::load_with(&weights, &config, precision, &device, Some(quant))
-            .map_err(Error::Weights)?;
+        let model =
+            TextModel::<B>::load(&weights, &config, precision, &device).map_err(Error::Weights)?;
         Ok(Self {
             model,
             tokenizer,
@@ -157,22 +154,12 @@ impl MiniCpm35bText {
         })?;
         let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
         #[cfg(any(feature = "metal", feature = "webgpu"))]
-        let quant = omni_minicpm_v::quant::LoadMode::Packed;
-        #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
-        let quant = omni_minicpm_v::quant::LoadMode::Dequantize;
-        #[cfg(any(feature = "metal", feature = "webgpu"))]
         let precision = Precision::F16;
         #[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
         let precision = Precision::F32;
         let device = default_device::<MiniCpm35bBackend>();
-        let model = TextModel::<MiniCpm35bBackend>::load_with(
-            &weights,
-            &config,
-            precision,
-            &device,
-            Some(quant),
-        )
-        .map_err(Error::Weights)?;
+        let model = TextModel::<MiniCpm35bBackend>::load(&weights, &config, precision, &device)
+            .map_err(Error::Weights)?;
         Ok(Self {
             inner: Loaded {
                 model,

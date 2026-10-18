@@ -95,6 +95,53 @@ pub enum LoadMode {
     Dequantize,
 }
 
+/// How a backend holds MiniCPM-V int4 expert weights after checkpoint load.
+///
+/// A raw Cube backend keeps the packed tensor and dequantizes inside matmul.
+/// NdArray and a Fusion wrapper dequantize once at load. Callers of
+/// `TextModel::load` do not choose.
+pub trait ExpertResidence {
+    fn load_mode() -> LoadMode;
+}
+
+#[cfg(any(feature = "cpu", feature = "metal", feature = "webgpu"))]
+impl ExpertResidence for burn::backend::NdArray {
+    fn load_mode() -> LoadMode {
+        LoadMode::Dequantize
+    }
+}
+
+#[cfg(any(feature = "metal", feature = "webgpu"))]
+mod cube_residence {
+    use super::{ExpertResidence, LoadMode};
+    use burn::backend::wgpu::{CubeBackend, WgpuRuntime};
+    use burn_fusion::Fusion;
+
+    impl ExpertResidence for CubeBackend<WgpuRuntime, f32, i32, u8> {
+        fn load_mode() -> LoadMode {
+            LoadMode::Packed
+        }
+    }
+
+    impl ExpertResidence for CubeBackend<WgpuRuntime, f32, i32, u32> {
+        fn load_mode() -> LoadMode {
+            LoadMode::Packed
+        }
+    }
+
+    impl ExpertResidence for Fusion<CubeBackend<WgpuRuntime, f32, i32, u8>> {
+        fn load_mode() -> LoadMode {
+            LoadMode::Dequantize
+        }
+    }
+
+    impl ExpertResidence for Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>> {
+        fn load_mode() -> LoadMode {
+            LoadMode::Dequantize
+        }
+    }
+}
+
 pub fn load_packed<B: Backend>(
     w: &impl WeightSource<B>,
     name: &str,
@@ -214,6 +261,27 @@ mod tests {
     }
 
     #[test]
+    fn ndarray_checkpoint_keeps_experts_dequantized() {
+        let bytes = fixture();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes]).unwrap();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let packed = load_packed::<NdArray>(
+            &weights,
+            "quant.weight",
+            "quant.weight_scale",
+            [64, 256],
+            <NdArray as ExpertResidence>::load_mode(),
+            Precision::F32,
+            &device,
+        )
+        .unwrap();
+        assert!(
+            matches!(packed, PackedWeight::Dequantized(_)),
+            "NdArray keeps expert weights dequantized at load"
+        );
+    }
+
+    #[test]
     fn load_point_dequant_matmul_matches_fixture_reference() {
         type B = NdArray;
         let bytes = fixture();
@@ -276,6 +344,65 @@ mod gpu_tests {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect()
+    }
+
+    #[test]
+    fn raw_cube_checkpoint_keeps_experts_packed() {
+        use burn::backend::wgpu::{CubeBackend, WgpuRuntime};
+        type CubeU8 = CubeBackend<WgpuRuntime, f32, i32, u8>;
+        type CubeU32 = CubeBackend<WgpuRuntime, f32, i32, u32>;
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pack-quantized-int4.safetensors"),
+        )
+        .unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes]).unwrap();
+        let device = WgpuDevice::default();
+        let packed = load_packed::<CubeU32>(
+            &weights,
+            "quant.weight",
+            "quant.weight_scale",
+            [64, 256],
+            <CubeU32 as ExpertResidence>::load_mode(),
+            Precision::F16,
+            &device,
+        )
+        .unwrap();
+        assert!(
+            matches!(packed, PackedWeight::Quantized(_)),
+            "raw Cube keeps int4 resident"
+        );
+        assert!(<CubeU8 as ExpertResidence>::load_mode() == LoadMode::Packed);
+    }
+
+    #[test]
+    fn fusion_checkpoint_dequantizes_experts() {
+        use burn::backend::wgpu::{CubeBackend, WgpuRuntime};
+        use burn_fusion::Fusion;
+        type FusedU8 = Fusion<CubeBackend<WgpuRuntime, f32, i32, u8>>;
+        type FusedU32 = Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>;
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pack-quantized-int4.safetensors"),
+        )
+        .unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes]).unwrap();
+        let device = Default::default();
+        let packed = load_packed::<FusedU8>(
+            &weights,
+            "quant.weight",
+            "quant.weight_scale",
+            [64, 256],
+            <FusedU8 as ExpertResidence>::load_mode(),
+            Precision::F32,
+            &device,
+        )
+        .unwrap();
+        assert!(
+            matches!(packed, PackedWeight::Dequantized(_)),
+            "Fusion dequantizes expert weights at load"
+        );
+        assert!(<FusedU32 as ExpertResidence>::load_mode() == LoadMode::Dequantize);
     }
 
     /// The MoE expert shapes and the single-token decode GEMV: the fused
