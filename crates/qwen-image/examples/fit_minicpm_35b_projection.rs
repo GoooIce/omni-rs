@@ -1,14 +1,17 @@
 //! Fit the MiniCPM-V-4.7-35B-A3B-int4 text-condition projection and leave it untracked.
 //!
-//! Reuses the official-condition cache from the 1B fit and the same 16/8 prompt
-//! split. The holdout error is on the condition tensor, against this model's
-//! own zero init. The loader keeps int4 packed on the raw cube backend.
+//! The official-condition cache defaults to this checkout's `artifacts/` tree.
+//! Numbered files are read only when a prompt manifest beside the cache lists
+//! the current 16/8 prompts in order; otherwise they are recomputed. The holdout
+//! error is on the condition tensor, against this model's own zero init. The
+//! loader keeps int4 packed on the raw cube backend.
 
 use burn::tensor::{FloatDType, backend::Backend};
 use omni_qwen_image::text::TextEncoder;
 use omni_qwen_image::{
     CONDITION_WIDTH, Config, MiniCpm35bProjection, MiniCpm35bText, Precision, Sequence,
-    default_35b_projection_weights_path, text_to_image_split,
+    default_35b_projection_weights_path, default_official_condition_cache, matching_cache_file,
+    text_to_image_split, write_prompt_manifest,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -19,10 +22,7 @@ fn main() {
         2,
         "/Users/goooice/code/omni-rs/models/MiniCPM-V-4.7-35B-A3B-int4",
     );
-    let official_cache = arg_path(
-        3,
-        "/Users/goooice/code/omni-rs-worktrees/26-minicpm-1b-row/artifacts/minicpm-v-4.7-1b/cache",
-    );
+    let official_cache = arg_path(3, default_official_condition_cache());
     let cache = arg_path(4, "artifacts/minicpm-v-4.7-35b-a3b/cache");
     let output = arg_path(
         5,
@@ -38,9 +38,10 @@ fn main() {
         .collect();
     std::fs::create_dir_all(&cache).expect("cache directory");
 
-    let missing_official =
-        (0..prompts.len()).any(|index| !cached(&official_cache, "official", index));
-    let missing_last = (0..prompts.len()).any(|index| !cached(&cache, "last-layer", index));
+    let missing_official = (0..prompts.len())
+        .any(|index| matching_cache_file(&official_cache, "official", index, &prompts).is_none());
+    let missing_last = (0..prompts.len())
+        .any(|index| matching_cache_file(&cache, "last-layer", index, &prompts).is_none());
     if missing_official {
         #[cfg(feature = "metal")]
         extract_official::<burn::backend::wgpu::Metal>(
@@ -68,10 +69,10 @@ fn main() {
         );
         let encoder = MiniCpm35bText::load(&minicpm).expect("MiniCPM-V-4.7-35B-A3B-int4");
         for (index, prompt) in prompts.iter().enumerate() {
-            let path = cache.join(format!("last-layer-{index:02}.bin"));
-            if path.is_file() {
+            if matching_cache_file(&cache, "last-layer", index, &prompts).is_some() {
                 continue;
             }
+            let path = cache.join(format!("last-layer-{index:02}.bin"));
             eprintln!("35B last layer {index} / {}", prompts.len());
             let sequence = encoder.last_layer(prompt).expect("last layer");
             if sequence.width() != MiniCpm35bProjection::HIDDEN {
@@ -83,6 +84,12 @@ fn main() {
             }
             write_sequence(&path, &sequence);
         }
+    }
+    if missing_official || (missing_last && cache == official_cache) {
+        write_prompt_manifest(&official_cache, &prompts).expect("official prompt manifest");
+    }
+    if missing_last && cache != official_cache {
+        write_prompt_manifest(&cache, &prompts).expect("last-layer prompt manifest");
     }
 
     let pairs: Vec<_> = (0..prompts.len())
@@ -122,15 +129,11 @@ fn main() {
     println!("saved {}", output.display());
 }
 
-fn arg_path(index: usize, default: &str) -> PathBuf {
+fn arg_path(index: usize, default: impl Into<PathBuf>) -> PathBuf {
     std::env::args()
         .nth(index)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(default))
-}
-
-fn cached(cache: &Path, kind: &str, index: usize) -> bool {
-    cache.join(format!("{kind}-{index:02}.bin")).is_file()
+        .unwrap_or_else(|| default.into())
 }
 
 fn extract_official<B: Backend>(
@@ -153,10 +156,10 @@ fn extract_official<B: Backend>(
     )
     .expect("text encoder");
     for (index, prompt) in prompts.iter().enumerate() {
-        let path = cache.join(format!("official-{index:02}.bin"));
-        if path.is_file() {
+        if matching_cache_file(cache, "official", index, prompts).is_some() {
             continue;
         }
+        let path = cache.join(format!("official-{index:02}.bin"));
         eprintln!("official condition {index} / {}", prompts.len());
         let tensor = encoder
             .encode(prompt, &cancel, &mut |_| {})

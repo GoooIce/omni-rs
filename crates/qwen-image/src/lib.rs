@@ -33,7 +33,9 @@ pub use pipeline::{
 };
 pub use projection::{
     CONDITION_WIDTH, ConditionProjection, MiniCpm35bProjection, Sequence,
-    default_35b_projection_weights_path, default_projection_weights_path, text_to_image_split,
+    default_35b_projection_weights_path, default_official_condition_cache,
+    default_projection_weights_path, matching_cache_file, text_to_image_split,
+    write_prompt_manifest,
 };
 
 pub use omni_r2t2::Precision;

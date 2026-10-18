@@ -47,6 +47,56 @@ pub fn text_to_image_split() -> (&'static [&'static str], &'static [&'static str
     )
 }
 
+/// Official text-condition cache inside the caller's `artifacts/` tree.
+pub fn default_official_condition_cache() -> PathBuf {
+    PathBuf::from("artifacts/minicpm-v-4.7-1b/cache")
+}
+
+const PROMPT_MANIFEST: &str = "prompt-manifest.txt";
+
+/// Records `prompts` in order beside numbered condition-cache files.
+pub fn write_prompt_manifest(cache: &Path, prompts: &[&str]) -> Result<()> {
+    if prompts
+        .iter()
+        .any(|prompt| prompt.contains('\n') || prompt.contains('\r'))
+    {
+        return Err(Error::Config("提示词清单的每一行只能是一条提示词".into()));
+    }
+    std::fs::create_dir_all(cache)?;
+    let mut text = String::new();
+    for prompt in prompts {
+        text.push_str(prompt);
+        text.push('\n');
+    }
+    std::fs::write(cache.join(PROMPT_MANIFEST), text)?;
+    Ok(())
+}
+
+fn prompt_manifest_matches(cache: &Path, prompts: &[&str]) -> bool {
+    let Ok(text) = std::fs::read_to_string(cache.join(PROMPT_MANIFEST)) else {
+        return false;
+    };
+    let mut listed: Vec<&str> = text.split('\n').collect();
+    if listed.last() == Some(&"") {
+        listed.pop();
+    }
+    listed == prompts
+}
+
+/// `official-NN.bin` or `last-layer-NN.bin` when the manifest lists `prompts` in order.
+pub fn matching_cache_file(
+    cache: &Path,
+    kind: &str,
+    index: usize,
+    prompts: &[&str],
+) -> Option<PathBuf> {
+    if !prompt_manifest_matches(cache, prompts) {
+        return None;
+    }
+    let path = cache.join(format!("{kind}-{index:02}.bin"));
+    path.is_file().then_some(path)
+}
+
 pub fn default_projection_weights_path() -> PathBuf {
     std::env::var_os("OMNI_1B_PROJECTION")
         .map(PathBuf::from)
@@ -222,6 +272,7 @@ impl ConditionProjection {
                 "去噪观察不能用未训练的 MiniCPM-V-4.7-1B 投影出图".into(),
             ));
         }
+        reject_nonfinite_weights(&self.weight, &self.bias)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -278,6 +329,7 @@ impl ConditionProjection {
         if cursor != bytes.len() {
             return Err(Error::Config("MiniCPM-V-4.7-1B 投影权重无法读取".into()));
         }
+        reject_nonfinite_weights(&weight, &bias)?;
         Ok(Self {
             in_width,
             weight,
@@ -307,6 +359,17 @@ impl ConditionProjection {
         }
         Ok((total / count as f64) as f32)
     }
+}
+
+fn reject_nonfinite_weights(weight: &[f32], bias: &[f32]) -> Result<()> {
+    if weight
+        .iter()
+        .chain(bias.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(Error::Config("投影权重含有非有限数值".into()));
+    }
+    Ok(())
 }
 
 fn missing_projection() -> Error {
@@ -401,6 +464,7 @@ impl MiniCpm35bProjection {
                 "MiniCPM-V-4.7-35B-A3B-int4 投影的输入宽度必须是 2048".into(),
             ));
         }
+        reject_nonfinite_weights(&self.inner.weight, &self.inner.bias)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -464,6 +528,7 @@ impl MiniCpm35bProjection {
                 "MiniCPM-V-4.7-35B-A3B-int4 投影权重无法读取".into(),
             ));
         }
+        reject_nonfinite_weights(&weight, &bias)?;
         Self::from_linear(&weight, &bias).map(|mut projection| {
             projection.inner.fitted = true;
             projection
@@ -603,23 +668,58 @@ mod tests {
         "月亮升上稻田，田里有一条窄窄的田埂",
     ];
 
-    fn synthetic_pair(index: usize, in_width: usize) -> (Sequence, Sequence) {
+    /// Nonzero entries of `output = weight * input + bias`. Every other entry is 0.
+    const KNOWN_WEIGHTS: [(usize, usize, f32); 2] = [(0, 0, 0.5), (1, 2, -0.25)];
+    const KNOWN_BIAS: [(usize, f32); 2] = [(0, 0.75), (2, -0.5)];
+
+    fn known_linear_pair(index: usize, in_width: usize) -> (Sequence, Sequence) {
         let length = 2;
-        let mut input = vec![0.0; length * in_width];
-        for (offset, value) in input.iter_mut().enumerate() {
-            *value = ((index * 13 + offset * 5) % 9) as f32 / 4.0 - 0.5;
-        }
-        let input = Sequence::last_layer(length, in_width, input).unwrap();
-        let mut target = vec![0.0; length * CONDITION_WIDTH];
+        let mut input_values = vec![0.0; length * in_width];
         for position in 0..length {
-            for dim in 0..CONDITION_WIDTH {
-                let source = input.get(position, dim % in_width);
-                target[position * CONDITION_WIDTH + dim] =
-                    0.75 + 0.1 * source + 0.01 * (dim % 5) as f32;
+            for dim in 0..in_width {
+                input_values[position * in_width + dim] = match (index + position + dim) % 5 {
+                    0 => -1.0,
+                    1 => -0.5,
+                    2 => 0.0,
+                    3 => 0.5,
+                    _ => 1.0,
+                };
             }
         }
-        let target = Sequence::last_layer(length, CONDITION_WIDTH, target).unwrap();
+        let input = Sequence::last_layer(length, in_width, input_values).unwrap();
+        let mut expected = vec![0.0; length * CONDITION_WIDTH];
+        for position in 0..length {
+            for &(dim, bias) in &KNOWN_BIAS {
+                expected[position * CONDITION_WIDTH + dim] = bias;
+            }
+            for &(in_dim, out_dim, weight) in &KNOWN_WEIGHTS {
+                expected[position * CONDITION_WIDTH + out_dim] +=
+                    input.get(position, in_dim) * weight;
+            }
+        }
+        let target = Sequence::last_layer(length, CONDITION_WIDTH, expected).unwrap();
         (input, target)
+    }
+
+    fn assert_known_map_anchor(pair: &(Sequence, Sequence)) {
+        assert_eq!(pair.0.length(), 2);
+        assert_eq!(pair.1.width(), CONDITION_WIDTH);
+        assert_eq!(pair.0.get(0, 0), -1.0);
+        assert_eq!(pair.0.get(0, 1), -0.5);
+        assert_eq!(pair.1.get(0, 0), 0.25);
+        assert_eq!(pair.1.get(0, 1), 0.0);
+        assert_eq!(pair.1.get(0, 2), -0.375);
+    }
+
+    fn assert_holdout_beats_init_within(init_mse: f32, fitted_mse: f32) {
+        assert!(
+            fitted_mse < init_mse,
+            "fitted {fitted_mse} vs init {init_mse}"
+        );
+        assert!(
+            fitted_mse < 1.0e-4,
+            "fitted holdout mse {fitted_mse} is not below 1e-4"
+        );
     }
 
     #[test]
@@ -692,26 +792,26 @@ mod tests {
 
         let hidden = MiniCpm35bProjection::HIDDEN;
         let train: Vec<_> = (0..train_prompts.len())
-            .map(|index| synthetic_pair(index, hidden))
+            .map(|index| known_linear_pair(index, hidden))
             .collect();
         let holdout: Vec<_> = (0..holdout_prompts.len())
-            .map(|index| synthetic_pair(16 + index, hidden))
+            .map(|index| known_linear_pair(16 + index, hidden))
             .collect();
+        assert_eq!(train[0].0.width(), hidden);
+        assert_known_map_anchor(&train[0]);
         let init = MiniCpm35bProjection::deterministic_init().unwrap();
         let fitted = MiniCpm35bProjection::fit(&train).unwrap();
         let init_mse = init.mean_squared_error(&holdout).unwrap();
         let fitted_mse = fitted.mean_squared_error(&holdout).unwrap();
-        assert!(
-            fitted_mse < init_mse,
-            "fitted {fitted_mse} vs init {init_mse}"
-        );
+        assert_holdout_beats_init_within(init_mse, fitted_mse);
         let pixels = Sequence::last_layer(1, 3, vec![1.0, 2.0, 3.0]).unwrap();
         assert!(
             fitted
                 .mean_squared_error(&[(holdout[0].0.clone(), pixels)])
                 .is_err()
         );
-        assert!(MiniCpm35bProjection::fit(&[synthetic_pair(0, 4)]).is_err());
+        let narrow = known_linear_pair(0, 4);
+        assert!(MiniCpm35bProjection::fit(&[narrow]).is_err());
     }
 
     #[test]
@@ -725,19 +825,164 @@ mod tests {
 
         let in_width = 4;
         let train: Vec<_> = (0..train_prompts.len())
-            .map(|index| synthetic_pair(index, in_width))
+            .map(|index| known_linear_pair(index, in_width))
             .collect();
         let holdout: Vec<_> = (0..holdout_prompts.len())
-            .map(|index| synthetic_pair(16 + index, in_width))
+            .map(|index| known_linear_pair(16 + index, in_width))
             .collect();
+        assert_eq!(train[0].0.width(), in_width);
+        assert_known_map_anchor(&train[0]);
         let init = ConditionProjection::deterministic_init(in_width).unwrap();
         let fitted = ConditionProjection::fit(&train).unwrap();
         let init_mse = init.mean_squared_error(&holdout).unwrap();
         let fitted_mse = fitted.mean_squared_error(&holdout).unwrap();
+        assert_holdout_beats_init_within(init_mse, fitted_mse);
+    }
+
+    #[test]
+    fn numbered_cache_files_require_the_current_prompt_manifest() {
+        let (train, holdout) = text_to_image_split();
+        let prompts: Vec<&str> = train
+            .iter()
+            .copied()
+            .chain(holdout.iter().copied())
+            .collect();
+        assert_eq!(prompts.len(), 24);
+
+        let cache = std::env::temp_dir().join(format!(
+            "omni-prompt-cache-{}-{}",
+            std::process::id(),
+            "manifest"
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("official-00.bin"), b"stale").unwrap();
+        std::fs::write(cache.join("last-layer-00.bin"), b"stale").unwrap();
+
         assert!(
-            fitted_mse < init_mse,
-            "fitted {fitted_mse} vs init {init_mse}"
+            matching_cache_file(&cache, "official", 0, &prompts).is_none(),
+            "a missing manifest must not expose official cache files"
         );
+        assert!(
+            matching_cache_file(&cache, "last-layer", 0, &prompts).is_none(),
+            "a missing manifest must not expose last-layer cache files"
+        );
+
+        let mut reordered = prompts.clone();
+        reordered.swap(0, 1);
+        write_prompt_manifest(&cache, &reordered).unwrap();
+        assert!(matching_cache_file(&cache, "official", 0, &prompts).is_none());
+        assert!(matching_cache_file(&cache, "last-layer", 0, &prompts).is_none());
+
+        let mut shortened = prompts.clone();
+        shortened.pop();
+        write_prompt_manifest(&cache, &shortened).unwrap();
+        assert!(matching_cache_file(&cache, "official", 0, &prompts).is_none());
+
+        write_prompt_manifest(&cache, &prompts).unwrap();
+        assert_eq!(
+            matching_cache_file(&cache, "official", 0, &prompts).as_deref(),
+            Some(cache.join("official-00.bin").as_path())
+        );
+        assert_eq!(
+            matching_cache_file(&cache, "last-layer", 0, &prompts).as_deref(),
+            Some(cache.join("last-layer-00.bin").as_path())
+        );
+        assert!(matching_cache_file(&cache, "official", 1, &prompts).is_none());
+        assert!(matching_cache_file(&cache, "last-layer", 23, &prompts).is_none());
+
+        let official_cache = default_official_condition_cache();
+        assert!(official_cache.is_relative());
+        assert_eq!(
+            official_cache,
+            PathBuf::from("artifacts/minicpm-v-4.7-1b/cache")
+        );
+
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn save_and_load_reject_nonfinite_projection_weights() {
+        let dir =
+            std::env::temp_dir().join(format!("omni-projection-finite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut projection = ConditionProjection {
+            in_width: 2,
+            weight: vec![0.25; 2 * CONDITION_WIDTH],
+            bias: vec![0.1; CONDITION_WIDTH],
+            fitted: true,
+        };
+        let path = dir.join("1b.bin");
+        projection.save(&path).unwrap();
+        let loaded = ConditionProjection::load(&path).unwrap();
+        assert_eq!(loaded.in_width, 2);
+        assert_eq!(loaded.weight[0], 0.25);
+        assert_eq!(loaded.bias[0], 0.1);
+
+        projection.weight[0] = f32::NAN;
+        let saved = projection.save(&path).unwrap_err().to_string();
+        assert!(saved.contains("非有限"), "{saved}");
+        projection.weight[0] = 0.25;
+        projection.bias[1] = f32::INFINITY;
+        let saved = projection.save(&path).unwrap_err().to_string();
+        assert!(saved.contains("非有限"), "{saved}");
+        projection.bias[1] = 0.1;
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[20..24].copy_from_slice(&f32::NAN.to_le_bytes());
+        let nan_path = dir.join("1b-nan.bin");
+        std::fs::write(&nan_path, &bytes).unwrap();
+        let loaded = ConditionProjection::load(&nan_path)
+            .unwrap_err()
+            .to_string();
+        assert!(loaded.contains("非有限"), "{loaded}");
+
+        bytes[20..24].copy_from_slice(&0.25f32.to_le_bytes());
+        let bias_at = 20 + 2 * CONDITION_WIDTH * 4;
+        bytes[bias_at..bias_at + 4].copy_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+        let inf_path = dir.join("1b-inf.bin");
+        std::fs::write(&inf_path, &bytes).unwrap();
+        let loaded = ConditionProjection::load(&inf_path)
+            .unwrap_err()
+            .to_string();
+        assert!(loaded.contains("非有限"), "{loaded}");
+
+        let mut wide = MiniCpm35bProjection {
+            inner: ConditionProjection {
+                in_width: MiniCpm35bProjection::HIDDEN,
+                weight: vec![0.0; MiniCpm35bProjection::HIDDEN * CONDITION_WIDTH],
+                bias: vec![0.0; CONDITION_WIDTH],
+                fitted: true,
+            },
+        };
+        let wide_path = dir.join("35b.bin");
+        wide.inner.weight[0] = f32::NAN;
+        let saved = match wide.save(&wide_path) {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("nonfinite 35B weights must not be saved"),
+        };
+        assert!(saved.contains("非有限"), "{saved}");
+        wide.inner.weight[0] = 0.0;
+        wide.inner.bias[4] = f32::INFINITY;
+        let saved = match wide.save(&wide_path) {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("nonfinite 35B weights must not be saved"),
+        };
+        assert!(saved.contains("非有限"), "{saved}");
+        wide.inner.bias[4] = 0.0;
+        wide.save(&wide_path).unwrap();
+        let mut wide_bytes = std::fs::read(&wide_path).unwrap();
+        wide_bytes[20..24].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(&wide_path, &wide_bytes).unwrap();
+        let loaded = match MiniCpm35bProjection::load(&wide_path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("nonfinite 35B weights must not load"),
+        };
+        assert!(loaded.contains("非有限"), "{loaded}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
