@@ -511,19 +511,25 @@ impl crate::engine_harness::Adapter for Worker {
                     .map_err(Failure::from)?;
                 let elapsed = start.elapsed().as_secs_f64();
                 if hold {
-                    let unusable = stop.load(Ordering::Acquire)
-                        || report.stopped
-                        || report.reached_limit
-                        || pcm.is_empty();
+                    let end = if stop.load(Ordering::Acquire) || report.stopped {
+                        enhancement::CandidateEnd::Stopped
+                    } else if report.reached_limit {
+                        enhancement::CandidateEnd::ReachedLimit
+                    } else {
+                        enhancement::CandidateEnd::Normal {
+                            delivered_audio: !pcm.is_empty(),
+                        }
+                    };
+                    let choosable = enhancement::candidate_is_choosable(end);
                     let mut held = Update::status(
-                        if unusable { "done" } else { "held" },
-                        if unusable {
-                            "这一段没有正常结束 · 未完成的盲选已作废"
-                        } else {
+                        if choosable { "held" } else { "done" },
+                        if choosable {
                             "已合成一段待选音频"
+                        } else {
+                            "这一段没有正常结束 · 未完成的盲选已作废"
                         },
                     );
-                    if !unusable {
+                    if choosable {
                         held.audio = Some(Arc::from(pcm.clone()));
                     }
                     held.audio_seconds = report.audio_seconds;

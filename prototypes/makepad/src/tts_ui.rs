@@ -567,10 +567,18 @@ impl App {
                     }
                 }
                 "replayed" | "voice_cancelled" => {
-                    let finished = update.message == "试听结束";
+                    let played_to_end = update.message == "试听结束";
                     let hearing = t.session.hearing();
                     let index = t.hearing_play.take();
-                    if finished {
+                    let keep =
+                        omni_breeze_tts::enhancement::candidate_is_choosable(if played_to_end {
+                            omni_breeze_tts::enhancement::CandidateEnd::Normal {
+                                delivered_audio: true,
+                            }
+                        } else {
+                            omni_breeze_tts::enhancement::CandidateEnd::Stopped
+                        });
+                    if keep {
                         if let Some(index) = index {
                             let _ = t.session.mark_heard(index);
                         }
@@ -579,7 +587,7 @@ impl App {
                     t.busy = false;
                     t.stopping = false;
                     t.controls = None;
-                    let abandon = hearing && !finished;
+                    let abandon = hearing && !keep;
                     let ready = t.session.can_choose();
                     if abandon {
                         t.session.abandon();

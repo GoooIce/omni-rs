@@ -332,6 +332,28 @@ pub fn sample_user_message(source: &Source) -> String {
     )
 }
 
+/// How one blind alternative ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateEnd {
+    /// The synthesizer finished on its own.
+    Normal { delivered_audio: bool },
+    /// The person or the runtime stopped it.
+    Stopped,
+    /// The frame ceiling ended it.
+    ReachedLimit,
+}
+
+/// A blind alternative can be chosen only after a normal end that delivered audio.
+/// A stop, a ceiling, or an empty buffer discards the set.
+pub fn candidate_is_choosable(end: CandidateEnd) -> bool {
+    matches!(
+        end,
+        CandidateEnd::Normal {
+            delivered_audio: true
+        }
+    )
+}
+
 /// Read-only check. A missing directory is an error and is not created.
 pub fn checkpoint_available(dir: &Path) -> Result<(), String> {
     if !dir.is_dir() {
@@ -799,6 +821,19 @@ mod tests {
         session.stage_draft("草稿".into());
         session.accept_displayed("新提示").unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_blind_alternative_is_choosable_only_after_a_normal_end_with_audio() {
+        use CandidateEnd::*;
+        assert!(candidate_is_choosable(Normal {
+            delivered_audio: true
+        }));
+        assert!(!candidate_is_choosable(Normal {
+            delivered_audio: false
+        }));
+        assert!(!candidate_is_choosable(Stopped));
+        assert!(!candidate_is_choosable(ReachedLimit));
     }
 
     fn pair(instruction: &str) -> Pair {

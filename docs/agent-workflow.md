@@ -12,6 +12,10 @@ Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` sele
 
 Use `--list` to inspect a profile without executing it. CPU checks run in GitHub Actions on pushes and pull requests once this directory is hosted in a GitHub repository. Metal and native checks run locally on real hardware; their output is not inferred from CI. The experimental `tts-gemv` prototype is formatted but is not part of the supported CPU/runtime matrix. The registry is `scripts/checks.json`; adding a crate without registering it fails the quick check. `scripts/pre-commit` (install into `.git/hooks/pre-commit`) runs `cargo check --locked` for every manifest with staged files plus the quick profile, keeping non-compiling commits out of history. The root manifest optionally depends on `omni-kernel`, so a dependency change in `crates/omni-kernel/Cargo.toml` refreshes both `crates/omni-kernel/Cargo.lock` and the root `Cargo.lock` in the same commit. The root `--locked` check fails until that root lock is current.
 
+## Local artifacts
+
+`artifacts/` stays gitignored. A working tree holds check logs, waveforms, upstream checkouts and one-off measurements; this machine's tree is about 28 GB. Durable contracts and decisions go in `docs/`. A note that exists only under `artifacts/` is local evidence, not something the next checkout can read.
+
 ## Compilation directories
 
 Each manifest in `scripts/checks.json` has one `target` directory. Those directories live in the primary checkout, the parent of `git rev-parse --git-common-dir`. A linked worktree uses that same tree.
