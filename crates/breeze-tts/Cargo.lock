@@ -3837,6 +3837,8 @@ dependencies = [
  "burn-fusion",
  "burn-ir",
  "cubecl",
+ "objc2-metal",
+ "wgpu",
 ]
 
 [[package]]

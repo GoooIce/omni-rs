@@ -4714,6 +4714,8 @@ name = "omni-minicpm-v"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-cubecl",
+ "burn-fusion",
  "burn-tensor",
  "half",
  "image",
@@ -5204,11 +5206,14 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-ane",
+ "burn-cubecl",
  "cpal",
+ "cubecl",
  "hound",
  "makepad-widgets",
  "omni-breeze-tts",
  "omni-hy-mt",
+ "omni-minicpm-v",
  "omni-music",
  "omni-qwen-image",
  "omni-r2t2",

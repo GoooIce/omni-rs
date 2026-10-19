@@ -55,8 +55,32 @@ Offline audio sources sharing text-decoder steps while retaining independent res
 **Continuous synthesis batch**:
 Speech requests sharing semantic-head and depth-decoder work at a codec-frame boundary. Each request owns its backbone history, sampler, audio codec and output. Finishing one voice does not reset another voice's state.
 
+**Speech text**:
+The words one speech synthesis is asked to speak, including official inline vocal events.
+_Avoid_: voice instruction, enhancer prompt, prompt
+
+**Voice instruction**:
+Optional natural-language direction for how a speech synthesis should sound, in the same language as the speech text. Empty means that synthesis has no voice instruction.
+_Avoid_: speech text, reference transcript, enhancer prompt, prompt
+
+**Reference transcript**:
+The words actually spoken in a reference recording. It stays paired with that recording.
+_Avoid_: speech text, voice instruction
+
+**Voice-conditioning**:
+The optional voice instruction and optional reference recording, with its reference transcript, fixed for one speech synthesis.
+_Avoid_: speech text, enhancer prompt
+
+**Enhancer prompt**:
+The standing instructions for rewriting a speech text and a voice instruction. It is neither the speech text nor the voice instruction.
+_Avoid_: speech text, voice instruction, prompt
+
+**Speech choice**:
+A person's selection of one completed speech synthesis from the alternatives produced together for the same speech text and voice-conditioning.
+_Avoid_: rating, score
+
 **Speech synthesis**:
-One generation of speech from a text and voice-conditioning snapshot, including its independent sampling, generated frames and delivered audio. A single request and a continuous synthesis batch stop at the same frame ceiling: pending audio is delivered, and the backbone is not continued past that frame. An interruption retains audio already delivered and discards audio that has not been delivered.
+One generation of speech from a speech text and voice-conditioning snapshot, including its independent sampling, generated frames and delivered audio. A single request and a continuous synthesis batch stop at the same frame ceiling: pending audio is delivered, and the backbone is not continued past that frame. An interruption retains audio already delivered and discards audio that has not been delivered.
 
 **First audio latency**:
 Time from the start of speech synthesis to the beginning of its first successful audio handoff. It excludes the recipient's processing time and any delay before physical playback.

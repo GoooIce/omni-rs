@@ -6,6 +6,7 @@ use crate::{
     playback_buffer::DurationHistory,
 };
 use omni_breeze_tts::{
+    enhancement::{self, Consideration, Source},
     reference::{self, ReferenceEncoder},
     Model, Precision, ReferenceAudio, SynthesisOptions, SAMPLE_RATE,
 };
@@ -72,10 +73,29 @@ pub enum Command {
         options: SynthesisOptions,
         reference: Option<ReferenceInput>,
         design: bool,
+        /// Capture audio without playing it. Used for a blind trio.
+        hold: bool,
+    },
+    Enhance {
+        source: Source,
+        prompt: String,
+        seeds: [u64; 3],
+        checkpoint: PathBuf,
+    },
+    Draft {
+        request: enhancement::DraftRequest,
+        seed: u64,
+        checkpoint: PathBuf,
+    },
+    Remember {
+        audio: Arc<[f32]>,
+        text: String,
+        seed: u64,
     },
     Replay(Arc<[f32]>),
     UseDesign,
 }
+#[derive(Clone)]
 pub enum ReferenceInput {
     File { path: PathBuf, text: String },
     Designed,
@@ -101,6 +121,10 @@ pub struct Update {
     pub playback: Option<PlaybackStats>,
     #[serde(skip)]
     pub audio: Option<Arc<[f32]>>,
+    #[serde(skip)]
+    pub consideration: Option<Consideration>,
+    #[serde(skip)]
+    pub draft_text: Option<String>,
 }
 impl Update {
     fn status(kind: &'static str, message: impl Into<String>) -> Self {
@@ -116,6 +140,8 @@ impl Update {
             reference_text: None,
             playback: None,
             audio: None,
+            consideration: None,
+            draft_text: None,
         }
     }
 }
@@ -159,6 +185,7 @@ pub struct Worker {
     completed_design: Option<Design>,
     designed_reference: Option<ReferenceAudio>,
     duration_history: DurationHistory,
+    enhancer: Option<crate::speech_enhancer::SpeechEnhancer>,
 }
 
 impl crate::engine_harness::Adapter for Worker {
@@ -184,6 +211,7 @@ impl crate::engine_harness::Adapter for Worker {
             completed_design: None,
             designed_reference: None,
             duration_history: DurationHistory::default(),
+            enhancer: None,
         }
     }
     fn unload(&mut self) {
@@ -192,6 +220,7 @@ impl crate::engine_harness::Adapter for Worker {
         self.reference_cache = None;
         self.designed_reference = None;
         self.duration_history = DurationHistory::default();
+        self.enhancer = None;
     }
     fn load_path(command: &Command) -> Option<&Path> {
         if let Command::Load(path) = command {
@@ -264,15 +293,88 @@ impl crate::engine_harness::Adapter for Worker {
             completed_design,
             designed_reference,
             duration_history,
+            enhancer,
         } = self;
         let stop = &context.stop;
         let sender = &context.updates;
         match command {
             Command::Load(_) => unreachable!("load is handled by the harness"),
+            Command::Enhance {
+                source,
+                prompt,
+                seeds,
+                checkpoint,
+            } => {
+                enhancement::checkpoint_available(&checkpoint)?;
+                if enhancer.is_none() {
+                    sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
+                    *enhancer = Some(
+                        crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
+                            .map_err(Failure::from)?,
+                    );
+                }
+                let model = model.as_ref().ok_or("语音合成模型尚未就绪")?;
+                let samples = crate::speech_enhancer::sample_three(
+                    enhancer.as_mut().unwrap(),
+                    &prompt,
+                    &source,
+                    seeds,
+                    stop,
+                )?;
+                let consideration =
+                    enhancement::consider(&prompt, &source, samples, |speech, instruction| {
+                        model.prompt_ids(speech, instruction).is_ok()
+                    });
+                let mut update = Update::status(
+                    "enhanced",
+                    match &consideration {
+                        Consideration::Speak(_) => "增强结果一致，开始合成".into(),
+                        Consideration::Choose { .. } => "请把甲、乙、丙都听完再选择".into(),
+                        Consideration::Failed(reason) => reason.clone(),
+                    },
+                );
+                update.consideration = Some(consideration);
+                Ok(update)
+            }
+            Command::Draft {
+                request,
+                seed,
+                checkpoint,
+            } => {
+                enhancement::checkpoint_available(&checkpoint)?;
+                if enhancer.is_none() {
+                    sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
+                    *enhancer = Some(
+                        crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
+                            .map_err(Failure::from)?,
+                    );
+                }
+                let text = enhancer.as_mut().unwrap().complete(
+                    &request.system,
+                    &request.user,
+                    seed,
+                    stop,
+                )?;
+                if text.trim().is_empty() {
+                    return Err("起草没有得到增强提示".into());
+                }
+                let mut update = Update::status("drafted", "增强提示草稿已显示，可修改后接受");
+                update.draft_text = Some(text);
+                Ok(update)
+            }
+            Command::Remember { audio, text, seed } => {
+                *pcm = audio.to_vec();
+                *completed_design = Some(Design { text, seed });
+                let mut update = Update::status("remembered", "已选定这一版音色");
+                update.reusable = true;
+                update.design_seed = Some(seed);
+                Ok(update)
+            }
             Command::Synthesize {
                 mut options,
                 reference,
                 design,
+                hold,
             } => {
                 let model = model.as_ref().ok_or("语音合成模型尚未就绪")?;
                 pcm.clear();
@@ -347,21 +449,25 @@ impl crate::engine_harness::Adapter for Worker {
                 // Keep synthesis/save usable on machines with no audio output.
                 let playback_offset = start.elapsed().as_secs_f64();
                 let voice = duration_voice(&options);
-                let mut playback = match Playback::open(
-                    stop.clone(),
-                    Some(
-                        duration_history
-                            .estimate(voice, &options.text)
-                            .min(options.max_frames as f64 * 0.08),
-                    ),
-                ) {
-                    Ok(output) => Some(output),
-                    Err(error) => {
-                        sender.publish(Update::status(
-                            "notice",
-                            format!("{error} · 仍可合成并保存 WAV"),
-                        ));
-                        None
+                let mut playback = if hold {
+                    None
+                } else {
+                    match Playback::open(
+                        stop.clone(),
+                        Some(
+                            duration_history
+                                .estimate(voice, &options.text)
+                                .min(options.max_frames as f64 * 0.08),
+                        ),
+                    ) {
+                        Ok(output) => Some(output),
+                        Err(error) => {
+                            sender.publish(Update::status(
+                                "notice",
+                                format!("{error} · 仍可合成并保存 WAV"),
+                            ));
+                            None
+                        }
                     }
                 };
                 let mut first = None;
@@ -387,6 +493,8 @@ impl crate::engine_harness::Adapter for Worker {
                                 } else {
                                     "正在合成并播放 · 可以随时停止".into()
                                 }
+                            } else if hold {
+                                "正在合成待选音频 · 可以随时停止".into()
                             } else if playback.is_some() {
                                 "正在生成音频 · 可以随时停止".into()
                             } else {
@@ -402,6 +510,27 @@ impl crate::engine_harness::Adapter for Worker {
                     })
                     .map_err(Failure::from)?;
                 let elapsed = start.elapsed().as_secs_f64();
+                if hold {
+                    let unusable = stop.load(Ordering::Acquire)
+                        || report.stopped
+                        || report.reached_limit
+                        || pcm.is_empty();
+                    let mut held = Update::status(
+                        if unusable { "done" } else { "held" },
+                        if unusable {
+                            "这一段没有正常结束 · 未完成的盲选已作废"
+                        } else {
+                            "已合成一段待选音频"
+                        },
+                    );
+                    if !unusable {
+                        held.audio = Some(Arc::from(pcm.clone()));
+                    }
+                    held.audio_seconds = report.audio_seconds;
+                    held.elapsed = elapsed;
+                    held.first_audio = first;
+                    return Ok(held);
+                }
                 let mut generated = Update::status("generated", "生成完成 · 可保存音频");
                 if !pcm.is_empty() {
                     generated.audio = Some(Arc::from(pcm.clone()));

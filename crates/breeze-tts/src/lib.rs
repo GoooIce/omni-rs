@@ -2,6 +2,7 @@
 mod batch;
 pub mod codec;
 pub mod config;
+pub mod enhancement;
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 mod metal_depth;
 mod ops;

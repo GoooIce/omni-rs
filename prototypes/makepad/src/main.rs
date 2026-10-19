@@ -41,6 +41,8 @@ mod protocol;
 #[cfg(not(target_arch = "wasm32"))]
 mod resampler;
 #[cfg(not(target_arch = "wasm32"))]
+mod speech_enhancer;
+#[cfg(not(target_arch = "wasm32"))]
 mod translation_engine;
 #[cfg(not(target_arch = "wasm32"))]
 mod translation_ui;
@@ -318,6 +320,23 @@ script_mod! {
                                             width: Fill height: Fit flow: Right spacing: 8
                                             tts_speech_mode := QuietButton{text: "朗读与克隆 · 当前" height: 30}
                                             tts_design_mode := QuietButton{text: "音色设计" height: 30}
+                                            tts_enhance := QuietButton{text: "提示词增强 · 关" height: 30}
+                                        }
+                                        tts_hearing := View{
+                                            visible: false width: Fill height: Fit flow: Down spacing: 8
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                tts_hear_0 := SpeechButton{text: "甲" height: 32}
+                                                tts_hear_1 := SpeechButton{text: "乙" height: 32}
+                                                tts_hear_2 := SpeechButton{text: "丙" height: 32}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                tts_pick_0 := SpeechButton{text: "选择甲" height: 32}
+                                                tts_pick_1 := SpeechButton{text: "选择乙" height: 32}
+                                                tts_pick_2 := SpeechButton{text: "选择丙" height: 32}
+                                            }
+                                            MutedLabel{text: "听完三段后再选择。这里不显示改写后的文字。"}
                                         }
                                         tts_text_title := SpeechLabel{text: "要朗读的文字"}
                                         tts_text := SpeechInput{
@@ -348,6 +367,17 @@ script_mod! {
                                             tts_instruction := SpeechInput{
                                                 width: Fill height: 66 is_multiline: true
                                                 empty_text: "例如：年轻女性，声音温柔清晰，语速自然。"
+                                            }
+                                            tts_draft := SpeechButton{text: "改进增强提示" height: 32}
+                                            tts_draft_text := SpeechInput{
+                                                width: Fill height: 88 is_multiline: true
+                                                empty_text: "起草后的增强提示显示在这里，可以修改。"
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                tts_draft_accept := SpeechButton{text: "接受" height: 32}
+                                                tts_draft_discard := QuietButton{text: "不接受" height: 32}
+                                                tts_draft_restore := QuietButton{text: "恢复上一版" height: 32}
                                             }
                                             tts_design_presets := View{
                                                 visible: false width: Fill height: Fit flow: Down spacing: 8

@@ -21,6 +21,9 @@ omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false }
 omni-qwen-image = { path = "../../crates/qwen-image", default-features = false }
 omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["native"] }
 omni-music = { path = "../../crates/omni-music", default-features = false }
+omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false }
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"] }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 omni-r2t2 = { path = "../..", default-features = false, features = ["metal"] }
@@ -28,6 +31,7 @@ omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false, 
 omni-qwen-image = { path = "../../crates/qwen-image", default-features = false, features = ["metal"] }
 omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["metal"] }
 omni-music = { path = "../../crates/omni-music", default-features = false, features = ["metal"] }
+omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false, features = ["metal"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 omni-r2t2 = { path = "../..", default-features = false, features = ["ane"] }
@@ -41,6 +45,7 @@ omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false, 
 omni-qwen-image = { path = "../../crates/qwen-image", default-features = false, features = ["webgpu"] }
 omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["webgpu"] }
 omni-music = { path = "../../crates/omni-music", default-features = false, features = ["webgpu"] }
+omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false, features = ["webgpu"] }
 
 [profile.release]
 lto = "thin"

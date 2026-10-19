@@ -12,6 +12,22 @@ enum ReferenceSelection {
     Designed,
 }
 
+enum Pending {
+    Idle,
+    Sampling {
+        reference: Option<crate::tts_engine::ReferenceInput>,
+        design: bool,
+        speech_seed: u64,
+    },
+    Holding {
+        next: usize,
+        pairs: [omni_breeze_tts::enhancement::Pair; 3],
+        reference: Option<crate::tts_engine::ReferenceInput>,
+        design: bool,
+        speech_seed: u64,
+    },
+}
+
 pub struct State {
     engine: Engine,
     dialog: Option<crate::desktop_runtime::Dialog>,
@@ -36,7 +52,13 @@ pub struct State {
     design: bool,
     reusable: bool,
     candidate: u64,
-    controls: Option<(bool, bool, bool, bool, bool, bool, bool, bool)>,
+    controls: Option<[bool; 17]>,
+    session: omni_breeze_tts::enhancement::Session,
+    checkpoint: PathBuf,
+    enhancement_settings: Option<PathBuf>,
+    pending: Pending,
+    hearing_audio: [Option<std::sync::Arc<[f32]>>; 3],
+    hearing_play: Option<usize>,
 }
 impl State {
     pub fn playing(&self) -> bool {
@@ -51,6 +73,14 @@ impl State {
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
         let settings =
             model_location::settings_path_for("BREEZE_TTS_SETTINGS_PATH", "breeze-tts.json");
+        let enhancement_settings = settings
+            .as_ref()
+            .map(|path| path.with_file_name("breeze-tts-enhancement.json"));
+        let session = enhancement_settings
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| omni_breeze_tts::enhancement::Session::load(&bytes))
+            .unwrap_or_default();
         let path = model_location::initial_directory_for(
             root,
             settings.as_deref(),
@@ -82,6 +112,12 @@ impl State {
             reusable: false,
             candidate: 1,
             controls: None,
+            session,
+            checkpoint: root.join(omni_breeze_tts::enhancement::DEFAULT_CHECKPOINT),
+            enhancement_settings,
+            pending: Pending::Idle,
+            hearing_audio: [None, None, None],
+            hearing_play: None,
         }
     }
 }
@@ -261,7 +297,7 @@ impl App {
         let Some(t) = self.tts.as_mut() else {
             return;
         };
-        let state = (
+        let state = [
             t.busy,
             t.loading,
             t.ready,
@@ -270,7 +306,16 @@ impl App {
             other_busy,
             dialog_busy,
             self.workspace.language(),
-        );
+            t.session.enabled(),
+            t.session.hearing(),
+            t.session.can_choose(),
+            !t.session.choices().is_empty(),
+            t.session.draft().is_some(),
+            t.session.previous_prompt().is_some(),
+            t.hearing_audio[0].is_some(),
+            t.hearing_audio[1].is_some(),
+            t.hearing_audio[2].is_some(),
+        ];
         if t.controls == Some(state) {
             return;
         }
@@ -326,6 +371,45 @@ impl App {
         self.ui
             .button(cx, ids!(tts_reference_clear))
             .set_action_enabled(cx, idle && t.reference.is_some());
+        self.ui.button(cx, ids!(tts_enhance)).set_text(
+            cx,
+            if t.session.enabled() {
+                "提示词增强 · 开"
+            } else {
+                "提示词增强 · 关"
+            },
+        );
+        self.ui
+            .button(cx, ids!(tts_enhance))
+            .set_action_enabled(cx, idle);
+        self.ui
+            .view(cx, ids!(tts_hearing))
+            .set_visible(cx, t.session.hearing());
+        for (index, id) in [ids!(tts_hear_0), ids!(tts_hear_1), ids!(tts_hear_2)]
+            .into_iter()
+            .enumerate()
+        {
+            self.ui
+                .button(cx, id)
+                .set_action_enabled(cx, idle && t.hearing_audio[index].is_some());
+        }
+        for id in [ids!(tts_pick_0), ids!(tts_pick_1), ids!(tts_pick_2)] {
+            self.ui
+                .button(cx, id)
+                .set_action_enabled(cx, idle && t.session.can_choose());
+        }
+        self.ui
+            .button(cx, ids!(tts_draft))
+            .set_action_enabled(cx, idle && !t.session.choices().is_empty());
+        self.ui
+            .button(cx, ids!(tts_draft_accept))
+            .set_action_enabled(cx, idle && t.session.draft().is_some());
+        self.ui
+            .button(cx, ids!(tts_draft_discard))
+            .set_action_enabled(cx, idle && t.session.draft().is_some());
+        self.ui
+            .button(cx, ids!(tts_draft_restore))
+            .set_action_enabled(cx, idle && t.session.previous_prompt().is_some());
     }
     pub fn poll_tts(&mut self, cx: &mut Cx) {
         if let Some(t) = self.tts.as_mut() {
@@ -341,7 +425,31 @@ impl App {
             .as_ref()
             .map(|t| t.engine.updates.try_iter().collect())
             .unwrap_or_default();
-        for update in updates {
+        for mut update in updates {
+            if update.kind == "enhanced" {
+                self.enhanced_ready(cx, update.consideration.take());
+                continue;
+            }
+            if update.kind == "held" {
+                self.held_ready(cx, update.audio.take());
+                continue;
+            }
+            if update.kind == "drafted" {
+                if let Some(text) = update.draft_text.take() {
+                    if let Some(t) = self.tts.as_mut() {
+                        t.session.stage_draft(text.clone());
+                        t.busy = false;
+                        t.stopping = false;
+                        t.controls = None;
+                    }
+                    self.ui
+                        .text_input(cx, ids!(tts_draft_text))
+                        .set_text(cx, &text);
+                    self.reveal_tts_details(cx);
+                    self.tts_status(cx, "增强提示草稿已显示，可修改后接受");
+                }
+                continue;
+            }
             let Some(t) = self.tts.as_mut() else {
                 return;
             };
@@ -391,9 +499,27 @@ impl App {
                     t.needs_directory = true;
                     self.tts_status(cx, &update.message);
                 }
+                "remembered" => {
+                    if let Some(t) = self.tts.as_mut() {
+                        t.reusable = true;
+                        t.busy = false;
+                        t.stopping = false;
+                        t.controls = None;
+                    }
+                    self.tts_status(cx, "已选定这一版");
+                }
                 "audio" | "draining" | "done" => {
                     t.has_audio = t.output.is_some();
                     if update.kind == "done" {
+                        let unfinished = !matches!(t.pending, Pending::Idle);
+                        if unfinished {
+                            t.session.abandon();
+                            t.pending = Pending::Idle;
+                            t.hearing_audio = [None, None, None];
+                            t.hearing_play = None;
+                            t.controls = None;
+                            self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
+                        }
                         t.playing = false;
                         t.busy = false;
                         t.stopping = false;
@@ -441,10 +567,35 @@ impl App {
                     }
                 }
                 "replayed" | "voice_cancelled" => {
+                    let finished = update.message == "试听结束";
+                    let hearing = t.session.hearing();
+                    let index = t.hearing_play.take();
+                    if finished {
+                        if let Some(index) = index {
+                            let _ = t.session.mark_heard(index);
+                        }
+                    }
                     t.playing = false;
                     t.busy = false;
                     t.stopping = false;
-                    self.tts_status(cx, &update.message);
+                    t.controls = None;
+                    let abandon = hearing && !finished;
+                    let ready = t.session.can_choose();
+                    if abandon {
+                        t.session.abandon();
+                        t.pending = Pending::Idle;
+                        t.hearing_audio = [None, None, None];
+                        t.controls = None;
+                        self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
+                    }
+                    let message: &str = if abandon {
+                        "已停止 · 未完成的盲选已作废"
+                    } else if ready {
+                        "三段都已听完，可以选择"
+                    } else {
+                        update.message.as_str()
+                    };
+                    self.tts_status(cx, message);
                 }
                 "voice_ready" => {
                     t.busy = false;
@@ -471,10 +622,14 @@ impl App {
                     self.tts_status(cx, &update.message);
                 }
                 "load_cancelled" | "cancelled" => {
+                    self.drop_unfinished_hearing(cx);
                     self.tts_error(cx, &update.message, false);
                     self.tts_status(cx, &update.message);
                 }
-                "error" | "fatal" => self.tts_error(cx, &update.message, update.kind == "fatal"),
+                "error" | "fatal" => {
+                    self.drop_unfinished_hearing(cx);
+                    self.tts_error(cx, &update.message, update.kind == "fatal");
+                }
                 _ => self.tts_status(cx, &update.message),
             }
         }
@@ -679,6 +834,143 @@ impl App {
             self.load_tts(cx);
             return;
         }
+        if self.ui.button(cx, ids!(tts_enhance)).clicked(actions) {
+            let enabled = !t.session.enabled();
+            t.session.set_enabled(enabled);
+            t.controls = None;
+            if !enabled {
+                t.session.abandon();
+                t.pending = Pending::Idle;
+                t.hearing_audio = [None, None, None];
+                t.hearing_play = None;
+                self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
+            }
+            self.remember_enhancement();
+            self.tts_status(
+                cx,
+                if enabled {
+                    "提示词增强已打开。合成前会先改写朗读文字和声音描述"
+                } else {
+                    "提示词增强已关闭"
+                },
+            );
+            return;
+        }
+        for (index, id) in [ids!(tts_hear_0), ids!(tts_hear_1), ids!(tts_hear_2)]
+            .into_iter()
+            .enumerate()
+        {
+            if self.ui.button(cx, id).clicked(actions) {
+                let Some(audio) = t.hearing_audio[index].clone() else {
+                    return;
+                };
+                if let Some(m) = &mut self.music {
+                    m.stop_playback();
+                }
+                t.hearing_play = Some(index);
+                t.playing = true;
+                t.busy = true;
+                t.stopping = false;
+                t.controls = None;
+                if let Err(error) = t.engine.submit(Command::Replay(audio)) {
+                    self.tts_error(cx, &error.to_string(), false);
+                }
+                return;
+            }
+        }
+        for (index, id) in [ids!(tts_pick_0), ids!(tts_pick_1), ids!(tts_pick_2)]
+            .into_iter()
+            .enumerate()
+        {
+            if self.ui.button(cx, id).clicked(actions) && t.session.can_choose() {
+                let design = t.design;
+                let seed = t.candidate.wrapping_add(41);
+                match t.session.choose(index) {
+                    Ok(pair) => {
+                        let audio = t.hearing_audio[index].clone();
+                        t.output = audio.clone();
+                        t.has_audio = audio.is_some();
+                        t.hearing_audio = [None, None, None];
+                        t.hearing_play = None;
+                        t.controls = None;
+                        let submit = if design {
+                            audio.map(|audio| {
+                                t.busy = true;
+                                t.engine.submit(Command::Remember {
+                                    audio,
+                                    text: pair.speech_text,
+                                    seed,
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
+                        self.remember_enhancement();
+                        if let Some(Err(error)) = submit {
+                            self.tts_error(cx, &error.to_string(), false);
+                        }
+                        self.tts_status(cx, "已选定这一版");
+                    }
+                    Err(error) => self.tts_status(cx, error),
+                }
+                return;
+            }
+        }
+        if self.ui.button(cx, ids!(tts_draft)).clicked(actions) {
+            match t.session.draft_request() {
+                Ok(request) => {
+                    let seed = t.session.next_sample_seeds()[0];
+                    let checkpoint = t.checkpoint.clone();
+                    t.busy = true;
+                    t.stopping = false;
+                    t.controls = None;
+                    if let Err(error) = t.engine.submit(Command::Draft {
+                        request,
+                        seed,
+                        checkpoint,
+                    }) {
+                        self.tts_error(cx, &error.to_string(), false);
+                    } else {
+                        self.tts_status(cx, "正在根据语音选择起草增强提示");
+                    }
+                }
+                Err(error) => self.tts_status(cx, error),
+            }
+            return;
+        }
+        if self.ui.button(cx, ids!(tts_draft_accept)).clicked(actions) {
+            let displayed = self.ui.text_input(cx, ids!(tts_draft_text)).text();
+            match t.session.accept_displayed(&displayed) {
+                Ok(()) => {
+                    t.controls = None;
+                    self.remember_enhancement();
+                    self.tts_status(cx, "已换上增强提示");
+                }
+                Err(error) => self.tts_status(cx, error),
+            }
+            return;
+        }
+        if self.ui.button(cx, ids!(tts_draft_discard)).clicked(actions) {
+            t.session.discard_draft();
+            t.controls = None;
+            self.ui
+                .text_input(cx, ids!(tts_draft_text))
+                .set_text(cx, "");
+            self.tts_status(cx, "未接受草稿，当前增强提示不变");
+            return;
+        }
+        if self.ui.button(cx, ids!(tts_draft_restore)).clicked(actions) {
+            match t.session.restore_prompt() {
+                Ok(()) => {
+                    t.controls = None;
+                    self.remember_enhancement();
+                    self.tts_status(cx, "已恢复上一版增强提示");
+                }
+                Err(error) => self.tts_status(cx, error),
+            }
+            return;
+        }
 
         let next_candidate = t.design && self.ui.button(cx, ids!(tts_design_next)).clicked(actions);
         if (self.ui.button(cx, ids!(tts_synthesize)).clicked(actions) || next_candidate) && t.ready
@@ -730,29 +1022,262 @@ impl App {
                     .label(cx, ids!(tts_design_candidate))
                     .set_text(cx, &format!("候选 {} · 正在生成", t.candidate));
             }
+            let design = t.design;
+            let enhance = t.session.enabled();
+            if enhance {
+                t.session.abandon();
+                t.hearing_audio = [None, None, None];
+                t.hearing_play = None;
+                t.pending = Pending::Sampling {
+                    reference: reference.clone(),
+                    design,
+                    speech_seed: seed,
+                };
+                self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
+            }
             t.busy = true;
             t.reusable = false;
             t.stopping = false;
+            t.controls = None;
             if let Some(m) = &mut self.music {
                 m.stop_playback();
             }
-            let result = t.engine.submit(Command::Synthesize {
-                options: omni_breeze_tts::SynthesisOptions {
-                    text,
-                    instruction,
-                    sampling: omni_breeze_tts::Sampling {
-                        seed,
+            let result = if enhance {
+                let seeds = t.session.next_sample_seeds();
+                let prompt = t.session.enhancer_prompt().to_string();
+                let checkpoint = t.checkpoint.clone();
+                t.engine.submit(Command::Enhance {
+                    source: omni_breeze_tts::enhancement::Source {
+                        speech_text: text,
+                        voice_instruction: instruction,
+                    },
+                    prompt,
+                    seeds,
+                    checkpoint,
+                })
+            } else {
+                t.engine.submit(Command::Synthesize {
+                    options: omni_breeze_tts::SynthesisOptions {
+                        text,
+                        instruction,
+                        sampling: omni_breeze_tts::Sampling {
+                            seed,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
+                    reference,
+                    design,
+                    hold: false,
+                })
+            };
+            self.tts_status(
+                cx,
+                if enhance {
+                    "正在用 35B 增强朗读文字和声音描述"
+                } else {
+                    "正在生成首段音频 · 自动缓冲，优先保持播放连贯"
                 },
-                reference,
-                design: t.design,
-            });
-            self.tts_status(cx, "正在生成首段音频 · 自动缓冲，优先保持播放连贯");
+            );
             if let Err(error) = result {
                 self.tts_error(cx, &error.to_string(), false);
             }
+        }
+    }
+
+    fn remember_enhancement(&self) {
+        let Some(t) = self.tts.as_ref() else {
+            return;
+        };
+        let Some(path) = t.enhancement_settings.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, t.session.store());
+    }
+
+    fn drop_unfinished_hearing(&mut self, cx: &mut Cx) {
+        let Some(t) = self.tts.as_mut() else {
+            return;
+        };
+        if matches!(t.pending, Pending::Idle) && !t.session.hearing() {
+            return;
+        }
+        t.session.abandon();
+        t.pending = Pending::Idle;
+        t.hearing_audio = [None, None, None];
+        t.hearing_play = None;
+        t.controls = None;
+        self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
+    }
+
+    fn enhanced_ready(
+        &mut self,
+        cx: &mut Cx,
+        consideration: Option<omni_breeze_tts::enhancement::Consideration>,
+    ) {
+        let step = {
+            let Some(t) = self.tts.as_mut() else {
+                return;
+            };
+            let pending = std::mem::replace(&mut t.pending, Pending::Idle);
+            let Pending::Sampling {
+                reference,
+                design,
+                speech_seed,
+            } = pending
+            else {
+                t.busy = false;
+                t.controls = None;
+                return;
+            };
+            match consideration {
+                Some(omni_breeze_tts::enhancement::Consideration::Failed(reason)) => {
+                    t.busy = false;
+                    t.stopping = false;
+                    t.controls = None;
+                    Err(reason)
+                }
+                Some(omni_breeze_tts::enhancement::Consideration::Speak(pair)) => {
+                    Ok((pair, reference, design, speech_seed, false))
+                }
+                Some(omni_breeze_tts::enhancement::Consideration::Choose {
+                    alternatives,
+                    enhancer_prompt,
+                }) => {
+                    t.session
+                        .start_hearing(alternatives.clone(), &enhancer_prompt);
+                    t.hearing_audio = [None, None, None];
+                    let pair = alternatives[0].clone();
+                    t.pending = Pending::Holding {
+                        next: 0,
+                        pairs: alternatives,
+                        reference: reference.clone(),
+                        design,
+                        speech_seed,
+                    };
+                    t.controls = None;
+                    Ok((pair, reference, design, speech_seed, true))
+                }
+                None => {
+                    t.busy = false;
+                    t.controls = None;
+                    return;
+                }
+            }
+        };
+        match step {
+            Err(reason) => self.tts_status(cx, &reason),
+            Ok((pair, reference, design, seed, hold)) => {
+                if hold {
+                    self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, true);
+                    self.tts_status(cx, "正在准备甲、乙、丙");
+                } else {
+                    self.tts_status(cx, "增强结果一致，开始合成");
+                }
+                self.submit_pair(
+                    cx,
+                    pair.speech_text,
+                    pair.voice_instruction,
+                    seed,
+                    reference,
+                    design,
+                    hold,
+                );
+            }
+        }
+    }
+
+    fn held_ready(&mut self, cx: &mut Cx, audio: Option<std::sync::Arc<[f32]>>) {
+        let next = {
+            let Some(t) = self.tts.as_mut() else {
+                return;
+            };
+            let Pending::Holding {
+                next,
+                pairs,
+                reference,
+                design,
+                speech_seed,
+            } = &mut t.pending
+            else {
+                t.busy = false;
+                t.controls = None;
+                return;
+            };
+            if let Some(audio) = audio {
+                if *next < 3 {
+                    t.hearing_audio[*next] = Some(audio);
+                }
+            }
+            *next += 1;
+            if *next >= 3 {
+                t.pending = Pending::Idle;
+                t.busy = false;
+                t.stopping = false;
+                t.controls = None;
+                None
+            } else {
+                let index = *next;
+                Some((
+                    pairs[index].clone(),
+                    reference.clone(),
+                    *design,
+                    speech_seed.wrapping_add(index as u64),
+                ))
+            }
+        };
+        match next {
+            None => self.tts_status(cx, "请把甲、乙、丙都听完再选择"),
+            Some((pair, reference, design, seed)) => self.submit_pair(
+                cx,
+                pair.speech_text,
+                pair.voice_instruction,
+                seed,
+                reference,
+                design,
+                true,
+            ),
+        }
+    }
+
+    fn submit_pair(
+        &mut self,
+        cx: &mut Cx,
+        text: String,
+        instruction: String,
+        seed: u64,
+        reference: Option<ReferenceInput>,
+        design: bool,
+        hold: bool,
+    ) {
+        let Some(t) = self.tts.as_mut() else {
+            return;
+        };
+        t.busy = true;
+        t.reusable = false;
+        t.stopping = false;
+        t.controls = None;
+        if let Err(error) = t.engine.submit(Command::Synthesize {
+            options: omni_breeze_tts::SynthesisOptions {
+                text,
+                instruction,
+                sampling: omni_breeze_tts::Sampling {
+                    seed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            reference,
+            design,
+            hold,
+        }) {
+            self.tts_error(cx, &error.to_string(), false);
         }
     }
 }
