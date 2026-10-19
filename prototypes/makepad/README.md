@@ -80,7 +80,7 @@ Apple Silicon 原生界面使用 `Ane<Metal>`，默认按延迟选择执行路�
 
 Intel Mac 使用 Metal，其他原生平台编译为 Burn WGPU，Web 继续使用 WebGPU。本次实测机器是 Apple M5 Max，其他操作系统尚未实机验证。Makepad 自己负责界面渲染，模型常驻工作线程，命令队列有界，界面通过 `try_send` / `try_recv` 和 `SignalToUI` 通信。停止通过原子标志打断推理，当前执行的运算返回后退出，保留模型供下一次任务使用。
 
-此命令运行开发用的独立可执行文件；西文字体来自 Cargo 的 Makepad checkout，中文 Noto Sans SC 位于本项目的 `resources/fonts/` 并附 OFL 许可。它不是可单独分发的 `.app` 安装包。
+此命令运行开发用的独立可执行文件。西文字体来自 Cargo 的 Makepad checkout；界面自带的字体、覆盖的文字和许可见 [resources/fonts/README.md](resources/fonts/README.md)。它不是可单独分发的 `.app` 安装包。
 原生 UI 使用独立的 `target/makepad-native`，避免与根 workspace 的 Burn 特性构建产物冲突。
 
 ## 语音合成

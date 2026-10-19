@@ -17,10 +17,12 @@ pub enum Command {
         path: String,
         context: String,
         options: DecodeOptions,
+        language: Option<String>,
     },
     Microphone {
         context: String,
         options: DecodeOptions,
+        language: Option<String>,
     },
 }
 
@@ -107,11 +109,15 @@ impl Adapter for Worker {
                 path,
                 context,
                 options,
+                language,
             } => {
                 let pcm = read_wav(&path)?;
-                let mut runner =
-                    Transcription::new(model, stream_config(options, context, false), 16000)
-                        .map_err(Failure::from)?;
+                let mut runner = Transcription::new(
+                    model,
+                    stream_config(options, context, false, language),
+                    16000,
+                )
+                .map_err(Failure::from)?;
                 runner.set_stop_handle(stop.clone());
                 for packet in pcm.chunks(320) {
                     if stop.load(Ordering::Acquire) {
@@ -125,10 +131,17 @@ impl Adapter for Worker {
                 }
                 finish(&mut runner, job)
             }
-            Command::Microphone { context, options } => {
-                let mut runner =
-                    Transcription::new(model, stream_config(options, context, true), 16000)
-                        .map_err(Failure::from)?;
+            Command::Microphone {
+                context,
+                options,
+                language,
+            } => {
+                let mut runner = Transcription::new(
+                    model,
+                    stream_config(options, context, true, language),
+                    16000,
+                )
+                .map_err(Failure::from)?;
                 runner.set_stop_handle(stop.clone());
                 let microphone =
                     crate::microphone::Microphone::start(stop.clone(), job.updates.clone())?;
@@ -221,6 +234,7 @@ fn update(report: TranscriptionEvent, kind: &str) -> Update {
         rtf: report.rtf,
         event_count: report.event_count,
         cancelled: report.cancelled,
+        language: report.event.language,
         ..Default::default()
     }
 }

@@ -87,6 +87,10 @@ script_mod! {
     let speech_font = FontFamily{
         latin := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-Text.ttf")}
         cjk := FontMember{res: crate_resource("self:resources/fonts/NotoSansSC-VF.ttf") weight: 400}
+        hangul := FontMember{res: crate_resource("self:resources/fonts/NotoSansKR-Hangul.ttf") weight: 400}
+        arabic := FontMember{res: crate_resource("self:resources/fonts/NotoSansArabic-VF.ttf") weight: 400}
+        thai := FontMember{res: crate_resource("self:resources/fonts/NotoSansThai-VF.ttf") weight: 400}
+        devanagari := FontMember{res: crate_resource("self:resources/fonts/NotoSansDevanagari-VF.ttf") weight: 400}
     }
     let speech_heading = FontFamily{
         latin := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-SemiBold.ttf")}
@@ -245,6 +249,12 @@ script_mod! {
                                         }
                                         input_status := MutedLabel{text: "麦克风未开启"}
                                         Divider{}
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            SpeechLabel{text: "识别语言" width: Fit}
+                                            asr_language := SpeechInput{width: Fill height: 34 text: "自动" empty_text: "自动，或 Korean / 韩语"}
+                                        }
+                                        MutedLabel{text: "自动判断语种。填写 Chinese、中文、Korean、韩语可固定，下一次转写生效。"}
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                             transcript_title := SpeechLabel{width: Fill text: "转写文字"}
@@ -874,6 +884,17 @@ impl App {
         self.ui.label(cx, ids!(status)).set_text(cx, text);
     }
 
+    fn set_transcript_language(&self, cx: &mut Cx, language: &str) {
+        let title = if language.is_empty() {
+            "转写文字".to_owned()
+        } else {
+            format!("转写文字 · {language}")
+        };
+        self.ui
+            .label(cx, ids!(transcript_title))
+            .set_text(cx, &title);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn set_model_progress(&self, cx: &mut Cx, progress: f64) {
         crate::engine_ui::set_progress(
@@ -1012,6 +1033,9 @@ impl App {
                         .text_input(cx, ids!(transcript))
                         .set_text(cx, &self.transcript);
                 }
+                if !update.language.is_empty() {
+                    self.set_transcript_language(cx, &update.language);
+                }
                 self.ui.label(cx, ids!(metrics)).set_text(
                     cx,
                     &format!(
@@ -1086,6 +1110,19 @@ impl App {
         let path = self.ui.text_input(cx, ids!(model_path)).text();
         let audio = self.ui.text_input(cx, ids!(audio_path)).text();
         let context = self.ui.text_input(cx, ids!(context)).text();
+        let language = if command == "transcribe" || command == "microphone" {
+            match protocol::asr_language(&self.ui.text_input(cx, ids!(asr_language)).text()) {
+                Ok(language) => language,
+                Err(error) => {
+                    self.busy = false;
+                    self.microphone = false;
+                    self.status(cx, &error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         #[cfg(not(target_arch = "wasm32"))]
         {
             let Some(engine) = &self.engine else {
@@ -1097,18 +1134,18 @@ impl App {
             }
             let request = if command == "load" {
                 engine::Command::Load(path)
+            } else if command == "microphone" {
+                engine::Command::Microphone {
+                    context,
+                    options: protocol::decode_options(self.mode),
+                    language,
+                }
             } else {
-                if command == "microphone" {
-                    engine::Command::Microphone {
-                        context,
-                        options: protocol::decode_options(self.mode),
-                    }
-                } else {
-                    engine::Command::Transcribe {
-                        path: audio,
-                        context,
-                        options: protocol::decode_options(self.mode),
-                    }
+                engine::Command::Transcribe {
+                    path: audio,
+                    context,
+                    options: protocol::decode_options(self.mode),
+                    language,
                 }
             };
             if let Err(error) = engine.submit(request) {
@@ -1122,7 +1159,8 @@ impl App {
         cx.os.from_wasm(web_bridge::FromWasmCommand {
             json: serde_json::json!({
                 "type": command, "url": path, "audio": audio, "context": context,
-                "config": protocol::decode_options(self.mode)
+                "config": protocol::decode_options(self.mode),
+                "language": language,
             })
             .to_string(),
         });
@@ -1337,9 +1375,16 @@ impl MatchEvent for App {
                 self.status(cx, "请先载入模型");
                 return;
             }
+            if let Err(error) =
+                protocol::asr_language(&self.ui.text_input(cx, ids!(asr_language)).text())
+            {
+                self.status(cx, &error);
+                return;
+            }
             self.busy = true;
             self.transcript.clear();
             self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
+            self.set_transcript_language(cx, "");
             self.status(cx, "开始转写 · 首次运行可能需要较长时间");
             self.command(cx, "transcribe");
         }
@@ -1348,11 +1393,18 @@ impl MatchEvent for App {
             && !self.inference_busy()
             && self.ready
         {
+            if let Err(error) =
+                protocol::asr_language(&self.ui.text_input(cx, ids!(asr_language)).text())
+            {
+                self.status(cx, &error);
+                return;
+            }
             self.busy = true;
             self.microphone = true;
             self.stopping = false;
             self.transcript.clear();
             self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
+            self.set_transcript_language(cx, "");
             self.ui
                 .label(cx, ids!(input_status))
                 .set_text(cx, "正在打开默认输入设备…");

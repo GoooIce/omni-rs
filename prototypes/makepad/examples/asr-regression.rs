@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             protocol::decode_options(case.mode),
             String::new(),
             case.microphone,
+            Some("Chinese".into()),
         );
         if let Some(padding) = case.final_padding_ms {
             config.final_padding_ms = padding;

@@ -89,6 +89,7 @@ pub struct Update {
     pub captured_seconds: f64,
     pub backlog_seconds: f64,
     pub level: f64,
+    pub language: String,
 }
 
 impl Update {
@@ -98,5 +99,96 @@ impl Update {
             message: message.into(),
             ..Self::default()
         }
+    }
+}
+
+/// Names accepted by Confucius4-R2T2 `support_languages`, with one Chinese alias each.
+/// English names must match `resources/asr-languages.json` in order.
+const ASR_LANGUAGES: &[(&str, &str)] = &[
+    ("Chinese", "中文"),
+    ("English", "英文"),
+    ("Cantonese", "粤语"),
+    ("Arabic", "阿拉伯语"),
+    ("German", "德语"),
+    ("French", "法语"),
+    ("Spanish", "西班牙语"),
+    ("Portuguese", "葡萄牙语"),
+    ("Indonesian", "印尼语"),
+    ("Italian", "意大利语"),
+    ("Korean", "韩语"),
+    ("Russian", "俄语"),
+    ("Thai", "泰语"),
+    ("Vietnamese", "越南语"),
+    ("Japanese", "日语"),
+    ("Turkish", "土耳其语"),
+    ("Hindi", "印地语"),
+    ("Malay", "马来语"),
+    ("Dutch", "荷兰语"),
+    ("Swedish", "瑞典语"),
+    ("Danish", "丹麦语"),
+    ("Finnish", "芬兰语"),
+    ("Polish", "波兰语"),
+    ("Czech", "捷克语"),
+    ("Filipino", "菲律宾语"),
+    ("Persian", "波斯语"),
+    ("Greek", "希腊语"),
+    ("Romanian", "罗马尼亚语"),
+    ("Hungarian", "匈牙利语"),
+    ("Macedonian", "马其顿语"),
+];
+
+/// `None` lets the model detect the language. A name must match `config.json`.
+pub fn asr_language(raw: &str) -> Result<Option<String>, String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "auto" | "none" | "自动" | "自动检测"
+        )
+    {
+        return Ok(None);
+    }
+    ASR_LANGUAGES
+        .iter()
+        .find(|(english, chinese)| english.eq_ignore_ascii_case(raw) || *chinese == raw)
+        .map(|(english, _)| Some((*english).to_owned()))
+        .ok_or_else(|| {
+            format!("不认识的识别语言“{raw}”。留空或填写“自动”，也可以填 Korean、韩语这样的名称。")
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asr_language;
+
+    #[test]
+    fn blank_and_auto_detect_language() {
+        for raw in ["", "  ", "自动", "自动检测", "auto", "AUTO", "None"] {
+            assert_eq!(asr_language(raw).unwrap(), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn language_names_match_the_committed_list() {
+        let expected: Vec<String> =
+            serde_json::from_str(include_str!("../resources/asr-languages.json")).unwrap();
+        let actual: Vec<String> = super::ASR_LANGUAGES
+            .iter()
+            .map(|(english, _)| (*english).to_owned())
+            .collect();
+        assert_eq!(actual, expected);
+        let aliases: Vec<&str> = super::ASR_LANGUAGES
+            .iter()
+            .map(|(_, alias)| *alias)
+            .collect();
+        let mut unique = aliases.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), aliases.len());
+        assert_eq!(asr_language("korean").unwrap().as_deref(), Some("Korean"));
+        assert_eq!(asr_language("韩语").unwrap().as_deref(), Some("Korean"));
+        assert_eq!(asr_language("中文").unwrap().as_deref(), Some("Chinese"));
+        assert_eq!(asr_language("粤语").unwrap().as_deref(), Some("Cantonese"));
+        assert!(asr_language("Klingon").is_err());
     }
 }

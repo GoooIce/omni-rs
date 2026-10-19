@@ -6,8 +6,11 @@ let busy = false;
 
 function sessionState(data) {
   if (!model) throw new Error("请先载入模型");
-  const session = model.createTranscription(JSON.stringify({ language: "Chinese", context: data.context || "",
-    chunk_ms: 960, lookahead_ms: 0, max_new_tokens: 8, ...data.config }), data.rate ?? 16000);
+  const session = model.createTranscription(JSON.stringify({
+    context: data.context || "",
+    chunk_ms: 960, lookahead_ms: 0, max_new_tokens: 8, ...data.config,
+    language: Object.hasOwn(data, "language") ? data.language : "Chinese",
+  }), data.rate ?? 16000);
   return { id: data.id, session, stopHandle: session.stopHandle(),
     microphone: data.type === "mic-start", cancelled: false, processing: false };
 }

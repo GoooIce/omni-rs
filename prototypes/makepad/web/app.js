@@ -172,7 +172,7 @@ async function startMicrophone(command) {
     current.started = true;
     state.microphone = { phase: "waiting-for-engine", rate: current.capture.context.sampleRate };
     worker.postMessage({ type: "mic-start", id, rate: current.capture.context.sampleRate,
-      context: command.context, config: command.config });
+      context: command.context, config: command.config, language: command.language });
   } catch (error) {
     current.capture.close();
     discardSpool(current);
@@ -251,7 +251,7 @@ class SpeechUI extends WasmWebGL {
             for (let i = 0; i < pcm.length; i++) pcm[i] += data[i] / audio.numberOfChannels;
           }
           pendingAudio = false;
-          worker.postMessage({ type: "transcribe", pcm, context: command.context, config: command.config }, [pcm.buffer]);
+          worker.postMessage({ type: "transcribe", pcm, context: command.context, config: command.config, language: command.language }, [pcm.buffer]);
         }
       } catch (error) {
         if (requestId !== undefined && requestId !== audioRequestId) return;

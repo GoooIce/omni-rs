@@ -2,9 +2,16 @@
 use crate::{protocol::DecodeOptions, resampler::NativeResampler};
 use omni_r2t2::{StreamConfig, TextPostprocess};
 
-pub fn stream_config(options: DecodeOptions, context: String, microphone: bool) -> StreamConfig {
+/// `language: None` lets the model detect the language. The regression runner
+/// still passes `Some("Chinese")` unless a case selects another name or `auto`.
+pub fn stream_config(
+    options: DecodeOptions,
+    context: String,
+    microphone: bool,
+    language: Option<String>,
+) -> StreamConfig {
     StreamConfig {
-        language: Some("Chinese".into()),
+        language,
         context,
         chunk_ms: options.chunk_ms,
         lookahead_ms: options.lookahead_ms,
