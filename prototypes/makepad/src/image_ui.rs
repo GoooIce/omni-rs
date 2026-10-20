@@ -955,15 +955,27 @@ impl ObservationBoard {
     }
 
     fn row_order(&self) -> [omni_qwen_image::ObservationRow; 3] {
-        [
-            omni_qwen_image::ObservationRow::Official,
-            omni_qwen_image::ObservationRow::MiniCpm1b,
-            omni_qwen_image::ObservationRow::MiniCpm35b,
-        ]
+        omni_qwen_image::ObservationRow::order()
     }
 
     fn rows(&self) -> [&OfficialRow; 3] {
-        [&self.official, &self.minicpm_1b, &self.minicpm_35b]
+        self.row_order().map(|row| self.stored_row(row))
+    }
+
+    fn stored_row(&self, row: omni_qwen_image::ObservationRow) -> &OfficialRow {
+        match row {
+            omni_qwen_image::ObservationRow::Official => &self.official,
+            omni_qwen_image::ObservationRow::MiniCpm1b => &self.minicpm_1b,
+            omni_qwen_image::ObservationRow::MiniCpm35b => &self.minicpm_35b,
+        }
+    }
+
+    fn stored_row_mut(&mut self, row: omni_qwen_image::ObservationRow) -> &mut OfficialRow {
+        match row {
+            omni_qwen_image::ObservationRow::Official => &mut self.official,
+            omni_qwen_image::ObservationRow::MiniCpm1b => &mut self.minicpm_1b,
+            omni_qwen_image::ObservationRow::MiniCpm35b => &mut self.minicpm_35b,
+        }
     }
 
     fn canvas(&self) -> (u32, u32) {
@@ -978,17 +990,7 @@ impl ObservationBoard {
         height: u32,
         pixels: &[u8],
     ) -> Result<(), String> {
-        match row {
-            omni_qwen_image::ObservationRow::Official => {
-                self.official.show(step, width, height, pixels)
-            }
-            omni_qwen_image::ObservationRow::MiniCpm1b => {
-                self.minicpm_1b.show(step, width, height, pixels)
-            }
-            omni_qwen_image::ObservationRow::MiniCpm35b => {
-                self.minicpm_35b.show(step, width, height, pixels)
-            }
-        }
+        self.stored_row_mut(row).show(step, width, height, pixels)
     }
 }
 
