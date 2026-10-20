@@ -52,7 +52,7 @@ def main():
 
             app.ready()
             for name in ("transcribe", "tts_synthesize", "transcript", "tts_text",
-                         "asr_translation_to_tts", "tts_translation_use"):
+                         "asr_translation_to_tts"):
                 fits(name)
             assert app.widget("asr_page")["r"][0] < app.widget("tts_page")["r"][0]
             assert not app.events("breeze") and not app.events("qwen-image") and not app.events("music")
@@ -119,7 +119,7 @@ def main():
             top()
             app.screenshot("creative-narrow")
             app.click("language_tab")
-            for name in ("transcribe", "tts_text", "tts_synthesize", "tts_translation_use"):
+            for name in ("transcribe", "tts_text", "tts_synthesize"):
                 app.reveal(name)
                 fits(name)
             app.screenshot("language-narrow-scrolled")

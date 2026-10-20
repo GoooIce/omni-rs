@@ -248,9 +248,9 @@ def validate_long_stream(app, out, saved, report):
     # The completion event can precede the UI's idle-state update. The preceding
     # playback normally already leaves the app in speech mode.
     app.wait(lambda: app.widget("tts_synthesize")["enabled"])
-    if "当前" not in app.widget("tts_speech_mode")["t"]:
+    if "●" not in app.widget("tts_speech_mode")["t"]:
         app.click("tts_speech_mode")
-    assert "当前" in app.widget("tts_speech_mode")["t"]
+    assert "●" in app.widget("tts_speech_mode")["t"]
     if app.widget("tts_reference_clear")["enabled"]:
         app.click("tts_reference_clear")
     fill(app, "tts_instruction", "")
@@ -339,11 +339,11 @@ def main():
             app.request("/w", k="resize", width=1000, height=1500, wait=1, if_user_seq=seq)
             assert app.widget("tts_page").get("v", 1) == 1
             assert not app.events("breeze"), "visible TTS must remain cold until requested"
-            app.click("tts_load")
+            app.click("tts_synthesize")
             app.wait(lambda: app.widget("tts_recovery").get("v", 1) == 1)
             app.click("tts_choose")
             app.wait(lambda: "尚未选择模型" in app.widget("tts_status")["t"], 30)
-            assert app.widget("tts_choose")["enabled"] and not app.widget("tts_synthesize")["enabled"]
+            assert app.widget("tts_choose")["enabled"] and "载入" in app.widget("tts_synthesize")["t"]
             checks.append("lazy load, missing model dialog, cancellation recovery")
             app.click("tts_choose")
             app.wait(lambda: any(u["kind"] == "loading" and 0.1 < u["progress"] < 0.8 for u in app.events("breeze")))

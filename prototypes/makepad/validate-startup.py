@@ -28,7 +28,7 @@ class App:
         match = self.wait(lambda: re.search(r"listening on (127\.0\.0\.1:\d+) pid=(\d+)", log_path.read_text()), 60)
         assert int(match[2]) == process.pid
         self.base = "http://" + match[1]
-        self.wait(lambda: (w := self.widget("app_title")) and w["r"][3] > 0, 30)
+        self.wait(lambda: (w := self.widget("transcribe")) and w["r"][3] > 0, 30)
 
     def wait(self, predicate, timeout=180):
         deadline = time.monotonic() + timeout
@@ -54,14 +54,30 @@ class App:
         assert w and w["enabled"] and w["r"][3] > 0, (name, w)
         x, y, width, height = w["r"]
         self.request("/click", x=x+width/2, y=y+height/2, wait=1, if_user_seq=seq)
+        if name == "creative_tab":
+            self.wait(
+                lambda: (page := self.widget("creative_page"))
+                and page["r"][3] > 0
+                and (other := self.widget("language_page"))
+                and other["r"][3] == 0,
+                3,
+            )
+        elif name == "language_tab":
+            self.wait(
+                lambda: (page := self.widget("language_page"))
+                and page["r"][3] > 0
+                and (other := self.widget("creative_page"))
+                and other["r"][3] == 0,
+                3,
+            )
 
     def reveal(self, name):
         """Reach a control through the same disclosure and scroll actions as a user."""
         groups = {
-            "asr": {"context", "speed", "model_path", "load", "ping"},
+            "asr": {"context", "audio_path", "speed_balanced", "speed_low", "speed_fast", "speed_save", "model_path", "load", "ping"},
             "tts": {"tts_instruction", "tts_reference_choose", "tts_reference_clear",
                     "tts_reference_text", "tts_voice_gentle", "tts_voice_warm",
-                    "tts_voice_bright", "tts_voice_english"},
+                    "tts_voice_bright", "tts_voice_english", "tts_enhance"},
             "music": {"music_models", "music_choose_models", "music_source", "music_choose_audio",
                       "music_analyze", "music_transcribe", "music_melody", "music_save_analysis",
                       "music_score", "music_use_score", "music_save_abc", "music_save_midi",
@@ -70,7 +86,7 @@ class App:
                       "image_reference_resolution", "image_width", "image_height", "image_seed",
                       "image_random_seed", "image_size_square", "image_size_landscape",
                       "image_size_portrait", "image_size_photo_landscape", "image_size_photo_portrait",
-                      "image_size_widescreen", "image_size_vertical"},
+                      "image_size_widescreen", "image_size_vertical", "image_observe_toggle"},
         }
         for group, controls in groups.items():
             toggle = "image_settings_toggle" if group == "image" else group + "_details_toggle"
@@ -79,6 +95,10 @@ class App:
             if name in controls and "收起" not in self.widget(toggle)["t"]:
                 self.click(toggle)
         fixed = {"language_tab", "creative_tab", "running_stop", "playback_stop"}
+        translation = {"tts_translate", "tts_translation", "tts_translation_use", "tts_translation_model",
+                       "tts_translation_language", "tts_translation_stop", "tts_translation_status"}
+        if name in translation and "收起" not in self.widget("tts_translate_toggle")["t"]:
+            self.click("tts_translate_toggle")
         for step in range(30):
             w = self.widget(name)
             assert w, name

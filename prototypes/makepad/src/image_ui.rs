@@ -46,6 +46,10 @@ pub struct State {
     )>,
 }
 impl State {
+    pub fn needs_model(&self) -> bool {
+        !self.ready && !self.loading
+    }
+
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
         let settings =
             model_location::settings_path_for("QWEN_IMAGE_SETTINGS_PATH", "qwen-image.json");
@@ -203,12 +207,23 @@ impl App {
         }
         i.controls = Some(state);
         let idle = !other_busy && !i.busy && !dialog_busy;
-        self.ui
-            .button(cx, ids!(image_load))
-            .set_action_enabled(cx, idle && !i.ready);
+        self.ui.button(cx, ids!(image_load)).set_visible(cx, false);
+        self.ui.button(cx, ids!(image_generate)).set_text(
+            cx,
+            if !i.ready {
+                "载入图像模型"
+            } else if i.observation {
+                "观察去噪"
+            } else if i.references.is_empty() {
+                "生成图像"
+            } else {
+                "编辑图像"
+            },
+        );
         self.ui
             .button(cx, ids!(image_generate))
-            .set_action_enabled(cx, idle && i.ready);
+            .set_action_enabled(cx, idle && !i.loading);
+        self.ui.button(cx, ids!(image_stop)).set_visible(cx, i.busy);
         self.ui.button(cx, ids!(image_stop)).set_action_enabled(
             cx,
             i.busy && !i.stopping && !i.picking && !i.picking_reference,
@@ -239,16 +254,9 @@ impl App {
         self.ui
             .button(cx, ids!(image_reference_clear))
             .set_action_enabled(cx, idle && !i.references.is_empty());
-        self.ui.button(cx, ids!(image_generate)).set_text(
-            cx,
-            if i.observation {
-                "观察去噪"
-            } else if i.references.is_empty() {
-                "生成图像"
-            } else {
-                "编辑图像"
-            },
-        );
+        self.ui
+            .button(cx, ids!(image_generate))
+            .set_action_enabled(cx, idle && !i.loading);
     }
     pub fn poll_image(&mut self, cx: &mut Cx) {
         if let Some(i) = self.image.as_mut() {
@@ -298,6 +306,9 @@ impl App {
                         self.ui
                             .image(cx, ids!(image_reference_preview))
                             .set_texture(cx, Some(texture));
+                        self.ui
+                            .view(cx, ids!(image_reference_thumb))
+                            .set_visible(cx, true);
                     }
                     self.image_status(cx, &update.message);
                 }
@@ -444,7 +455,7 @@ impl App {
                             .set_visible(cx, true);
                         self.ui
                             .label(cx, ids!(image_preview_caption))
-                            .set_text(cx, "图像预览");
+                            .set_text(cx, "");
                         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
                     }
                     if let Some((official, minicpm, large, width, height)) = observed {
@@ -604,9 +615,9 @@ impl App {
             self.ui.button(cx, ids!(image_observe_toggle)).set_text(
                 cx,
                 if observation {
-                    "去噪观察 · 开启"
+                    "● 去噪观察"
                 } else {
-                    "去噪观察 · 关闭"
+                    "去噪观察"
                 },
             );
             self.image_status(
@@ -720,6 +731,9 @@ impl App {
             self.ui
                 .image(cx, ids!(image_reference_preview))
                 .set_texture(cx, None);
+            self.ui
+                .view(cx, ids!(image_reference_thumb))
+                .set_visible(cx, false);
             self.ui
                 .label(cx, ids!(image_reference_name))
                 .set_text(cx, "未选择参考图 · 文生图");
@@ -926,34 +940,42 @@ impl OfficialRow {
 }
 
 struct ObservationBoard {
-    official: OfficialRow,
-    minicpm_1b: OfficialRow,
-    minicpm_35b: OfficialRow,
+    rows: [OfficialRow; 3],
 }
 
 impl ObservationBoard {
     fn new(canvas_width: u32, canvas_height: u32) -> Self {
         Self {
-            official: OfficialRow::new(canvas_width, canvas_height),
-            minicpm_1b: OfficialRow::new(canvas_width, canvas_height),
-            minicpm_35b: OfficialRow::new(canvas_width, canvas_height),
+            rows: std::array::from_fn(|_| OfficialRow::new(canvas_width, canvas_height)),
         }
     }
 
     fn row_order(&self) -> [omni_qwen_image::ObservationRow; 3] {
-        [
-            omni_qwen_image::ObservationRow::Official,
-            omni_qwen_image::ObservationRow::MiniCpm1b,
-            omni_qwen_image::ObservationRow::MiniCpm35b,
-        ]
+        omni_qwen_image::ObservationRow::order()
+    }
+
+    fn slot(row: omni_qwen_image::ObservationRow) -> usize {
+        omni_qwen_image::ObservationRow::order()
+            .iter()
+            .position(|candidate| *candidate == row)
+            .expect("observation row is missing from order()")
     }
 
     fn rows(&self) -> [&OfficialRow; 3] {
-        [&self.official, &self.minicpm_1b, &self.minicpm_35b]
+        self.row_order().map(|row| self.stored_row(row))
+    }
+
+    fn stored_row(&self, row: omni_qwen_image::ObservationRow) -> &OfficialRow {
+        &self.rows[Self::slot(row)]
+    }
+
+    fn stored_row_mut(&mut self, row: omni_qwen_image::ObservationRow) -> &mut OfficialRow {
+        &mut self.rows[Self::slot(row)]
     }
 
     fn canvas(&self) -> (u32, u32) {
-        self.official.canvas()
+        self.stored_row(omni_qwen_image::ObservationRow::Official)
+            .canvas()
     }
 
     fn show(
@@ -964,17 +986,7 @@ impl ObservationBoard {
         height: u32,
         pixels: &[u8],
     ) -> Result<(), String> {
-        match row {
-            omni_qwen_image::ObservationRow::Official => {
-                self.official.show(step, width, height, pixels)
-            }
-            omni_qwen_image::ObservationRow::MiniCpm1b => {
-                self.minicpm_1b.show(step, width, height, pixels)
-            }
-            omni_qwen_image::ObservationRow::MiniCpm35b => {
-                self.minicpm_35b.show(step, width, height, pixels)
-            }
-        }
+        self.stored_row_mut(row).show(step, width, height, pixels)
     }
 }
 
@@ -1153,14 +1165,7 @@ mod tests {
     #[test]
     fn minicpm_1b_decodes_stay_under_the_official_row() {
         let mut board = ObservationBoard::new(320, 240);
-        assert_eq!(
-            board.row_order(),
-            [
-                ObservationRow::Official,
-                ObservationRow::MiniCpm1b,
-                ObservationRow::MiniCpm35b,
-            ]
-        );
+        assert_eq!(board.row_order(), ObservationRow::order());
         for step in 1..=8 {
             board
                 .show(ObservationRow::Official, step, 320, 240, &paint(step as u8))
@@ -1203,14 +1208,7 @@ mod tests {
     #[test]
     fn minicpm_35b_decodes_stay_under_the_1b_row() {
         let mut board = ObservationBoard::new(320, 240);
-        assert_eq!(
-            board.row_order(),
-            [
-                ObservationRow::Official,
-                ObservationRow::MiniCpm1b,
-                ObservationRow::MiniCpm35b,
-            ]
-        );
+        assert_eq!(board.row_order(), ObservationRow::order());
         for step in 1..=8 {
             board
                 .show(ObservationRow::Official, step, 320, 240, &paint(step as u8))

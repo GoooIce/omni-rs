@@ -1,27 +1,5 @@
-//! Native ASR input policy shared by the UI and real-model regression runner.
-use crate::{protocol::DecodeOptions, resampler::NativeResampler};
-use omni_r2t2::{StreamConfig, TextPostprocess};
-
-/// `language: None` lets the model detect the language. The regression runner
-/// still passes `Some("Chinese")` unless a case selects another name or `auto`.
-pub fn stream_config(
-    options: DecodeOptions,
-    context: String,
-    microphone: bool,
-    language: Option<String>,
-) -> StreamConfig {
-    StreamConfig {
-        language,
-        context,
-        chunk_ms: options.chunk_ms,
-        lookahead_ms: options.lookahead_ms,
-        max_new_tokens: options.max_new_tokens,
-        text_postprocess: TextPostprocess::Official,
-        stable_tail_ms: if microphone { 800 } else { 0 },
-        final_padding_ms: 640,
-        ..Default::default()
-    }
-}
+//! WAV reader shared by the native engine and the real-model regression runner.
+use crate::resampler::NativeResampler;
 
 pub fn read_wav(path: &str) -> Result<Vec<f32>, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;

@@ -250,10 +250,9 @@ impl<B: Backend> Model<B> {
         self.finish_generation(state, cancel, &mut progress)
     }
 
-    /// Three trajectories: official text, the fitted 1B projection, then the fitted
-    /// 35B projection. They share the prompt, seed, canvas and initial noise.
-    /// One trajectory is denoised at a time, and each MiniCPM is dropped after its
-    /// last-layer sequence is taken. Guidance stays off.
+    /// Denoise `ObservationRow::order()`, one trajectory at a time. Rows share the
+    /// prompt, seed, canvas and initial noise. Guidance stays off. Each MiniCPM
+    /// checkpoint is dropped after its last layer is read.
     pub fn observe(
         &mut self,
         options: &Options,
@@ -290,87 +289,50 @@ impl<B: Backend> Model<B> {
             crate::projection::ProjectionSource::Weights(&weights_1b),
             crate::projection::ProjectionSource::Weights(&weights_35b),
         )?;
-        let projection = observation.projection().cloned().ok_or_else(|| {
-            Error::Config(
-                "去噪观察缺少 MiniCPM-V-4.7-1B 投影权重，不能用未训练投影出图，也不会退回 JSON 改写"
-                    .into(),
-            )
-        })?;
-        let projection_35b = observation.projection_35b().cloned().ok_or_else(|| {
-            Error::Config(
-                "去噪观察缺少 MiniCPM-V-4.7-35B-A3B-int4 投影权重，不能用未训练投影出图，也不会退回 JSON 改写"
-                    .into(),
-            )
-        })?;
+        observation.require_fitted_projections()?;
         let noise = observation.trajectories()[0].initial_noise().to_vec();
         let prompt = options.prompt.clone();
-        let mut official =
-            self.prepare_generation(options, cancel, &mut progress, Some(noise.clone()))?;
-        if official.negative.is_some() {
-            return Err(Error::Config("去噪观察没有负向条件分支".into()));
+        let mut canvas: Option<ObservedCanvas> = None;
+        for row in crate::ObservationRow::order() {
+            let official_length = canvas.as_ref().map(|canvas| canvas.length);
+            let condition = observation.row_condition(row, &prompt, official_length, &self.root)?;
+            let mut state = match condition {
+                observation::RowCondition::OfficialText => {
+                    let state = self.prepare_generation(
+                        options,
+                        cancel,
+                        &mut progress,
+                        Some(noise.clone()),
+                    )?;
+                    if state.negative.is_some() {
+                        return Err(Error::Config("去噪观察没有负向条件分支".into()));
+                    }
+                    let official_length = state.text.dims()[1];
+                    if state.text.dims()[2] != crate::projection::CONDITION_WIDTH {
+                        return Err(Error::Config(
+                            "官方文本条件的宽度不是 4096，无法对齐投影条件".into(),
+                        ));
+                    }
+                    canvas = Some(ObservedCanvas::from_generation(&state, official_length));
+                    state
+                }
+                observation::RowCondition::Projected { values, label } => {
+                    let canvas = canvas.as_ref().ok_or_else(|| {
+                        Error::Config("官方文本条件的宽度不是 4096，无法对齐投影条件".into())
+                    })?;
+                    self.trajectory_with_condition(canvas, &noise, &values, label)?
+                }
+            };
+            self.denoise_observed_row(
+                &mut state,
+                row,
+                &mut observation,
+                cancel,
+                &mut progress,
+                &mut on_cell,
+            )?;
         }
-        let official_length = official.text.dims()[1];
-        if official.text.dims()[2] != crate::projection::CONDITION_WIDTH {
-            return Err(Error::Config(
-                "官方文本条件的宽度不是 4096，无法对齐投影条件".into(),
-            ));
-        }
-        let canvas = ObservedCanvas::from_generation(&official, official_length);
-        self.denoise_observed_row(
-            &mut official,
-            crate::ObservationRow::Official,
-            &mut observation,
-            cancel,
-            &mut progress,
-            &mut on_cell,
-        )?;
-        drop(official);
-        let projected = projection
-            .project_last_layer(&self.minicpm_1b_last_layer(&prompt)?, official_length)?;
-        let mut minicpm = self.trajectory_with_condition(
-            &canvas,
-            &noise,
-            projected.values(),
-            "MiniCPM-V-4.7-1B",
-        )?;
-        self.denoise_observed_row(
-            &mut minicpm,
-            crate::ObservationRow::MiniCpm1b,
-            &mut observation,
-            cancel,
-            &mut progress,
-            &mut on_cell,
-        )?;
-        drop(minicpm);
-        let projected_35b = projection_35b
-            .project_last_layer(&self.minicpm_35b_last_layer(&prompt)?, official_length)?;
-        let mut minicpm_35b = self.trajectory_with_condition(
-            &canvas,
-            &noise,
-            projected_35b.values(),
-            "MiniCPM-V-4.7-35B-A3B-int4",
-        )?;
-        self.denoise_observed_row(
-            &mut minicpm_35b,
-            crate::ObservationRow::MiniCpm35b,
-            &mut observation,
-            cancel,
-            &mut progress,
-            &mut on_cell,
-        )?;
         Ok(observation)
-    }
-
-    /// Load the 1B checkpoint, read the last layer, then drop the checkpoint.
-    fn minicpm_1b_last_layer(&self, prompt: &str) -> Result<crate::projection::Sequence> {
-        let dir = crate::minicpm_condition::default_minicpm_1b_dir(&self.root);
-        crate::minicpm_condition::MiniCpm1bText::load(&dir)?.last_layer(prompt)
-    }
-
-    /// Load the 35B checkpoint, read the last layer, then drop the checkpoint.
-    fn minicpm_35b_last_layer(&self, prompt: &str) -> Result<crate::projection::Sequence> {
-        let dir = crate::minicpm_condition::default_minicpm_35b_dir(&self.root);
-        crate::minicpm_condition::MiniCpm35bText::load(&dir)?.last_layer(prompt)
     }
 
     fn denoise_observed_row(
@@ -1109,6 +1071,35 @@ mod tests {
         assert!(!kind.loads_minicpm_35b());
         assert!(!kind.reads_projection_weights());
         assert!(!kind.decodes_after_each_step());
+    }
+
+    #[test]
+    fn observation_row_order_is_official_then_1b_then_35b_on_one_noise() {
+        let expected = [
+            ObservationRow::Official,
+            ObservationRow::MiniCpm1b,
+            ObservationRow::MiniCpm35b,
+        ];
+        assert_eq!(ObservationRow::order(), expected);
+
+        let observation = DenoisingObservation::begin(
+            ObservationRequest::accept(&plain_observation()).unwrap(),
+            DEFAULT_TURBO_STEPS,
+        )
+        .unwrap();
+        let trajectories = observation.trajectories();
+        assert_eq!(
+            trajectories.iter().map(Trajectory::row).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            trajectories[1].initial_noise(),
+            trajectories[0].initial_noise()
+        );
+        assert_eq!(
+            trajectories[2].initial_noise(),
+            trajectories[0].initial_noise()
+        );
     }
 
     #[test]

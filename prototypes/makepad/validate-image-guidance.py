@@ -64,7 +64,7 @@ def main():
         try:
             app = startup.App(process, log_path, out)
             app.ready()
-            app.click("creative_tab");app.click("image_load")
+            app.click("creative_tab");app.click("image_generate")
             app.wait(lambda: app.widget("image_generate")["enabled"], 240)
             app.screenshot("default-controls")
             assert tuple(int(app.widget("image_" + axis)["val"]) for axis in ["width", "height"]) == (2048, 2048)

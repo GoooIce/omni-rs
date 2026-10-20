@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-// Web keeps its existing presets. Native has an additional balanced preset;
-// labels and help always describe the parameters actually sent to its engine.
+// Wasm still sends this three-mode table as DecodeOptions, and its hints stay
+// beside that table. Native millisecond numbers come from `transcription_start`.
+// Labels and help stay here and describe the parameters each target actually sends.
+#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct DecodeOptions {
     pub chunk_ms: usize,
@@ -9,15 +11,8 @@ pub struct DecodeOptions {
     pub max_new_tokens: usize,
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn decode_options(mode: usize) -> DecodeOptions {
-    #[cfg(not(target_arch = "wasm32"))]
-    let (chunk_ms, lookahead_ms, max_new_tokens) = match mode {
-        1 => (160, 160, 4),
-        2 => (960, 0, 8),
-        3 => (1280, 0, 12),
-        _ => (320, 160, 8),
-    };
-    #[cfg(target_arch = "wasm32")]
     let (chunk_ms, lookahead_ms, max_new_tokens) = match mode {
         1 => (960, 0, 8),
         2 => (1280, 0, 12),
@@ -33,16 +28,16 @@ pub fn decode_options(mode: usize) -> DecodeOptions {
 pub fn mode_label(mode: usize) -> &'static str {
     #[cfg(not(target_arch = "wasm32"))]
     return match mode {
-        1 => "速度：低延迟",
-        2 => "速度：快速",
-        3 => "速度：省算力",
-        _ => "速度：均衡",
+        1 => "低延迟",
+        2 => "快速",
+        3 => "省算力",
+        _ => "均衡",
     };
     #[cfg(target_arch = "wasm32")]
     match mode {
-        1 => "速度：快速",
-        2 => "速度：省算力",
-        _ => "速度：低延迟",
+        1 => "快速",
+        2 => "省算力",
+        _ => "低延迟",
     }
 }
 
@@ -54,15 +49,19 @@ pub fn mode_count() -> usize {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mode_hint(mode: usize) -> String {
+    let (chunk_ms, lookahead_ms, _) = crate::transcription_start::mode_timing(mode);
+    match mode {
+        1 => format!("低延迟：{chunk_ms} ms 一块，更费算力，下次生效。"),
+        2 => format!("快速：{chunk_ms} ms 一块，下次生效。"),
+        3 => format!("省算力：{chunk_ms} ms 一块，下次生效。"),
+        _ => format!("均衡：{chunk_ms} ms 一块，前瞻 {lookahead_ms} ms，下次生效。"),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn mode_hint(mode: usize) -> &'static str {
-    #[cfg(not(target_arch = "wasm32"))]
-    return match mode {
-        1 => "低延迟 · 每 160 ms 处理一块，CPU 开销较高；下一次识别生效",
-        2 => "快速 · 每 960 ms 处理一块；下一次识别生效",
-        3 => "省算力 · 每 1280 ms 处理一块；下一次识别生效",
-        _ => "均衡 · 每 320 ms 处理一块，保留 160 ms 前瞻；下一次识别生效",
-    };
-    #[cfg(target_arch = "wasm32")]
     match mode {
         1 => "快速模式 · 每 0.96 秒更新，适合浏览器持续录音",
         2 => "省算力模式 · 每 1.28 秒更新，适合较慢的设备",
@@ -153,7 +152,7 @@ pub fn asr_language(raw: &str) -> Result<Option<String>, String> {
         .find(|(english, chinese)| english.eq_ignore_ascii_case(raw) || *chinese == raw)
         .map(|(english, _)| Some((*english).to_owned()))
         .ok_or_else(|| {
-            format!("不认识的识别语言“{raw}”。留空或填写“自动”，也可以填 Korean、韩语这样的名称。")
+            format!("不认识的识别语言“{raw}”。可点选一种语言，或填写韩语、泰语这样的名称。")
         })
 }
 

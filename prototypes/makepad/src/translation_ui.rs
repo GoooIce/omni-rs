@@ -23,6 +23,9 @@ pub struct State {
     results: [String; 2],
 }
 impl State {
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
     pub fn running(&self) -> Option<bool> {
         (self.busy && !self.picking).then_some(self.stopping)
     }
@@ -69,6 +72,9 @@ impl App {
         self.translation_status(cx, "正在停止翻译…");
     }
     fn translation_status(&self, cx: &mut Cx, message: &str) {
+        self.ui
+            .view(cx, ids!(asr_translation_note))
+            .set_visible(cx, !message.is_empty());
         for id in [ids!(asr_translation_status), ids!(tts_translation_status)] {
             self.ui.label(cx, id).set_text(cx, message);
         }
@@ -79,26 +85,78 @@ impl App {
             return;
         };
         let idle = !state.busy && !other_busy;
-        self.ui
-            .button(cx, ids!(asr_translate))
-            .set_action_enabled(cx, idle && !self.transcript.is_empty());
+        self.ui.button(cx, ids!(asr_translate)).set_text(
+            cx,
+            if state.ready {
+                "翻译"
+            } else {
+                "载入翻译模型"
+            },
+        );
+        self.ui.label(cx, ids!(asr_translation_readiness)).set_text(
+            cx,
+            if state.ready {
+                "翻译上面的转写 · 模型已就绪"
+            } else {
+                "翻译上面的转写 · 模型尚未载入"
+            },
+        );
+        self.ui.button(cx, ids!(asr_translate)).set_action_enabled(
+            cx,
+            idle && (!state.ready || !self.transcription.transcript().is_empty()),
+        );
         self.ui
             .button(cx, ids!(tts_translate))
             .set_action_enabled(cx, idle);
         for id in [ids!(asr_translation_stop), ids!(tts_translation_stop)] {
+            self.ui.button(cx, id).set_visible(cx, state.busy);
             self.ui
                 .button(cx, id)
                 .set_action_enabled(cx, state.busy && !state.stopping && !state.picking);
         }
         for id in [ids!(asr_translation_model), ids!(tts_translation_model)] {
+            self.ui.button(cx, id).set_visible(cx, state.ready);
             self.ui.button(cx, id).set_action_enabled(cx, idle);
         }
+        let asr_result = !state.results[0].is_empty();
+        self.ui
+            .view(cx, ids!(asr_translation_well))
+            .set_visible(cx, asr_result);
         self.ui
             .button(cx, ids!(asr_translation_copy))
-            .set_action_enabled(cx, !state.results[0].is_empty());
+            .set_visible(cx, asr_result);
+        self.ui
+            .button(cx, ids!(asr_translation_to_tts))
+            .set_visible(cx, asr_result);
+        self.ui
+            .button(cx, ids!(asr_translation_copy))
+            .set_action_enabled(cx, asr_result);
+        let tts_result = !state.results[1].is_empty();
         self.ui
             .button(cx, ids!(tts_translation_use))
-            .set_action_enabled(cx, idle && !state.results[1].is_empty());
+            .set_visible(cx, tts_result);
+        self.ui
+            .button(cx, ids!(tts_translation_use))
+            .set_action_enabled(cx, idle && tts_result);
+    }
+    fn load_translation_model(&mut self, cx: &mut Cx) {
+        let state = self.translation.as_mut().unwrap();
+        if state.ready || state.busy {
+            return;
+        }
+        state.next_id += 1;
+        state.current = Some((state.next_id, 0));
+        state.busy = true;
+        state.stopping = false;
+        state.pending = None;
+        let command = Command::Load(state.path.clone());
+        if let Err(error) = state.engine.submit(command) {
+            state.busy = false;
+            state.current = None;
+            self.translation_status(cx, &error.to_string());
+        } else {
+            self.translation_status(cx, "正在载入翻译模型…");
+        }
     }
     fn submit_translation(&mut self, cx: &mut Cx, origin: usize, request: Request) {
         if let Err(error) = request.validate() {
@@ -209,6 +267,12 @@ impl App {
                 self.ui.text_input(cx, ids!(tts_text)).set_text(cx, text);
             }
         }
+        if self.ui.button(cx, ids!(asr_translate)).clicked(actions)
+            && !self.translation.as_ref().is_some_and(|state| state.ready())
+        {
+            self.load_translation_model(cx);
+            return;
+        }
         let origin = if self.ui.button(cx, ids!(asr_translate)).clicked(actions) {
             0
         } else if self.ui.button(cx, ids!(tts_translate)).clicked(actions) {
@@ -217,7 +281,7 @@ impl App {
             return;
         };
         let text = if origin == 0 {
-            self.transcript.clone()
+            self.transcription.transcript().to_owned()
         } else {
             self.ui.text_input(cx, ids!(tts_text)).text()
         };

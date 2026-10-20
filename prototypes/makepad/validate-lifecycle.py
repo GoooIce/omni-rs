@@ -85,8 +85,8 @@ def main():
             assert event["kind"] == "load_cancelled", event
             assert not any(e["kind"] == "translation" for e in app.events("translation"))
             assert not app.events("qwen-image"), "opening the creative workspace must not load image weights"
-            app.wait(lambda: app.widget("image_load")["enabled"])
-            app.click("image_load")
+            app.wait(lambda: "载入" in app.widget("image_generate")["t"] and app.widget("image_generate")["enabled"])
+            app.click("image_generate")
             app.wait(lambda: any(e["kind"] == "loading" for e in app.events("qwen-image")))
             assert "Metal" in app.widget("backend")["t"]
             app.click("running_stop")
@@ -95,6 +95,9 @@ def main():
             check("Tabs and input remain usable during loading; global stop cancels cold translation without continuation; explicit image load starts only once idle and is cancellable")
 
             app.click("language_tab")
+            if app.widget("asr_translate")["t"] != "翻译":
+                app.click("asr_translate")
+                app.wait(lambda: app.widget("asr_translate")["t"] == "翻译", 240)
             offset = len(app.events("translation"))
             app.click("asr_translate")
             app.click("language_tab")
@@ -108,8 +111,8 @@ def main():
             assert app.widget("tts_text")["val"] == app.widget("asr_translation")["val"]
             helper.fill(app, "tts_text", draft)
             assert not app.events("breeze"), "TTS remains cold until explicitly requested"
-            app.wait(lambda: app.widget("tts_load")["enabled"])
-            app.click("tts_load")
+            app.wait(lambda: "载入" in app.widget("tts_synthesize")["t"] and app.widget("tts_synthesize")["enabled"])
+            app.click("tts_synthesize")
             app.wait(lambda: app.widget("tts_synthesize")["enabled"], 240)
             records = (out / "app.log").read_text().splitlines()
             translated_at = next(i for i, line in enumerate(records) if '[translation]' in line and '"kind":"done"' in line)

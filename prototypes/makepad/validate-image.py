@@ -60,7 +60,7 @@ def main():
             app = startup.App(process, log_path, out)
             app.ready()
             assert not app.events("qwen-image"), "image weights must load lazily"
-            app.click("creative_tab");app.click("image_load")
+            app.click("creative_tab");app.click("image_generate")
             app.wait(lambda: app.widget("image_recovery").get("v", 1) == 1)
             app.click("image_choose")
             app.wait(lambda: "尚未选择模型" in app.widget("image_status")["t"], 30)

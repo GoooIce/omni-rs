@@ -100,7 +100,7 @@ def main():
         match = wait_for(lambda: re.search(r"listening on (127\.0\.0\.1:\d+) pid=(\d+)", log_path.read_text()), 60)
         assert int(match[2]) == process.pid
         base = "http://" + match[1]
-        wait_for(lambda: (w := widget("app_title")) and w["r"][3] > 0, 30)
+        wait_for(lambda: (w := widget("transcribe")) and w["r"][3] > 0, 30)
         # Retain support for historical control binaries with manual loading.
         if (w := widget("load")) and w["r"][3] > 0:
             click("load")
