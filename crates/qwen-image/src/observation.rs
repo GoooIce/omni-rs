@@ -1,6 +1,7 @@
 use super::{Options, gaussian_noise};
 use crate::projection::{ConditionProjection, MiniCpm35bProjection, ProjectionSource};
 use crate::{Error, Result};
+use std::path::Path;
 
 /// Default Qwen-Image-2.1-Turbo schedule length. The checkpoint sigmas stay as loaded.
 pub const DEFAULT_TURBO_STEPS: usize = 8;
@@ -84,6 +85,30 @@ pub enum ObservationRow {
     MiniCpm35b,
 }
 
+impl ObservationRow {
+    /// The only row sequence: official text, fitted 1B, then fitted 35B.
+    pub fn order() -> [Self; 3] {
+        [Self::Official, Self::MiniCpm1b, Self::MiniCpm35b]
+    }
+
+    fn slot(self) -> usize {
+        Self::order()
+            .iter()
+            .position(|row| *row == self)
+            .expect("observation row is missing from order()")
+    }
+}
+
+/// How one observation row gets its condition. The official row uses the text
+/// tower `Model` encodes; a fitted row is that row's projection of its last layer.
+pub(super) enum RowCondition {
+    OfficialText,
+    Projected {
+        values: Vec<f32>,
+        label: &'static str,
+    },
+}
+
 /// One trajectory inside a denoising observation. Histories are not shared.
 pub struct Trajectory {
     row: ObservationRow,
@@ -137,7 +162,7 @@ impl Trajectory {
     }
 }
 
-/// Official text row, then MiniCPM-V-4.7-1B, then MiniCPM-V-4.7-35B-A3B-int4.
+/// Three trajectories in [`ObservationRow::order`], sharing one initial noise.
 pub struct DenoisingObservation {
     trajectories: [Trajectory; 3],
     cells: [Vec<ObservationCell>; 3],
@@ -154,38 +179,21 @@ impl DenoisingObservation {
         }
         let (width, height) = request.canvas();
         let noise = latent_noise(LATENT_CHANNELS, height, width, request.seed());
-        let prompt = request.prompt().to_string();
         let seed = request.seed();
+        let trajectories = std::array::from_fn(|index| {
+            let row = ObservationRow::order()[index];
+            Trajectory {
+                row,
+                prompt: request.prompt().to_string(),
+                seed,
+                width,
+                height,
+                initial_noise: noise.clone(),
+                attention_history: (index as u64) + 1,
+            }
+        });
         Ok(Self {
-            trajectories: [
-                Trajectory {
-                    row: ObservationRow::Official,
-                    prompt: prompt.clone(),
-                    seed,
-                    width,
-                    height,
-                    initial_noise: noise.clone(),
-                    attention_history: 1,
-                },
-                Trajectory {
-                    row: ObservationRow::MiniCpm1b,
-                    prompt: prompt.clone(),
-                    seed,
-                    width,
-                    height,
-                    initial_noise: noise.clone(),
-                    attention_history: 2,
-                },
-                Trajectory {
-                    row: ObservationRow::MiniCpm35b,
-                    prompt,
-                    seed,
-                    width,
-                    height,
-                    initial_noise: noise,
-                    attention_history: 3,
-                },
-            ],
+            trajectories,
             cells: [Vec::new(), Vec::new(), Vec::new()],
             projection: None,
             projection_35b: None,
@@ -232,11 +240,7 @@ impl DenoisingObservation {
     }
 
     pub fn cells(&self, row: ObservationRow) -> &[ObservationCell] {
-        match row {
-            ObservationRow::Official => &self.cells[0],
-            ObservationRow::MiniCpm1b => &self.cells[1],
-            ObservationRow::MiniCpm35b => &self.cells[2],
-        }
+        &self.cells[row.slot()]
     }
 
     pub fn retain(
@@ -246,11 +250,7 @@ impl DenoisingObservation {
         image: image::RgbaImage,
     ) -> Result<()> {
         let (width, height) = self.trajectories[0].canvas();
-        let cells = match row {
-            ObservationRow::Official => &mut self.cells[0],
-            ObservationRow::MiniCpm1b => &mut self.cells[1],
-            ObservationRow::MiniCpm35b => &mut self.cells[2],
-        };
+        let cells = &mut self.cells[row.slot()];
         if step != cells.len() + 1 || step > DEFAULT_TURBO_STEPS {
             return Err(Error::Config(
                 "去噪观察按步留下格子，不能替换已经出现的画面".into(),
@@ -273,9 +273,92 @@ impl DenoisingObservation {
         self.projection_35b.as_ref()
     }
 
+    /// Fail before denoising when either fitted map is missing.
+    pub(super) fn require_fitted_projections(&self) -> Result<()> {
+        self.fitted_1b()?;
+        self.fitted_35b()?;
+        Ok(())
+    }
+
+    /// Condition for `row`. A fitted row reads its last layer and drops that checkpoint.
+    pub(super) fn row_condition(
+        &self,
+        row: ObservationRow,
+        prompt: &str,
+        official_length: Option<usize>,
+        model_root: &Path,
+    ) -> Result<RowCondition> {
+        match row {
+            ObservationRow::Official => Ok(RowCondition::OfficialText),
+            ObservationRow::MiniCpm1b => Ok(RowCondition::Projected {
+                values: self.project_1b(prompt, aligned_length(official_length)?, model_root)?,
+                label: "MiniCPM-V-4.7-1B",
+            }),
+            ObservationRow::MiniCpm35b => Ok(RowCondition::Projected {
+                values: self.project_35b(prompt, aligned_length(official_length)?, model_root)?,
+                label: "MiniCPM-V-4.7-35B-A3B-int4",
+            }),
+        }
+    }
+
+    fn fitted_1b(&self) -> Result<&ConditionProjection> {
+        self.projection.as_ref().ok_or_else(|| {
+            Error::Config(
+                "去噪观察缺少 MiniCPM-V-4.7-1B 投影权重，不能用未训练投影出图，也不会退回 JSON 改写"
+                    .into(),
+            )
+        })
+    }
+
+    fn fitted_35b(&self) -> Result<&MiniCpm35bProjection> {
+        self.projection_35b.as_ref().ok_or_else(|| {
+            Error::Config(
+                "去噪观察缺少 MiniCPM-V-4.7-35B-A3B-int4 投影权重，不能用未训练投影出图，也不会退回 JSON 改写"
+                    .into(),
+            )
+        })
+    }
+
+    fn project_1b(
+        &self,
+        prompt: &str,
+        official_length: usize,
+        model_root: &Path,
+    ) -> Result<Vec<f32>> {
+        let dir = crate::minicpm_condition::default_minicpm_1b_dir(model_root);
+        let checkpoint = crate::minicpm_condition::MiniCpm1bText::load(&dir)?;
+        let layer = checkpoint.last_layer(prompt)?;
+        drop(checkpoint);
+        let projected = self
+            .fitted_1b()?
+            .project_last_layer(&layer, official_length)?;
+        Ok(projected.values().to_vec())
+    }
+
+    fn project_35b(
+        &self,
+        prompt: &str,
+        official_length: usize,
+        model_root: &Path,
+    ) -> Result<Vec<f32>> {
+        let dir = crate::minicpm_condition::default_minicpm_35b_dir(model_root);
+        let checkpoint = crate::minicpm_condition::MiniCpm35bText::load(&dir)?;
+        let layer = checkpoint.last_layer(prompt)?;
+        drop(checkpoint);
+        let projected = self
+            .fitted_35b()?
+            .project_last_layer(&layer, official_length)?;
+        Ok(projected.values().to_vec())
+    }
+
     pub fn uses_negative_guidance(&self) -> bool {
         false
     }
+}
+
+fn aligned_length(official_length: Option<usize>) -> Result<usize> {
+    official_length
+        .ok_or_else(|| Error::Config("官方文本条件的宽度不是 4096，无法对齐投影条件".into()))
 }
 
 #[derive(Debug)]

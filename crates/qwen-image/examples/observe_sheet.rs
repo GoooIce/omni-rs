@@ -106,12 +106,15 @@ fn file_name(index: usize, row: ObservationRow, step: usize) -> String {
     format!("p{index:02}-{row}-{step:02}.png")
 }
 
+fn row_label(row: ObservationRow) -> &'static str {
+    match row {
+        ObservationRow::Official => "官方文本条件",
+        ObservationRow::MiniCpm1b => "MiniCPM-V-4.7-1B",
+        ObservationRow::MiniCpm35b => "MiniCPM-V-4.7-35B-A3B-int4",
+    }
+}
+
 fn write_html(output: &Path, prompts: &[&str], _finished: &[&str]) {
-    let rows = [
-        (ObservationRow::Official, "官方文本条件"),
-        (ObservationRow::MiniCpm1b, "MiniCPM-V-4.7-1B"),
-        (ObservationRow::MiniCpm35b, "MiniCPM-V-4.7-35B-A3B-int4"),
-    ];
     let mut body = String::new();
     for (index, prompt) in prompts.iter().enumerate() {
         body.push_str(&format!(
@@ -123,7 +126,8 @@ fn write_html(output: &Path, prompts: &[&str], _finished: &[&str]) {
             body.push_str(&format!("<th>步 {step}</th>"));
         }
         body.push_str("</tr></thead><tbody>");
-        for (row, label) in rows {
+        for row in ObservationRow::order() {
+            let label = row_label(row);
             body.push_str(&format!("<tr><th>{}</th>", label));
             for step in 1..=8 {
                 let name = file_name(index, row, step);
