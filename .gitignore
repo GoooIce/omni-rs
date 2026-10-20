@@ -10,7 +10,6 @@
 *.wav
 *.pcm
 *.safetensors
-!crates/hy-mt/tests/fixtures/hunyuan/*.safetensors
 .DS_Store
 __pycache__/
 /.venv*/
