@@ -125,6 +125,8 @@ def main():
         request("/click", x=x + width/2, y=y + height/2, wait=1, if_user_seq=activity["user_seq"])
 
     def fill(name, value):
+        if name == "audio_path" and "收起" not in widget("asr_details_toggle")["t"]:
+            click("asr_details_toggle")
         click(name)
         seq = request("/activity")["user_seq"]
         request("/k", k="press", c="KeyA", cmd=1, wait=1, if_user_seq=seq)
@@ -179,11 +181,14 @@ def main():
             report["startup"] = "automatic; idle_unloaded measurement does not apply"
         wait_for(lambda: widget("transcribe")["enabled"])
         report["backend"] = widget("backend")["t"]
-        for _ in range(args.mode):
-            previous = widget("speed")["t"]
-            click("speed")
-            wait_for(lambda: widget("speed")["t"] != previous, 15)
-        report["speed_mode"] = widget("speed")["t"]
+        speeds = ["speed_balanced", "speed_low", "speed_fast", "speed_save"]
+        if args.mode:
+            if "收起" not in widget("asr_details_toggle")["t"]:
+                click("asr_details_toggle")
+            chosen = speeds[args.mode % len(speeds)]
+            click(chosen)
+            wait_for(lambda: widget(chosen)["t"].startswith("●"), 15)
+        report["speed_mode"] = next(widget(name)["t"] for name in speeds if widget(name)["t"].startswith("●"))
         measured("warmup_wav", lambda: transcribe("transcribe"))
         measured("idle_loaded", lambda: time.sleep(5))
         for i in range(args.repeats):

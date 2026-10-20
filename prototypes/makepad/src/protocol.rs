@@ -33,16 +33,16 @@ pub fn decode_options(mode: usize) -> DecodeOptions {
 pub fn mode_label(mode: usize) -> &'static str {
     #[cfg(not(target_arch = "wasm32"))]
     return match mode {
-        1 => "速度：低延迟",
-        2 => "速度：快速",
-        3 => "速度：省算力",
-        _ => "速度：均衡",
+        1 => "低延迟",
+        2 => "快速",
+        3 => "省算力",
+        _ => "均衡",
     };
     #[cfg(target_arch = "wasm32")]
     match mode {
-        1 => "速度：快速",
-        2 => "速度：省算力",
-        _ => "速度：低延迟",
+        1 => "快速",
+        2 => "省算力",
+        _ => "低延迟",
     }
 }
 
@@ -57,10 +57,10 @@ pub fn mode_count() -> usize {
 pub fn mode_hint(mode: usize) -> &'static str {
     #[cfg(not(target_arch = "wasm32"))]
     return match mode {
-        1 => "低延迟 · 每 160 ms 处理一块，CPU 开销较高；下一次识别生效",
-        2 => "快速 · 每 960 ms 处理一块；下一次识别生效",
-        3 => "省算力 · 每 1280 ms 处理一块；下一次识别生效",
-        _ => "均衡 · 每 320 ms 处理一块，保留 160 ms 前瞻；下一次识别生效",
+        1 => "低延迟：160 ms 一块，更费算力，下次生效。",
+        2 => "快速：960 ms 一块，下次生效。",
+        3 => "省算力：1280 ms 一块，下次生效。",
+        _ => "均衡：320 ms 一块，前瞻 160 ms，下次生效。",
     };
     #[cfg(target_arch = "wasm32")]
     match mode {
@@ -153,7 +153,7 @@ pub fn asr_language(raw: &str) -> Result<Option<String>, String> {
         .find(|(english, chinese)| english.eq_ignore_ascii_case(raw) || *chinese == raw)
         .map(|(english, _)| Some((*english).to_owned()))
         .ok_or_else(|| {
-            format!("不认识的识别语言“{raw}”。留空或填写“自动”，也可以填 Korean、韩语这样的名称。")
+            format!("不认识的识别语言“{raw}”。可点选一种语言，或填写韩语、泰语这样的名称。")
         })
 }
 

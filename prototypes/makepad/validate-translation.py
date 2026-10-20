@@ -36,6 +36,9 @@ def main():
             assert not app.widget('asr_translate')['enabled']
             app.click('transcribe');app.ready()
             original=app.widget('transcript')['val'];assert original.strip()
+            if app.widget('asr_translate')['t'] != '翻译':
+                app.click('asr_translate')
+                app.wait(lambda: app.widget('asr_translate')['t']=='翻译', 240)
             app.click('asr_translate')
             app.wait(lambda:app.widget('asr_translation_stop')['enabled'])
             assert not app.widget('transcribe')['enabled']

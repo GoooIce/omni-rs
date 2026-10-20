@@ -147,6 +147,7 @@ impl App {
         for id in [ids!(music_choose_audio), ids!(music_choose_models)] {
             self.ui.button(cx, id).set_action_enabled(cx, !dialog_busy);
         }
+        self.ui.button(cx, ids!(music_stop)).set_visible(cx, m.busy);
         self.ui
             .button(cx, ids!(music_stop))
             .set_action_enabled(cx, m.busy && !m.stopping);

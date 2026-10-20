@@ -70,6 +70,10 @@ impl State {
             self.engine.cancel();
         }
     }
+    pub fn needs_model(&self) -> bool {
+        !self.ready && !self.loading
+    }
+
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
         let settings =
             model_location::settings_path_for("BREEZE_TTS_SETTINGS_PATH", "breeze-tts.json");
@@ -156,7 +160,7 @@ impl App {
         self.ui.button(cx, ids!(tts_design_mode)).set_text(
             cx,
             if design {
-                "音色设计 · 当前"
+                "● 音色设计"
             } else {
                 "音色设计"
             },
@@ -166,7 +170,7 @@ impl App {
             if design {
                 "朗读与克隆"
             } else {
-                "朗读与克隆 · 当前"
+                "● 朗读与克隆"
             },
         );
         self.ui.label(cx, ids!(tts_text_title)).set_text(
@@ -321,12 +325,23 @@ impl App {
         }
         t.controls = Some(state);
         let idle = !t.busy && !other_busy && !dialog_busy;
-        self.ui
-            .button(cx, ids!(tts_load))
-            .set_action_enabled(cx, idle && !t.ready);
+        self.ui.button(cx, ids!(tts_load)).set_visible(cx, false);
+        self.ui.button(cx, ids!(tts_synthesize)).set_text(
+            cx,
+            if t.loading {
+                "正在载入…"
+            } else if !t.ready {
+                "载入语音模型"
+            } else if t.design {
+                "生成并试听"
+            } else {
+                "合成并播放"
+            },
+        );
         self.ui
             .button(cx, ids!(tts_synthesize))
-            .set_action_enabled(cx, idle && t.ready);
+            .set_action_enabled(cx, idle && !t.loading);
+        self.ui.button(cx, ids!(tts_stop)).set_visible(cx, t.busy);
         self.ui.button(cx, ids!(tts_stop)).set_action_enabled(
             cx,
             t.busy && !t.stopping && !t.picking && !t.picking_reference,
@@ -374,9 +389,9 @@ impl App {
         self.ui.button(cx, ids!(tts_enhance)).set_text(
             cx,
             if t.session.enabled() {
-                "提示词增强 · 开"
+                "● 提示词增强"
             } else {
-                "提示词增强 · 关"
+                "提示词增强"
             },
         );
         self.ui

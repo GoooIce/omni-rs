@@ -46,6 +46,10 @@ pub struct State {
     )>,
 }
 impl State {
+    pub fn needs_model(&self) -> bool {
+        !self.ready && !self.loading
+    }
+
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
         let settings =
             model_location::settings_path_for("QWEN_IMAGE_SETTINGS_PATH", "qwen-image.json");
@@ -203,12 +207,23 @@ impl App {
         }
         i.controls = Some(state);
         let idle = !other_busy && !i.busy && !dialog_busy;
-        self.ui
-            .button(cx, ids!(image_load))
-            .set_action_enabled(cx, idle && !i.ready);
+        self.ui.button(cx, ids!(image_load)).set_visible(cx, false);
+        self.ui.button(cx, ids!(image_generate)).set_text(
+            cx,
+            if !i.ready {
+                "载入图像模型"
+            } else if i.observation {
+                "观察去噪"
+            } else if i.references.is_empty() {
+                "生成图像"
+            } else {
+                "编辑图像"
+            },
+        );
         self.ui
             .button(cx, ids!(image_generate))
-            .set_action_enabled(cx, idle && i.ready);
+            .set_action_enabled(cx, idle && !i.loading);
+        self.ui.button(cx, ids!(image_stop)).set_visible(cx, i.busy);
         self.ui.button(cx, ids!(image_stop)).set_action_enabled(
             cx,
             i.busy && !i.stopping && !i.picking && !i.picking_reference,
@@ -239,16 +254,9 @@ impl App {
         self.ui
             .button(cx, ids!(image_reference_clear))
             .set_action_enabled(cx, idle && !i.references.is_empty());
-        self.ui.button(cx, ids!(image_generate)).set_text(
-            cx,
-            if i.observation {
-                "观察去噪"
-            } else if i.references.is_empty() {
-                "生成图像"
-            } else {
-                "编辑图像"
-            },
-        );
+        self.ui
+            .button(cx, ids!(image_generate))
+            .set_action_enabled(cx, idle && !i.loading);
     }
     pub fn poll_image(&mut self, cx: &mut Cx) {
         if let Some(i) = self.image.as_mut() {
@@ -298,6 +306,9 @@ impl App {
                         self.ui
                             .image(cx, ids!(image_reference_preview))
                             .set_texture(cx, Some(texture));
+                        self.ui
+                            .view(cx, ids!(image_reference_thumb))
+                            .set_visible(cx, true);
                     }
                     self.image_status(cx, &update.message);
                 }
@@ -444,7 +455,7 @@ impl App {
                             .set_visible(cx, true);
                         self.ui
                             .label(cx, ids!(image_preview_caption))
-                            .set_text(cx, "图像预览");
+                            .set_text(cx, "");
                         self.ui.view(cx, ids!(image_preview_group)).redraw(cx);
                     }
                     if let Some((official, minicpm, large, width, height)) = observed {
@@ -604,9 +615,9 @@ impl App {
             self.ui.button(cx, ids!(image_observe_toggle)).set_text(
                 cx,
                 if observation {
-                    "去噪观察 · 开启"
+                    "● 去噪观察"
                 } else {
-                    "去噪观察 · 关闭"
+                    "去噪观察"
                 },
             );
             self.image_status(
@@ -720,6 +731,9 @@ impl App {
             self.ui
                 .image(cx, ids!(image_reference_preview))
                 .set_texture(cx, None);
+            self.ui
+                .view(cx, ids!(image_reference_thumb))
+                .set_visible(cx, false);
             self.ui
                 .label(cx, ids!(image_reference_name))
                 .set_text(cx, "未选择参考图 · 文生图");

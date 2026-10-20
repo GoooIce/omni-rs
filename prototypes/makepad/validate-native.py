@@ -76,6 +76,8 @@ def click(name):
     return request("/click", x=x+width/2, y=y+height/2, wait=1, if_user_seq=activity["user_seq"])
 
 def fill(name, value):
+    if name == "audio_path" and "收起" not in widget("asr_details_toggle")["t"]:
+        click("asr_details_toggle")
     click(name)
     seq = request("/activity")["user_seq"]
     request("/k", k="press", c="KeyA", cmd=1, wait=1, if_user_seq=seq)
@@ -146,7 +148,7 @@ try:
     match = wait_for(lambda: re.search(r"listening on (127\.0\.0\.1:\d+) pid=(\d+)", log_path.read_text()), 60)
     assert int(match[2]) == process.pid
     base = "http://" + match[1]
-    wait_for(lambda: (w := widget("app_title")) and w["r"][3] > 0, 30)
+    wait_for(lambda: (w := widget("transcribe")) and w["r"][3] > 0, 30)
     assert widget("model_title")["t"] == "转写模型"
     assert not (w := widget("load")) or w["r"][3] == 0, "manual preparation still visible"
     seq = request("/activity")["user_seq"]
@@ -197,14 +199,16 @@ try:
 
     # Verify the mode action after model readiness, and keep the old low-latency
     # setting available without rebuilding or changing inference backends.
-    previous_mode = widget("speed")["t"]
-    assert previous_mode == "速度：均衡", previous_mode
-    click("speed")
-    wait_for(lambda: widget("speed")["t"] == "速度：低延迟", 15)
+    previous_mode = widget("speed_balanced")["t"]
+    assert previous_mode == "● 均衡", previous_mode
+    if "收起" not in widget("asr_details_toggle")["t"]:
+        click("asr_details_toggle")
+    click("speed_low")
+    wait_for(lambda: widget("speed_low")["t"] == "● 低延迟", 15)
     run_sample()
-    for expected_mode in ["速度：快速", "速度：省算力", "速度：均衡"]:
-        click("speed")
-        wait_for(lambda: widget("speed")["t"] == expected_mode, 15)
+    for button, expected_mode in [("speed_fast", "● 快速"), ("speed_save", "● 省算力"), ("speed_balanced", "● 均衡")]:
+        click(button)
+        wait_for(lambda: widget(button)["t"] == expected_mode, 15)
     results["checks"].append("all four native presets are selectable; low-latency transcription remains correct")
 
     # Exercise an ordinary error and recovery without reloading GPU weights.

@@ -128,9 +128,10 @@ def main():
                 print(name + ": " + final["text"], flush=True)
                 return final
 
+            speeds = ["speed_low", "speed_fast", "speed_save", "speed_balanced"]
             for mode in range(4):
                 run(f"wav-short-mode{mode}", regression.SHORT, regression.WELCOME)
-                app.click("speed")
+                app.click(speeds[mode])
             run("microphone-short-eof", regression.SHORT, regression.WELCOME, microphone=True)
             run("microphone-48k-stereo", stereo, regression.OFFICIAL_TEXT, microphone=True)
             run("microphone-pause-resume-window", pause, regression.WELCOME * 2, microphone=True, pauses=True)

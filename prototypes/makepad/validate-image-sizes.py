@@ -49,7 +49,7 @@ def main():
         try:
             app = startup.App(process, out / "app.log", out)
             app.ready()
-            app.click("creative_tab");app.click("image_load")
+            app.click("creative_tab");app.click("image_generate")
             app.wait(lambda: app.widget("image_generate")["enabled"], 240)
             dims = lambda: tuple(int(app.widget("image_" + axis)["val"]) for axis in ["width", "height"])
             assert dims() == official["1:1"]

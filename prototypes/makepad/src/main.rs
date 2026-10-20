@@ -195,15 +195,22 @@ script_mod! {
                         draw_bg.color: #111814 draw_bg.border_radius: 0
                         View{
                             width: Fill height: Fit flow: Right spacing: 16 align: Align{y: 0.5}
-                            View{
+                            app_heading := View{
                                 width: Fill height: Fit flow: Down spacing: 4
                                 app_title := SectionLabel{text: "知音" draw_text.text_style.font_size: 20}
                                 app_subtitle := MutedLabel{text: "声音、文字、图像与音乐"}
                             }
-                            navigation := View{
-                                visible: false width: Fit height: Fit flow: Right spacing: 6
-                                language_tab := SpeechButton{text: "语言工作台 · 当前" height: 38}
-                                creative_tab := SpeechButton{text: "创作工作台" height: 38}
+                            nav_group := View{
+                                visible: false width: Fit height: Fit flow: Down spacing: 4
+                                navigation := View{
+                                    width: Fit height: Fit flow: Right spacing: 6
+                                    language_tab := SpeechButton{text: "● 语言" height: 38}
+                                    creative_tab := SpeechButton{text: "创作" height: 38}
+                                }
+                                tab_indicator := RoundedView{
+                                    width: 48 height: 3 margin: {left: 0}
+                                    draw_bg.color: #b7dfc7 draw_bg.border_radius: 2
+                                }
                             }
                         }
                         running_bar := RoundedView{
@@ -215,12 +222,17 @@ script_mod! {
                             playback_stop := SpeechButton{text: "停止播放" height: 32}
                         }
                         pages := ScrollYView{
-                            width: Fill height: Fill flow: Down spacing: 12
+                            width: Fill height: Fill flow: Down spacing: 0
+                            page_stage := View{
+                                width: Fill height: Fit flow: Down clip_x: true clip_y: false
+                                page_track := View{
+                                    width: Fill height: Fit flow: Right spacing: 0
                             language_page := View{
                                 width: Fill height: Fit flow: Down spacing: 12
                                 language_columns := View{
                                     width: Fill height: Fit flow: Right spacing: 14
                                     asr_page := WorkspacePanel{
+                                        width: Fill{weight: 170}
                                         spacing: 8
                                         View{
                                             width: Fill height: Fit flow: Right align: Align{y: 0.5}
@@ -238,23 +250,37 @@ script_mod! {
                                             choose_model := SpeechButton{text: "选择模型…"}
                                             retry_model := SpeechButton{text: "重试加载"}
                                         }
-                                        audio_title := SpeechLabel{text: "音频输入"}
-                                        audio_path := SpeechInput{width: Fill height: 38 empty_text: "粘贴 WAV 文件路径…"}
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            audio_file := SpeechLabel{
+                                                width: Fill text: "尚未选择音频"
+                                                draw_text.color: #edf3ef
+                                                draw_text.text_style.font_size: 15
+                                            }
+                                            choose_audio := SpeechButton{text: "选择音频" height: 34}
+                                            sample := QuietButton{text: "官方示例" height: 34}
+                                        }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
                                             transcribe := PrimaryButton{text: "开始转写" height: 38}
                                             microphone := SpeechButton{text: "麦克风" height: 38}
                                             stop := QuietButton{text: "停止" height: 38}
-                                            sample := QuietButton{text: "示例" height: 38}
                                         }
-                                        input_status := MutedLabel{text: "麦克风未开启"}
+                                        input_status_row := View{
+                                            visible: false width: Fill height: Fit
+                                            input_status := MutedLabel{text: ""}
+                                        }
                                         Divider{}
                                         View{
-                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                            SpeechLabel{text: "识别语言" width: Fit}
-                                            asr_language := SpeechInput{width: Fill height: 34 text: "自动" empty_text: "自动，或 Korean / 韩语"}
+                                            width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                                            asr_language_caption := SpeechLabel{text: "语言" width: Fit}
+                                            asr_lang_auto := QuietButton{text: "● 自动" height: 30}
+                                            asr_lang_zh := QuietButton{text: "中文" height: 30}
+                                            asr_lang_en := QuietButton{text: "英文" height: 30}
+                                            asr_lang_yue := QuietButton{text: "粤语" height: 30}
+                                            asr_lang_ja := QuietButton{text: "日语" height: 30}
+                                            asr_lang_ko := QuietButton{text: "韩语" height: 30}
                                         }
-                                        MutedLabel{text: "自动判断语种。填写 Chinese、中文、Korean、韩语可固定，下一次转写生效。"}
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                             transcript_title := SpeechLabel{width: Fill text: "转写文字"}
@@ -262,42 +288,74 @@ script_mod! {
                                             asr_to_tts := QuietButton{text: "送去朗读 →" height: 30}
                                         }
                                         transcript := SpeechInput{
-                                            width: Fill height: 116 is_multiline: true is_read_only: true
-                                            empty_text: "转写内容会逐段出现在这里。"
+                                            width: Fill height: 188 is_multiline: true is_read_only: true
+                                            empty_text: "转写出现在这里。"
                                             draw_text.text_style.font_size: 16
+                                            draw_bg.color: #24312b
+                                            draw_bg.color_empty: #24312b
+                                            draw_bg.color_hover: #24312b
+                                            draw_bg.color_focus: #24312b
                                         }
                                         asr_translation_group := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 8
-                                            View{
+                                                asr_translation_readiness := MutedLabel{text: "尚未载入" draw_text.color: #d7b56a}
+                                                View{
                                                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                                 SpeechLabel{text: "翻译为"}
                                                 asr_translation_language := SpeechInput{width: Fill height: 34 text: "English" empty_text: "目标语言全称"}
-                                                asr_translate := SpeechButton{text: "翻译"}
+                                                asr_translate := QuietButton{text: "载入翻译模型" height: 38}
                                                 asr_translation_stop := QuietButton{text: "停止"}
                                             }
-                                            asr_translation := SpeechInput{
-                                                width: Fill height: 72 is_multiline: true is_read_only: true
-                                                empty_text: "译文保留在这里，原文不变。"
+                                            asr_translation_well := View{
+                                                width: Fill height: Fit
+                                                asr_translation := SpeechInput{
+                                                    width: Fill height: 56 is_multiline: true is_read_only: true
+                                                    empty_text: "译文写在这里。"
+                                                }
                                             }
                                             View{
                                                 width: Fill height: Fit flow: Right spacing: 8
                                                 asr_translation_copy := QuietButton{text: "复制译文" height: 30}
                                                 asr_translation_to_tts := QuietButton{text: "译文朗读 →" height: 30}
-                                                asr_translation_model := QuietButton{text: "模型…" height: 30}
+                                                asr_translation_model := QuietButton{text: "翻译模型" height: 30 visible: false}
                                             }
-                                            asr_translation_status := MutedLabel{text: "首次翻译时载入模型。"}
+                                            asr_translation_note := View{
+                                                visible: false width: Fill height: Fit
+                                                asr_translation_status := MutedLabel{text: ""}
+                                            }
                                         }
                                         asr_details := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 10
+                                            asr_details_pad := View{width: Fill height: 0}
                                             Divider{}
-                                            SpeechLabel{text: "识别提示词"}
-                                            context := SpeechInput{width: Fill height: 56 is_multiline: true empty_text: "人名、术语等；下一次转写生效。"}
-                                            View{
-                                                width: Fill height: Fit flow: Right spacing: 8
-                                                speed := SpeechButton{text: "速度：均衡"}
-                                                ping := QuietButton{text: "响应测试"}
+                                            asr_details_title := SpeechLabel{text: "识别设置"}
+                                            SpeechLabel{text: "音频路径"}
+                                            audio_path_name := SpeechLabel{
+                                                visible: false
+                                                width: Fill text: "尚未选择音频"
+                                                draw_text.color: #edf3ef
+                                                draw_text.text_style.font_size: 15
                                             }
-                                            hint := MutedLabel{text: "停止会打断识别，并保留已确认文字。"}
+                                            audio_path := SpeechInput{
+                                                width: Fill height: 72 is_multiline: true
+                                                empty_text: "完整 WAV 路径。也可以用上面的选择音频。"
+                                            }
+                                            asr_other_language := SpeechLabel{text: "其他识别语言"}
+                                            asr_language := SpeechInput{width: Fill height: 34 empty_text: "泰语，或其他没有按钮的名称"}
+                                            asr_language_tail := View{width: Fill height: 36}
+                                            MutedLabel{visible: false text: "这里只填按钮上没有的语言。下次转写生效。"}
+                                            SpeechLabel{text: "识别提示词"}
+                                            context := SpeechInput{width: Fill height: 56 is_multiline: true empty_text: "人名、术语。下次转写才用。"}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                speed_balanced := QuietButton{text: "● 均衡" height: 30}
+                                                speed_low := QuietButton{text: "低延迟" height: 30}
+                                                speed_fast := QuietButton{text: "快速" height: 30}
+                                                speed_save := QuietButton{text: "省算力" height: 30}
+                                            }
+                                            speed_hint := MutedLabel{text: "均衡：320 ms 一块，前瞻 160 ms，下次生效。"}
+                                            ping := QuietButton{text: "响应测试" height: 30}
+                                            hint := MutedLabel{text: "开始之后，停止会保留已经确认的文字。"}
                                             model_title := SpeechLabel{text: "转写模型"}
                                             model_form := View{
                                                 width: Fill height: Fit flow: Right spacing: 8
@@ -308,6 +366,7 @@ script_mod! {
                                             heartbeat := MutedLabel{text: "界面就绪"}
                                         }
                                     }
+                                    language_stack_gap := View{visible: false width: Fill height: 64}
                                     tts_page := WorkspacePanel{
                                         spacing: 8
                                         View{
@@ -315,7 +374,7 @@ script_mod! {
                                             SectionLabel{width: Fill text: "让文字开口"}
                                             tts_load := QuietButton{text: "载入模型" height: 30}
                                         }
-                                        tts_status := MutedLabel{text: "按需载入语音模型" draw_text.color: #b7dfc7}
+                                        tts_status := MutedLabel{text: "语音模型尚未载入" draw_text.color: #d7b56a}
                                         tts_progress := RoundedView{
                                             visible: false width: Fill height: 4 padding: 0
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
@@ -328,9 +387,8 @@ script_mod! {
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
-                                            tts_speech_mode := QuietButton{text: "朗读与克隆 · 当前" height: 30}
+                                            tts_speech_mode := QuietButton{text: "● 朗读与克隆" height: 30}
                                             tts_design_mode := QuietButton{text: "音色设计" height: 30}
-                                            tts_enhance := QuietButton{text: "提示词增强 · 关" height: 30}
                                         }
                                         tts_hearing := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 8
@@ -349,9 +407,9 @@ script_mod! {
                                             MutedLabel{text: "听完三段后再选择。这里不显示改写后的文字。"}
                                         }
                                         tts_text_title := SpeechLabel{text: "要朗读的文字"}
-                                        tts_text := SpeechInput{
-                                            width: Fill height: 116 is_multiline: true
-                                            empty_text: "输入中文或英文，或从转写结果送入。"
+                                            tts_text := SpeechInput{
+                                                width: Fill height: 116 is_multiline: true
+                                                empty_text: "写上要读的中文或英文。"
                                             draw_text.text_style.font_size: 16
                                         }
                                         View{
@@ -359,7 +417,7 @@ script_mod! {
                                             tts_synthesize := PrimaryButton{text: "合成并播放" height: 38}
                                             tts_stop := QuietButton{text: "停止" height: 38}
                                             tts_replay := QuietButton{text: "试听" height: 38}
-                                            tts_save := QuietButton{text: "保存…" height: 38}
+                                            tts_save := QuietButton{text: "保存" height: 38}
                                         }
                                         tts_design_results := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 8
@@ -373,6 +431,7 @@ script_mod! {
                                         tts_details_toggle := QuietButton{text: "声音设置" height: 32}
                                         tts_details := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 9
+                                            tts_enhance := QuietButton{text: "提示词增强" height: 32}
                                             tts_instruction_title := SpeechLabel{text: "声音描述（可选）"}
                                             tts_instruction := SpeechInput{
                                                 width: Fill height: 66 is_multiline: true
@@ -419,24 +478,27 @@ script_mod! {
                                             tts_metrics := MutedLabel{text: "音频 —  ·  首声 —  ·  缓冲 —"}
                                             MutedLabel{text: "Breeze-TTS-2 · 24 kHz · 权重与输出限研究及非商业用途"}
                                         }
-                                        Divider{}
-                                        View{
-                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                            SpeechLabel{text: "翻译为"}
-                                            tts_translation_language := SpeechInput{width: Fill height: 34 text: "English" empty_text: "目标语言全称"}
-                                            tts_translate := SpeechButton{text: "翻译"}
-                                            tts_translation_stop := QuietButton{text: "停止"}
+                                        tts_translate_toggle := QuietButton{text: "翻译这段朗读" height: 32}
+                                        tts_translation_panel := View{
+                                            visible: false width: Fill height: Fit flow: Down spacing: 8
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                                SpeechLabel{text: "翻译为"}
+                                                tts_translation_language := SpeechInput{width: Fill height: 34 text: "English" empty_text: "目标语言全称"}
+                                                tts_translate := SpeechButton{text: "翻译"}
+                                                tts_translation_stop := QuietButton{text: "停止"}
+                                            }
+                                            tts_translation := SpeechInput{
+                                                width: Fill height: 56 is_multiline: true is_read_only: true
+                                                empty_text: "译文写在这里。"
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                tts_translation_use := SpeechButton{text: "用译文朗读" height: 30}
+                                                tts_translation_model := QuietButton{text: "翻译模型" height: 30}
+                                            }
+                                            tts_translation_status := MutedLabel{text: ""}
                                         }
-                                        tts_translation := SpeechInput{
-                                            width: Fill height: 72 is_multiline: true is_read_only: true
-                                            empty_text: "翻译后可直接用译文朗读。"
-                                        }
-                                        View{
-                                            width: Fill height: Fit flow: Right spacing: 8
-                                            tts_translation_use := SpeechButton{text: "用译文朗读" height: 30}
-                                            tts_translation_model := QuietButton{text: "翻译模型…" height: 30}
-                                        }
-                                        tts_translation_status := MutedLabel{text: "支持多语言翻译；朗读支持中文、英文。"}
                                     }
                                 }
                             }
@@ -451,20 +513,20 @@ script_mod! {
                                             music_stop := QuietButton{text: "停止" height: 30}
                                         }
                                         MutedLabel{text: "从风格和歌词开始，也可以从录音转谱。"}
-                                        music_status := MutedLabel{text: "准备就绪 · 模型按需载入" draw_text.color: #b7dfc7}
+                                        music_status := MutedLabel{text: "歌曲在生成时再载入" draw_text.color: #d7b56a}
                                         music_progress := RoundedView{
                                             visible: false width: Fill height: 4 padding: 0
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
                                             music_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}
                                         }
-                                        SpeechLabel{text: "风格与声音"}
+                                        SpeechLabel{text: "风格与声音 · 用英文"}
                                         music_style := SpeechInput{
                                             width: Fill height: 76 is_multiline: true
-                                            empty_text: "Mandarin acoustic pop, piano, 90 BPM"
+                                            empty_text: "acoustic pop, piano, 90 BPM"
                                         }
                                         SpeechLabel{text: "歌词"}
-                                        music_lyrics := SpeechInput{
-                                            width: Fill height: 136 is_multiline: true
+                                            music_lyrics := SpeechInput{
+                                                width: Fill height: 112 is_multiline: true
                                             empty_text: "用 [Verse]、[Chorus] 标记段落。\n纯音乐可以填写 [Instrumental]。"
                                         }
                                         View{
@@ -472,19 +534,19 @@ script_mod! {
                                             SpeechLabel{text: "最长秒数"}
                                             music_seconds := SpeechInput{width: 64 height: 34 text: "60"}
                                             SpeechLabel{text: "种子"}
-                                            music_seed := SpeechInput{width: Fill height: 34 text: "831001"}
+                                            music_seed := SpeechInput{width: 96 height: 34 text: "831001"}
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
                                             music_generate := PrimaryButton{text: "生成歌曲" height: 38}
                                             music_replay := QuietButton{text: "试听" height: 38}
-                                            music_save_audio := QuietButton{text: "保存 WAV…" height: 38}
+                                            music_save_audio := QuietButton{text: "保存 WAV" height: 38}
                                         }
                                         music_song_status := MutedLabel{text: "48 kHz 双声道 · 达到时长上限时会标记截断"}
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
-                                            music_details_toggle := QuietButton{text: "音乐分析 / 转谱 / ABC" height: 32}
-                                            music_save_song := QuietButton{text: "生成记录…" height: 32}
+                                            music_details_toggle := QuietButton{text: "从录音转谱" height: 32}
+                                            music_save_song := QuietButton{text: "生成记录" height: 32}
                                         }
                                         music_details := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 10
@@ -538,14 +600,15 @@ script_mod! {
                                         }
                                         music_export_status := MutedLabel{text: ""}
                                     }
+                                    creative_stack_gap := View{visible: false width: Fill height: 64}
                                     image_page := WorkspacePanel{
+                                        width: Fill{weight: 170}
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                             SectionLabel{width: Fill text: "画出想象"}
                                             image_load := QuietButton{text: "载入模型" height: 30}
                                         }
-                                        MutedLabel{text: "描述画面，或添加参考图进行编辑。"}
-                                        image_status := MutedLabel{text: "按需载入图像模型" draw_text.color: #b7dfc7}
+                                        image_status := MutedLabel{text: "图像模型尚未载入" draw_text.color: #d7b56a}
                                         image_progress := RoundedView{
                                             visible: false width: Fill height: 4 padding: 0
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
@@ -556,41 +619,11 @@ script_mod! {
                                             image_choose := SpeechButton{text: "选择模型…"}
                                             image_retry := SpeechButton{text: "重试加载"}
                                         }
-                                        image_description := View{
-                                            width: Fill height: Fit flow: Down spacing: 10
-                                            SpeechLabel{text: "画面描述 / 编辑指令"}
-                                            image_prompt := SpeechInput{
-                                                width: Fill height: 112 is_multiline: true
-                                                empty_text: "描述想看到的画面；需要透明 PNG 时注明透明背景。"
-                                                draw_text.text_style.font_size: 16
-                                            }
-                                            View{
-                                                width: Fill height: 48 flow: Right spacing: 10
-                                                image_reference_preview := Image{width: 48 height: 48 fit: ImageFit.Smallest}
-                                                View{
-                                                    width: Fill height: Fit flow: Down spacing: 4
-                                                    View{
-                                                        width: Fill height: Fit flow: Right spacing: 8
-                                                        image_reference_choose := QuietButton{text: "参考图…" height: 28}
-                                                        image_reference_clear := QuietButton{text: "清除" height: 28}
-                                                        image_example := QuietButton{text: "示例" height: 28}
-                                                    }
-                                                    image_reference_name := MutedLabel{text: "可添加 1–4 张 PNG、JPEG 或 WebP"}
-                                                }
-                                            }
-                                        }
-                                        View{
-                                            width: Fill height: Fit flow: Right spacing: 8
-                                            image_generate := PrimaryButton{text: "生成图像" height: 38}
-                                            image_observe_toggle := QuietButton{text: "去噪观察 · 关闭" height: 38}
-                                            image_stop := QuietButton{text: "停止" height: 38}
-                                            image_save := QuietButton{text: "保存 PNG…" height: 38}
-                                        }
                                         image_preview_group := RoundedView{
-                                            width: Fill height: 460 padding: 10 flow: Down spacing: 6
-                                            draw_bg.color: #121a15 draw_bg.border_radius: 5
-                                            draw_bg.border_color: #344137 draw_bg.border_size: 1
-                                            image_preview_caption := MutedLabel{text: "图像预览"}
+                                            width: Fill height: 280 padding: 8 flow: Down spacing: 0
+                                            draw_bg.color: #121719 draw_bg.border_radius: 8
+                                            draw_bg.border_color: #5d7d6c draw_bg.border_size: 1
+                                            image_preview_caption := MutedLabel{text: "载入后，画面出现在这里。"}
                                             image_preview_single := View{
                                                 width: Fill height: Fill
                                                 image_preview := Image{width: Fill height: Fill fit: ImageFit.Smallest}
@@ -635,9 +668,42 @@ script_mod! {
                                                 }
                                             }
                                         }
+                                        image_description := View{
+                                            width: Fill height: Fit flow: Down spacing: 10
+                                            SpeechLabel{text: "画面描述 / 编辑指令"}
+                                            image_prompt := SpeechInput{
+                                                width: Fill height: 88 is_multiline: true
+                                                empty_text: "雨后的玻璃音乐厅，暖色灯光。"
+                                                draw_text.text_style.font_size: 16
+                                            }
+                                            View{
+                                                width: Fill height: 48 flow: Right spacing: 10
+                                                image_reference_thumb := View{
+                                                    visible: false width: Fit height: Fit
+                                                    image_reference_preview := Image{width: 48 height: 48 fit: ImageFit.Smallest}
+                                                }
+                                                View{
+                                                    width: Fill height: Fit flow: Down spacing: 4
+                                                    View{
+                                                        width: Fill height: Fit flow: Right spacing: 8
+                                                        image_reference_choose := QuietButton{text: "参考图" height: 28}
+                                                        image_reference_clear := QuietButton{text: "清除" height: 28}
+                                                        image_example := QuietButton{text: "示例描述" height: 28}
+                                                    }
+                                                    image_reference_name := MutedLabel{text: "可添加 1–4 张 PNG、JPEG 或 WebP"}
+                                                }
+                                            }
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8
+                                            image_generate := PrimaryButton{text: "生成图像" height: 38}
+                                            image_stop := QuietButton{text: "停止" height: 38}
+                                            image_save := QuietButton{text: "保存 PNG" height: 38}
+                                        }
                                         image_settings_toggle := QuietButton{text: "尺寸与更多参数" height: 32}
                                         image_advanced := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 9
+                                            image_observe_toggle := QuietButton{text: "去噪观察" height: 32}
                                             Divider{}
                                             View{
                                                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -689,11 +755,22 @@ script_mod! {
                                     }
                                 }
                             }
+                                }
+                                slide_lip_left := RoundedView{
+                                    visible: false width: 28 height: 200
+                                    draw_bg.color: #111814 draw_bg.border_radius: 0
+                                }
+                                slide_lip_right := RoundedView{
+                                    visible: false width: 28 height: 200
+                                    draw_bg.color: #111814 draw_bg.border_radius: 0
+                                }
+                            }
+                            scroll_tail := View{width: Fill height: 20}
                         }
                         View{
                             width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
-                            MutedLabel{width: Fill text: "本地处理 · 切换工作台会保留输入和结果" draw_text.text_style.font_size: 11}
-                            backend := SpeechLabel{text: "Makepad" draw_text.text_style.font_size: 11 draw_text.color: #7f9286}
+                            MutedLabel{width: Fill text: "本地处理 · 换页保留输入和结果" draw_text.text_style.font_size: 13}
+                            backend := SpeechLabel{text: "Makepad" draw_text.text_style.font_size: 13 draw_text.color: #7f9286}
                         }
                     }
                 }
@@ -702,12 +779,29 @@ script_mod! {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct NavSlide {
+    from_x: f64,
+    from_w: f64,
+    started: std::time::Instant,
+    to_creative: bool,
+}
+
 #[derive(Script, ScriptHook)]
 pub struct App {
     #[live]
     ui: WidgetRef,
     #[rust]
     timer: Timer,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[rust]
+    nav_timer: Timer,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[rust]
+    nav_slide: Option<NavSlide>,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[rust]
+    nav_placed: bool,
     #[rust]
     ticks: usize,
     #[rust]
@@ -726,6 +820,8 @@ pub struct App {
     mode: usize,
     #[rust]
     transcript: String,
+    #[rust]
+    language_choice: String,
     #[rust]
     controls: Option<(bool, bool, bool, bool, bool, bool)>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -746,6 +842,9 @@ pub struct App {
     #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     picking_model: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[rust]
+    picking_audio: bool,
     #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     remember_model: bool,
@@ -867,11 +966,30 @@ impl App {
             .button(cx, ids!(sample))
             .set_action_enabled(cx, !busy);
         self.ui
-            .button(cx, ids!(speed))
+            .button(cx, ids!(choose_audio))
             .set_action_enabled(cx, !busy);
+        for id in [
+            ids!(asr_lang_auto),
+            ids!(asr_lang_zh),
+            ids!(asr_lang_en),
+            ids!(asr_lang_yue),
+            ids!(asr_lang_ja),
+            ids!(asr_lang_ko),
+        ] {
+            self.ui.button(cx, id).set_action_enabled(cx, !busy);
+        }
+        for id in [
+            ids!(speed_balanced),
+            ids!(speed_low),
+            ids!(speed_fast),
+            ids!(speed_save),
+        ] {
+            self.ui.button(cx, id).set_action_enabled(cx, !busy);
+        }
         self.ui
             .button(cx, ids!(microphone))
             .set_action_enabled(cx, self.ready && !busy);
+        self.ui.button(cx, ids!(stop)).set_visible(cx, self.busy);
         self.ui
             .button(cx, ids!(stop))
             .set_action_enabled(cx, self.busy && !self.stopping);
@@ -881,7 +999,360 @@ impl App {
     }
 
     fn status(&self, cx: &mut Cx, text: &str) {
-        self.ui.label(cx, ids!(status)).set_text(cx, text);
+        let shown = text.replacen("模型已就绪", "转写已就绪", 1);
+        self.ui.label(cx, ids!(status)).set_text(cx, &shown);
+    }
+
+    fn show_input_status(&self, cx: &mut Cx, text: &str) {
+        self.ui
+            .view(cx, ids!(input_status_row))
+            .set_visible(cx, true);
+        self.ui.label(cx, ids!(input_status)).set_text(cx, text);
+    }
+
+    fn audio_path_value(&self, cx: &mut Cx) -> String {
+        self.ui
+            .text_input(cx, ids!(audio_path))
+            .text()
+            .replace(['\n', '\r'], "")
+    }
+
+    fn set_audio_path_text(&self, cx: &mut Cx, path: &str) {
+        let clean: Vec<char> = path
+            .chars()
+            .filter(|ch| *ch != '\n' && *ch != '\r')
+            .collect();
+        let mut split_at = None;
+        let mut best_tail = 0usize;
+        for (index, ch) in clean.iter().enumerate() {
+            if *ch != '/' || index == 0 {
+                continue;
+            }
+            let tail = clean.len() - index - 1;
+            if tail > best_tail && tail <= 48 {
+                best_tail = tail;
+                split_at = Some(index);
+            }
+        }
+        let shown = if let Some(index) = split_at {
+            let head: String = clean[..=index].iter().collect();
+            let tail: String = clean[index + 1..].iter().collect();
+            format!("{head}\n{tail}")
+        } else {
+            clean.into_iter().collect()
+        };
+        self.ui
+            .text_input(cx, ids!(audio_path))
+            .set_text(cx, &shown);
+    }
+
+    fn refresh_audio_file(&self, cx: &mut Cx) {
+        let path = self.audio_path_value(cx);
+        let trimmed = path.trim();
+        let name = if trimmed.is_empty() {
+            "尚未选择音频".to_owned()
+        } else {
+            std::path::Path::new(trimmed)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| trimmed.to_owned())
+        };
+        self.ui.label(cx, ids!(audio_file)).set_text(cx, &name);
+        self.ui.label(cx, ids!(audio_path_name)).set_text(cx, &name);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tab_indicator_target(&self, cx: &mut Cx) -> Option<(f64, f64)> {
+        let nav = self.ui.widget(cx, ids!(navigation)).area().rect(cx);
+        let id = if self.workspace.indicator_language() {
+            ids!(language_tab)
+        } else {
+            ids!(creative_tab)
+        };
+        let tab = self.ui.widget(cx, id).area().rect(cx);
+        if nav.size.x < 1.0 || tab.size.x < 1.0 {
+            return None;
+        }
+        Some(((tab.pos.x - nav.pos.x).max(0.0), tab.size.x))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn place_tab_indicator(&self, cx: &mut Cx, x: f64, width: f64) {
+        if let Some(mut view) = self.ui.view(cx, ids!(tab_indicator)).borrow_mut() {
+            view.walk.margin.left = x;
+            view.walk.width = Size::Fixed(width.max(28.0));
+            view.redraw(cx);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn follow_tab_indicator(&mut self, cx: &mut Cx, animate: bool) -> bool {
+        let Some((x, width)) = self.tab_indicator_target(cx) else {
+            return false;
+        };
+        let current = self
+            .ui
+            .view(cx, ids!(tab_indicator))
+            .borrow()
+            .map(|view| {
+                let width = match view.walk.width {
+                    Size::Fixed(width) => width,
+                    _ => 48.0,
+                };
+                (view.walk.margin.left, width)
+            })
+            .unwrap_or((0.0, 48.0));
+        if animate && self.nav_placed {
+            self.nav_slide = Some(NavSlide {
+                from_x: current.0,
+                from_w: current.1,
+                started: std::time::Instant::now(),
+                to_creative: !self.workspace.indicator_language(),
+            });
+            self.nav_timer = cx.start_interval(1.0 / 60.0);
+            return true;
+        }
+        if self.nav_placed && (current.0 - x).abs() < 0.5 && (current.1 - width).abs() < 0.5 {
+            return false;
+        }
+        self.place_tab_indicator(cx, x, width);
+        self.nav_placed = true;
+        false
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn step_tab_indicator(&mut self, cx: &mut Cx) {
+        let Some(slide) = &self.nav_slide else {
+            cx.stop_timer(self.nav_timer);
+            return;
+        };
+        let started = slide.started;
+        let from_x = slide.from_x;
+        let from_w = slide.from_w;
+        let to_creative = slide.to_creative;
+        let Some((x, width)) = self.tab_indicator_target(cx) else {
+            return;
+        };
+        let t = (started.elapsed().as_secs_f64() / 0.28).clamp(0.0, 1.0);
+        let page_eased = 1.0 - (1.0 - t) * (1.0 - t);
+        let line_eased = (page_eased * 1.7).min(1.0);
+        self.place_tab_indicator(
+            cx,
+            from_x + (x - from_x) * line_eased,
+            from_w + (width - from_w) * line_eased,
+        );
+        self.slide_pages(cx, page_eased, to_creative);
+        if t > 0.0 {
+            self.reveal_pending_page(cx);
+        }
+        if t >= 1.0 {
+            self.nav_slide = None;
+            cx.stop_timer(self.nav_timer);
+            self.apply_pending_page(cx);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slide_pages(&mut self, cx: &mut Cx, eased: f64, to_creative: bool) {
+        let pages = self.ui.widget(cx, ids!(pages)).area().rect(cx);
+        let width = pages.size.x;
+        if width < 40.0 {
+            return;
+        }
+        let shift = if to_creative {
+            -width * eased
+        } else {
+            -width * (1.0 - eased)
+        };
+        self.ui.view(cx, ids!(language_page)).set_visible(cx, true);
+        self.ui.view(cx, ids!(creative_page)).set_visible(cx, true);
+        for id in [ids!(language_page), ids!(creative_page)] {
+            if let Some(mut view) = self.ui.view(cx, id).borrow_mut() {
+                view.walk.width = Size::Fixed(width);
+                view.redraw(cx);
+            }
+        }
+        if let Some(mut track) = self.ui.view(cx, ids!(page_track)).borrow_mut() {
+            track.walk.width = Size::Fixed(width * 2.0);
+            track.walk.margin.left = shift;
+            track.redraw(cx);
+        }
+        self.place_slide_lips(
+            cx,
+            true,
+            pages.pos.x,
+            pages.pos.y,
+            width,
+            pages.size.y,
+            shift,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn place_slide_lips(
+        &mut self,
+        cx: &mut Cx,
+        show: bool,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        shift: f64,
+    ) {
+        let mut slivers: Vec<(f64, f64)> = Vec::new();
+        if show {
+            let gap = 14.0;
+            let wide = (width - gap) * 170.0 / 270.0;
+            let narrow = width - gap - wide;
+            let view_left = x;
+            let view_right = x + width;
+            let lang_x = x + shift;
+            let crea_x = lang_x + width;
+            for (card_x, card_w) in [
+                (lang_x, wide),
+                (lang_x + wide + gap, narrow),
+                (crea_x, narrow),
+                (crea_x + narrow + gap, wide),
+            ] {
+                let card_right = card_x + card_w;
+                let overlaps = card_right > view_left + 1.0 && card_x < view_right - 1.0;
+                let full = card_x >= view_left - 1.0 && card_right <= view_right + 1.0;
+                if overlaps && !full {
+                    let left = card_x.max(view_left);
+                    let right = card_right.min(view_right);
+                    if right - left > 1.0 {
+                        slivers.push((left, right));
+                    }
+                }
+            }
+        }
+        slivers.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let slots = [ids!(slide_lip_left), ids!(slide_lip_right)];
+        for (index, id) in slots.into_iter().enumerate() {
+            let sliver = if index == 0 {
+                slivers.first()
+            } else {
+                slivers.get(slivers.len().saturating_sub(1))
+            };
+            let distinct = index == 0 || slivers.len() > 1;
+            self.ui
+                .view(cx, id)
+                .set_visible(cx, sliver.is_some() && distinct);
+            if let Some((left, right)) = sliver.filter(|_| distinct) {
+                if let Some(mut view) = self.ui.view(cx, id).borrow_mut() {
+                    view.walk.abs_pos = Some(dvec2(*left, y));
+                    view.walk.width = Size::Fixed((*right - *left).max(1.0));
+                    view.walk.height = Size::Fixed(height.max(200.0));
+                    view.redraw(cx);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rest_page_track(&mut self, cx: &mut Cx) {
+        for id in [ids!(language_page), ids!(creative_page)] {
+            if let Some(mut view) = self.ui.view(cx, id).borrow_mut() {
+                view.walk.width = Size::fill();
+                view.redraw(cx);
+            }
+        }
+        if let Some(mut track) = self.ui.view(cx, ids!(page_track)).borrow_mut() {
+            track.walk.width = Size::fill();
+            track.walk.margin.left = 0.0;
+            track.redraw(cx);
+        }
+        let pages = self.ui.widget(cx, ids!(pages)).area().rect(cx);
+        self.place_slide_lips(
+            cx,
+            false,
+            pages.pos.x,
+            pages.pos.y,
+            pages.size.x,
+            pages.size.y,
+            0.0,
+        );
+    }
+
+    fn refresh_speed_choices(&self, cx: &mut Cx) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let choices = [
+            (ids!(speed_balanced), 0usize),
+            (ids!(speed_low), 1),
+            (ids!(speed_fast), 2),
+            (ids!(speed_save), 3),
+        ];
+        #[cfg(target_arch = "wasm32")]
+        let choices = [
+            (ids!(speed_low), 0usize),
+            (ids!(speed_fast), 1),
+            (ids!(speed_save), 2),
+        ];
+        for (id, mode) in choices {
+            let name = protocol::mode_label(mode);
+            let label = if self.mode == mode {
+                format!("● {name}")
+            } else {
+                name.to_owned()
+            };
+            self.ui.button(cx, id).set_text(cx, &label);
+        }
+        self.ui
+            .label(cx, ids!(speed_hint))
+            .set_text(cx, protocol::mode_hint(self.mode));
+    }
+
+    fn asr_language_raw(&self, cx: &mut Cx) -> String {
+        let custom = self.ui.text_input(cx, ids!(asr_language)).text();
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            return custom.to_string();
+        }
+        if self.language_choice.is_empty() {
+            "自动".to_owned()
+        } else {
+            self.language_choice.clone()
+        }
+    }
+
+    fn refresh_language_choices(&self, cx: &mut Cx) {
+        let raw = self.asr_language_raw(cx);
+        let selected = match protocol::asr_language(&raw) {
+            Ok(None) => Some("自动"),
+            Ok(Some(name)) => match name.as_str() {
+                "Chinese" => Some("中文"),
+                "English" => Some("英文"),
+                "Cantonese" => Some("粤语"),
+                "Japanese" => Some("日语"),
+                "Korean" => Some("韩语"),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let caption = match selected {
+            Some(_) => "语言".to_owned(),
+            None if protocol::asr_language(&raw).is_err() => "语言 · 无法识别".to_owned(),
+            None => format!("语言 · {}", raw.trim()),
+        };
+        self.ui
+            .label(cx, ids!(asr_language_caption))
+            .set_text(cx, &caption);
+        for (id, name) in [
+            (ids!(asr_lang_auto), "自动"),
+            (ids!(asr_lang_zh), "中文"),
+            (ids!(asr_lang_en), "英文"),
+            (ids!(asr_lang_yue), "粤语"),
+            (ids!(asr_lang_ja), "日语"),
+            (ids!(asr_lang_ko), "韩语"),
+        ] {
+            let label = if selected == Some(name) {
+                format!("● {name}")
+            } else {
+                name.to_owned()
+            };
+            self.ui.button(cx, id).set_text(cx, &label);
+        }
     }
 
     fn set_transcript_language(&self, cx: &mut Cx, language: &str) {
@@ -929,8 +1400,29 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn choose_audio(&mut self, cx: &mut Cx) {
+        if self.picking_model || self.picking_audio {
+            return;
+        }
+        let Some(dialog) = self.runtime.dialog("asr") else {
+            return;
+        };
+        self.model_dialog = Some(dialog);
+        self.picking_audio = true;
+        self.busy = true;
+        let current = std::path::PathBuf::from(self.audio_path_value(cx));
+        let mut dialog = FileDialog::new()
+            .set_title("选择要转写的 WAV".into())
+            .add_filter("WAV 音频".into(), vec!["wav".into()]);
+        if let Some(parent) = current.parent().filter(|path| path.is_dir()) {
+            dialog = dialog.set_location(parent.to_owned());
+        }
+        cx.open_select_file_dialog(dialog);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn choose_model(&mut self, cx: &mut Cx) {
-        if self.picking_model {
+        if self.picking_model || self.picking_audio {
             return;
         }
         let Some(dialog) = self.runtime.dialog("asr") else {
@@ -1011,7 +1503,7 @@ impl App {
             "capture" => {
                 if self.microphone && self.busy {
                     let bars = (update.level.clamp(0.0, 1.0).sqrt() * 12.0).round() as usize;
-                    self.ui.label(cx, ids!(input_status)).set_text(
+                    self.show_input_status(
                         cx,
                         &format!(
                             "{} · 已采集 {:.1}s · 待处理 {:.1}s · [{}{}]",
@@ -1051,7 +1543,7 @@ impl App {
                     self.busy = false;
                     self.stopping = false;
                     if self.microphone {
-                        self.ui.label(cx, ids!(input_status)).set_text(
+                        self.show_input_status(
                             cx,
                             &format!("录音已结束 · 已采集 {:.2} s", update.captured_seconds),
                         );
@@ -1088,9 +1580,7 @@ impl App {
                 self.loading = false;
                 self.stopping = false;
                 if self.microphone {
-                    self.ui
-                        .label(cx, ids!(input_status))
-                        .set_text(cx, "麦克风已关闭");
+                    self.show_input_status(cx, "麦克风已关闭");
                 }
                 self.microphone = false;
                 self.status(cx, &format!("错误：{}", update.message));
@@ -1108,10 +1598,10 @@ impl App {
 
     fn command(&mut self, cx: &mut Cx, command: &str) {
         let path = self.ui.text_input(cx, ids!(model_path)).text();
-        let audio = self.ui.text_input(cx, ids!(audio_path)).text();
+        let audio = self.audio_path_value(cx);
         let context = self.ui.text_input(cx, ids!(context)).text();
         let language = if command == "transcribe" || command == "microphone" {
-            match protocol::asr_language(&self.ui.text_input(cx, ids!(asr_language)).text()) {
+            match protocol::asr_language(&self.asr_language_raw(cx)) {
                 Ok(language) => language,
                 Err(error) => {
                     self.busy = false;
@@ -1195,6 +1685,8 @@ impl MatchEvent for App {
             self.ui
                 .view(cx, ids!(asr_translation_group))
                 .set_visible(cx, true);
+            self.ui.view(cx, ids!(app_heading)).set_visible(cx, false);
+            self.ui.view(cx, ids!(nav_group)).set_visible(cx, true);
             self.ui.view(cx, ids!(navigation)).set_visible(cx, true);
             self.ui.label(cx, ids!(app_title)).set_text(cx, "知音");
             self.ui
@@ -1209,24 +1701,19 @@ impl MatchEvent for App {
                 .label(cx, ids!(model_title))
                 .set_text(cx, "转写模型");
             self.ui
-                .label(cx, ids!(audio_title))
-                .set_text(cx, "音频输入");
-            self.ui
                 .label(cx, ids!(transcript_title))
                 .set_text(cx, "转写文字");
-            self.ui.text_input(cx, ids!(audio_path)).set_text(
-                cx,
-                &root
-                    .join("artifacts/Confucius4-R2T2-upstream/resources/test.wav")
-                    .to_string_lossy(),
-            );
+            let sample = root.join("artifacts/Confucius4-R2T2-upstream/resources/test.wav");
+            let sample = std::fs::canonicalize(&sample).unwrap_or(sample);
+            self.set_audio_path_text(cx, &sample.to_string_lossy());
+            self.refresh_audio_file(cx);
+            self.language_choice = "自动".to_owned();
+            self.refresh_language_choices(cx);
+            self.refresh_speed_choices(cx);
             self.engine = Some(engine::Engine::spawn_shared(
                 SignalToUI::set_ui_signal,
                 self.runtime.clone(),
             ));
-            self.ui
-                .button(cx, ids!(speed))
-                .set_text(cx, protocol::mode_label(self.mode));
             self.ui.label(cx, ids!(backend)).set_text(
                 cx,
                 if cfg!(target_os = "macos") {
@@ -1241,18 +1728,23 @@ impl MatchEvent for App {
         {
             self.mode = 1;
             self.ui
-                .button(cx, ids!(speed))
-                .set_text(cx, protocol::mode_label(self.mode));
+                .button(cx, ids!(speed_balanced))
+                .set_visible(cx, false);
             self.ui
                 .text_input(cx, ids!(model_path))
                 .set_text(cx, "/models/web/manifest.json");
-            self.ui
-                .text_input(cx, ids!(audio_path))
-                .set_text(cx, "/artifacts/Confucius4-R2T2-upstream/resources/test.wav");
+            self.set_audio_path_text(cx, "/artifacts/Confucius4-R2T2-upstream/resources/test.wav");
             self.ui
                 .label(cx, ids!(backend))
                 .set_text(cx, "WebGPU · 浏览器推理");
             self.ui.button(cx, ids!(sample)).set_text(cx, "选择音频");
+            self.ui
+                .button(cx, ids!(choose_audio))
+                .set_visible(cx, false);
+            self.refresh_audio_file(cx);
+            self.language_choice = "自动".to_owned();
+            self.refresh_language_choices(cx);
+            self.refresh_speed_choices(cx);
         }
     }
 
@@ -1280,11 +1772,32 @@ impl MatchEvent for App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             for action in actions {
-                if !self.picking_model {
+                if !self.picking_model && !self.picking_audio {
                     continue;
                 }
                 match action.downcast_ref::<FileDialogAction>() {
-                    Some(FileDialogAction::FolderSelected(path)) => {
+                    Some(FileDialogAction::FileSelected { paths, .. }) if self.picking_audio => {
+                        self.model_dialog.take();
+                        self.picking_audio = false;
+                        self.busy = false;
+                        if let Some(path) = paths.first() {
+                            self.set_audio_path_text(cx, &path.to_string_lossy());
+                            self.refresh_audio_file(cx);
+                            self.status(
+                                cx,
+                                &format!(
+                                    "已选择 {} · 可以开始转写",
+                                    self.ui.label(cx, ids!(audio_file)).text()
+                                ),
+                            );
+                        }
+                    }
+                    Some(FileDialogAction::FileCancelled { .. }) if self.picking_audio => {
+                        self.model_dialog.take();
+                        self.picking_audio = false;
+                        self.busy = false;
+                    }
+                    Some(FileDialogAction::FolderSelected(path)) if self.picking_model => {
                         self.model_dialog.take();
                         self.picking_model = false;
                         let directory = model_location::selected_directory(path);
@@ -1300,7 +1813,7 @@ impl MatchEvent for App {
                             self.start_model_load(cx);
                         }
                     }
-                    Some(FileDialogAction::FolderCancelled) => {
+                    Some(FileDialogAction::FolderCancelled) if self.picking_model => {
                         self.model_dialog.take();
                         self.picking_model = false;
                         self.busy = false;
@@ -1313,6 +1826,9 @@ impl MatchEvent for App {
             if !self.workspace.language() {
                 return;
             }
+            if self.ui.button(cx, ids!(choose_audio)).clicked(actions) && !self.busy {
+                self.choose_audio(cx);
+            }
             if self.ui.button(cx, ids!(choose_model)).clicked(actions) && !self.busy {
                 self.choose_model(cx);
             }
@@ -1320,12 +1836,28 @@ impl MatchEvent for App {
                 self.start_model_load(cx);
             }
         }
-        if self.ui.button(cx, ids!(speed)).clicked(actions) && !self.busy {
-            self.mode = (self.mode + 1) % protocol::mode_count();
-            self.ui
-                .button(cx, ids!(speed))
-                .set_text(cx, protocol::mode_label(self.mode));
-            self.status(cx, protocol::mode_hint(self.mode));
+        let speed_choice = [
+            (ids!(speed_balanced), 0usize),
+            (
+                ids!(speed_low),
+                if cfg!(target_arch = "wasm32") { 0 } else { 1 },
+            ),
+            (
+                ids!(speed_fast),
+                if cfg!(target_arch = "wasm32") { 1 } else { 2 },
+            ),
+            (
+                ids!(speed_save),
+                if cfg!(target_arch = "wasm32") { 2 } else { 3 },
+            ),
+        ];
+        for (id, mode) in speed_choice {
+            if self.ui.button(cx, id).clicked(actions) && !self.busy && !self.inference_busy() {
+                if mode < protocol::mode_count() {
+                    self.mode = mode;
+                    self.refresh_speed_choices(cx);
+                }
+            }
         }
         if self.ui.button(cx, ids!(ping)).clicked(actions) {
             self.pings += 1;
@@ -1348,14 +1880,56 @@ impl MatchEvent for App {
             self.command(cx, "stop");
             self.status(cx, "正在打断识别 · 保留已确认文字…");
         }
+        if self
+            .ui
+            .text_input(cx, ids!(audio_path))
+            .changed(actions)
+            .is_some()
+        {
+            self.refresh_audio_file(cx);
+        }
+        if let Some(text) = self.ui.text_input(cx, ids!(asr_language)).changed(actions) {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                self.refresh_language_choices(cx);
+            } else if let Some(choice) = ["自动", "中文", "英文", "粤语", "日语", "韩语"]
+                .into_iter()
+                .find(|choice| *choice == trimmed)
+            {
+                self.language_choice = choice.to_owned();
+                self.ui.text_input(cx, ids!(asr_language)).set_text(cx, "");
+                self.refresh_language_choices(cx);
+            } else {
+                self.refresh_language_choices(cx);
+                if let Err(error) = protocol::asr_language(trimmed) {
+                    self.status(cx, &error);
+                }
+            }
+        }
+        for (id, value) in [
+            (ids!(asr_lang_auto), "自动"),
+            (ids!(asr_lang_zh), "中文"),
+            (ids!(asr_lang_en), "英文"),
+            (ids!(asr_lang_yue), "粤语"),
+            (ids!(asr_lang_ja), "日语"),
+            (ids!(asr_lang_ko), "韩语"),
+        ] {
+            if self.ui.button(cx, id).clicked(actions) && !self.busy && !self.inference_busy() {
+                self.language_choice = value.to_owned();
+                self.ui.text_input(cx, ids!(asr_language)).set_text(cx, "");
+                self.refresh_language_choices(cx);
+            }
+        }
         if self.ui.button(cx, ids!(sample)).clicked(actions) && !self.busy {
             #[cfg(not(target_arch = "wasm32"))]
-            self.ui.text_input(cx, ids!(audio_path)).set_text(
-                cx,
-                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../artifacts/Confucius4-R2T2-upstream/resources/test.wav")
-                    .to_string_lossy(),
-            );
+            {
+                let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../artifacts/Confucius4-R2T2-upstream/resources/test.wav");
+                let sample = std::fs::canonicalize(&sample).unwrap_or(sample);
+                self.set_audio_path_text(cx, &sample.to_string_lossy());
+                self.refresh_audio_file(cx);
+                self.status(cx, "已填入官方示例 · 可以开始转写");
+            }
             #[cfg(target_arch = "wasm32")]
             self.command(cx, "choose");
         }
@@ -1375,9 +1949,7 @@ impl MatchEvent for App {
                 self.status(cx, "请先载入模型");
                 return;
             }
-            if let Err(error) =
-                protocol::asr_language(&self.ui.text_input(cx, ids!(asr_language)).text())
-            {
+            if let Err(error) = protocol::asr_language(&self.asr_language_raw(cx)) {
                 self.status(cx, &error);
                 return;
             }
@@ -1393,9 +1965,7 @@ impl MatchEvent for App {
             && !self.inference_busy()
             && self.ready
         {
-            if let Err(error) =
-                protocol::asr_language(&self.ui.text_input(cx, ids!(asr_language)).text())
-            {
+            if let Err(error) = protocol::asr_language(&self.asr_language_raw(cx)) {
                 self.status(cx, &error);
                 return;
             }
@@ -1405,9 +1975,7 @@ impl MatchEvent for App {
             self.transcript.clear();
             self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
             self.set_transcript_language(cx, "");
-            self.ui
-                .label(cx, ids!(input_status))
-                .set_text(cx, "正在打开默认输入设备…");
+            self.show_input_status(cx, "正在打开默认输入设备…");
             self.status(cx, "正在开启麦克风 · 首次使用请允许录音权限");
             self.command(cx, "microphone");
         }
@@ -1423,6 +1991,17 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if self.timer.is_event(event).is_some() {
             self.ticks += 1;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.settle_asr_clip(cx);
+                if !self.asr_clip_pending() {
+                    cx.stop_timer(self.timer);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.nav_timer.is_event(event).is_some() {
+            self.step_tab_indicator(cx);
         }
         // The pinned Makepad version caches TextInput layout before web fonts
         // arrive. Re-layout the prefilled paths when resource loading completes.
@@ -1454,10 +2033,10 @@ impl AppMain for App {
             if message.id == web_bridge::ToWasmUpdate::live_id() {
                 let message = web_bridge::ToWasmUpdate::read_to_wasm(&mut message.as_ref());
                 match serde_json::from_str::<Update>(&message.json) {
-                    Ok(update) if update.kind == "file" => self
-                        .ui
-                        .text_input(cx, ids!(audio_path))
-                        .set_text(cx, &update.text),
+                    Ok(update) if update.kind == "file" => {
+                        self.set_audio_path_text(cx, &update.text);
+                        self.refresh_audio_file(cx);
+                    }
                     Ok(update) => self.apply_update(cx, update),
                     Err(error) => self.apply_update(
                         cx,
@@ -1474,6 +2053,10 @@ impl AppMain for App {
             self.refresh_workspace_controls(cx);
             if let Event::WindowGeomChange(geometry) = event {
                 self.refresh_workspace_layout(cx, geometry.new_geom.inner_size.x);
+                self.follow_tab_indicator(cx, false);
+            }
+            if self.nav_slide.is_none() {
+                self.follow_tab_indicator(cx, false);
             }
         }
         self.refresh_controls(cx);

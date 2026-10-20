@@ -47,7 +47,7 @@ def main():
     with log_path.open("w") as log:
         process=subprocess.Popen([str(args.binary.resolve()),"--remote"],cwd=ROOT,env=env,stdout=log,stderr=log)
         try:
-            app=startup.App(process,log_path,out);app.ready();app.click("creative_tab");app.click("image_load")
+            app=startup.App(process,log_path,out);app.ready();app.click("creative_tab");app.click("image_generate")
             app.wait(lambda: app.widget("image_generate")["enabled"],240)
             app.click("image_reference_choose")
             app.wait(lambda: "已取消" in app.widget("image_status")["t"],30)

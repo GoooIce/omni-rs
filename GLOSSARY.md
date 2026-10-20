@@ -88,6 +88,10 @@ Time from the start of speech synthesis to the beginning of its first successful
 **Diffusion trajectory**:
 One image request's evolving latent, timestep, conditioning and optional negative-guidance branch. Several trajectories can share DiT projections and MLPs even when their dimensions or timesteps differ; their attention histories remain separate.
 
+**Observation row**:
+One diffusion trajectory inside a denoising observation. The rows share one prompt, seed, canvas and initial noise, and stay in order: official text conditioning, then the fitted MiniCPM-V-4.7-1B conditioning, then the fitted MiniCPM-V-4.7-35B conditioning.
+_Avoid_: a separate image request
+
 **Inference job**:
 One admitted HTTP request with its own progress, result and cancellation handle. Execution returns the result value and any files still to be written; it does not mark the job terminal. The terminal state is published once, after execution releases request resources and any result file is published. A cancellation can retain completed partial output; an execution or publication failure remains an error.
 
