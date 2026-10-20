@@ -11,6 +11,8 @@
 *.pcm
 *.safetensors
 !crates/hy-mt/tests/fixtures/hunyuan/*.safetensors
+!crates/minicpm-v/tests/fixtures/*.safetensors
+!crates/minicpm-v/tests/fixtures/preprocess/*.safetensors
 .DS_Store
 __pycache__/
 /.venv*/
