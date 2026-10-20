@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-// Web keeps its existing presets. Native has an additional balanced preset;
-// labels and help always describe the parameters actually sent to its engine.
+// Wasm still sends this three-mode table as DecodeOptions. Native start numbers
+// live in `transcription_start`. Labels and help stay here and describe the
+// parameters each target actually sends.
+#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct DecodeOptions {
     pub chunk_ms: usize,
@@ -9,15 +11,8 @@ pub struct DecodeOptions {
     pub max_new_tokens: usize,
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn decode_options(mode: usize) -> DecodeOptions {
-    #[cfg(not(target_arch = "wasm32"))]
-    let (chunk_ms, lookahead_ms, max_new_tokens) = match mode {
-        1 => (160, 160, 4),
-        2 => (960, 0, 8),
-        3 => (1280, 0, 12),
-        _ => (320, 160, 8),
-    };
-    #[cfg(target_arch = "wasm32")]
     let (chunk_ms, lookahead_ms, max_new_tokens) = match mode {
         1 => (960, 0, 8),
         2 => (1280, 0, 12),

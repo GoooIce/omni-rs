@@ -651,14 +651,14 @@ impl App {
             } else if command == "microphone" {
                 engine::Command::Microphone {
                     context,
-                    options: protocol::decode_options(self.transcription.mode),
+                    mode: self.transcription.mode,
                     language,
                 }
             } else {
                 engine::Command::Transcribe {
                     path: audio,
                     context,
-                    options: protocol::decode_options(self.transcription.mode),
+                    mode: self.transcription.mode,
                     language,
                 }
             };

@@ -1,15 +1,14 @@
-//! Real-model native ASR runner. Uses the UI's presets, WAV reader and resampler.
+//! Real-model native ASR runner. Uses the desktop start config, WAV reader and resampler.
 //! Usage: asr-regression CASES.json [MODEL_DIR] > events.jsonl
 #[path = "../src/asr.rs"]
 mod asr;
 #[path = "../src/gpu.rs"]
 mod gpu;
 #[allow(dead_code)]
-#[path = "../src/protocol.rs"]
-mod protocol;
-#[allow(dead_code)]
 #[path = "../src/resampler.rs"]
 mod resampler;
+#[path = "../src/transcription_start.rs"]
+mod transcription_start;
 
 use omni_r2t2::{Error, Model, Precision, Session};
 use serde::Deserialize;
@@ -63,11 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for case in corpus.cases {
         assert!(!case.packet_sizes.is_empty() && case.packet_sizes.iter().all(|&n| n > 0));
         let pcm = asr::read_wav(&case.audio)?;
-        let mut config = asr::stream_config(
-            protocol::decode_options(case.mode),
-            String::new(),
+        let mut config = transcription_start::stream_config(
+            case.mode,
             case.microphone,
             Some("Chinese".into()),
+            String::new(),
         );
         if let Some(padding) = case.final_padding_ms {
             config.final_padding_ms = padding;

@@ -42,6 +42,8 @@ mod protocol;
 mod resampler;
 #[cfg(not(target_arch = "wasm32"))]
 mod speech_enhancer;
+#[cfg(not(target_arch = "wasm32"))]
+mod transcription_start;
 mod transcription_ui;
 #[cfg(not(target_arch = "wasm32"))]
 mod translation_engine;

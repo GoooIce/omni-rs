@@ -1,9 +1,10 @@
-use crate::asr::{read_wav, stream_config};
+use crate::asr::read_wav;
 use crate::engine_harness::Failure;
 use crate::engine_harness::{Adapter, Context, Event, Lifecycle};
 use crate::gpu::{self, Backend};
-use crate::protocol::{DecodeOptions, Update};
+use crate::protocol::Update;
 use crate::resampler::NativeResampler;
+use crate::transcription_start::stream_config;
 use omni_r2t2::{Model, Precision, Transcription, TranscriptionEvent};
 use std::{
     path::Path,
@@ -16,12 +17,12 @@ pub enum Command {
     Transcribe {
         path: String,
         context: String,
-        options: DecodeOptions,
+        mode: usize,
         language: Option<String>,
     },
     Microphone {
         context: String,
-        options: DecodeOptions,
+        mode: usize,
         language: Option<String>,
     },
 }
@@ -108,16 +109,13 @@ impl Adapter for Worker {
             Command::Transcribe {
                 path,
                 context,
-                options,
+                mode,
                 language,
             } => {
                 let pcm = read_wav(&path)?;
-                let mut runner = Transcription::new(
-                    model,
-                    stream_config(options, context, false, language),
-                    16000,
-                )
-                .map_err(Failure::from)?;
+                let mut runner =
+                    Transcription::new(model, stream_config(mode, false, language, context), 16000)
+                        .map_err(Failure::from)?;
                 runner.set_stop_handle(stop.clone());
                 for packet in pcm.chunks(320) {
                     if stop.load(Ordering::Acquire) {
@@ -133,15 +131,12 @@ impl Adapter for Worker {
             }
             Command::Microphone {
                 context,
-                options,
+                mode,
                 language,
             } => {
-                let mut runner = Transcription::new(
-                    model,
-                    stream_config(options, context, true, language),
-                    16000,
-                )
-                .map_err(Failure::from)?;
+                let mut runner =
+                    Transcription::new(model, stream_config(mode, true, language, context), 16000)
+                        .map_err(Failure::from)?;
                 runner.set_stop_handle(stop.clone());
                 let microphone =
                     crate::microphone::Microphone::start(stop.clone(), job.updates.clone())?;
