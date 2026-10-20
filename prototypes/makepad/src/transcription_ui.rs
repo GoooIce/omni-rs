@@ -322,7 +322,7 @@ impl App {
         }
         self.ui
             .label(cx, ids!(speed_hint))
-            .set_text(cx, protocol::mode_hint(self.transcription.mode));
+            .set_text(cx, &protocol::mode_hint(self.transcription.mode));
     }
 
     fn asr_language_raw(&self, cx: &mut Cx) -> String {

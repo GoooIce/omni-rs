@@ -47,14 +47,21 @@ impl State {
         self.pending.unwrap_or(self.page)
     }
 
-    /// Ask for another page. The current page stays until `land`. Repeating the
-    /// page the indicator already names does not start a second transition.
+    /// Ask for another page. The page on screen stays until the slide reveals it.
+    /// Repeating the page the indicator already names does not start a second transition.
     pub fn request(&mut self, page: Page) -> bool {
         if self.indicator() == page {
             return false;
         }
         self.pending = Some(page);
         true
+    }
+
+    /// The slide has started. The pending page is current, and it stays pending until `land`.
+    pub fn reveal(&mut self) {
+        if let Some(page) = self.pending {
+            self.page = page;
+        }
     }
 
     pub fn land(&mut self) {
@@ -155,8 +162,9 @@ impl App {
         self.paint_tabs(cx);
     }
 
-    /// Move the dot onto the destination while both pages are still on the track.
+    /// Commit the pending page and move the dot while both pages stay on the track.
     pub fn reveal_pending_page(&mut self, cx: &mut Cx) {
+        self.workspace.reveal();
         if self.workspace.pending().is_none() || self.workspace.dot == self.workspace.indicator() {
             return;
         }
@@ -628,6 +636,11 @@ mod tests {
 
         assert!(workspace.request(Page::Creative));
         assert_eq!(workspace.page(), Page::Language);
+        assert_eq!(workspace.indicator(), Page::Creative);
+        assert_eq!(workspace.pending(), Some(Page::Creative));
+
+        workspace.reveal();
+        assert_eq!(workspace.page(), Page::Creative);
         assert_eq!(workspace.pending(), Some(Page::Creative));
         assert_eq!(workspace.indicator(), Page::Creative);
 
@@ -638,7 +651,16 @@ mod tests {
 
         assert!(workspace.request(Page::Language));
         assert_eq!(workspace.page(), Page::Creative);
-        assert_eq!(workspace.pending(), Some(Page::Language));
         assert_eq!(workspace.indicator(), Page::Language);
+        assert_eq!(workspace.pending(), Some(Page::Language));
+
+        workspace.reveal();
+        assert_eq!(workspace.page(), Page::Language);
+        assert_eq!(workspace.pending(), Some(Page::Language));
+        assert!(workspace.language());
+
+        workspace.land();
+        assert!(workspace.language());
+        assert_eq!(workspace.pending(), None);
     }
 }

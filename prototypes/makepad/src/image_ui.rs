@@ -940,17 +940,13 @@ impl OfficialRow {
 }
 
 struct ObservationBoard {
-    official: OfficialRow,
-    minicpm_1b: OfficialRow,
-    minicpm_35b: OfficialRow,
+    rows: [OfficialRow; 3],
 }
 
 impl ObservationBoard {
     fn new(canvas_width: u32, canvas_height: u32) -> Self {
         Self {
-            official: OfficialRow::new(canvas_width, canvas_height),
-            minicpm_1b: OfficialRow::new(canvas_width, canvas_height),
-            minicpm_35b: OfficialRow::new(canvas_width, canvas_height),
+            rows: std::array::from_fn(|_| OfficialRow::new(canvas_width, canvas_height)),
         }
     }
 
@@ -958,28 +954,28 @@ impl ObservationBoard {
         omni_qwen_image::ObservationRow::order()
     }
 
+    fn slot(row: omni_qwen_image::ObservationRow) -> usize {
+        omni_qwen_image::ObservationRow::order()
+            .iter()
+            .position(|candidate| *candidate == row)
+            .expect("observation row is missing from order()")
+    }
+
     fn rows(&self) -> [&OfficialRow; 3] {
         self.row_order().map(|row| self.stored_row(row))
     }
 
     fn stored_row(&self, row: omni_qwen_image::ObservationRow) -> &OfficialRow {
-        match row {
-            omni_qwen_image::ObservationRow::Official => &self.official,
-            omni_qwen_image::ObservationRow::MiniCpm1b => &self.minicpm_1b,
-            omni_qwen_image::ObservationRow::MiniCpm35b => &self.minicpm_35b,
-        }
+        &self.rows[Self::slot(row)]
     }
 
     fn stored_row_mut(&mut self, row: omni_qwen_image::ObservationRow) -> &mut OfficialRow {
-        match row {
-            omni_qwen_image::ObservationRow::Official => &mut self.official,
-            omni_qwen_image::ObservationRow::MiniCpm1b => &mut self.minicpm_1b,
-            omni_qwen_image::ObservationRow::MiniCpm35b => &mut self.minicpm_35b,
-        }
+        &mut self.rows[Self::slot(row)]
     }
 
     fn canvas(&self) -> (u32, u32) {
-        self.official.canvas()
+        self.stored_row(omni_qwen_image::ObservationRow::Official)
+            .canvas()
     }
 
     fn show(
@@ -1169,14 +1165,7 @@ mod tests {
     #[test]
     fn minicpm_1b_decodes_stay_under_the_official_row() {
         let mut board = ObservationBoard::new(320, 240);
-        assert_eq!(
-            board.row_order(),
-            [
-                ObservationRow::Official,
-                ObservationRow::MiniCpm1b,
-                ObservationRow::MiniCpm35b,
-            ]
-        );
+        assert_eq!(board.row_order(), ObservationRow::order());
         for step in 1..=8 {
             board
                 .show(ObservationRow::Official, step, 320, 240, &paint(step as u8))
@@ -1219,14 +1208,7 @@ mod tests {
     #[test]
     fn minicpm_35b_decodes_stay_under_the_1b_row() {
         let mut board = ObservationBoard::new(320, 240);
-        assert_eq!(
-            board.row_order(),
-            [
-                ObservationRow::Official,
-                ObservationRow::MiniCpm1b,
-                ObservationRow::MiniCpm35b,
-            ]
-        );
+        assert_eq!(board.row_order(), ObservationRow::order());
         for step in 1..=8 {
             board
                 .show(ObservationRow::Official, step, 320, 240, &paint(step as u8))

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-// Wasm still sends this three-mode table as DecodeOptions. Native start numbers
-// live in `transcription_start`. Labels and help stay here and describe the
-// parameters each target actually sends.
+// Wasm still sends this three-mode table as DecodeOptions, and its hints stay
+// beside that table. Native millisecond numbers come from `transcription_start`.
+// Labels and help stay here and describe the parameters each target actually sends.
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct DecodeOptions {
@@ -49,15 +49,19 @@ pub fn mode_count() -> usize {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mode_hint(mode: usize) -> String {
+    let (chunk_ms, lookahead_ms, _) = crate::transcription_start::mode_timing(mode);
+    match mode {
+        1 => format!("低延迟：{chunk_ms} ms 一块，更费算力，下次生效。"),
+        2 => format!("快速：{chunk_ms} ms 一块，下次生效。"),
+        3 => format!("省算力：{chunk_ms} ms 一块，下次生效。"),
+        _ => format!("均衡：{chunk_ms} ms 一块，前瞻 {lookahead_ms} ms，下次生效。"),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn mode_hint(mode: usize) -> &'static str {
-    #[cfg(not(target_arch = "wasm32"))]
-    return match mode {
-        1 => "低延迟：160 ms 一块，更费算力，下次生效。",
-        2 => "快速：960 ms 一块，下次生效。",
-        3 => "省算力：1280 ms 一块，下次生效。",
-        _ => "均衡：320 ms 一块，前瞻 160 ms，下次生效。",
-    };
-    #[cfg(target_arch = "wasm32")]
     match mode {
         1 => "快速模式 · 每 0.96 秒更新，适合浏览器持续录音",
         2 => "省算力模式 · 每 1.28 秒更新，适合较慢的设备",

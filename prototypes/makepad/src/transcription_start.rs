@@ -2,6 +2,16 @@
 //! become the `StreamConfig` the desktop engine runs.
 use omni_r2t2::{StreamConfig, TextPostprocess};
 
+/// Chunk, lookahead and token budget for one desktop mode. Hints read the first two.
+pub(crate) fn mode_timing(mode: usize) -> (usize, usize, usize) {
+    match mode {
+        1 => (160, 160, 4),
+        2 => (960, 0, 8),
+        3 => (1280, 0, 12),
+        _ => (320, 160, 8),
+    }
+}
+
 /// `language: None` lets the model detect the language.
 pub fn stream_config(
     mode: usize,
@@ -9,12 +19,7 @@ pub fn stream_config(
     language: Option<String>,
     context: String,
 ) -> StreamConfig {
-    let (chunk_ms, lookahead_ms, max_new_tokens) = match mode {
-        1 => (160, 160, 4),
-        2 => (960, 0, 8),
-        3 => (1280, 0, 12),
-        _ => (320, 160, 8),
-    };
+    let (chunk_ms, lookahead_ms, max_new_tokens) = mode_timing(mode);
     StreamConfig {
         language,
         context,
@@ -63,6 +68,31 @@ mod tests {
             }
             assert_eq!(file.stable_tail_ms, 0);
             assert_eq!(microphone.stable_tail_ms, 800);
+        }
+    }
+
+    #[test]
+    fn desktop_hints_quote_the_chunk_and_lookahead_used_to_start() {
+        let sentences = [
+            (0, "均衡：320 ms 一块，前瞻 160 ms，下次生效。"),
+            (1, "低延迟：160 ms 一块，更费算力，下次生效。"),
+            (2, "快速：960 ms 一块，下次生效。"),
+            (3, "省算力：1280 ms 一块，下次生效。"),
+            (4, "均衡：320 ms 一块，前瞻 160 ms，下次生效。"),
+        ];
+        for (mode, sentence) in sentences {
+            let config = stream_config(mode, false, None, String::new());
+            assert_eq!(crate::protocol::mode_hint(mode), sentence);
+            assert!(
+                sentence.contains(&format!("{} ms", config.chunk_ms)),
+                "mode {mode}"
+            );
+            if sentence.contains("前瞻") {
+                assert!(
+                    sentence.contains(&format!("前瞻 {} ms", config.lookahead_ms)),
+                    "mode {mode}"
+                );
+            }
         }
     }
 }

@@ -357,8 +357,7 @@ impl DenoisingObservation {
 }
 
 fn aligned_length(official_length: Option<usize>) -> Result<usize> {
-    official_length
-        .ok_or_else(|| Error::Config("官方文本条件的宽度不是 4096，无法对齐投影条件".into()))
+    official_length.ok_or_else(|| Error::Config("官方行还没有产生序列长度".into()))
 }
 
 #[derive(Debug)]
@@ -479,5 +478,46 @@ impl ObservationRequest {
 
     pub fn guidance_enabled(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn observation() -> DenoisingObservation {
+        let options = Options {
+            prompt: "一只茶壶".into(),
+            width: 512,
+            height: 512,
+            seed: 7,
+            observation: true,
+            ..Options::default()
+        };
+        DenoisingObservation::begin(
+            ObservationRequest::accept(&options).unwrap(),
+            DEFAULT_TURBO_STEPS,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fitted_rows_wait_until_the_official_row_has_a_sequence_length() {
+        let observation = observation();
+        assert!(
+            observation
+                .row_condition(ObservationRow::Official, "一只茶壶", None, Path::new("."))
+                .is_ok()
+        );
+        for row in [ObservationRow::MiniCpm1b, ObservationRow::MiniCpm35b] {
+            let Err(error) = observation.row_condition(row, "一只茶壶", None, Path::new("."))
+            else {
+                panic!("fitted row aligned before the official row had a sequence length");
+            };
+            let message = error.to_string();
+            assert!(message.contains("官方行还没有产生序列长度"), "{message}");
+            assert!(!message.contains("宽度不是 4096"), "{message}");
+        }
     }
 }
