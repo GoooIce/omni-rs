@@ -252,7 +252,7 @@ impl App {
         let Some(t) = self.tts.as_mut() else {
             return;
         };
-        if t.picking || self.picking_model {
+        if t.picking || self.transcription.choosing_model() {
             return;
         }
         let Some(dialog) = self.runtime.dialog("tts") else {

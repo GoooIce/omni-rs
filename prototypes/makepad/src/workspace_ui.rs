@@ -2,11 +2,18 @@ use crate::ActionButtonState;
 use crate::App;
 use makepad_widgets::*;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum Page {
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
     #[default]
     Language,
     Creative,
+}
+
+struct Slide {
+    from_x: f64,
+    from_w: f64,
+    started: std::time::Instant,
+    to_creative: bool,
 }
 
 #[derive(Default)]
@@ -19,9 +26,43 @@ pub struct State {
     music_details: bool,
     transcript_height: f64,
     clip_passes: u8,
+    nav_timer: Timer,
+    slide: Option<Slide>,
+    nav_placed: bool,
+    dot: Page,
 }
 
 impl State {
+    pub fn page(&self) -> Page {
+        self.page
+    }
+
+    pub fn pending(&self) -> Option<Page> {
+        self.pending
+    }
+
+    /// The tab the indicator is traveling toward. A pending page wins over the
+    /// page still on screen, so the dot can leave before the transition lands.
+    pub fn indicator(&self) -> Page {
+        self.pending.unwrap_or(self.page)
+    }
+
+    /// Ask for another page. The current page stays until `land`. Repeating the
+    /// page the indicator already names does not start a second transition.
+    pub fn request(&mut self, page: Page) -> bool {
+        if self.indicator() == page {
+            return false;
+        }
+        self.pending = Some(page);
+        true
+    }
+
+    pub fn land(&mut self) {
+        if let Some(page) = self.pending.take() {
+            self.page = page;
+        }
+    }
+
     pub fn language(&self) -> bool {
         self.page == Page::Language
     }
@@ -31,11 +72,7 @@ impl State {
     }
 
     pub fn indicator_language(&self) -> bool {
-        match self.pending {
-            Some(Page::Language) => true,
-            Some(Page::Creative) => false,
-            None => self.page == Page::Language,
-        }
+        self.indicator() == Page::Language
     }
 }
 
@@ -81,7 +118,7 @@ impl App {
     pub fn refresh_workspace_controls(&self, cx: &mut Cx) {
         self.ui
             .button(cx, ids!(asr_to_tts))
-            .set_action_enabled(cx, !self.transcript.is_empty());
+            .set_action_enabled(cx, !self.transcription.transcript().is_empty());
         self.ui
             .button(cx, ids!(asr_translation_to_tts))
             .set_action_enabled(
@@ -94,8 +131,18 @@ impl App {
             );
     }
 
-    fn show_page(&mut self, cx: &mut Cx, page: Page) {
-        self.workspace.page = page;
+    fn paint_tabs(&mut self, cx: &mut Cx) {
+        let language = self.workspace.indicator_language();
+        self.workspace.dot = self.workspace.indicator();
+        self.ui
+            .button(cx, ids!(language_tab))
+            .set_text(cx, if language { "● 语言" } else { "语言" });
+        self.ui
+            .button(cx, ids!(creative_tab))
+            .set_text(cx, if language { "创作" } else { "● 创作" });
+    }
+
+    fn show_settled_page(&mut self, cx: &mut Cx) {
         self.ui
             .view(cx, ids!(language_page))
             .set_visible(cx, self.workspace.language());
@@ -105,56 +152,23 @@ impl App {
         self.ui
             .view(cx, ids!(pages))
             .set_scroll_pos(cx, Vec2d::default());
-        self.ui.button(cx, ids!(language_tab)).set_text(
-            cx,
-            if self.workspace.language() {
-                "● 语言"
-            } else {
-                "语言"
-            },
-        );
-        self.ui.button(cx, ids!(creative_tab)).set_text(
-            cx,
-            if self.workspace.creative() {
-                "● 创作"
-            } else {
-                "创作"
-            },
-        );
+        self.paint_tabs(cx);
     }
 
     /// Move the dot onto the destination while both pages are still on the track.
     pub fn reveal_pending_page(&mut self, cx: &mut Cx) {
-        let Some(page) = self.workspace.pending else {
-            return;
-        };
-        if self.workspace.page == page {
+        if self.workspace.pending().is_none() || self.workspace.dot == self.workspace.indicator() {
             return;
         }
-        self.workspace.page = page;
-        self.ui.button(cx, ids!(language_tab)).set_text(
-            cx,
-            if self.workspace.language() {
-                "● 语言"
-            } else {
-                "语言"
-            },
-        );
-        self.ui.button(cx, ids!(creative_tab)).set_text(
-            cx,
-            if self.workspace.creative() {
-                "● 创作"
-            } else {
-                "创作"
-            },
-        );
+        self.paint_tabs(cx);
     }
 
     pub fn apply_pending_page(&mut self, cx: &mut Cx) {
-        let Some(page) = self.workspace.pending.take() else {
+        if self.workspace.pending().is_none() {
             return;
-        };
-        self.show_page(cx, page);
+        }
+        self.workspace.land();
+        self.show_settled_page(cx);
         self.rest_page_track(cx);
         self.follow_tab_indicator(cx, false);
     }
@@ -168,11 +182,8 @@ impl App {
             None
         };
         if let Some(page) = page {
-            if self.workspace.page != page && self.workspace.pending != Some(page) {
-                self.workspace.pending = Some(page);
-                if !self.follow_tab_indicator(cx, true) {
-                    self.apply_pending_page(cx);
-                }
+            if self.workspace.request(page) && !self.follow_tab_indicator(cx, true) {
+                self.apply_pending_page(cx);
             }
         }
 
@@ -236,7 +247,10 @@ impl App {
 
         if self.workspace.language() {
             let transfer = if self.ui.button(cx, ids!(asr_to_tts)).clicked(actions) {
-                Some((self.transcript.clone(), "已填入转写文字 · 可编辑后朗读"))
+                Some((
+                    self.transcription.transcript().to_owned(),
+                    "已填入转写文字 · 可编辑后朗读",
+                ))
             } else if self
                 .ui
                 .button(cx, ids!(asr_translation_to_tts))
@@ -373,5 +387,258 @@ impl App {
             }
             self.workspace.clip_passes = self.workspace.clip_passes.max(1);
         }
+    }
+
+    pub fn step_workspace_slide(&mut self, cx: &mut Cx, event: &Event) {
+        if self.workspace.nav_timer.is_event(event).is_some() {
+            self.step_tab_indicator(cx);
+        }
+    }
+
+    pub fn place_workspace_indicator(&mut self, cx: &mut Cx, event: &Event) {
+        if let Event::WindowGeomChange(geometry) = event {
+            self.refresh_workspace_layout(cx, geometry.new_geom.inner_size.x);
+            self.follow_tab_indicator(cx, false);
+        }
+        if self.workspace.slide.is_none() {
+            self.follow_tab_indicator(cx, false);
+        }
+    }
+
+    fn tab_indicator_target(&self, cx: &mut Cx) -> Option<(f64, f64)> {
+        let nav = self.ui.widget(cx, ids!(navigation)).area().rect(cx);
+        let id = if self.workspace.indicator_language() {
+            ids!(language_tab)
+        } else {
+            ids!(creative_tab)
+        };
+        let tab = self.ui.widget(cx, id).area().rect(cx);
+        if nav.size.x < 1.0 || tab.size.x < 1.0 {
+            return None;
+        }
+        Some(((tab.pos.x - nav.pos.x).max(0.0), tab.size.x))
+    }
+
+    fn place_tab_indicator(&self, cx: &mut Cx, x: f64, width: f64) {
+        if let Some(mut view) = self.ui.view(cx, ids!(tab_indicator)).borrow_mut() {
+            view.walk.margin.left = x;
+            view.walk.width = Size::Fixed(width.max(28.0));
+            view.redraw(cx);
+        }
+    }
+
+    fn follow_tab_indicator(&mut self, cx: &mut Cx, animate: bool) -> bool {
+        let Some((x, width)) = self.tab_indicator_target(cx) else {
+            return false;
+        };
+        let current = self
+            .ui
+            .view(cx, ids!(tab_indicator))
+            .borrow()
+            .map(|view| {
+                let width = match view.walk.width {
+                    Size::Fixed(width) => width,
+                    _ => 48.0,
+                };
+                (view.walk.margin.left, width)
+            })
+            .unwrap_or((0.0, 48.0));
+        if animate && self.workspace.nav_placed {
+            self.workspace.slide = Some(Slide {
+                from_x: current.0,
+                from_w: current.1,
+                started: std::time::Instant::now(),
+                to_creative: !self.workspace.indicator_language(),
+            });
+            self.workspace.nav_timer = cx.start_interval(1.0 / 60.0);
+            return true;
+        }
+        if self.workspace.nav_placed
+            && (current.0 - x).abs() < 0.5
+            && (current.1 - width).abs() < 0.5
+        {
+            return false;
+        }
+        self.place_tab_indicator(cx, x, width);
+        self.workspace.nav_placed = true;
+        false
+    }
+
+    fn step_tab_indicator(&mut self, cx: &mut Cx) {
+        let Some(slide) = &self.workspace.slide else {
+            cx.stop_timer(self.workspace.nav_timer);
+            return;
+        };
+        let started = slide.started;
+        let from_x = slide.from_x;
+        let from_w = slide.from_w;
+        let to_creative = slide.to_creative;
+        let Some((x, width)) = self.tab_indicator_target(cx) else {
+            return;
+        };
+        let t = (started.elapsed().as_secs_f64() / 0.28).clamp(0.0, 1.0);
+        let page_eased = 1.0 - (1.0 - t) * (1.0 - t);
+        let line_eased = (page_eased * 1.7).min(1.0);
+        self.place_tab_indicator(
+            cx,
+            from_x + (x - from_x) * line_eased,
+            from_w + (width - from_w) * line_eased,
+        );
+        self.slide_pages(cx, page_eased, to_creative);
+        if t > 0.0 {
+            self.reveal_pending_page(cx);
+        }
+        if t >= 1.0 {
+            self.workspace.slide = None;
+            cx.stop_timer(self.workspace.nav_timer);
+            self.apply_pending_page(cx);
+        }
+    }
+
+    fn slide_pages(&mut self, cx: &mut Cx, eased: f64, to_creative: bool) {
+        let pages = self.ui.widget(cx, ids!(pages)).area().rect(cx);
+        let width = pages.size.x;
+        if width < 40.0 {
+            return;
+        }
+        let shift = if to_creative {
+            -width * eased
+        } else {
+            -width * (1.0 - eased)
+        };
+        self.ui.view(cx, ids!(language_page)).set_visible(cx, true);
+        self.ui.view(cx, ids!(creative_page)).set_visible(cx, true);
+        for id in [ids!(language_page), ids!(creative_page)] {
+            if let Some(mut view) = self.ui.view(cx, id).borrow_mut() {
+                view.walk.width = Size::Fixed(width);
+                view.redraw(cx);
+            }
+        }
+        if let Some(mut track) = self.ui.view(cx, ids!(page_track)).borrow_mut() {
+            track.walk.width = Size::Fixed(width * 2.0);
+            track.walk.margin.left = shift;
+            track.redraw(cx);
+        }
+        self.place_slide_lips(
+            cx,
+            true,
+            pages.pos.x,
+            pages.pos.y,
+            width,
+            pages.size.y,
+            shift,
+        );
+    }
+
+    fn place_slide_lips(
+        &mut self,
+        cx: &mut Cx,
+        show: bool,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        shift: f64,
+    ) {
+        let mut slivers: Vec<(f64, f64)> = Vec::new();
+        if show {
+            let gap = 14.0;
+            let wide = (width - gap) * 170.0 / 270.0;
+            let narrow = width - gap - wide;
+            let view_left = x;
+            let view_right = x + width;
+            let lang_x = x + shift;
+            let crea_x = lang_x + width;
+            for (card_x, card_w) in [
+                (lang_x, wide),
+                (lang_x + wide + gap, narrow),
+                (crea_x, narrow),
+                (crea_x + narrow + gap, wide),
+            ] {
+                let card_right = card_x + card_w;
+                let overlaps = card_right > view_left + 1.0 && card_x < view_right - 1.0;
+                let full = card_x >= view_left - 1.0 && card_right <= view_right + 1.0;
+                if overlaps && !full {
+                    let left = card_x.max(view_left);
+                    let right = card_right.min(view_right);
+                    if right - left > 1.0 {
+                        slivers.push((left, right));
+                    }
+                }
+            }
+        }
+        slivers.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let slots = [ids!(slide_lip_left), ids!(slide_lip_right)];
+        for (index, id) in slots.into_iter().enumerate() {
+            let sliver = if index == 0 {
+                slivers.first()
+            } else {
+                slivers.get(slivers.len().saturating_sub(1))
+            };
+            let distinct = index == 0 || slivers.len() > 1;
+            self.ui
+                .view(cx, id)
+                .set_visible(cx, sliver.is_some() && distinct);
+            if let Some((left, right)) = sliver.filter(|_| distinct) {
+                if let Some(mut view) = self.ui.view(cx, id).borrow_mut() {
+                    view.walk.abs_pos = Some(dvec2(*left, y));
+                    view.walk.width = Size::Fixed((*right - *left).max(1.0));
+                    view.walk.height = Size::Fixed(height.max(200.0));
+                    view.redraw(cx);
+                }
+            }
+        }
+    }
+
+    fn rest_page_track(&mut self, cx: &mut Cx) {
+        for id in [ids!(language_page), ids!(creative_page)] {
+            if let Some(mut view) = self.ui.view(cx, id).borrow_mut() {
+                view.walk.width = Size::fill();
+                view.redraw(cx);
+            }
+        }
+        if let Some(mut track) = self.ui.view(cx, ids!(page_track)).borrow_mut() {
+            track.walk.width = Size::fill();
+            track.walk.margin.left = 0.0;
+            track.redraw(cx);
+        }
+        let pages = self.ui.widget(cx, ids!(pages)).area().rect(cx);
+        self.place_slide_lips(
+            cx,
+            false,
+            pages.pos.x,
+            pages.pos.y,
+            pages.size.x,
+            pages.size.y,
+            0.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indicator_points_at_the_requested_page_while_that_page_is_still_pending() {
+        let mut workspace = State::default();
+        assert_eq!(workspace.page(), Page::Language);
+        assert_eq!(workspace.pending(), None);
+        assert_eq!(workspace.indicator(), Page::Language);
+
+        assert!(workspace.request(Page::Creative));
+        assert_eq!(workspace.page(), Page::Language);
+        assert_eq!(workspace.pending(), Some(Page::Creative));
+        assert_eq!(workspace.indicator(), Page::Creative);
+
+        workspace.land();
+        assert_eq!(workspace.page(), Page::Creative);
+        assert_eq!(workspace.pending(), None);
+        assert_eq!(workspace.indicator(), Page::Creative);
+
+        assert!(workspace.request(Page::Language));
+        assert_eq!(workspace.page(), Page::Creative);
+        assert_eq!(workspace.pending(), Some(Page::Language));
+        assert_eq!(workspace.indicator(), Page::Language);
     }
 }

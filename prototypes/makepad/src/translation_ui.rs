@@ -101,9 +101,10 @@ impl App {
                 "翻译上面的转写 · 模型尚未载入"
             },
         );
-        self.ui
-            .button(cx, ids!(asr_translate))
-            .set_action_enabled(cx, idle && (!state.ready || !self.transcript.is_empty()));
+        self.ui.button(cx, ids!(asr_translate)).set_action_enabled(
+            cx,
+            idle && (!state.ready || !self.transcription.transcript().is_empty()),
+        );
         self.ui
             .button(cx, ids!(tts_translate))
             .set_action_enabled(cx, idle);
@@ -280,7 +281,7 @@ impl App {
             return;
         };
         let text = if origin == 0 {
-            self.transcript.clone()
+            self.transcription.transcript().to_owned()
         } else {
             self.ui.text_input(cx, ids!(tts_text)).text()
         };
