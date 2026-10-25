@@ -13,10 +13,10 @@
 //! packed `[hidden, E * inter]` (row-major, group 128, u32 words with f32
 //! scales appended), exactly the tensors [`crate::quant`] concatenates for
 //! [`crate::moe::SparseMoeBlock`].
+use crate::metal_bridge::{alloc_f32, borrowable, cube_float, cube_int, take_as};
 use burn::tensor::{DType, Shape, Tensor as BurnTensor, TensorPrimitive, backend::Backend};
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::{prelude::*, wgpu::WgpuRuntime};
-use std::mem::{forget, size_of};
 
 const LANES: u32 = 64;
 
@@ -284,9 +284,7 @@ pub(crate) fn try_dense_moe<B: Backend>(
     dense: &crate::moe::DenseExperts<B>,
 ) -> Option<BurnTensor<B, 2>> {
     use burn::backend::wgpu::Metal;
-    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 2>>() != size_of::<BurnTensor<Metal, 2>>()
-    {
+    if !borrowable::<B, 2>() {
         return None;
     }
     let (m, hidden) = (x.dims()[0], x.dims()[1]);
@@ -295,15 +293,15 @@ pub(crate) fn try_dense_moe<B: Backend>(
         return None;
     }
 
-    let router_w = cube_float2d(dense.router.clone())?;
-    let gate_vec = cube_float2d(dense.shared_gate_vec.clone())?;
+    let router_w = cube_float(dense.router.clone())?;
+    let gate_vec = cube_float(dense.shared_gate_vec.clone())?;
     let x: BurnTensor<Metal, 2> = unsafe { take_as(x) };
     // The kernels read FP32; the model keeps activations in its device dtype.
     let x_row = cube_float(x.clone().cast(burn::tensor::FloatDType::F32))?;
     let client = x_row.client.clone();
     let device = x_row.device.clone();
-    let weights = alloc_f32_2d(&client, &device, [m, experts]);
-    let shared_gate = alloc_f32_2d(&client, &device, [m, 1]);
+    let weights = alloc_f32(&client, &device, [m, experts]);
+    let shared_gate = alloc_f32(&client, &device, [m, 1]);
     let (m_len, hidden, experts) = (m as u32, hidden as u32, experts as u32);
     unsafe {
         moe_router::launch_unchecked::<WgpuRuntime>(
@@ -341,9 +339,7 @@ pub(crate) fn try_dense_experts<B: Backend>(
     shared_gate: BurnTensor<B, 2>,
 ) -> Option<BurnTensor<B, 2>> {
     use burn::backend::wgpu::Metal;
-    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 2>>() != size_of::<BurnTensor<Metal, 2>>()
-    {
+    if !borrowable::<B, 2>() {
         return None;
     }
     let (m, hidden) = (x.dims()[0], x.dims()[1]);
@@ -358,25 +354,25 @@ pub(crate) fn try_dense_experts<B: Backend>(
     {
         return None;
     }
-    let gate_words = cube_int(dense.gate_words.clone())?;
-    let gate_scales = cube_f32_1d(dense.gate_scales.clone())?;
-    let up_words = cube_int(dense.up_words.clone())?;
-    let up_scales = cube_f32_1d(dense.up_scales.clone())?;
-    let down_words = cube_int(dense.down_words.clone())?;
-    let down_scales = cube_f32_1d(dense.down_scales.clone())?;
-    let shared_gate_w = cube_float2d(dense.shared_gate_w.clone())?;
-    let shared_up_w = cube_float2d(dense.shared_up_w.clone())?;
-    let shared_down_w = cube_float2d(dense.shared_down_w.clone())?;
+    let gate_words = cube_int(dense.gate_words.clone());
+    let gate_scales = cube_float(dense.gate_scales.clone())?;
+    let up_words = cube_int(dense.up_words.clone());
+    let up_scales = cube_float(dense.up_scales.clone())?;
+    let down_words = cube_int(dense.down_words.clone());
+    let down_scales = cube_float(dense.down_scales.clone())?;
+    let shared_gate_w = cube_float(dense.shared_gate_w.clone())?;
+    let shared_up_w = cube_float(dense.shared_up_w.clone())?;
+    let shared_down_w = cube_float(dense.shared_down_w.clone())?;
     let x: BurnTensor<Metal, 2> = unsafe { take_as(x) };
     // The kernels read FP32; the model keeps activations in its device dtype.
     let x_f32 = x.cast(burn::tensor::FloatDType::F32);
     let x_row = cube_float(x_f32)?;
-    let weights = cube_float2d(weights)?;
-    let shared_gate = cube_float2d(shared_gate)?;
+    let weights = cube_float(weights)?;
+    let shared_gate = cube_float(shared_gate)?;
     let client = x_row.client.clone();
     let device = x_row.device.clone();
-    let act = alloc_f32(&client, &device, m * experts * inter);
-    let act_shared = alloc_f32(&client, &device, m * shared_inter);
+    let act = alloc_f32(&client, &device, [m * experts * inter]);
+    let act_shared = alloc_f32(&client, &device, [m * shared_inter]);
     let masks = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
@@ -465,9 +461,7 @@ pub(crate) fn try_dense_router<B: Backend>(
     top_k: usize,
 ) -> Option<(BurnTensor<B, 2>, BurnTensor<B, 2>)> {
     use burn::backend::wgpu::Metal;
-    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 2>>() != size_of::<BurnTensor<Metal, 2>>()
-    {
+    if !borrowable::<B, 2>() {
         return None;
     }
     let (m, hidden) = (x.dims()[0], x.dims()[1]);
@@ -475,14 +469,14 @@ pub(crate) fn try_dense_router<B: Backend>(
     if m == 0 || experts > 1024 || top_k > experts || hidden == 0 {
         return None;
     }
-    let router_w = cube_float2d(router.clone())?;
-    let gate_vec = cube_float2d(gate_vec.clone())?;
+    let router_w = cube_float(router.clone())?;
+    let gate_vec = cube_float(gate_vec.clone())?;
     let x: BurnTensor<Metal, 2> = unsafe { take_as(x) };
     let x_row = cube_float(x.clone().cast(burn::tensor::FloatDType::F32))?;
     let client = x_row.client.clone();
     let device = x_row.device.clone();
-    let weights = alloc_f32_2d(&client, &device, [m, experts]);
-    let shared_gate = alloc_f32_2d(&client, &device, [m, 1]);
+    let weights = alloc_f32(&client, &device, [m, experts]);
+    let shared_gate = alloc_f32(&client, &device, [m, 1]);
     let (m_len, hidden, experts) = (m as u32, hidden as u32, experts as u32);
     unsafe {
         moe_router::launch_unchecked::<WgpuRuntime>(
@@ -502,82 +496,6 @@ pub(crate) fn try_dense_router<B: Backend>(
     let weights = BurnTensor::<Metal, 2>::from_primitive(TensorPrimitive::Float(weights));
     let shared_gate = BurnTensor::<Metal, 2>::from_primitive(TensorPrimitive::Float(shared_gate));
     Some((unsafe { take_as(weights) }, unsafe { take_as(shared_gate) }))
-}
-
-fn cube_int<B: Backend>(
-    tensor: BurnTensor<B, 1, burn::tensor::Int>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    use burn::backend::wgpu::Metal;
-    let tensor: BurnTensor<Metal, 1, burn::tensor::Int> = unsafe { take_as(tensor) };
-    Some(burn_cubecl::kernel::into_contiguous(
-        tensor.into_primitive(),
-    ))
-}
-
-fn cube_f32_1d<B: Backend>(tensor: BurnTensor<B, 1>) -> Option<CubeTensor<WgpuRuntime>> {
-    use burn::backend::wgpu::Metal;
-    let tensor: BurnTensor<Metal, 1> = unsafe { take_as(tensor) };
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn cube_float2d<B: Backend>(tensor: BurnTensor<B, 2>) -> Option<CubeTensor<WgpuRuntime>> {
-    use burn::backend::wgpu::Metal;
-    let tensor: BurnTensor<Metal, 2> = unsafe { take_as(tensor) };
-    cube_float(tensor)
-}
-
-fn cube_float(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 2>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn alloc_f32(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
-    device: &cubecl::wgpu::WgpuDevice,
-    values: usize,
-) -> CubeTensor<WgpuRuntime> {
-    CubeTensor::new_contiguous(
-        client.clone(),
-        device.clone(),
-        Shape::from([values]),
-        client.empty(values * size_of::<f32>()),
-        DType::F32,
-    )
-}
-
-/// Outputs that leave the raw world through [`crate::cube_bridge::wrap`] must
-/// carry their true rank: the fusion stream analyzes shapes and strides, and a
-/// flat `[values]` shape under a rank-2 burn tensor corrupts its traces.
-fn alloc_f32_2d(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
-    device: &cubecl::wgpu::WgpuDevice,
-    shape: [usize; 2],
-) -> CubeTensor<WgpuRuntime> {
-    let values = shape[0] * shape[1];
-    CubeTensor::new_contiguous(
-        client.clone(),
-        device.clone(),
-        Shape::from(shape),
-        client.empty(values * size_of::<f32>()),
-        DType::F32,
-    )
-}
-
-/// # Safety
-/// `T` and `U` are the same type: the caller checked `TypeId` and size.
-unsafe fn take_as<T, U>(value: T) -> U {
-    let out = unsafe { std::ptr::read((&value) as *const T as *const U) };
-    forget(value);
-    out
 }
 
 #[cfg(test)]

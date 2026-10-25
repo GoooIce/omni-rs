@@ -13,6 +13,8 @@ pub mod image;
 pub mod latent;
 #[cfg(feature = "metal")]
 pub(crate) mod markov;
+#[cfg(feature = "metal")]
+pub(crate) mod metal_bridge;
 pub mod model;
 pub mod moe;
 #[cfg(feature = "metal")]

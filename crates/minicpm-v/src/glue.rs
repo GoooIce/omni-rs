@@ -11,12 +11,11 @@
 //! them for A/B). The kernels reproduce `Norm::forward` / `shared::rope` /
 //! `shared::residual` arithmetic with f16 in/out and f32 math.
 
+use crate::metal_bridge::take_as;
 use burn::tensor::{DType, Shape, Tensor as BurnTensor, TensorPrimitive, backend::Backend};
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::{prelude::*, wgpu::WgpuRuntime};
 use half::f16;
-use std::any::TypeId;
-use std::mem::{forget, size_of};
 
 const LANES: u32 = 64;
 
@@ -131,9 +130,7 @@ fn norm_launch<B: Backend>(
     plus_one: bool,
 ) -> Option<BurnTensor<B, 2>> {
     use burn::backend::wgpu::Metal;
-    if TypeId::of::<B>() != TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 2>>() != size_of::<BurnTensor<Metal, 2>>()
-    {
+    if !crate::metal_bridge::borrowable::<B, 2>() {
         return None;
     }
     let [m, hidden] = x.dims();
@@ -142,8 +139,8 @@ fn norm_launch<B: Backend>(
     }
     let x: BurnTensor<Metal, 2> = unsafe { take_as(x) };
     let weight: BurnTensor<Metal, 2> = unsafe { take_as(weight.clone().unsqueeze_dim::<2>(0)) };
-    let x = cube_tensor(x)?;
-    let weight = cube_tensor(weight)?;
+    let x = crate::metal_bridge::cube_float(x)?;
+    let weight = crate::metal_bridge::cube_float(weight)?;
     let client = x.client.clone();
     let device = x.device.clone();
     let out = CubeTensor::new_contiguous(
@@ -200,9 +197,7 @@ fn residual_launch<B: Backend>(
     y: BurnTensor<B, 2>,
 ) -> Option<BurnTensor<B, 2>> {
     use burn::backend::wgpu::Metal;
-    if TypeId::of::<B>() != TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 2>>() != size_of::<BurnTensor<Metal, 2>>()
-    {
+    if !crate::metal_bridge::borrowable::<B, 2>() {
         return None;
     }
     let [m, hidden] = x.dims();
@@ -212,8 +207,8 @@ fn residual_launch<B: Backend>(
     }
     let x: BurnTensor<Metal, 2> = unsafe { take_as(x) };
     let y: BurnTensor<Metal, 2> = unsafe { take_as(y) };
-    let x = cube_tensor(x)?;
-    let y = cube_tensor(y)?;
+    let x = crate::metal_bridge::cube_float(x)?;
+    let y = crate::metal_bridge::cube_float(y)?;
     let client = x.client.clone();
     let device = x.device.clone();
     let out = CubeTensor::new_contiguous(
@@ -270,9 +265,7 @@ pub(crate) fn rope_metal<B: Backend>(
     sin: &BurnTensor<B, 4>,
 ) -> Option<BurnTensor<B, 4>> {
     use burn::backend::wgpu::Metal;
-    if TypeId::of::<B>() != TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 4>>() != size_of::<BurnTensor<Metal, 4>>()
-    {
+    if !crate::metal_bridge::borrowable::<B, 4>() {
         return None;
     }
     let [batch, heads, tokens, width] = x.dims();
@@ -290,9 +283,9 @@ pub(crate) fn rope_metal<B: Backend>(
     let x: BurnTensor<Metal, 4> = unsafe { take_as(x) };
     let cos: BurnTensor<Metal, 4> = unsafe { take_as(cos.clone()) };
     let sin: BurnTensor<Metal, 4> = unsafe { take_as(sin.clone()) };
-    let x = cube_tensor4(x)?;
-    let cos = cube_tensor4(cos)?;
-    let sin = cube_tensor4(sin)?;
+    let x = crate::metal_bridge::cube_float(x)?;
+    let cos = crate::metal_bridge::cube_float(cos)?;
+    let sin = crate::metal_bridge::cube_float(sin)?;
     let client = x.client.clone();
     let device = x.device.clone();
     let values = heads * tokens * width;
@@ -318,34 +311,6 @@ pub(crate) fn rope_metal<B: Backend>(
     }
     let out = BurnTensor::<Metal, 4>::from_primitive(TensorPrimitive::Float(out));
     Some(unsafe { take_as(out) })
-}
-
-fn cube_tensor(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 2>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn cube_tensor4(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 4>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-/// # Safety
-/// `T` and `U` are the same type: the caller checked `TypeId` and size.
-pub(crate) unsafe fn take_as<T, U>(value: T) -> U {
-    let out = unsafe { std::ptr::read((&value) as *const T as *const U) };
-    forget(value);
-    out
 }
 
 #[cfg(test)]

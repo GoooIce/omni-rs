@@ -160,7 +160,7 @@ impl TreeSpec {
     /// an ancestor of `i`.
     pub fn ancestor_mask(&self) -> Vec<bool> {
         let m = self.parent.len();
-        let is_ancestor = |mut node: usize, mut other: usize| {
+        let is_ancestor = |mut node: usize, other: usize| {
             // `other` is an ancestor-or-self of `node` iff walking parents
             // from `node` reaches it; depths bound the walk.
             while self.depth[other] <= self.depth[node] {

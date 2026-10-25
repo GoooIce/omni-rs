@@ -2,10 +2,10 @@
 //!
 //! The host loop issues a kernel per token per tensor op. This kernel keeps
 //! that FP32 update order and writes each token's state for a later rollback.
-use burn::tensor::{DType, Shape, Tensor as BurnTensor, TensorPrimitive, backend::Backend};
+use crate::metal_bridge::take_as;
+use burn::tensor::{DType, Tensor as BurnTensor, TensorPrimitive, backend::Backend};
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::{prelude::*, wgpu::WgpuRuntime};
-use std::mem::{forget, size_of};
 
 #[cube(launch_unchecked)]
 fn gdn_scan_kernel(
@@ -159,9 +159,7 @@ pub(crate) fn try_scan<B: Backend>(
     record: bool,
 ) -> Option<(BurnTensor<B, 4>, BurnTensor<B, 4>, Vec<BurnTensor<B, 4>>)> {
     use burn::backend::wgpu::Metal;
-    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 4>>() != size_of::<BurnTensor<Metal, 4>>()
-    {
+    if !crate::metal_bridge::borrowable::<B, 4>() {
         return None;
     }
     let q: BurnTensor<Metal, 4> = unsafe { take_as(q) };
@@ -179,14 +177,6 @@ pub(crate) fn try_scan<B: Backend>(
             .map(|step| unsafe { take_as(step) })
             .collect(),
     ))
-}
-
-/// # Safety
-/// `T` and `U` are the same type: the caller checked `TypeId` and size.
-unsafe fn take_as<T, U>(value: T) -> U {
-    let out = unsafe { std::ptr::read((&value) as *const T as *const U) };
-    forget(value);
-    out
 }
 
 fn scan_metal(
@@ -234,20 +224,20 @@ fn scan_metal(
     let state_device = state.device();
     let state = state + BurnTensor::zeros(state_shape, &state_device);
     let g = g.exp();
-    let q = cube(q)?;
-    let k = cube(k)?;
-    let v = cube(v)?;
-    let g = cube(g)?;
-    let beta = cube(beta)?;
-    let mut state = cube(state)?;
+    let q = crate::metal_bridge::cube_float(q)?;
+    let k = crate::metal_bridge::cube_float(k)?;
+    let v = crate::metal_bridge::cube_float(v)?;
+    let g = crate::metal_bridge::cube_float(g)?;
+    let beta = crate::metal_bridge::cube_float(beta)?;
+    let mut state = crate::metal_bridge::cube_float(state)?;
     state = burn_cubecl::kernel::into_contiguous(state);
     let client = state.client.clone();
     let device = state.device.clone();
-    let out = alloc(&client, &device, [1, t_len, heads, v_dim]);
+    let out = crate::metal_bridge::alloc_f32(&client, &device, [1, t_len, heads, v_dim]);
     let steps = if record {
-        alloc(&client, &device, [t_len, heads, k_dim, v_dim])
+        crate::metal_bridge::alloc_f32(&client, &device, [t_len, heads, k_dim, v_dim])
     } else {
-        alloc(&client, &device, [1, 1, 1, 1])
+        crate::metal_bridge::alloc_f32(&client, &device, [1, 1, 1, 1])
     };
     // Split-kk path: k_dim sliced four ways per column. Falls back to the
     // scalar kernel when the shapes do not divide.
@@ -311,31 +301,6 @@ fn scan_metal(
         Vec::new()
     };
     Some((out, state, steps))
-}
-
-fn cube<const D: usize>(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, D>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn alloc(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
-    device: &cubecl::wgpu::WgpuDevice,
-    shape: [usize; 4],
-) -> CubeTensor<WgpuRuntime> {
-    let bytes = shape.iter().product::<usize>() * size_of::<f32>();
-    CubeTensor::new_contiguous(
-        client.clone(),
-        device.clone(),
-        Shape::from(shape),
-        client.empty(bytes),
-        DType::F32,
-    )
 }
 
 #[cfg(test)]

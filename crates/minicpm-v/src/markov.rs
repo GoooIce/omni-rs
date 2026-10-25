@@ -10,12 +10,11 @@
 //! quantization may flip near-tie proposals, which the greedy verify
 //! corrects, so committed text is unaffected while τ can drift slightly.
 
+use crate::metal_bridge::take_as;
 use burn::tensor::{DType, Shape, Tensor as BurnTensor, TensorPrimitive, backend::Backend};
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::{prelude::*, wgpu::WgpuRuntime};
 use half::f16;
-use std::any::TypeId;
-use std::mem::{forget, size_of};
 
 const LANES: u32 = 64;
 
@@ -120,9 +119,7 @@ pub(crate) fn try_scores<B: Backend>(
     quant: &MarkovQuant<B>,
 ) -> Option<BurnTensor<B, 2>> {
     use burn::backend::wgpu::Metal;
-    if TypeId::of::<B>() != TypeId::of::<Metal>()
-        || size_of::<BurnTensor<B, 2>>() != size_of::<BurnTensor<Metal, 2>>()
-    {
+    if !crate::metal_bridge::borrowable::<B, 2>() {
         return None;
     }
     let [_, vocab] = base.dims();
@@ -136,11 +133,11 @@ pub(crate) fn try_scores<B: Backend>(
     let w1: BurnTensor<Metal, 2> = unsafe { take_as(w1) };
     let words: BurnTensor<Metal, 2, burn::tensor::Int> = unsafe { take_as(quant.words.clone()) };
     let scales: BurnTensor<Metal, 1> = unsafe { take_as(quant.scales.clone()) };
-    let base = cube_row(base)?;
-    let ids = cube_row_int(ids)?;
-    let w1 = cube_float2d(w1)?;
-    let words = cube_int2d(words)?;
-    let scales = cube_row_f32(scales)?;
+    let base = crate::metal_bridge::cube_float(base)?;
+    let ids = crate::metal_bridge::cube_int(ids);
+    let w1 = crate::metal_bridge::cube_float(w1)?;
+    let words = crate::metal_bridge::cube_int(words);
+    let scales = crate::metal_bridge::cube_float(scales)?;
     let client = base.client.clone();
     let device = base.device.clone();
     let out = CubeTensor::new_contiguous(
@@ -167,58 +164,6 @@ pub(crate) fn try_scores<B: Backend>(
     }
     let out = BurnTensor::<Metal, 2>::from_primitive(TensorPrimitive::Float(out));
     Some(unsafe { take_as(out) })
-}
-
-fn cube_row(tensor: BurnTensor<burn::backend::wgpu::Metal, 2>) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn cube_row_f32(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 1>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn cube_row_int(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 2, burn::tensor::Int>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    Some(burn_cubecl::kernel::into_contiguous(
-        tensor.into_primitive(),
-    ))
-}
-
-fn cube_float2d(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 2>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    let primitive = tensor.into_primitive();
-    let TensorPrimitive::Float(tensor) = primitive else {
-        return None;
-    };
-    Some(burn_cubecl::kernel::into_contiguous(tensor))
-}
-
-fn cube_int2d(
-    tensor: BurnTensor<burn::backend::wgpu::Metal, 2, burn::tensor::Int>,
-) -> Option<CubeTensor<WgpuRuntime>> {
-    Some(burn_cubecl::kernel::into_contiguous(
-        tensor.into_primitive(),
-    ))
-}
-
-/// # Safety
-/// `T` and `U` are the same type: the caller checked `TypeId` and size.
-unsafe fn take_as<T, U>(value: T) -> U {
-    let out = unsafe { std::ptr::read((&value) as *const T as *const U) };
-    forget(value);
-    out
 }
 
 #[cfg(test)]

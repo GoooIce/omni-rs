@@ -385,7 +385,7 @@ impl<B: Backend> FullAttention<B> {
         x: Tensor<B, 3>,
         cos: &Tensor<B, 3>,
         sin: &Tensor<B, 3>,
-        mut cache: Option<&mut KvCache<B>>,
+        cache: Option<&mut KvCache<B>>,
         block_mask: Tensor<B, 4, Bool>,
     ) -> Tensor<B, 3> {
         let [_, seq, _] = x.dims();
@@ -698,7 +698,7 @@ impl<B: Backend> FullLayer<B> {
         cache: Option<&mut KvCache<B>>,
         block_mask: Tensor<B, 4, Bool>,
     ) -> Tensor<B, 3> {
-        let [_, seq, _] = x.dims();
+        let [_, _seq, _] = x.dims();
         let dtype = shared::dtype(&x);
         let normed = norm_seam(&self.input_norm, x.clone(), dtype);
         let attended = self.attn.forward_tree(normed, cos, sin, cache, block_mask);
