@@ -88,6 +88,175 @@ fn fixed_block() -> Option<usize> {
 /// and the top covers repetitive text.
 const BLOCK_LADDER: [usize; 3] = [3, 8, 16];
 
+/// One speculative cycle's proposal layout, chosen by the [`Ladder`].
+#[derive(Debug, PartialEq, Eq)]
+enum BlockLayout {
+    /// A linear chain of `len` draft tokens (the markov argmax path).
+    Chain { len: usize },
+    /// A full binary markov tree of `levels` child depths; the ladder's
+    /// token budget maps to depth (3/8/16 → 1/2/3).
+    Tree { levels: usize },
+}
+
+impl BlockLayout {
+    /// The acceptance cap this layout offers: the chain length, or the
+    /// tree depth.
+    fn policy_len(&self) -> usize {
+        match self {
+            BlockLayout::Chain { len } => *len,
+            BlockLayout::Tree { levels } => *levels,
+        }
+    }
+}
+
+/// The adaptive ladder over [`BLOCK_LADDER`] with hysteresis AIMD: grow one
+/// step after two consecutive cycles accepting >= 80% of the layout's cap
+/// (on the prose optimum of 3 that still means a full accept, so easy
+/// content does not ratchet up); shrink one step after two consecutive
+/// cycles accepting at most half — one low cycle is variance, not a regime
+/// change. A pinned block disables adaptation (and tree mode).
+struct Ladder {
+    index: usize,
+    full_streak: usize,
+    low_streak: usize,
+    fixed: Option<usize>,
+    tree: bool,
+}
+
+impl Ladder {
+    fn new(fixed: Option<usize>, tree: bool) -> Self {
+        Self {
+            index: 0,
+            full_streak: 0,
+            low_streak: 0,
+            fixed,
+            tree,
+        }
+    }
+
+    /// The layout for the next cycle.
+    fn layout(&self) -> BlockLayout {
+        if self.tree && self.fixed.is_none() {
+            let levels = match self.index {
+                0 => 1,
+                1 => 2,
+                _ => 3,
+            };
+            BlockLayout::Tree { levels }
+        } else {
+            BlockLayout::Chain {
+                len: self.block_len(),
+            }
+        }
+    }
+
+    /// The ladder's current token budget (trace average uses it).
+    fn block_len(&self) -> usize {
+        self.fixed.unwrap_or(BLOCK_LADDER[self.index])
+    }
+
+    /// Fold one cycle's outcome in. `policy_len` is the layout's acceptance
+    /// cap; a trimmed cycle (max-length edge) carries no signal.
+    fn observe(&mut self, accepted: usize, policy_len: usize, trimmed: bool) {
+        if self.fixed.is_some() || trimmed {
+            return;
+        }
+        if accepted * 5 >= policy_len * 4 {
+            self.full_streak += 1;
+            self.low_streak = 0;
+            if self.full_streak >= 2 {
+                self.index = (self.index + 1).min(BLOCK_LADDER.len() - 1);
+                self.full_streak = 0;
+            }
+        } else if accepted * 2 <= policy_len {
+            self.low_streak += 1;
+            self.full_streak = 0;
+            if self.low_streak >= 2 && self.index > 0 {
+                self.index -= 1;
+                self.low_streak = 0;
+            }
+        } else {
+            self.full_streak = 0;
+            self.low_streak = 0;
+        }
+    }
+}
+
+/// The acceptance walk's outcome over one verified block: the longest
+/// prefix whose tokens match the target's prediction, plus the correction
+/// from the stop node (the next bonus).
+struct AcceptedPath {
+    /// Accepted draft tokens in path order.
+    tokens: Vec<u32>,
+    /// Block slots to retain, bonus at 0 included, in path order (the chain
+    /// walks a contiguous prefix; the tree walks root-to-leaf slots).
+    slots: Vec<usize>,
+    /// The stop node's prediction when the walk stopped on a mismatch or a
+    /// fully accepted chain.
+    correction: Option<u32>,
+    /// A matched draft token was an EOS token (finish reason Stop).
+    draft_eos: bool,
+}
+
+/// Walk one verified block under `layout`: `predict(i)` returns the target's
+/// prediction after block token `i`. Both layouts commit the longest
+/// matching prefix and take one correction token; the chain walks positions
+/// 0..n in order, the tree follows children whose token matches.
+fn accept_path(
+    tree: Option<&TreeSpec>,
+    proposals: &[u32],
+    eos_ids: &[u32],
+    predict: &mut dyn FnMut(usize) -> std::result::Result<u32, String>,
+) -> std::result::Result<AcceptedPath, String> {
+    let mut slots = vec![0usize];
+    let mut tokens = Vec::new();
+    let mut correction = None;
+    let mut draft_eos = false;
+    match tree {
+        Some(tree) => loop {
+            let predicted = predict(slots[slots.len() - 1])?;
+            let child = tree.children[slots[slots.len() - 1]]
+                .iter()
+                .copied()
+                .find(|&child| tree.tokens[child - 1] == predicted);
+            let Some(child) = child else {
+                correction = Some(predicted);
+                break;
+            };
+            if eos_ids.contains(&predicted) {
+                draft_eos = true;
+                break;
+            }
+            tokens.push(predicted);
+            slots.push(child);
+        },
+        None => {
+            for index in 0..proposals.len() {
+                let predicted = predict(index)?;
+                if predicted != proposals[index] {
+                    correction = Some(predicted);
+                    break;
+                }
+                if eos_ids.contains(&proposals[index]) {
+                    draft_eos = true;
+                    break;
+                }
+                tokens.push(predicted);
+                slots.push(index + 1);
+            }
+            if correction.is_none() && !draft_eos {
+                correction = Some(predict(proposals.len())?);
+            }
+        }
+    }
+    Ok(AcceptedPath {
+        tokens,
+        slots,
+        correction,
+        draft_eos,
+    })
+}
+
 /// Tree-mode switch: `MINICPM_DSPARK_TREE=1` proposes a full binary markov
 /// tree instead of a linear chain and verifies it with ancestor-masked
 /// attention plus per-path linear-attention scans (exact, Metal-only).
@@ -237,6 +406,12 @@ struct Layer<B: Backend> {
     gate: shared::Linear<B>,
     up: shared::Linear<B>,
     down: shared::Linear<B>,
+}
+
+/// Phase timings of one propose for the MINICPM_DSPARK_TRACE split.
+struct ProposeTiming {
+    draft: std::time::Duration,
+    logits: std::time::Duration,
 }
 
 impl<B: Backend> Draft<B> {
@@ -435,6 +610,11 @@ impl<B: Backend> Draft<B> {
     /// full binary tree — one batched gather + matmul + top-2 per level, so
     /// the head reads `markov_w2` `levels` times instead of once per token.
     /// Returns the verify block ids (bonus first) and the tree layout.
+    /// Tree-mode propose: the draft forward runs on `levels` masked tokens
+    /// (its row `d` is the depth-`d` prior), then the markov head expands a
+    /// full binary tree — one batched correction + top-2 per level, so the
+    /// head reads `markov_w2` `levels` times instead of once per token.
+    /// Returns the verify block's tree tokens and the tree layout.
     fn propose_tree(
         &self,
         target: &TextModel<B>,
@@ -442,65 +622,11 @@ impl<B: Backend> Draft<B> {
         anchor: u32,
         levels: usize,
     ) -> Result<(Vec<u32>, TreeSpec)> {
-        let ctx = state.length;
-        let dtype = shared::dtype(&state.keys[0]);
         let device = state.keys[0].device();
-        let end = ctx + levels;
-        debug_assert!(
-            end <= state.keys[0].dims()[2],
-            "draft K/V capacity exceeded"
-        );
-        let mut ids = vec![anchor];
-        ids.extend(std::iter::repeat(MASK_TOKEN).take(levels - 1));
-        let t_draft = Instant::now();
-        let mut hidden = target.embeddings(&ids)?;
-        let (block_cos, block_sin) =
-            shared::rope_tables(&self.frequencies, ctx, levels, dtype, &device);
-        for (index, layer) in self.layers.iter().enumerate() {
-            let residual = hidden.clone();
-            let normed = draft_norm_seam(&layer.input_norm, hidden, dtype);
-            let q = project_kv(&layer.q, &layer.q_norm, &normed, dtype, HEADS);
-            let k = project_kv(&layer.k, &layer.k_norm, &normed, dtype, KV_HEADS);
-            let v = project_v(&layer.v, &normed, KV_HEADS);
-            let q = draft_rope_seam(q, &block_cos, &block_sin);
-            let k = draft_rope_seam(k, &block_cos, &block_sin);
-            state.keys[index] = state.keys[index]
-                .clone()
-                .slice_assign([0..1, 0..KV_HEADS, ctx..end, 0..HEAD_DIM], k);
-            state.values[index] = state.values[index]
-                .clone()
-                .slice_assign([0..1, 0..KV_HEADS, ctx..end, 0..HEAD_DIM], v);
-            let attended = shared::attention(
-                q,
-                state.keys[index]
-                    .clone()
-                    .slice([0..1, 0..KV_HEADS, 0..end, 0..HEAD_DIM]),
-                state.values[index]
-                    .clone()
-                    .slice([0..1, 0..KV_HEADS, 0..end, 0..HEAD_DIM]),
-                AttentionOptions {
-                    causal: false,
-                    ..AttentionOptions::default()
-                },
-            );
-            let attended = attended.permute([0, 2, 1, 3]).reshape([1, levels, HIDDEN]);
-            hidden = draft_residual_seam(residual, layer.o.forward(attended), dtype);
-            let mlp_in = draft_norm_seam(&layer.post_norm, hidden.clone(), dtype);
-            let mlp = layer.down.forward(
-                burn::tensor::activation::silu(layer.gate.forward(mlp_in.clone()))
-                    * layer.up.forward(mlp_in),
-            );
-            hidden = draft_residual_seam(hidden, mlp, dtype);
-        }
-        let t_draft = t_draft.elapsed();
-        let t_logits = Instant::now();
-        hidden = draft_norm_seam(&self.norm, hidden, dtype);
-        let base = target.project_logits(hidden.reshape([levels, HIDDEN]));
-        let t_logits = t_logits.elapsed();
+        let (base, timing) = self.draft_logits(target, state, anchor, levels)?;
         let t_markov = Instant::now();
-        // Level-batched expansion: all nodes of a depth share one gather,
-        // one `markov_w2` matmul and one top-2; the next level's ids stay on
-        // the device, so the only readback is the final tree.
+        // Level-batched expansion: the next level's ids stay on the device,
+        // so the only readback is the final tree.
         let mut previous = Tensor::<B, 2, burn::tensor::Int>::from_data(
             burn::tensor::TensorData::new(vec![anchor as i64], [1, 1]),
             &device,
@@ -509,32 +635,7 @@ impl<B: Backend> Draft<B> {
         for depth in 0..levels {
             let count = previous.dims()[0];
             let depth_base = base.clone().slice([depth..depth + 1, 0..VOCAB]);
-            #[cfg(feature = "metal")]
-            let scores = match self.markov_quant.as_ref().and_then(|quant| {
-                crate::markov::try_scores(
-                    depth_base.clone(),
-                    previous.clone(),
-                    self.markov_w1.clone(),
-                    quant,
-                )
-            }) {
-                Some(scores) => scores,
-                None => {
-                    let embed = self
-                        .markov_w1
-                        .clone()
-                        .gather(0, previous.clone().repeat_dim(1, RANK));
-                    self.markov_w2.forward(embed) + depth_base
-                }
-            };
-            #[cfg(not(feature = "metal"))]
-            let scores = {
-                let embed = self
-                    .markov_w1
-                    .clone()
-                    .gather(0, previous.clone().repeat_dim(1, RANK));
-                self.markov_w2.forward(embed) + depth_base
-            };
+            let scores = self.markov_scores(depth_base, &previous);
             let (_, picks) = scores.topk_with_indices(2, 1);
             previous = picks.clone().reshape([count * 2, 1]);
             level_indices.push(picks);
@@ -545,8 +646,8 @@ impl<B: Backend> Draft<B> {
         if tree_trace() {
             eprintln!(
                 "propose_split: draft {:.2} logits {:.2} markov {:.2} readback {:.2} (tree {} levels, {} tokens)",
-                t_draft.as_secs_f64() * 1000.0,
-                t_logits.as_secs_f64() * 1000.0,
+                timing.draft.as_secs_f64() * 1000.0,
+                timing.logits.as_secs_f64() * 1000.0,
                 t_markov.as_secs_f64() * 1000.0,
                 t_readback.elapsed().as_secs_f64() * 1000.0,
                 levels,
@@ -563,6 +664,8 @@ impl<B: Backend> Draft<B> {
         Ok((tokens, tree))
     }
 
+    /// Chain-mode propose: the draft forward runs on `block_len` masked
+    /// tokens, then the markov head walks `block_len` serial argmax steps.
     fn propose(
         &self,
         target: &TextModel<B>,
@@ -570,26 +673,74 @@ impl<B: Backend> Draft<B> {
         anchor: u32,
         block_len: usize,
     ) -> Result<Vec<u32>> {
-        // vLLM sample_from_anchor: the query is [bonus, mask…], and its first
-        // RoPE position is the bonus, right after the context.
+        let device = state.keys[0].device();
+        let (base, timing) = self.draft_logits(target, state, anchor, block_len)?;
+        let t_markov = Instant::now();
+        // Markov head: each row feeds the previous pick, so the chain stays
+        // on the device (gather + argmax) and one readback returns the block.
+        let mut previous = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(vec![anchor as i64], [1, 1]),
+            &device,
+        );
+        let mut picks = Vec::with_capacity(block_len);
+        for row in 0..block_len {
+            let row_base = base.clone().slice([row..row + 1, 0..VOCAB]);
+            let scores = self.markov_scores(row_base, &previous);
+            previous = scores.argmax(1);
+            picks.push(previous.clone().reshape([1]));
+        }
+        let t_markov = t_markov.elapsed();
+        let t_readback = Instant::now();
+        let values = Tensor::cat(picks, 0).into_data().convert::<i32>();
+        if tree_trace() {
+            eprintln!(
+                "propose_split: draft {:.2} logits {:.2} markov {:.2} readback {:.2}",
+                timing.draft.as_secs_f64() * 1000.0,
+                timing.logits.as_secs_f64() * 1000.0,
+                t_markov.as_secs_f64() * 1000.0,
+                t_readback.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let picks = values
+            .as_slice::<i32>()
+            .map_err(|error| omni_r2t2::Error::Inference(error.to_string()))?;
+        picks
+            .iter()
+            .map(|&id| {
+                if id < 0 {
+                    Err(omni_r2t2::Error::Inference("empty draft scores".into()))
+                } else {
+                    Ok(id as u32)
+                }
+            })
+            .collect()
+    }
+
+    /// The masked draft forward shared by both layouts (vLLM
+    /// sample_from_anchor: the query is `[anchor, mask…]` with the anchor's
+    /// RoPE position right after the context). Returns the per-position base
+    /// logits, `tokens` rows, plus the trace-phase timings.
+    fn draft_logits(
+        &self,
+        target: &TextModel<B>,
+        state: &mut DraftState<B>,
+        anchor: u32,
+        tokens: usize,
+    ) -> Result<(Tensor<B, 2>, ProposeTiming)> {
         let ctx = state.length;
         let dtype = shared::dtype(&state.keys[0]);
         let device = state.keys[0].device();
-        let end = ctx + block_len;
+        let end = ctx + tokens;
         debug_assert!(
             end <= state.keys[0].dims()[2],
             "draft K/V capacity exceeded"
         );
         let mut ids = vec![anchor];
-        ids.extend(std::iter::repeat(MASK_TOKEN).take(block_len - 1));
-        // Sub-phase timings for the MINICPM_DSPARK_TRACE split: draft
-        // forward, logits projection, markov chain, readback.
-        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let trace = *TRACE.get_or_init(|| std::env::var_os("MINICPM_DSPARK_TRACE").is_some());
+        ids.extend(std::iter::repeat(MASK_TOKEN).take(tokens - 1));
         let t_draft = Instant::now();
         let mut hidden = target.embeddings(&ids)?;
         let (block_cos, block_sin) =
-            shared::rope_tables(&self.frequencies, ctx, block_len, dtype, &device);
+            shared::rope_tables(&self.frequencies, ctx, tokens, dtype, &device);
         for (index, layer) in self.layers.iter().enumerate() {
             let residual = hidden.clone();
             let normed = draft_norm_seam(&layer.input_norm, hidden, dtype);
@@ -619,9 +770,7 @@ impl<B: Backend> Draft<B> {
                     ..AttentionOptions::default()
                 },
             );
-            let attended = attended
-                .permute([0, 2, 1, 3])
-                .reshape([1, block_len, HIDDEN]);
+            let attended = attended.permute([0, 2, 1, 3]).reshape([1, tokens, HIDDEN]);
             hidden = draft_residual_seam(residual, layer.o.forward(attended), dtype);
             let mlp_in = draft_norm_seam(&layer.post_norm, hidden.clone(), dtype);
             let mlp = layer.down.forward(
@@ -633,72 +782,41 @@ impl<B: Backend> Draft<B> {
         let t_draft = t_draft.elapsed();
         let t_logits = Instant::now();
         hidden = draft_norm_seam(&self.norm, hidden, dtype);
-        let base = target.project_logits(hidden.reshape([block_len, HIDDEN]));
-        let t_logits = t_logits.elapsed();
-        let t_markov = Instant::now();
-        // Markov head: each row feeds the previous pick, so the chain stays on
-        // the device (gather + argmax) and one readback returns the block.
-        let mut previous = Tensor::<B, 2, burn::tensor::Int>::from_data(
-            burn::tensor::TensorData::new(vec![anchor as i64], [1, 1]),
-            &device,
-        );
-        let mut picks = Vec::with_capacity(block_len);
-        for row in 0..block_len {
-            let row_base = base.clone().slice([row..row + 1, 0..VOCAB]);
-            #[cfg(feature = "metal")]
-            let scores = match self.markov_quant.as_ref().and_then(|quant| {
-                crate::markov::try_scores(
-                    row_base.clone(),
-                    previous.clone(),
-                    self.markov_w1.clone(),
-                    quant,
-                )
-            }) {
-                Some(scores) => scores,
-                None => {
-                    let embed = self
-                        .markov_w1
-                        .clone()
-                        .gather(0, previous.clone().repeat_dim(1, RANK));
-                    row_base + self.markov_w2.forward(embed)
-                }
-            };
-            #[cfg(not(feature = "metal"))]
-            let scores = {
-                let embed = self
-                    .markov_w1
-                    .clone()
-                    .gather(0, previous.clone().repeat_dim(1, RANK));
-                row_base + self.markov_w2.forward(embed)
-            };
-            previous = scores.argmax(1);
-            picks.push(previous.clone().reshape([1]));
+        let base = target.project_logits(hidden.reshape([tokens, HIDDEN]));
+        Ok((
+            base,
+            ProposeTiming {
+                draft: t_draft,
+                logits: t_logits.elapsed(),
+            },
+        ))
+    }
+
+    /// The markov correction for one chain row or tree level:
+    /// `base_row + markov_w2 · markov_w1[prev]` over the `[n, 1]` previous
+    /// picks, through the quantized kernel when enabled (draft-only
+    /// numerics; falls back to the gather + matmul + add chain).
+    fn markov_scores(
+        &self,
+        base_row: Tensor<B, 2>,
+        previous: &Tensor<B, 2, burn::tensor::Int>,
+    ) -> Tensor<B, 2> {
+        #[cfg(feature = "metal")]
+        if let Some(scores) = self.markov_quant.as_ref().and_then(|quant| {
+            crate::markov::try_scores(
+                base_row.clone(),
+                previous.clone(),
+                self.markov_w1.clone(),
+                quant,
+            )
+        }) {
+            return scores;
         }
-        let t_markov = t_markov.elapsed();
-        let t_readback = Instant::now();
-        let values = Tensor::cat(picks, 0).into_data().convert::<i32>();
-        if trace {
-            eprintln!(
-                "propose_split: draft {:.2} logits {:.2} markov {:.2} readback {:.2}",
-                t_draft.as_secs_f64() * 1000.0,
-                t_logits.as_secs_f64() * 1000.0,
-                t_markov.as_secs_f64() * 1000.0,
-                t_readback.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        let picks = values
-            .as_slice::<i32>()
-            .map_err(|error| omni_r2t2::Error::Inference(error.to_string()))?;
-        picks
-            .iter()
-            .map(|&id| {
-                if id < 0 {
-                    Err(omni_r2t2::Error::Inference("empty draft scores".into()))
-                } else {
-                    Ok(id as u32)
-                }
-            })
-            .collect()
+        let embed = self
+            .markov_w1
+            .clone()
+            .gather(0, previous.clone().repeat_dim(1, RANK));
+        self.markov_w2.forward(embed) + base_row
     }
 }
 
@@ -806,14 +924,11 @@ fn row_vec<B: Backend>(logits: Tensor<B, 2>, row: usize) -> std::result::Result<
         .map_err(|error| error.to_string())
 }
 
-fn slice_captured<B: Backend>(captured: Vec<Tensor<B, 3>>, tokens: usize) -> Vec<Tensor<B, 3>> {
-    captured
-        .into_iter()
-        .map(|hidden| {
-            let width = hidden.dims()[2];
-            hidden.slice([0..1, 0..tokens, 0..width])
-        })
-        .collect()
+fn assemble_block(bonus: u32, drafts: &[u32]) -> Vec<u32> {
+    let mut block = Vec::with_capacity(1 + drafts.len());
+    block.push(bonus);
+    block.extend_from_slice(drafts);
+    block
 }
 
 /// [`slice_captured`]'s tree variant: keep the given block slots, in path
@@ -906,18 +1021,11 @@ pub fn generate<B: Backend>(
         )
         .map_err(|error| error.to_string())?;
     let capacity = prompt.ids.len() + options.max_new_tokens + BLOCK_LADDER[2] + 1;
-    let fixed = fixed_block();
-    // Adaptive block state; measured acceptance walks the ladder between the
-    // prose optimum (~3) and the repetitive-text optimum (~12-24).
-    let mut block_idx = 0usize;
-    let mut block_len = fixed.unwrap_or(BLOCK_LADDER[0]);
-    let mut full_streak = 0usize;
-    let mut low_streak = 0usize;
+    // The ladder picks each cycle's layout: a linear chain of the block
+    // budget, or (adaptive runs only; a pinned MINICPM_DSPARK_BLOCK stays
+    // linear for experiments) a markov tree.
+    let mut ladder = Ladder::new(fixed_block(), tree_enabled());
     let mut block_sum = 0usize;
-    let mut block: Vec<u32> = Vec::new();
-    // Tree mode replaces the chain with a markov tree (adaptive runs only; a
-    // pinned MINICPM_DSPARK_BLOCK stays linear for experiments).
-    let tree_mode = tree_enabled() && fixed.is_none();
     let mut draft_state = draft
         .prepare(captured, capacity)
         .map_err(|error| error.to_string())?;
@@ -971,51 +1079,34 @@ pub fn generate<B: Backend>(
         }
 
         stats.cycles += 1;
-        block_sum += block_len;
-        // Tree mode proposes a markov tree of `levels` child depths; the
-        // ladder value is the token budget (2/6/14 nodes for 3/8/16).
-        let tree_levels = if tree_mode && block_idx >= 2 {
-            3
-        } else if tree_mode && block_idx == 1 {
-            2
-        } else {
-            0
-        };
-        let tree_spec = if tree_mode {
-            let levels = if tree_levels == 0 { 1 } else { tree_levels };
-            let phase = Instant::now();
-            let (tokens, tree) = draft
-                .propose_tree(model, &mut draft_state, bonus, levels)
-                .map_err(|error| error.to_string())?;
-            if stats.trace.enabled {
-                stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
+        block_sum += ladder.block_len();
+        let layout = ladder.layout();
+        // Propose: the layout owns the block's shape; both variants share
+        // the masked draft forward and the markov correction.
+        let phase = Instant::now();
+        let (block, tree) = match &layout {
+            BlockLayout::Tree { levels } => {
+                let (tokens, tree) = draft
+                    .propose_tree(model, &mut draft_state, bonus, *levels)
+                    .map_err(|error| error.to_string())?;
+                if stats.trace.enabled {
+                    stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
+                }
+                (assemble_block(bonus, &tokens), Some(tree))
             }
-            block = {
-                let mut block = Vec::with_capacity(1 + tokens.len());
-                block.push(bonus);
-                block.extend_from_slice(&tokens);
-                block
-            };
-            Some(tree)
-        } else {
-            let phase = Instant::now();
-            let proposals = draft
-                .propose(model, &mut draft_state, bonus, block_len)
-                .map_err(|error| error.to_string())?;
-            if stats.trace.enabled {
-                stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
+            BlockLayout::Chain { len } => {
+                let proposals = draft
+                    .propose(model, &mut draft_state, bonus, *len)
+                    .map_err(|error| error.to_string())?;
+                if stats.trace.enabled {
+                    stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
+                }
+                (assemble_block(bonus, &proposals), None)
             }
-            block = {
-                let mut block = Vec::with_capacity(1 + proposals.len());
-                block.push(bonus);
-                block.extend_from_slice(&proposals);
-                block
-            };
-            None
         };
         let length_before = state.length;
         let phase = Instant::now();
-        let (position_logits, captured, linear_after) = match &tree_spec {
+        let (position_logits, captured, linear_after) = match &tree {
             Some(tree) => model
                 .forward_verifying_tree(&block, tree, &mut state, target_layers())
                 .map_err(|error| error.to_string())?,
@@ -1027,9 +1118,6 @@ pub fn generate<B: Backend>(
             stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
         }
         let phase = Instant::now();
-        let mut accepted_drafts = 0usize;
-        let mut correction = None;
-        let mut draft_eos = false;
         // Greedy without penalties: the sampler is a plain argmax, so the
         // whole block is argmaxed on the device and read back once, instead
         // of one megabyte-wide row per position.
@@ -1050,152 +1138,59 @@ pub fn generate<B: Backend>(
         } else {
             Vec::new()
         };
-        // Tree acceptance walks the greedy argmax down the candidate tree;
-        // linear acceptance walks the chain. Both commit the longest prefix
-        // that matches the target's argmax, then take one correction token.
-        let mut path_slots: Vec<usize> = Vec::new();
-        let accepted_tokens: Vec<u32> = match &tree_spec {
-            Some(tree) => {
-                if greedy_block.is_empty() {
-                    return Err("tree mode verifies greedy decoding".into());
+        if tree.is_some() && greedy_block.is_empty() {
+            return Err("tree mode verifies greedy decoding".into());
+        }
+        // Acceptance walks the layout's shape: the longest prefix matching
+        // the target's prediction, then one correction token.
+        let proposals = &block[1..];
+        let path = {
+            let mut predict = |index: usize| -> std::result::Result<u32, String> {
+                if !greedy_block.is_empty() {
+                    return Ok(greedy_block[index]);
                 }
-                let mut node = 0usize;
-                let mut slots = vec![0usize];
-                let mut committed = Vec::new();
-                loop {
-                    let predicted = greedy_block[node];
-                    let child = tree.children[node]
-                        .iter()
-                        .copied()
-                        .find(|&child| tree.tokens[child - 1] == predicted);
-                    let Some(child) = child else {
-                        correction = Some(predicted);
-                        break;
-                    };
-                    if eos_ids.contains(&predicted) {
-                        draft_eos = true;
-                        break;
-                    }
-                    accepted_drafts += 1;
-                    committed.push(predicted);
-                    slots.push(child);
-                    node = child;
-                }
-                path_slots = slots;
-                committed
-            }
-            None => {
-                let proposals = &block[1..];
-                for index in 0..proposals.len() {
-                    let predicted = if greedy_block.is_empty() {
-                        let mut seen = history.clone();
-                        seen.extend_from_slice(&proposals[..accepted_drafts]);
-                        sampler
-                            .sample(row_vec(position_logits.clone(), index)?, &seen)
-                            .map_err(|error| error.to_string())?
-                    } else {
-                        greedy_block[index]
-                    };
-                    if predicted != proposals[index] {
-                        correction = Some(predicted);
-                        break;
-                    }
-                    if eos_ids.contains(&proposals[index]) {
-                        draft_eos = true;
-                        break;
-                    }
-                    accepted_drafts += 1;
-                }
-                if correction.is_none() && !draft_eos {
-                    correction = Some(if greedy_block.is_empty() {
-                        let mut seen = history.clone();
-                        seen.extend_from_slice(&proposals[..accepted_drafts]);
-                        sampler
-                            .sample(row_vec(position_logits, proposals.len())?, &seen)
-                            .map_err(|error| error.to_string())?
-                    } else {
-                        greedy_block[proposals.len()]
-                    });
-                }
-                proposals[..accepted_drafts].to_vec()
-            }
+                let mut seen = history.clone();
+                seen.extend_from_slice(&proposals[..index]);
+                sampler
+                    .sample(row_vec(position_logits.clone(), index)?, &seen)
+                    .map_err(|error| error.to_string())
+            };
+            accept_path(tree.as_ref(), proposals, eos_ids, &mut predict)?
         };
         let room = options.max_new_tokens - tokens.len();
         let mut trimmed = false;
-        if accepted_drafts > room {
-            accepted_drafts = room;
-            correction = None;
-            draft_eos = false;
+        let mut path = path;
+        if path.tokens.len() > room {
+            path.tokens.truncate(room);
+            path.slots.truncate(1 + room);
+            path.correction = None;
+            path.draft_eos = false;
             trimmed = true;
-        } else if correction.is_some() && accepted_drafts + 1 > room {
-            correction = None;
+        } else if path.correction.is_some() && path.tokens.len() + 1 > room {
+            path.correction = None;
             trimmed = true;
         }
-        path_slots.truncate(1 + accepted_drafts);
-        if draft_eos && !trimmed {
+        if path.draft_eos && !trimmed {
             finish = FinishReason::Stop;
         }
         if stats.trace.enabled {
             stats.trace.accept_ms += phase.elapsed().as_secs_f64() * 1000.0;
         }
         let phase = Instant::now();
-        // Keep the bonus plus the accepted prefix (tree: the accepted path's
-        // block slots, compacted). The correction is the next bonus and stays
-        // out of this cache.
-        if tree_spec.is_some() {
-            state.retain_path(length_before, &path_slots, &linear_after);
-            draft
-                .extend(&mut draft_state, select_captured(captured, &path_slots))
-                .map_err(|error| error.to_string())?;
-        } else {
-            state.retain_accepted(length_before, 1 + accepted_drafts, &linear_after);
-            draft
-                .extend(
-                    &mut draft_state,
-                    slice_captured(captured, 1 + accepted_drafts),
-                )
-                .map_err(|error| error.to_string())?;
-        }
+        // Keep the bonus plus the accepted path's block slots (the chain's
+        // slots are the contiguous prefix, so one retain covers both
+        // layouts). The correction is the next bonus and stays out.
+        state.retain_path(length_before, &path.slots, &linear_after);
+        draft
+            .extend(&mut draft_state, select_captured(captured, &path.slots))
+            .map_err(|error| error.to_string())?;
         if stats.trace.enabled {
             stats.trace.retain_ms += phase.elapsed().as_secs_f64() * 1000.0;
         }
-        stats.draft_tokens_accepted += accepted_drafts as u64;
-        // The tree's policy unit is its depth (the acceptance cap), the
-        // chain's is its length.
-        let policy_len = if tree_spec.is_some() {
-            if tree_levels == 0 { 1 } else { tree_levels }
-        } else {
-            block_len
-        };
-        if fixed.is_none() && !trimmed {
-            // Grow on two consecutive cycles accepting >= 80% of the block
-            // (on the prose optimum of 3 that still means a full accept, so
-            // easy content does not ratchet up); shrink one ladder step
-            // after two consecutive cycles accepting at most half — one
-            // low cycle is treated as variance, not a regime change.
-            if accepted_drafts * 5 >= policy_len * 4 {
-                full_streak += 1;
-                low_streak = 0;
-                if full_streak >= 2 {
-                    block_idx = (block_idx + 1).min(BLOCK_LADDER.len() - 1);
-                    block_len = BLOCK_LADDER[block_idx];
-                    full_streak = 0;
-                }
-            } else if accepted_drafts * 2 <= policy_len {
-                low_streak += 1;
-                full_streak = 0;
-                if low_streak >= 2 && block_idx > 0 {
-                    block_idx -= 1;
-                    block_len = BLOCK_LADDER[block_idx];
-                    low_streak = 0;
-                }
-            } else {
-                full_streak = 0;
-                low_streak = 0;
-            }
-        }
+        stats.draft_tokens_accepted += path.tokens.len() as u64;
+        ladder.observe(path.tokens.len(), layout.policy_len(), trimmed);
 
-        for token in accepted_tokens.iter().copied().take(accepted_drafts) {
+        for token in path.tokens {
             if tokens.len() == options.max_new_tokens {
                 break;
             }
@@ -1204,7 +1199,7 @@ pub fn generate<B: Backend>(
         if finish == FinishReason::Stop {
             break;
         }
-        if let Some(token) = correction {
+        if let Some(token) = path.correction {
             if eos_ids.contains(&token) {
                 finish = FinishReason::Stop;
             } else if tokens.len() < options.max_new_tokens {
@@ -1238,4 +1233,103 @@ pub fn generate<B: Backend>(
 
 fn prompt_device<B: Backend>() -> B::Device {
     Default::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BLOCK_LADDER, BlockLayout, Ladder};
+
+    #[test]
+    fn ladder_grows_on_two_full_accepts() {
+        let mut ladder = Ladder::new(None, false);
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::Chain {
+                len: BLOCK_LADDER[0]
+            }
+        );
+        ladder.observe(1, 3, false); // 33%: neutral
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::Chain {
+                len: BLOCK_LADDER[0]
+            }
+        );
+        ladder.observe(3, 3, false); // full #1
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::Chain {
+                len: BLOCK_LADDER[0]
+            }
+        );
+        ladder.observe(3, 3, false); // full #2 -> step up
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::Chain {
+                len: BLOCK_LADDER[1]
+            }
+        );
+        ladder.observe(8, 8, false);
+        ladder.observe(8, 8, false);
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::Chain {
+                len: BLOCK_LADDER[2]
+            }
+        );
+        ladder.observe(16, 16, false);
+        ladder.observe(16, 16, false); // ceiling holds
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::Chain {
+                len: BLOCK_LADDER[2]
+            }
+        );
+    }
+
+    #[test]
+    fn ladder_shrinks_after_two_lows_only() {
+        let mut ladder = Ladder::new(None, false);
+        ladder.observe(3, 3, false);
+        ladder.observe(3, 3, false); // rung 1
+        ladder.observe(8, 8, false);
+        ladder.observe(8, 8, false); // top
+        ladder.observe(8, 16, false); // low #1: hold
+        assert_eq!(ladder.block_len(), BLOCK_LADDER[2]);
+        ladder.observe(8, 16, false); // low #2: step down
+        assert_eq!(ladder.block_len(), BLOCK_LADDER[1]);
+    }
+
+    #[test]
+    fn ladder_floor_and_trimmed_and_fixed() {
+        let mut ladder = Ladder::new(None, false);
+        ladder.observe(0, 3, false);
+        ladder.observe(0, 3, false); // floor holds at the bottom rung
+        assert_eq!(ladder.block_len(), BLOCK_LADDER[0]);
+        ladder.observe(3, 3, true); // trimmed cycles carry no signal
+        assert_eq!(ladder.block_len(), BLOCK_LADDER[0]);
+
+        let mut pinned = Ladder::new(Some(7), false);
+        pinned.observe(7, 7, false);
+        pinned.observe(7, 7, false);
+        assert_eq!(pinned.layout(), BlockLayout::Chain { len: 7 });
+        assert_eq!(pinned.block_len(), 7);
+    }
+
+    #[test]
+    fn ladder_tree_maps_budget_to_depth() {
+        let mut ladder = Ladder::new(None, true);
+        assert_eq!(ladder.layout(), BlockLayout::Tree { levels: 1 });
+        ladder.observe(1, 1, false);
+        ladder.observe(1, 1, false);
+        assert_eq!(ladder.layout(), BlockLayout::Tree { levels: 2 });
+        ladder.observe(2, 2, false);
+        ladder.observe(2, 2, false);
+        assert_eq!(ladder.layout(), BlockLayout::Tree { levels: 3 });
+        // A pinned block stays linear even with tree mode requested.
+        assert_eq!(
+            Ladder::new(Some(3), true).layout(),
+            BlockLayout::Chain { len: 3 }
+        );
+    }
 }
