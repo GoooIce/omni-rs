@@ -106,19 +106,14 @@ fn residual_add(x: &Tensor<f16>, y: &Tensor<f16>, out: &mut Tensor<f16>) {
 /// Opt-in switch: the fused verify seams run only with `MINICPM_GLUE=1`
 /// (they measured slower than the burn chains there; see the module doc).
 fn verify_enabled() -> bool {
-    // Lib unit tests exercise the kernels; integration tests and production
-    // see the default-off seam behavior.
-    if cfg!(test) {
-        return true;
-    }
-    matches!(std::env::var("MINICPM_GLUE"), Ok(value) if value == "1")
+    crate::knobs::verify_glue()
 }
 
 /// The draft seams default ON: the draft forward is CPU-dispatch-bound, so
 /// each replaced burn op is dispatch saved. `MINICPM_DRAFT_GLUE=0` is the
 /// same-binary kill switch for A/B.
 fn draft_enabled() -> bool {
-    !matches!(std::env::var("MINICPM_DRAFT_GLUE"), Ok(value) if value == "0")
+    crate::knobs::draft_glue()
 }
 
 /// The shared RMS-norm launch: one cube per row, one kernel per call

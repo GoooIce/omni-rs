@@ -10,6 +10,7 @@ pub mod generate;
 #[cfg(feature = "metal")]
 pub(crate) mod glue;
 pub mod image;
+pub(crate) mod knobs;
 pub mod latent;
 #[cfg(feature = "metal")]
 pub(crate) mod markov;

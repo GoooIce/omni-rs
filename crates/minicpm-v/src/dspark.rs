@@ -27,35 +27,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 const DEFAULT_LAYERS: [usize; 5] = [3, 11, 19, 27, 35];
-
-/// The target layers whose hidden states feed the draft's cross-attention
-/// context. `MINICPM_DSPARK_LAYERS` (five ascending indices in 0..40,
-/// comma-separated) overrides the default for experiments; anything else
-/// falls back to the default set.
-fn target_layers() -> &'static [usize; 5] {
-    static LAYERS: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
-    LAYERS.get_or_init(|| {
-        let parsed: Option<Vec<usize>> =
-            std::env::var("MINICPM_DSPARK_LAYERS")
-                .ok()
-                .and_then(|value| {
-                    let parts: Vec<usize> = value
-                        .split(',')
-                        .map(|part| part.trim().parse().ok())
-                        .collect::<Option<Vec<_>>>()?;
-                    (parts.len() == 5
-                        && parts.windows(2).all(|pair| pair[0] < pair[1])
-                        && parts.first().is_some_and(|&first| first < 40)
-                        && parts.last().is_some_and(|&last| last < 40))
-                    .then_some(parts)
-                });
-        parsed.map_or(DEFAULT_LAYERS, |parts| {
-            let mut layers = [0usize; 5];
-            layers.copy_from_slice(&parts);
-            layers
-        })
-    })
-}
 const MASK_TOKEN: u32 = 248076;
 const HIDDEN: usize = 2048;
 const HEADS: usize = 8;
@@ -64,23 +35,6 @@ const HEAD_DIM: usize = 256;
 const INTERMEDIATE: usize = 6144;
 const RANK: usize = 256;
 const VOCAB: usize = 248144;
-
-/// Draft block length policy. `MINICPM_DSPARK_BLOCK` (1..=31) pins a fixed
-/// block; without it the generation loop adapts the block AIMD-style from
-/// observed acceptance: two fully-accepted cycles double it, a cycle that
-/// accepts at most half shrinks it. The verify length is `block + 1` and the
-/// expert-mask kernel packs one token per u32 bit, capping the range at 32
-/// verify tokens.
-fn fixed_block() -> Option<usize> {
-    static BLOCK: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *BLOCK.get_or_init(|| {
-        std::env::var("MINICPM_DSPARK_BLOCK")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|size| (1..=31).contains(size))
-    })
-}
-
 /// The adaptive block's ladder. Discrete sizes keep the verify-shape set
 /// finite: every size's matmul/attention autotune key is paid once and then
 /// replays from the persistent cache, instead of re-tuning on every step of
@@ -255,26 +209,6 @@ fn accept_path(
         correction,
         draft_eos,
     })
-}
-
-/// Tree-mode switch: `MINICPM_DSPARK_TREE=1` proposes a full binary markov
-/// tree instead of a linear chain and verifies it with ancestor-masked
-/// attention plus per-path linear-attention scans (exact, Metal-only).
-fn tree_enabled() -> bool {
-    static TREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TREE.get_or_init(|| matches!(std::env::var("MINICPM_DSPARK_TREE"), Ok(v) if v == "1"))
-}
-
-/// `MINICPM_DSPARK_MARKOV_QUANT=1` swaps the markov head's correction to
-/// the int8-quantized single-kernel path (draft-only numerics).
-fn markov_quant_enabled() -> bool {
-    static QUANT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *QUANT.get_or_init(|| matches!(std::env::var("MINICPM_DSPARK_MARKOV_QUANT"), Ok(v) if v == "1"))
-}
-
-fn tree_trace() -> bool {
-    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var_os("MINICPM_DSPARK_TRACE").is_some())
 }
 
 /// A candidate tree over one speculative block, flattened breadth-first:
@@ -527,7 +461,7 @@ impl<B: Backend> Draft<B> {
             )?,
             markov_w2: shared::Linear::from_parts(markov_w2_weights.clone(), None),
             #[cfg(feature = "metal")]
-            markov_quant: if markov_quant_enabled() {
+            markov_quant: if crate::knobs::dspark_markov_quant() {
                 Some(crate::markov::quantize_w2(
                     &markov_w2_weights,
                     VOCAB,
@@ -643,7 +577,7 @@ impl<B: Backend> Draft<B> {
         let t_markov = t_markov.elapsed();
         let t_readback = Instant::now();
         let flat = Tensor::cat(level_indices, 0).into_data().convert::<i64>();
-        if tree_trace() {
+        if crate::knobs::dspark_trace() {
             eprintln!(
                 "propose_split: draft {:.2} logits {:.2} markov {:.2} readback {:.2} (tree {} levels, {} tokens)",
                 timing.draft.as_secs_f64() * 1000.0,
@@ -692,7 +626,7 @@ impl<B: Backend> Draft<B> {
         let t_markov = t_markov.elapsed();
         let t_readback = Instant::now();
         let values = Tensor::cat(picks, 0).into_data().convert::<i32>();
-        if tree_trace() {
+        if crate::knobs::dspark_trace() {
             eprintln!(
                 "propose_split: draft {:.2} logits {:.2} markov {:.2} readback {:.2}",
                 timing.draft.as_secs_f64() * 1000.0,
@@ -1006,7 +940,7 @@ pub fn generate<B: Backend>(
         draft_tokens_accepted: 0,
         output_tokens: 0,
         trace: PhaseTrace {
-            enabled: std::env::var_os("MINICPM_DSPARK_TRACE").is_some(),
+            enabled: crate::knobs::dspark_trace(),
             ..PhaseTrace::default()
         },
     };
@@ -1016,7 +950,7 @@ pub fn generate<B: Backend>(
             prompt.embeddings.clone(),
             prompt.positions.as_deref(),
             &mut state,
-            target_layers(),
+            crate::knobs::dspark_layers(),
             false,
         )
         .map_err(|error| error.to_string())?;
@@ -1024,7 +958,7 @@ pub fn generate<B: Backend>(
     // The ladder picks each cycle's layout: a linear chain of the block
     // budget, or (adaptive runs only; a pinned MINICPM_DSPARK_BLOCK stays
     // linear for experiments) a markov tree.
-    let mut ladder = Ladder::new(fixed_block(), tree_enabled());
+    let mut ladder = Ladder::new(crate::knobs::dspark_block(), crate::knobs::dspark_tree());
     let mut block_sum = 0usize;
     let mut draft_state = draft
         .prepare(captured, capacity)
@@ -1108,10 +1042,10 @@ pub fn generate<B: Backend>(
         let phase = Instant::now();
         let (position_logits, captured, linear_after) = match &tree {
             Some(tree) => model
-                .forward_verifying_tree(&block, tree, &mut state, target_layers())
+                .forward_verifying_tree(&block, tree, &mut state, crate::knobs::dspark_layers())
                 .map_err(|error| error.to_string())?,
             None => model
-                .forward_verifying_with(&block, &mut state, target_layers(), numerics)
+                .forward_verifying_with(&block, &mut state, crate::knobs::dspark_layers(), numerics)
                 .map_err(|error| error.to_string())?,
         };
         if stats.trace.enabled {
