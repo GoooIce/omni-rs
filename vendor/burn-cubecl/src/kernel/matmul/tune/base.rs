@@ -26,6 +26,47 @@ fn matmul_input_gen<R: CubeRuntime>(
     (lhs.clone(), rhs.clone(), out.copy())
 }
 
+/// `[..., rows, k] @ [..., k, n]` as a batch of `m = 1` float matmuls.
+fn float_row_batch<R: CubeRuntime>(
+    lhs: CubeTensor<R>,
+    rhs: CubeTensor<R>,
+    out_dtype: DType,
+) -> Option<CubeTensor<R>> {
+    let lhs_rank = lhs.meta.num_dims();
+    let rhs_rank = rhs.meta.num_dims();
+    if lhs_rank < 2 || rhs_rank < 2 {
+        return None;
+    }
+    let rows = lhs.meta.shape[lhs_rank - 2];
+    if !(2..=32).contains(&rows) {
+        return None;
+    }
+    let mut lhs_dims = lhs.meta.shape.as_slice().to_vec();
+    let k = lhs_dims.pop()?;
+    let m = lhs_dims.pop()?;
+    lhs_dims.extend([m, 1, k]);
+    let mut rhs_dims = rhs.meta.shape.as_slice().to_vec();
+    let n = rhs_dims.pop()?;
+    let rhs_k = rhs_dims.pop()?;
+    if rhs_k != k {
+        return None;
+    }
+    rhs_dims.extend([1, rhs_k, n]);
+    let lhs_batched = crate::ops::reshape(lhs.clone(), burn_backend::Shape::from(lhs_dims));
+    let rhs_batched = crate::ops::reshape(rhs.clone(), burn_backend::Shape::from(rhs_dims));
+    let output = matmul_autotune(lhs_batched, rhs_batched, None, out_dtype);
+    let mut out_dims = output.meta.shape.as_slice().to_vec();
+    let width = out_dims.pop()?;
+    if out_dims.pop()? != 1 {
+        return None;
+    }
+    out_dims.push(width);
+    Some(crate::ops::reshape(
+        output,
+        burn_backend::Shape::from(out_dims),
+    ))
+}
+
 /// Executes autotune on matmul operations
 pub fn matmul_autotune<R: CubeRuntime>(
     lhs: CubeTensor<R>,
@@ -34,6 +75,29 @@ pub fn matmul_autotune<R: CubeRuntime>(
     out_dtype: DType,
 ) -> CubeTensor<R> {
     let output = out.unwrap_or_else(|| init_matmul_output(&lhs, &rhs, out_dtype));
+
+    if crate::kernel::matmul::decode_tile_rows() {
+        let rank = lhs.meta.num_dims();
+        if rank >= 2 {
+            let rows = lhs.meta.shape[rank - 2];
+            if (1..=32).contains(&rows)
+                && crate::kernel::matmul::try_launch_decode_tile(
+                    lhs.clone(),
+                    rhs.clone(),
+                    output.clone(),
+                )
+                .is_ok()
+            {
+                return output;
+            }
+            if rhs.qparams.is_none()
+                && lhs.qparams.is_none()
+                && let Some(batched) = float_row_batch(lhs.clone(), rhs.clone(), out_dtype)
+            {
+                return batched;
+            }
+        }
+    }
 
     let client = lhs.client.clone();
     let num_cpu_cores = client.properties().hardware.num_cpu_cores;

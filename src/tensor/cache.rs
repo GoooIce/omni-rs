@@ -40,6 +40,27 @@ impl<B: Backend> KvCache<B> {
             tensors: Some((copy(k), copy(v))),
         }
     }
+    /// Independent storage for the selected slots, in the given order. A
+    /// speculative tree verify compacts its accepted path with this.
+    pub fn copy_selected(&self, slots: &[usize]) -> Self {
+        assert!(slots.iter().all(|&slot| slot < self.len()));
+        if slots.is_empty() {
+            return Self::default();
+        }
+        let (k, v) = self.tensors.as_ref().expect("nonempty cache");
+        let device = k.device();
+        let ids = Tensor::<B, 1, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(
+                slots.iter().map(|&slot| slot as i64).collect(),
+                [slots.len()],
+            ),
+            &device,
+        );
+        let select = |x: &Tensor<B, 4>| x.clone().select(2, ids.clone());
+        Self {
+            tensors: Some((select(k), select(v))),
+        }
+    }
     /// Append an immutable cached segment. Tensor ownership keeps active
     /// requests valid even when the radix tree evicts its copy of the segment.
     pub fn append_cache(&mut self, segment: &Self) {

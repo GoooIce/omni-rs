@@ -12,11 +12,66 @@ mod tests;
 use crate::{Precision, Result, weights::WeightSource};
 use burn::tensor::{Bool, DType, FloatDType, Tensor, TensorData, backend::Backend, module};
 pub use cache::KvCache;
+use std::cell::Cell;
 mod decode_cache;
 pub use decode_cache::DecodeCache;
 pub use embedding::Embedding;
 pub use norm::{Norm, NormKind, NormReduction, layer_norm};
 pub use radix::{PageId, RadixCache, RadixGuard, RadixMatch, RadixStats};
+
+thread_local! {
+    static DECODE_ROW_GEMV: Cell<bool> = const { Cell::new(false) };
+    static DECODE_QUERY_ATTENTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While this guard is alive, a sequence matmul runs one token row at a time.
+///
+/// A multi-row matmul and the single-token decode matmul are different kernels.
+/// Speculative verification has to score and commit with the decode kernel, or a
+/// later close argmax leaves the greedy stream.
+pub struct DecodeRowGemv {
+    previous: bool,
+}
+
+impl DecodeRowGemv {
+    pub fn enter() -> Self {
+        let previous = DECODE_ROW_GEMV.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for DecodeRowGemv {
+    fn drop(&mut self) {
+        DECODE_ROW_GEMV.with(|flag| flag.set(self.previous));
+    }
+}
+
+pub fn decode_row_gemv() -> bool {
+    DECODE_ROW_GEMV.with(|flag| flag.get())
+}
+
+/// While this guard is alive, each query in a verify block uses the single-token
+/// attention kernel. Projections stay one matmul for the block.
+pub struct DecodeQueryAttention {
+    previous: bool,
+}
+
+impl DecodeQueryAttention {
+    pub fn enter() -> Self {
+        let previous = DECODE_QUERY_ATTENTION.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for DecodeQueryAttention {
+    fn drop(&mut self) {
+        DECODE_QUERY_ATTENTION.with(|flag| flag.set(self.previous));
+    }
+}
+
+pub fn decode_rows() -> bool {
+    DECODE_QUERY_ATTENTION.with(|flag| flag.get()) || decode_row_gemv()
+}
 
 pub fn dtype<B: Backend, const D: usize>(x: &Tensor<B, D>) -> FloatDType {
     if x.dtype() == DType::F16 {
@@ -115,6 +170,9 @@ impl<B: Backend> Linear<B> {
         ))
     }
     /// The resident view lets kernel adapters dispatch without repacking weights.
+    /// Shape is `[input, output]` — the transposed executable view, not the
+    /// checkpoint's `[output, input]`; kernels indexing checkpoint-style rows
+    /// must transpose (see docs/cube-dsl-pitfalls.md).
     pub fn weight(&self) -> &Tensor<B, 2> {
         &self.weight
     }
@@ -123,6 +181,34 @@ impl<B: Backend> Linear<B> {
     }
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         module::linear(x, self.weight.clone(), self.bias.clone())
+    }
+
+    /// `[1, seq, hidden]` projection. Under [`DecodeRowGemv`], each token is a decode matmul.
+    pub fn forward_sequence(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let seq = x.dims()[1];
+        if seq <= 1 || !decode_row_gemv() {
+            return self.forward(x);
+        }
+        let width = x.dims()[2];
+        let mut rows = Vec::with_capacity(seq);
+        for index in 0..seq {
+            rows.push(self.forward(x.clone().slice([0..1, index..index + 1, 0..width])));
+        }
+        Tensor::cat(rows, 1)
+    }
+
+    /// `[rows, hidden]` projection. Under [`DecodeRowGemv`], each row is a decode matmul.
+    pub fn forward_rows(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let rows_n = x.dims()[0];
+        if rows_n <= 1 || !decode_row_gemv() {
+            return self.forward(x);
+        }
+        let width = x.dims()[1];
+        let mut rows = Vec::with_capacity(rows_n);
+        for index in 0..rows_n {
+            rows.push(self.forward(x.clone().slice([index..index + 1, 0..width])));
+        }
+        Tensor::cat(rows, 0)
     }
 }
 

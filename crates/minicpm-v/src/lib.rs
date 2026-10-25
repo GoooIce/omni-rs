@@ -3,10 +3,20 @@
 pub mod chat;
 pub mod config;
 pub mod doctor;
+pub mod dspark;
+#[cfg(feature = "metal")]
+mod gdn_scan;
 pub mod generate;
+#[cfg(feature = "metal")]
+pub(crate) mod glue;
 pub mod image;
+pub mod latent;
+#[cfg(feature = "metal")]
+pub(crate) mod markov;
 pub mod model;
 pub mod moe;
+#[cfg(feature = "metal")]
+pub(crate) mod moe_dense;
 pub mod multimodal;
 pub mod positions;
 pub mod quant;

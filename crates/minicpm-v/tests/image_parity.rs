@@ -57,6 +57,7 @@ fn single_image_greedy_matches_official_tokens() {
                 model_dir: &model_dir,
                 image: &image,
                 prompt,
+                enable_thinking: None,
                 device: &device,
                 precision: omni_r2t2::Precision::F32,
             })

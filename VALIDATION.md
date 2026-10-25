@@ -3,7 +3,498 @@
 记录日期：2026-10-15（历史基线保留原日期）。设备：Apple M5 Max，40 核 GPU，128 GB RAM，macOS 27.0.1。
 工具链：rustc/cargo 1.99.0，Burn 0.21.0；依赖版本保存在 Cargo.lock。
 
+## 2026-10-23：DSpark 投机解码首次反超普通解码（分组 MoE 内核）
+
+`crates/minicpm-v` 的 DSpark 路径从“比普通贪心慢 4.6 倍”改到“快 1.5–1.9 倍”。
+提示「用几句话说明分页 KV 缓存是什么。」，温度 0，同一检查点（int4 目标 + BF16 草稿）。
+本机 GPU 时钟随热状态波动（普通解码同长度两场可差 134→235 ms/token），所以以
+**同场交错对比**为准；`MINICPM_DSPARK_TRACE=1` 可复测分相。
+
+| 对照场次 | 普通贪心 | DSpark | 加速比 |
+| --- | --- | --- | --- |
+| 向量内核后 200 token 交错（普/DS/普） | 188 / 196 ms/token | 85 ms/token（11.8 tok/s） | 2.21× / 2.30× |
+| GPU argmax 后慢状态场交错（普/DS/普） | 149 / 139 ms/token | 83 ms/token（12.0 tok/s） | 1.79× / 1.68× |
+| 收尾快状态场（普/DS 交错） | 134 / 141 ms/token（历史快基线） | 78–86 ms/token（最高 12.8 tok/s） | 保守 ≥1.72×；深度节流场高达 3.8–4.9×（基线 329/422 ms/token） |
+| 向量内核后 200 token 单场 | — | 80 ms/token（12.5 tok/s） | — |
+| 200 token 交错三连（普/DS/普） | 134 / 141 ms/token | 86 ms/token（11.6 tok/s） | 1.56× / 1.64× |
+| 300 token 第一场 | 235 ms/token | 126 ms/token | 1.87× |
+| 300 token 复测 | 166 ms/token | 103 ms/token | 1.61× |
+| 200 token 早期场 | 169 ms/token | 113 ms/token | 1.50× |
+| DSpark 改前 | — | 381 ms/token（0.44×） | — |
+
+改前每周期 746 ms（propose 148 / verify 582 / accept 8），τ=1.96；向量内核后
+200-token 周期约 153 ms（propose 17 / verify 120 / accept 13 / retain 2），
+τ≈2.0。DSpark 绝对吞吐从改前 2.6 tok/s 升到 11.8–12.5 tok/s。
+
+### 改动
+
+1. **草稿增量上下文**（`dspark.rs` `DraftState`）：fc/hidden-norm/K/V 按接受 token
+   增量投影；K/V 驻留在预分配的 `[1, KV_HEADS, capacity, HEAD_DIM]` 缓冲——接受前缀
+   与 propose 的块行都走 `slice_assign`，任何周期都不再拷贝上下文（此前每周期两次
+   O(ctx) 的 `Tensor::cat`）。Markov 头 gather+argmax 全程驻留设备，一次读回 15 个
+   提案。
+2. **批量校验数值模式**（`model.rs` `VerifyNumerics`）：默认 `Batched`（多行 tile、
+   批量注意力、prefill 式 MoE，即 vLLM 式整块打分）；`MatchingDecode` 保留逐位一致
+   语义，`forward_verifying` 与 `verify_commit` 测试不变。CLI `--dspark-match-decode`
+   可退回。
+3. **分组 MoE 三内核**（`moe_dense.rs`，cube DSL）：每层 256 个专家在加载期拼接成
+   三个原始 u32-words+f32-scales 线性缓冲（`quant.rs` 的 v/h concat 加载器），校验块
+   的 MoE 由 gate+up / down / combine 三次启动完成——路由 softmax/topk 全在设备端
+   （40 次/层的路由回读同步清零），未触达专家的工作组在读权重前早退。内核内层
+   “每 word 单次加载、m 为 comptime 展开的 16 个 Array 累加器”：nibble 解包与 token
+   无关，解一次喂全部 token（解包量从 16× 降 1×）。校验前向 582→约 180 ms。
+4. **接受相整块 GPU argmax**（`dspark.rs`）：贪心且无惩罚时（DSpark CLI 限定温度 0）
+   整块 `[16, vocab]` 在设备上 argmax 一次读回 16 个 id，替代每位置一次 1 MB 行读回
+   加主机采样；惩罚路径保留逐行主机采样。
+5. **verify 块的向量内核**（`moe_gate_up_vec`/`moe_down_vec`）：校验块恒为 16 token，
+   该形状走 `Tensor<Vector<f32, 8>>` 专用内核——x 转置 `[hidden, 16]` 使每列 16 值为
+   两个向量读，累加器是两个 8-lane 向量，解包出的权重经 `Vector::cast_from` splat
+   后做向量 FMA（标量版每权重 16 次 FMA）；act 用转置 `[E*inter, 16]` 布局衔接
+   K1→K2。verify 176→120 ms。标量内核保留给 prefill（m≠16）。后续四个受控实验
+   均为中性或负结果并已记录：纯转置不配向量（更慢）；K1 的 k 维 4 路拆分加两
+   阶段归约（持平）；K1 双累加器指令级并行（单链 119 对双链 136 ms，寄存器压
+   力反超）；**权重 k 主序重排以合并相邻线程的内存读取（A/B 同机同态：行主序
+   156–160 ms、k 主序 158 ms——完全持平，证明分组内核不是带宽/合并受限，瓶颈
+   在每层的内核发射与主机编排）**。k 主序版保留（设计正确、测试等价）。
+
+### 坑（都已写成测试或注释；常驻清单在 docs/cube-dsl-pitfalls.md，本节留证据）
+
+- cube DLS 的 `if cond { a } else { b }` 不能当值用（求值成 0）——nibble 补码必须
+  branchless（`raw - i32::cast_from(raw >= 8) * 16`，同 cubek dequantize 的写法）。
+  该 bug 曾让全部专家权重带上 +8×scale 的系统偏移。
+- burn 的 Int 张量默认 dtype 是 I64：`Tensor::<B,1,Int>::from_data` 需显式
+  `TensorCreationOptions { dtype: Some(DType::I32) }`，否则 i32 内核读进交错垃圾。
+- 大尺寸拼接 QFloat 张量过 packed matmul 静默错值（与 3-D batched QFloat 同病），
+  故分组内核直读原始线性缓冲，CPU 测试证明两种 concat 与逐专家加载器逐元素一致。
+- `TensorData` 的 f32 数据默认上成设备 f16：scales 用显式 F32 options 创建。
+- cube 的 `#[unroll]` 循环变量类型必须可推断：字面量范围需要后缀（`0..8u32`）。
+
+### 测试
+
+`verify_commit`（matching 模式逐位一致）、`greedy_parity`、`metal_spot` 全绿；
+lib 单元测试 59/59（`moe_dense` 分组内核 9/9，含 16-token 向量路径与 256×512×2048
+的 35B 层尺寸、f64
+参考加“平方权重必须可分辨”的敏感性断言；`quant` concat 加载器 CPU 对照；既有 int4
+测试）。CPU 构建（`--no-default-features --features native,cpu`）编译通过（分组路径
+仅 Metal，其余后端回落原路径）。
+
+### 与 vLLM 的对照
+
+vLLM 的 DSpark（GPU）对自身普通解码的加速通常 1.5–3×；本机（M5 Max/Metal，无
+vLLM 部署）以同场普通贪心为基线测得 1.6–2.3×（GPU 高频态 2.2–2.3×，低频态
+1.7–1.8×；DSpark 绝对值稳定在 80–86 ms/token，波动主要来自普通解码基线），
+落在该区间的中段。绝对
+tok/s 对照需要用户提供其 vLLM 部署（同模型 int4、同提示、
+`num_speculative_tokens 15`）的实测值。verify 内 10 层全注意力随上下文线性增长
+属模型固有；接受相 13 ms 为 GPU 队列排空（与 verify 部分重叠）。
+
+## 2026-10-23（晚）：用户提供本地参照与新靶值 100 tok/s
+
+用户本机（同机 M5 Max）LM Studio/MLX 实测：MiniCPM-V-4.7-35B-A3B **BF16 全精度
++ DSpark draft** 挂载，think=on，883 token 生成，**稳态 50 tok/s**（首 token
+26.14 s、预填充 1 tok/s）。BF16 每激活参数 2 字节 → ~6 GB/token → 50 tok/s 即
+~300 GB/s 有效带宽（M5 Max ~400 GB/s 的 75%），证明该硬件上 MLX 级实现的上限。
+用户新靶值：**100 tok/s**。我方现状 12.0–12.8 tok/s（int4，~2 GB/token，有效
+~27 GB/s）。差距根源经本轮合并读取实验排除带宽解释后，定位在每层内核发射次数
+（40 层 × ~25 启动/层 ≈ 千次/周期）与主机编排间隙——对齐 100 tok/s 需要内核融
+合与发射批量化级别的重构（多会话工程）。
+
+## 2026-10-23（夜）：MoE 单内核融合（五连发 → 每层 5 发）与两个瓶颈假设的证伪
+
+按「融合 MoE 五连发作为单内核」的计划，把每层 MoE 的设备端算子从 ~19 次发射
+（router matmul + topk + min_dim + lower + mask_fill + softmax + gate/up + down +
+combine + 共享专家 3×matmul + silu/mul + 门控 matmul + sigmoid + mul + add，再计
+cast/transpose）压到 **5 次**（`moe_dense.rs`）：
+
+1. `moe_router`：一 cube 一 token、一 unit 一专家。unit 算各自 logit，
+   `SharedMemory` + `sync_cube` 共享后，每个 unit 冗余推导同一 top-k（严格 `>`
+   保最低索引，与 `route()` 稳定排序同规约），renormalized softmax 权重双布局输出
+   （`[m,E]` 给 gate/up 触达检查、`[E,16]` 给向量 down 的 lane 权重）；unit 0 顺带
+   算共享专家 sigmoid 门。替换 6 连 burn 链（topk 内含排序）。
+2. `moe_gate_up[_vec]`：不变（向量版 act 写回转置 `[E*inter,16]`）。
+3. `moe_shared_gate_up`：共享专家 SwiGLU，f32 权重（bf16 加载点无损上转）。
+4. `moe_down_vec_split` + `moe_reduce_shared`（m=16）：down 向量化保持（一个解包
+   权重喂 16 token 的 lane FMA），专家分 ≤16 块并行、路由权重以 `[E,16]` 向量乘入，
+   partial 由 reduce 内核求和并叠加门控共享专家——combine、共享 down、门控乘、最终
+   加法全部折入。m≠16 走标量 `moe_down_total`（每 (m,h) 线程自带 combine+共享）。
+
+`DenseExperts` 扩展持有 router/共享专家 f32 视图；`forward_dense` 瘦身为一次
+`try_dense_moe`（+cast）。测试拆出 `try_dense_experts`（显式权重/门控驱动专家段，
+与 router 的 f32 点积噪声隔离）与 `try_dense_router`（router 单测）。
+
+### 本轮坑（均已并入 docs/cube-dsl-pitfalls.md；此处留证据）
+
+- **cube 宏不接受 let 初始化器里的负浮点字面量与字面量间算术**（报
+  `f32: From<NativeExpand<f32>>`，`-1.0f32`/`0.0f32 - 1.0`/`f32::NEG_INFINITY`
+  全灭）：两行式 `let mut x = 0.0f32; x = x - 3.4e38;` 可用；语句位置的 `-v`/e 记数
+  正常。
+- **`shared::Linear::weight()` 返回可执行视图 `[input, output]`**（加载时已转置）：
+  内核按 checkpoint 式 `[output, input]` 行索引，构造 `DenseExperts` 时必须再
+  `.transpose().cast(F32)`。此 bug 曾让真权重 seam 相对 RMSE 0.28（合成测试自建
+  张量测不出）；修复后 **real-35B layer0 seam RMSE 0.0147**。
+- **中途 `into_data` 读回会污染后续内核**（既有已知坑）：诊断用的多读回 bisect 测试
+  给出「共享专家输出恒 0」的假象；以单次前向的 seam 测试为准。
+- SharedMemory 需 `let mut`；`sync_cube` 前 diverge（`terminate!`）会挂起。
+
+### 性能（同态交错 A/B，propose 相为热态指示器，200 token）
+
+| 版本 | propose | verify | 备注 |
+| --- | --- | --- | --- |
+| 旧（3 发 + burn router/共享链） | 21.2/22.1/22.0 | 135.7/136.7/141.8 | 基线 |
+| 新（融合，标量 down_total） | 23.3/19.9/21.5 | 144.9/120.6/127.2 | τ 1.942（f32 路由，略升） |
+| 新（融合，向量 down_split） | 23.0/23.4/22.2 | 137.7/144.5/138.2 | τ 1.905 |
+
+**初步结论（当晚）**：发射数 -600/verify（~19→5/层）只换来 verify ~5–10%；down
+标量/向量分解持平——当时记为「发射间隙假设证伪」。**次日逐内核计数证明该结论是
+抽样偏差**：-600 发只占 verify 总发射的 ~10%，-8% 墙钟恰是线性响应；整体
+verify 仍是发射受限（见下节构成表，140.8 ms ÷ 5829 发 ≈ 24 µs/发）。
+
+### 测试
+
+lib 60/60（分组内核 10：显式权重专家段 × 9 + router 模型规模对照；router 权重对照
+容差 1e-3 = f32+FMA 点积噪声，选择集/零元/门控严格断言）；`verify_commit`、
+`greedy_parity`、`metal_spot`、CPU 构建、fmt 全绿。
+
+### 2026-10-24：verify 140 ms 的确切构成（逐内核计数）
+
+新诊断 harness `crates/minicpm-v/tests/verify_profile.rs`（`#[ignore]`，跑法与
+聚合命令在其文件头）：只跑 Batched 校验前向（16 token、40 层、上下文 ~30，
+verify 后 retain 回滚保持上下文恒定），配合
+`CUBECL_DEBUG_OPTION=profile CUBECL_DEBUG_LOG=1` 抓 cubecl 逐内核日志。无
+profiling 时 **140.8 ms/前向**，与 trace 的 verify 相完全吻合（harness 有代表性）。
+跑两遍取第二遍（第一遍付 autotune/编译）。
+
+**每前向 5829 次内核发射，140.8 ms ÷ 5829 ≈ 24 µs/发——verify 整体发射受限，
+GPU 从未跑满。** 按发射数（精确）与 System 计时口径时长（含每发同步、为上界）：
+
+| 构成 | 发射/前向 | 占比(发) | ms/前向(上界) | 占比(时) |
+| --- | --- | --- | --- | --- |
+| burn 粘合算子（Binop/Scalar/Unary/Cast/Slice/SliceAssign/Reduce/Copy/Mask 等） | ~5244 | 90% | ~352.8 | 57% |
+| 融合后 MoE（router+gate_up+shared+down+reduce） | 164 | 2.8% | ~101.3 | 16% |
+| MatmulEntry（qkv/o/a/b 等投影） | 250 | 4.3% | 45.2 | 7% |
+| GdnScanKernel（30 层线性注意力扫描） | 31 | 0.5% | 97.4 | 16% |
+| FullKernel（10 层全注意力） | 96 | 1.6% | 8.0 | 1% |
+
+单层发射序列点名（每层 ~145 发）：MoE 段已是 7 发（融合生效）；其余 ~60 发为
+Norm 链（Reduce+ScalarBinop+Unary+Mul+Cast 各 7-9 发 ×2 norm）、gdn 卷积状态维护
+（Slice×8 + SliceAssign×12）、投影间 Cast/Binop。粘合算子风暴的两条出路：
+**burn-fusion 流式融合**（metal 构建已编译入 burn-cubecl 的 fusion 特性但日志显示
+这些链未被融合——需要核实流式上下文为何不吞并 Cast f16↔f32 断链）与**手工融合
+每层粘合**（rmsnorm+残差+cast 一发化、gdn 状态 SliceAssign 风暴一发化）。
+GdnScanKernel 是最大的单内核线目（30 发、System 计时 ~3.1 ms/发，recurrence 对
+token 天然串行）——若其实机时长接近上界，单它就占 verify 一半，需读
+`crates/minicpm-v/src/gdn_scan.rs` 的并行化空间。
+
+## 2026-10-24（午后）：burn-fusion 实验全程——确认为死路并回退
+
+按构成表的第 1 杠杆验证 burn-fusion 流式融合。探针（`tests/fusion_probe.rs`，
+保留）显示合成 norm 链 409→71 发（-83%）——收益方向成立；但全模型接入后为
+**决定性负结果**，已完整回退（131 ms/前向复原，全部测试绿）：
+
+- **接入**：metal 特性补 `burn/fusion`（爆炸半径仅 moe_dense 7 处 + gdn_scan 2 处）；
+  新桥接层 `resolve`（排空流保序）/`register_external_tensor`+`Init` op 回流。
+  途中修真 bug：router 输出张量曾以一维 `[values]` 形状冒充 rank-2（裸后端不查、
+  融合 trace 分析崩）——已按真实 2-D 形状分配（`alloc_f32_2d`，回退后保留）。
+- **负结果一**：Reduce/ReduceBroadcasted fuser 的 trace codegen 在本模型流上 panic
+  （`GlobalArgsLaunch::resolve_arg` 越界 + ordering 二次崩）——上游 bug。
+- **负结果二**：砍 reduce fuser后 **MatmulFuser 把 matmul 发射 250→6290/前向（25×）**。
+- **负结果三**：只留 ElementWiseFuser 仍 **285 ms/前向（2× 回归）**：融合流的逐算子
+  簿记（IR 构造 + 通道发送，~50µs/op × 5800 op）比省下的发射更贵；且真实流上
+  Slice/Cast（2774+1496 发）根本不参与融合——探针的干净合成链会融合，交错流不会。
+- **结论**：burn-fusion 0.21 在此工作负载上不可用（CPU 簿记主导 + 两个 fuser 各自
+  崩/炸）。100 tok/s 的路径回到：粘合算子手工融合（norm+残差+cast 单内核、gdn 状态
+  SliceAssign 风暴单内核）与 GdnScanKernel 优化。未来 burn 升级可用 fusion_probe
+  一分钟重测（全 fuser、真实交错流两类都要测）。
+
+## 2026-10-24（晚）：自研粘合融合（norm+残差单内核）——结构兑现、墙钟负结果
+
+不待 burn 升级、自己实现 fusion 的第一刀：`crates/minicpm-v/src/glue.rs` 两个
+cube 内核——`gemma_norm`（一行一 cube，SharedMemory 行平方和归约，f16 进出/f32
+计算，Gemma `weight+1` + `NormReduction::Divide` 逐位对应 `Norm::forward`）与
+`residual_add`（平铺 f32 相加回 f16）——替换四条层 seam 的 burn 链。
+
+**结构精确兑现**：verify 发射 5829 → 4915（-914，与构成表预测一致；norm 链的
+Reduce/Cast/Binop/Scalar/Unary 全部塌缩）。**但同二进制交错 A/B（`MINICPM_GLUE`
+开关，消二进制/数值/热态配对噪声，冷态两对）显示 glue ON 稳定慢 ~4%**（verify
++8–11 ms、accept +12 ms/周期）：被替换的 10 个轻量 elementwise 在深队列里互相
+流水，而融合内核把自身全延迟加进依赖链（GemmaNorm 53 µs/发、ResidualAdd
+67 µs/发，System 口径）。**修正认知：24 µs/发的整体均值只对重内核成立**
+（MoE A/B 的 -600 发是读几百 MB 的内核）；轻量 elementwise 的边际发射成本远低
+——「verify 发射受限」的结论被本实验直接证伪，verify 实为 GdnScan 延迟链主导。
+
+处置：内核与接缝保留、**默认关闭**（`MINICPM_GLUE=1` 选用；lib 单测内
+cfg!(test) 强制开启以保覆盖）， seam/lib 61/verify_commit/greedy_parity/
+metal_spot 全绿。下一杠杆回到 **GdnScanKernel 本体**（30 发、System 计时
+~97–105 ms/前向，真·大设备时间）与 accept 相读回（13–45 ms/周期）。
+
+## 2026-10-24（夜二）：GdnScan 两刀——主延迟链 -75%
+
+对构成表定位的最大单内核 GdnScanKernel（30 层线性注意力扫描，System 计时
+97–105 ms/前向）连砍两刀，均为 `gdn_scan.rs` 内的小改动：
+
+1. **并行度**：发射从每 cube 32 线程提到 `v_dim`（128）线程——原先 v 维被
+   chunk 循环串成 4 轮，全内核只有 heads×32=1024 线程在跑。内核本身已按
+   `CUBE_DIM_X` 参数化，改一行发射参数，chunk 循环自动退化。
+   **3.1–3.4 → 1.29 ms/发（-60%），97–105 → 40.2 ms/前向。**
+2. **访存**：kv 归约循环原先边读边写衰减态（每元素一次 store 且第二循环依赖
+   这些写）；改为只读归约 + 单写更新循环，数学不变。
+   **40.2 → 25.1 ms/前向（807 µs/发）。两刀合计 -75%。**
+
+3. **kk 维四分**（`gdn_scan_split_kernel`）：每 v 列由 4 个 unit 分摊 k 维归约，
+   部分和走 cube address space、各 unit 冗余求和（省一次屏障），每 token 仅
+   两次 sync。串行链 256→64 迭代，线程 4096→16384。**807 → 208 µs/发（再
+   -74%），25.1 → 6.7 ms/前向。三刀合计 3.1–3.4 ms → 208 µs/发（16×），
+   97–105 → 6.7 ms/前向。**（坑：`SharedMemory::new` 的字面量尺寸需要
+   `usize` 后缀，否则宏报 `usize: From<i32>`。）
+
+端到端（半冷态）：verify 119 ms、accept 4.9 ms、整链 **75.5 ms/token
+（13.3 tok/s）**；verify 内 GdnScan 占比从 ~70% 降到 ~6%。分裂版改变了 kv/y
+的浮点累加顺序，贪心文本随之变化（τ 波动属预期），全部数值门禁仍绿。
+注意本机在长时间连续重载后会进入暂态劣化（连 propose 都 ×2.5，空转几分钟
+即恢复，`pmset` 无热告警）——性能测量如见全场劣化先空转几分钟再测；测试与
+基准不要并行跑（抢 GPU 互相污染）。
+
+测试：gdn 2/2、lib 61/61、seam、verify_commit、greedy_parity、metal_spot、
+CPU 构建、fmt 全绿。
+
+### MoeRouter 拆分实验（负结果，已回退）
+
+按「每 unit 2048 串行点积是瓶颈」的假设做了 hidden 四分（SharedMemory 部分
+和）+ 选择循环收敛到 unit 0 + taken 掩码三步。同态 profiled 对比判决：
+拆分版 ≈ 原版（721 vs 26.3×劣化系数），掩码版反而更差（862 µs/发）。
+**教训（已入坑文档）：并行的冗余工作不占墙钟**——原设计 256 unit 冗余推导
+top-k 是并行抵消的，改成单 unit 串行没有省任何墙钟，反而把 18k 次比较压到
+一条线程上。原设计（并行冗余选择 + 每 unit 独立点积）本就是均衡的。已完整
+回退（与原版字节等价），回退后冷却态墙钟 **verify 102.3 ms、65.7 ms/token
+（15.2 tok/s）——本日最佳**。
+
+剩余构成（System 口径，扫描已降至 ~7ms）：Binop/Cast/Slice 风暴 ~200ms
+（双证伪）、MoE 其余四内核 ~93ms（int4 读出为主）、Matmul 投影 45ms、
+propose 相 19-21ms。下一刀候选：MoeGateUpVec/DownVecSplit 的 int4 读出
+评估（BW 下限 ~20ms，System 70ms，有 2-3× 空间）或 propose 相剖析。
+
+## 2026-10-24（深夜）：稀疏 token-expert gate_up——MAC 砍 13×、墙钟持平、代码大减
+
+按「每个触达专家为全部 16 token 计算」的冗余假设（分散路由下每专家平均
+~1.2 个 token）实施稀疏化：`moe_masks`（每专家一个 u32 token 位图，67µs/发）+
+`moe_gate_up_sparse`（位图驱动，只投影路由到的 token）+ down 回归按 (m,h)
+天然跳过的 `moe_down_total`。
+
+**结果三分**：① down -8ms System（24.5→16.5，弃 16× m 向量浪费）；②
+gate_up 持平（44.6→47.1ms）——**真正的瓶颈是每 word 的 int4 解包 ALU 与
+权重读出带宽（各 ~15ms 下限），不是被砍掉的 FMA**；③ 墙钟热态折算持平
+（~78-81 ms/tok 非冷态）。保留稀疏版：System 净 -11ms、去掉 transpose 发射、
+派发简化为恒定 5 内核单路径（router → masks → gate_up_sparse →
+shared_gate_up → down_total），并删除四个不再调度的旧内核
+（moe_gate_up/vec、moe_down_vec_split、moe_reduce_shared）与 weights_t 双布局
+管道（router 输出、分配、转置全链）。
+
+测试：grouped 10/10、router 1、seam、lib 61/61、verify_commit、greedy_parity、
+metal_spot、CPU 构建、fmt 全绿。稀疏化改变近平局 argmax（贪心文本变化，预期）。
+
+剩余 verify（System 口径）：Matmul 投影 44、gate_up_sparse 47（解包/带宽下限
+~15+15，理论余量 ~2×）、down_total 16.5、router 21、共享 15——下一刀候选：
+gate_up 解包向量化（nibble→f32 用向量查表或位技巧减 ALU）或 propose 相
+（21ms）剖析。
+
+## 2026-10-24（夜三）：解包 ALU 与 router 扫描两刀落地；逐内核 System 归因证伪
+
+两刀落地 + 一个方法论反转，全部门绿（grouped 10、router、lib 61/61、
+verify_commit、greedy_parity、metal_spot、CPU 检查、doctor、fmt）。
+
+### 方法论反转：CUBECL 逐内核 System 归因不可信
+
+复测 verify profile 时发现昨日与今日的逐内核 System 数字互相矛盾（未改动过的
+`moe_shared_gate_up` 15→5.3ms、`moe_down_total` 16.5→4.2ms——后者低于其
+~15ms 带宽下限，物理不可能）。机理：批量异步提交下，profiler 把**排队排水
+时间记到同步落点所在的内核**，重内核（gate_up）吸收了别人的时间，轻内核记 0。
+结论：跨版本/跨场次比较逐内核 System 数字无效；launch 计数仍精确。
+
+替代真相源：新增 `moe_bench_model_scale`（`#[ignore]` 隔离微基准，35B 层形状 +
+分散路由 ~110/256 专家，每入口单独发射、尾部一次 sync，~1.4s/场）。可信读数
+（同场）：router 270-296µs/发（dot 段 ~230µs 与 top_k 无关，扫描段 65-129µs）、
+experts 四连发 1.05ms/层（与 ~320MB/层的**带宽下限吻合，已在地板上**）、
+qkv 形状 F16 matmul [16,2048]×[2048,6144] 114-139µs、投影形状
+[16,2048]×[2048,2048] 38-45µs。由此得诚实墙钟构成：MoE ~53ms（router 12 +
+experts 42，带宽定死）+ 投影 matmul ~8-12ms（System 44ms 是虚的）+ gdn 6.7 +
+attention 8 + 粘合发射风暴。模型级墙钟：**119.0 vs 118.6 ms/前向（12 分钟闲置
+恢复态），持平**——router/matmul/gate_up 不在关键路径上（发射管线在其执行期间
+已在提交后续内核），只有 GdnScan 类串行链是墙钟敏感的。
+
+### 落地的两刀（内核做功确减，墙钟持平）
+
+1. **int4 解包双算术移位 + 每词 scale 提升**（`moe_gate_up_sparse`/
+   `moe_down_total`）：`word_bits` 从 mask+修正 6 op/nibble 改为
+   `(w << (28-4n)) >> 28` 2 op 符号扩展（Metal 有符号 `>>` 为算术移位，grouped
+   测试的 f64 参考含负 nibble 可证伪）；一个 word 的 8 个 nibble 同属一个 128
+   宽 scale 组，scale 乘法从每权重提升到每词部分和一次。experts 四连发本已
+   带宽封顶，故墙钟不可见，保留（严格减功）。
+2. **router top-k 扫描 -inf 掩码**：选中槽写哨兵后下轮纯扫描，去掉 taken-check
+   分支风暴（扫描段 129→65µs，整发 360→296µs 隔离口径）。**新坑**：共享
+   memory 掩码必须在每轮 `扫描→sync→写→sync` 双屏障——单屏障下快 unit 的写
+   与慢 unit 的同轮读竞争，各 unit 选出不同 top-k（router 测试
+   "outside weights not zero" 捕获）；tie 规则与求和顺序不变，数值位级等价。
+
+### 今日证伪（封存）
+
+- **转置 router 读**（[hidden,experts] 合并访存）：+200µs/发——跨 unit 合并输给
+  每 unit 顺序流式读（L1 行内 32 次复用）。
+- **burn F32 细长 matmul 出 logits + topk 内核拆分**：332µs——F32 m=16 matmul
+  与串行 dot 一样慢；F16 matmul 快但 logits 精度撑不住 router 测试 1e-3 容差
+  且有 τ 风险。
+- **router dot 4 路 k-split**（1024 线程）：dot 231→179µs 但 1024 线程的扫描
+  屏障 +64µs，净变差。
+
+下一刀候选重排：① 粘合发射风暴（唯一大池，CPU 发射侧；需源级 op 削减或图捕
+获，burn-fusion/手写粘合已证伪）；② propose 相（19-21ms）剖析；③ BLOCK/τ 带
+宽权衡研究（16-token verify 读 ~8GB MoE 权重、τ≈2 → 4GB/接受 token，是普通
+解码 1.7GB 的 2.4×；小 BLOCK 或许在更低 τ 下净赚 tok/s——算法级，需用户知情）。
+
+## 2026-10-25（凌晨）：自适应 draft block——两类内容同时逼近各自最优
+
+### propose 剖析（插桩：draft/logits/markov/读回）
+
+`MINICPM_DSPARK_TRACE=1` 下细分计时（BLOCK=15，63 周期均值）：draft 前向
+8.68ms（**CPU 派发受限**：~320 个 burn op × ~27µs 派发费）、logits 1.86（带宽
+地板附近）、markov 2.95 CPU + **~6.3ms GPU 串行**（15 行链每行全量重读
+127MB 的 markov_w2）、读回 6.67ms（大半是 sync 排队排水）。结论：内核融合在
+CPU 派发受限的 propose 相有效（与 GPU 受限的 verify 相相反——解释了粘合融合
+在 verify 的负结果）。
+
+### BLOCK/τ 扫描（固定值，200 token，同窗交错）
+
+带宽账成立：verify 触达专家数随 m 近线性，τ 降得慢。**但最优 BLOCK 内容相
+关**：
+
+| BLOCK | 中文说明文 τ | tok/s | 代码生成 τ | tok/s |
+| --- | --- | --- | --- | --- |
+| 15（旧默认）| 2.254 | 13.4 | **7.692** | **52.5** |
+| 11 | 2.254 | 14.8 | — | — |
+| 7 | 2.029 | 15.7-18.3 | — | — |
+| 4 | 1.972 | 17.1-20.3 | — | — |
+| 3 | 1.945 | 24.1 | — | — |
+| 2 | 1.844 | 24.1 | — | — |
+
+（冷窗最佳值；热窗整体下移但排序不变。τ=7.7 时管线 52 tok/s 证明接收率配合
+时硬件早已越过 MLX 50 tok/s 参照。）
+
+### 自适应策略（三轮迭代后定稿）
+
+`BLOCK_LADDER = [3, 8, 16]`，AIMD+滞回：连续 2 周期接收 ≥80% → 升一级；连
+续 2 周期 ≤50% → 降一级；起点 3；`MINICPM_DSPARK_BLOCK=N`（1..=31）钉死固
+定值做实验。迭代教训：① 块大小**连续变化会不断制造新 autotune shape key**，
+每次转档触发数秒运行时调优——阶梯化后一次付清永久缓存；② 纯「两次全收」增
+长在 acc≈5/6 的内容上几乎不触发（均衡点过低）；③ 单次低谷收缩会被方差打出
+均衡点——收缩也要双连。
+
+终测（同窗交错，冷窗）：中文说明文 **22.5-23.3 tok/s**（旧默认 13.4，
+**+69%**）、代码生成 **50.7 tok/s**（固定 15 的 52.5 噪声内）。贪心输出与固
+定 15 **逐字节一致**（verify 保护与 BLOCK 无关）。回归门：lib 61、
+verify_commit、greedy_parity、metal_spot、CPU 检查、fmt 全绿。
+
+### 后续杠杆（更新）
+
+1. draft 前向融合（RMS norm/rope 单内核化，砍 ~5ms CPU 派发；verify 相无效
+   但 propose 相有效）；
+2. markov_w2 量化（int8/int4 副本：6.3ms GPU 串行 → 1.6-3.2ms；仅影响
+   draft，τ 可测）；
+3. 粘合发射风暴（verify 相，需源级 op 削减）；
+4. 杂项：BLOCK=5（m=6）疑似 autotune 坏候选（verify 反常慢于 m=8），可删
+   `target/autotune` 对应缓存重调。
+
+## 2026-10-25（午）：draft 前向融合——draft 段 -37%、墙钟 -2%
+
+`glue.rs` 重构为两套门控：verify seam 维持 `MINICPM_GLUE=1` 选配（GPU 受限相，
+已证伪）；**draft seam 默认开启**（`MINICPM_DRAFT_GLUE=0` 为同二进制杀开关），
+含 plain RMS norm（`rms_norm` 内核加 comptime `plus_one`，主模型 Gemma 路径不
+变）、split-half rope 单内核（cos/sin 表全宽、前半为独立频率——索引坑）、
+residual。dspark 的 propose 接 seam：input/post 终 norm（rank-3）、q/k norm
+（project_kv 内 permute 后 reshape 一次拷贝进 (head,pos,dim) 序）、rope×2、
+residual×2；~170 发/propose 削掉。
+
+A/B（同二进制交错，两对一致，prose、block avg 3.3）：draft 段 **6.13→3.87ms
+（-37%）**；propose 相 12.3→10.6-11.1；总墙钟 6261-6266→6133-6163ms（**-2.1%**，
+23.1 tok/s）。增益小于 draft 段的原因：CPU 派发省下后 GPU 的 draft 计算成为
+propose 新地板（读回排水不变）。τ 无变化（draft picks 未翻转），贪心文本与融
+合前**逐字节一致**。glue 单测扩三链对照（plain RMS/rope/residual vs burn 链）
+全绿；lib 61、verify_commit、metal_spot、CPU、fmt 全绿。
+
+剩余杠杆：markov_w2 量化（≤4%）、verify 粘合风暴（大池难啃）、BLOCK=5 的
+m=6 autotune 坏候选排查。prose 端 propose 已近 GPU 地板，下一步大头只能在
+verify（60ms@block3）或 τ。
+
+## 2026-10-25（晚）：#43 树状推测原型——精确合同成立、τ 无增益、墙钟负（原型口径）
+
+`MINICPM_DSPARK_TREE=1`（默认关，自适应模式专属）落地完整树状推测原型：
+- **propose**：markov 头逐层批量（每深度一次 gather + 一次 w2 matmul + 一次
+  top-2，设备端链、末尾一次读回）——同节点数下比逐行链少读 w2（深度次 vs
+  节点次）；draft 前向长度从块长缩到深度数。
+- **verify**：BFS 展平；位置=深度；全注意力层一次 `module::attention` 走显式
+  掩码（历史全可见 + 块内仅祖先）；gdn 层逐 token 批量投影 + 每条根→叶路径
+  复用现有 causal_conv/try_scan（路径=从根态出发的合法线性序列，精确）；
+  `KvCache::copy_selected` + `DecodeState::retain_path` 按路径压缩。
+- **accept**：贪心步进器沿树走最长匹配路径 + 修正 token；AIMD 梯级语义映射
+  为深度（3/8/16 → 1/2/3 层）。
+
+**结果（prose 200-token ×2 场）**：文本与线性版**逐字节一致**（两场）——贪心
+精确合同在树模式下成立；τ=1.972 与线性完全相同（**第二候选从未在首候选失
+手处命中**——该内容下宽度零增益）；墙钟 17.8s vs 线性 6.1s：verify 171 vs
+60ms，来自每路径 burn-op gdn（~220 发/层）与掩码注意力的**原型惩罚**（换
+每深度批段扫描内核可消，预估 -100ms 级）。
+
+**结论**：① 精确树 verify 在 gdn 混合架构上工程可行（祖先掩码 + 路径状态
+回放，无需改内核）；② prose 场 τ 增益为零、code 场深度上限反而封顶——
+**当前树形状（k=2 全二叉）不满足切换门槛**，默认保持关闭；③ 后续若重启，
+前置条件：批段 gdn 内核（墙钟归位）+ 更宽/更深的树形与 τ(B) 曲线实测。
+**新地雷**：burn `module::attention` 掩码约定 **true=排除**（与直觉相反；
+首版即因此全错——历史被整段屏蔽）。已记 pitfalls。
+
+测试：lib 61、verify_commit、metal_spot、CPU 检查、fmt 全绿；greedy_parity
+（1B CPU 路径）不触及本改动。未提交 git 变更（沿用本仓库会话惯例）。
+
+## 2026-10-25（夜）：#44 markov_w2 int8 量化——段 -36%、默认场景 ~0%、默认保持关
+
+`MINICPM_DSPARK_MARKOV_QUANT=1`（默认关，加载期生效）：w2（[248144,256] f16
+127MB）量化为 packed i32 words（每词 4 个 +128 偏置 int8，~64MB）+ per-row f32
+scale；新 `markov.rs` 单内核一次算 `base + scale·Σq·w1[prev]`（prev 留设备作
+id 张量，省 gather 发射），替代每行 gather+matmul+add 三连发。线性链与树模式
+两处接入，CPU 后端走原路径。
+
+**A/B（同二进制 env 交错，同窗 ≥2 场）**：
+- prose（block≈3.3）：文本逐字节一致×4、τ=1.972 无漂移；markov 段本就
+  0.2-0.3ms，总墙钟中性偏正（6271-6344 vs 6361-6474ms）。
+- 代码自适应（block≈8.7）：markov 段 1.01-1.31→0.76-0.78（**-35%**），读回
+  排水 -0.7~-1.9ms（GPU 节省实锤），总墙钟持平（draft 段 +0.6ms 噪声吸收）。
+- 代码固定 BLOCK=16（最长链）：markov 段 2.15→1.38（**-36%**），总墙钟
+  4174→4091-4111（-1.5~-2.0%），文本一致、τ 5.882 无漂移。
+
+**判定：未达切换门槛**（-36% < -40%；自适应默认下总收益 ~0%——markov 仅
+~2ms/105-125ms 周期，符合 checkpoint 预估的 ≤4% 上限）。剩余地板=串行链每行
+~60µs 内核延迟（量化不可及，需树模式或批段内核消除）。默认保持关闭；数据留
+档，若未来 BLOCK 上调或树模式重启可复用。
+
+测试：markov 内核单测（vs CPU 镜像 worst<5e-2）、lib 62、verify_commit、
+metal_spot、CPU 检查、fmt 全绿。未提交 git 变更。
+
+## 2026-10-25（夜二）：#42 draft 上下文层集合扫描——默认集合全面最优（负结果）
+
+`MINICPM_DSPARK_LAYERS`（5 个 0..39 升序层号，非法回退默认）落地；默认值下
+200-token 输出与改动前逐字节一致。4 集合 × 2 提示 × 2 轮交错扫描（τ 两轮
+逐集合完全一致，信号确定性极强）：
+
+| 层集合 | prose τ | code τ |
+| --- | --- | --- |
+| **[3,11,19,27,35]（默认）** | **1.972** | **5.882** |
+| [1,5,9,13,17] 前段 | 1.449（-27%）| 2.439（-59%）|
+| [23,27,31,35,39] 后段 | 1.479（-25%）| 2.500（-58%）|
+| [5,13,21,29,37] 偏移展开 | 1.919（-3%）| 4.762（-19%）|
+
+**结论：默认集合已是训练匹配的最优，换层即大幅负优化**（draft 权重与
+[3,11,19,27,35] 的隐状态分布强耦合）。保持默认；env 留作未来换 draft 检查点
+时的实验通道。门全绿（lib 62、verify_commit、metal_spot、CPU、fmt）。
+
 ## 2026-10-16：W4A16 融合反量化路由修复（ADR-0001 目标路径落地）
+
 
 T11 收口时生产路径按 ADR-0001 的降级方案走“加载点反量化”。本节记录把融合路由
 （int4 驻留、matmul 内核反量化）修通的过程与证据。

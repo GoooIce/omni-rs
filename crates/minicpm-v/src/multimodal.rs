@@ -49,6 +49,7 @@ pub struct Build<'a, B: Backend> {
     pub model_dir: &'a std::path::Path,
     pub image: &'a std::path::Path,
     pub prompt: &'a str,
+    pub enable_thinking: Option<bool>,
     pub device: &'a B::Device,
     pub precision: Precision,
 }
@@ -80,6 +81,7 @@ impl<B: Backend> Multimodal<B> {
             model_dir,
             image: image_path,
             prompt,
+            enable_thinking,
             device,
             precision,
         } = request;
@@ -126,7 +128,7 @@ impl<B: Backend> Multimodal<B> {
             role: Role::User,
             content: vec![chat::Part::Image, chat::Part::Text(prompt.to_string())],
         }];
-        let rendered = chat::render(&messages, true, None).map_err(|e| e.to_string())?;
+        let rendered = chat::render(&messages, true, enable_thinking).map_err(|e| e.to_string())?;
         let text_input = rendered.replace(chat::IMAGE_PAD, &replacement);
         let ids = tokenizer.encode(&text_input);
 

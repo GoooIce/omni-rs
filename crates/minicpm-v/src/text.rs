@@ -1,7 +1,7 @@
 //! Qwen3.5-style text decoder: zero-centered RMSNorm, full attention with a
 //! sigmoid output gate and partial interleaved M-RoPE, and SwiGLU MLP.
 use crate::config::TextConfig;
-use burn::tensor::{FloatDType, Tensor, backend::Backend};
+use burn::tensor::{Bool, FloatDType, Tensor, backend::Backend};
 use omni_r2t2::{
     Precision, tensor as shared,
     tensor::{AttentionOptions, KvCache, NormReduction},
@@ -117,6 +117,45 @@ pub struct Mlp<B: Backend> {
 
 /// The position-wise feed-forward after attention: dense SwiGLU (1B) or the
 /// sparse MoE block (35B).
+/// Layer seams through the hand-fused glue kernels (single launches) when
+/// the backend, dtype and norm kind allow; otherwise the burn chains. See
+/// `crate::glue`.
+fn norm_seam<B: Backend>(
+    norm: &omni_r2t2::tensor::Norm<B>,
+    x: Tensor<B, 3>,
+    dtype: FloatDType,
+) -> Tensor<B, 3> {
+    #[cfg(feature = "metal")]
+    if norm.kind() == shared::NormKind::Gemma {
+        let [_, tokens, width] = x.dims();
+        let fused = crate::glue::gemma_norm_metal(
+            x.clone().reshape([tokens, width]),
+            norm.weight(),
+            norm.epsilon(),
+        );
+        if let Some(fused) = fused {
+            return fused.reshape([1, tokens, width]);
+        }
+    }
+    norm.forward(x, dtype)
+}
+
+/// [`norm_seam`]'s twin for `shared::residual`.
+fn residual_seam<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>, dtype: FloatDType) -> Tensor<B, 3> {
+    #[cfg(feature = "metal")]
+    {
+        let [_, tokens, width] = x.dims();
+        let fused = crate::glue::residual_metal(
+            x.clone().reshape([tokens, width]),
+            y.clone().reshape([tokens, width]),
+        );
+        if let Some(fused) = fused {
+            return fused.reshape([1, tokens, width]);
+        }
+    }
+    shared::residual(x, y, dtype)
+}
+
 pub enum FeedForward<B: Backend> {
     Dense(Mlp<B>),
     Sparse(crate::moe::SparseMoeBlock<B>),
@@ -235,12 +274,12 @@ impl<B: Backend> FullAttention<B> {
         x: Tensor<B, 3>,
         cos: &Tensor<B, 3>,
         sin: &Tensor<B, 3>,
-        cache: Option<&mut KvCache<B>>,
+        mut cache: Option<&mut KvCache<B>>,
         kernel: shared::AttentionKernel,
     ) -> Tensor<B, 3> {
-        let [_, seq, _width] = x.dims();
+        let [_, seq, _] = x.dims();
         let dtype = shared::dtype(&x);
-        let projected = self.q.forward(x.clone());
+        let projected = self.q.forward_sequence(x.clone());
         // Query and gate arrive head-interleaved: (seq, heads, 2, head_dim).
         debug_assert_eq!(2 * self.heads * self.head_dim, projected.dims()[2]);
         let view = projected.reshape([seq, self.heads, 2, self.head_dim]);
@@ -256,13 +295,14 @@ impl<B: Backend> FullAttention<B> {
                 .permute([0, 2, 1, 3])
         };
         let mut q = shape(query, self.heads);
-        let mut k = shape(self.k.forward(x.clone()), self.kv_heads);
-        let v = shape(self.v.forward(x), self.kv_heads);
+        let mut k = shape(self.k.forward_sequence(x.clone()), self.kv_heads);
+        let v = shape(self.v.forward_sequence(x.clone()), self.kv_heads);
         // Norm before rotation, per head.
         q = self.q_norm.forward(q, dtype);
         k = self.k_norm.forward(k, dtype);
         // Partial rotation: rotate the leading rotary_dim dims, pass the rest.
         let rotate = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+            let n_heads = t.dims()[1];
             if self.rotary_dim == self.head_dim {
                 let cos4 = cos.clone().unsqueeze::<4>();
                 let sin4 = sin.clone().unsqueeze::<4>();
@@ -270,8 +310,116 @@ impl<B: Backend> FullAttention<B> {
             } else {
                 let pass =
                     t.clone()
-                        .slice([0..1, 0..self.heads, 0..seq, self.rotary_dim..self.head_dim]);
-                let rot = t.slice([0..1, 0..self.heads, 0..seq, 0..self.rotary_dim]);
+                        .slice([0..1, 0..n_heads, 0..seq, self.rotary_dim..self.head_dim]);
+                let rot = t.slice([0..1, 0..n_heads, 0..seq, 0..self.rotary_dim]);
+                let cos4 = cos.clone().unsqueeze::<4>();
+                let sin4 = sin.clone().unsqueeze::<4>();
+                let rotated = shared::rope(rot, &cos4, &sin4, shared::RotaryLayout::SplitHalf);
+                Tensor::cat(vec![rotated, pass], 3)
+            }
+        };
+        let q = rotate(q);
+        let k = rotate(k);
+        let attended = if seq > 1 && shared::decode_rows() {
+            let mut parts = Vec::with_capacity(seq);
+            for index in 0..seq {
+                let q_i =
+                    q.clone()
+                        .slice([0..1, 0..self.heads, index..index + 1, 0..self.head_dim]);
+                let k_i =
+                    k.clone()
+                        .slice([0..1, 0..self.kv_heads, index..index + 1, 0..self.head_dim]);
+                let v_i =
+                    v.clone()
+                        .slice([0..1, 0..self.kv_heads, index..index + 1, 0..self.head_dim]);
+                let offset = cache.as_ref().map_or(0, |c| c.len());
+                let (k_i, v_i) = match cache.as_deref_mut() {
+                    Some(cache) => cache.append(k_i, v_i, offset),
+                    None => (k_i, v_i),
+                };
+                parts.push(shared::attention(
+                    q_i,
+                    k_i,
+                    v_i,
+                    AttentionOptions {
+                        causal: true,
+                        offset,
+                        kernel,
+                        ..Default::default()
+                    },
+                ));
+            }
+            Tensor::cat(parts, 2)
+        } else {
+            let offset = cache.as_ref().map_or(0, |c| c.len());
+            let (k, v) = match cache {
+                Some(cache) => cache.append(k, v, offset),
+                None => (k, v),
+            };
+            shared::attention(
+                q,
+                k,
+                v,
+                AttentionOptions {
+                    causal: true,
+                    offset,
+                    kernel,
+                    ..Default::default()
+                },
+            )
+        };
+        let attended = attended
+            .permute([0, 2, 1, 3])
+            .reshape([1, seq, self.heads * self.head_dim]);
+        let gate = burn::tensor::activation::sigmoid(gate);
+        let attended = attended * gate;
+        self.o.forward_sequence(attended)
+    }
+
+    /// Tree sibling of [`forward_with_kernel`]: one attention over history
+    /// plus the flattened tree under an explicit block mask. `block_mask` is
+    /// `[1, 1, seq, seq]` with `mask[i, j]` set when block token `j` is `i`
+    /// or an ancestor of `i`; history tokens are always visible.
+    pub fn forward_tree(
+        &self,
+        x: Tensor<B, 3>,
+        cos: &Tensor<B, 3>,
+        sin: &Tensor<B, 3>,
+        mut cache: Option<&mut KvCache<B>>,
+        block_mask: Tensor<B, 4, Bool>,
+    ) -> Tensor<B, 3> {
+        let [_, seq, _] = x.dims();
+        let dtype = shared::dtype(&x);
+        let projected = self.q.forward_sequence(x.clone());
+        debug_assert_eq!(2 * self.heads * self.head_dim, projected.dims()[2]);
+        let view = projected.reshape([seq, self.heads, 2, self.head_dim]);
+        let query = view
+            .clone()
+            .slice([0..seq, 0..self.heads, 0..1, 0..self.head_dim])
+            .reshape([1, seq, self.heads * self.head_dim]);
+        let gate = view
+            .slice([0..seq, 0..self.heads, 1..2, 0..self.head_dim])
+            .reshape([1, seq, self.heads * self.head_dim]);
+        let shape = |t: Tensor<B, 3>, heads: usize| {
+            t.reshape([1, seq, heads, self.head_dim])
+                .permute([0, 2, 1, 3])
+        };
+        let mut q = shape(query, self.heads);
+        let mut k = shape(self.k.forward_sequence(x.clone()), self.kv_heads);
+        let v = shape(self.v.forward_sequence(x.clone()), self.kv_heads);
+        q = self.q_norm.forward(q, dtype);
+        k = self.k_norm.forward(k, dtype);
+        let rotate = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+            let n_heads = t.dims()[1];
+            if self.rotary_dim == self.head_dim {
+                let cos4 = cos.clone().unsqueeze::<4>();
+                let sin4 = sin.clone().unsqueeze::<4>();
+                shared::rope(t, &cos4, &sin4, shared::RotaryLayout::SplitHalf)
+            } else {
+                let pass =
+                    t.clone()
+                        .slice([0..1, 0..n_heads, 0..seq, self.rotary_dim..self.head_dim]);
+                let rot = t.slice([0..1, 0..n_heads, 0..seq, 0..self.rotary_dim]);
                 let cos4 = cos.clone().unsqueeze::<4>();
                 let sin4 = sin.clone().unsqueeze::<4>();
                 let rotated = shared::rope(rot, &cos4, &sin4, shared::RotaryLayout::SplitHalf);
@@ -285,23 +433,132 @@ impl<B: Backend> FullAttention<B> {
             Some(cache) => cache.append(k, v, offset),
             None => (k, v),
         };
-        let attended = shared::attention(
+        let repeat = |x: Tensor<B, 4>| {
+            if self.heads == self.kv_heads {
+                x
+            } else {
+                let [b, _, k_len, width] = x.dims();
+                x.reshape([b, self.kv_heads, 1, k_len, width])
+                    .repeat_dim(2, self.heads / self.kv_heads)
+                    .reshape([b, self.heads, k_len, width])
+            }
+        };
+        // Burn's attention mask convention: true positions are EXCLUDED
+        // (the causal mask in `shared::attention` marks the future true).
+        // History rows are always visible, so they stay false; block rows
+        // exclude everything that is not the token or its ancestors.
+        let history = Tensor::<B, 4, Bool>::from_data(
+            burn::tensor::TensorData::new(vec![false; offset * seq], [1, 1, seq, offset]),
+            &x.device(),
+        );
+        let full_mask = Tensor::cat(vec![history, block_mask], 3);
+        let attended = burn::tensor::module::attention(
             q,
-            k,
-            v,
-            AttentionOptions {
-                causal: true,
-                offset,
-                kernel,
-                ..Default::default()
-            },
+            repeat(k),
+            repeat(v),
+            Some(full_mask),
+            None,
+            Default::default(),
         );
         let attended = attended
             .permute([0, 2, 1, 3])
             .reshape([1, seq, self.heads * self.head_dim]);
         let gate = burn::tensor::activation::sigmoid(gate);
         let attended = attended * gate;
-        self.o.forward(attended)
+        self.o.forward_sequence(attended)
+    }
+
+    /// Same block as [`Self::forward_with_kernel`], but the KV history is a latent.
+    ///
+    /// Query, gate, output projection and the key norm stay on the original weights.
+    /// K's non-rotary rows and V are reconstructed from `factors` instead of `k_proj`
+    /// and `v_proj`.
+    pub fn forward_latent(
+        &self,
+        x: Tensor<B, 3>,
+        cos: &Tensor<B, 3>,
+        sin: &Tensor<B, 3>,
+        cache: &mut crate::latent::LatentCache<B>,
+        factors: &crate::latent::LatentFactors<B>,
+    ) -> Tensor<B, 3> {
+        let [_, seq, _] = x.dims();
+        let dtype = shared::dtype(&x);
+        let rank = factors.rank;
+        let nope = self.head_dim - self.rotary_dim;
+        let projected = self.q.forward_sequence(x.clone());
+        let view = projected.reshape([seq, self.heads, 2, self.head_dim]);
+        let query = view
+            .clone()
+            .slice([0..seq, 0..self.heads, 0..1, 0..self.head_dim])
+            .reshape([1, seq, self.heads * self.head_dim]);
+        let gate = view
+            .slice([0..seq, 0..self.heads, 1..2, 0..self.head_dim])
+            .reshape([1, seq, self.heads * self.head_dim]);
+        let shape = |t: Tensor<B, 3>, heads: usize| {
+            t.reshape([1, seq, heads, self.head_dim])
+                .permute([0, 2, 1, 3])
+        };
+        let q = shape(query, self.heads);
+        let q = self.q_norm.forward(q, dtype);
+        let rotate = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+            let n_heads = t.dims()[1];
+            let pass = t
+                .clone()
+                .slice([0..1, 0..n_heads, 0..seq, self.rotary_dim..self.head_dim]);
+            let rot = t.slice([0..1, 0..n_heads, 0..seq, 0..self.rotary_dim]);
+            let cos4 = cos.clone().unsqueeze::<4>();
+            let sin4 = sin.clone().unsqueeze::<4>();
+            let rotated = shared::rope(rot, &cos4, &sin4, shared::RotaryLayout::SplitHalf);
+            Tensor::cat(vec![rotated, pass], 3)
+        };
+        let q = rotate(q);
+
+        let c = burn::tensor::module::linear(x.clone(), factors.down.clone().swap_dims(0, 1), None);
+        let rope_raw = burn::tensor::module::linear(x, factors.rope.clone().swap_dims(0, 1), None)
+            .reshape([1, seq, self.kv_heads, self.rotary_dim])
+            .permute([0, 2, 1, 3]);
+        let c_flat = c.clone().reshape([seq, rank]);
+        let mut nope_heads = Vec::with_capacity(self.kv_heads);
+        for h in 0..self.kv_heads {
+            let up = factors
+                .k_up
+                .clone()
+                .slice([h..h + 1, 0..nope, 0..rank])
+                .reshape([nope, rank]);
+            let projected = c_flat.clone().matmul(up.swap_dims(0, 1));
+            nope_heads.push(projected.reshape([1, 1, seq, nope]));
+        }
+        let k_raw = Tensor::cat(vec![rope_raw, Tensor::cat(nope_heads, 1)], 3);
+        let rms = (k_raw
+            .clone()
+            .cast(burn::tensor::FloatDType::F32)
+            .square()
+            .mean_dim(3)
+            + self.k_norm.epsilon())
+        .sqrt()
+        .reshape([self.kv_heads, seq])
+        .swap_dims(0, 1);
+        let k = rotate(self.k_norm.forward(k_raw, dtype));
+        let rope = k
+            .slice([0..1, 0..self.kv_heads, 0..seq, 0..self.rotary_dim])
+            .permute([2, 1, 0, 3])
+            .reshape([seq, self.kv_heads, self.rotary_dim]);
+        let attended = crate::latent::attend(
+            q,
+            c.reshape([seq, rank]),
+            rope,
+            rms,
+            &factors.k_up,
+            &factors.v_up,
+            &factors.w_nope,
+            cache,
+            1.0 / (self.head_dim as f64).sqrt(),
+        );
+        let attended = attended
+            .permute([0, 2, 1, 3])
+            .reshape([1, seq, self.heads * self.head_dim]);
+        let gate = burn::tensor::activation::sigmoid(gate);
+        self.o.forward(attended * gate)
     }
 }
 
@@ -345,8 +602,9 @@ impl<B: Backend> Mlp<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gate = burn::tensor::activation::silu(self.gate.forward(x.clone()));
-        self.down.forward(gate * self.up.forward(x))
+        let gate = burn::tensor::activation::silu(self.gate.forward_sequence(x.clone()));
+        self.down
+            .forward_sequence(gate * self.up.forward_sequence(x))
     }
 }
 
@@ -400,15 +658,55 @@ impl<B: Backend> FullLayer<B> {
         kernel: shared::AttentionKernel,
     ) -> Tensor<B, 3> {
         let dtype = shared::dtype(&x);
-        let normed = self.input_norm.forward(x.clone(), dtype);
+        let normed = norm_seam(&self.input_norm, x.clone(), dtype);
         let attended = self
             .attn
             .forward_with_kernel(normed, cos, sin, cache, kernel);
-        let x = shared::residual(x, attended, dtype);
+        let x = residual_seam(x, attended, dtype);
         let mlp = self
             .feed_forward
-            .forward(self.post_norm.forward(x.clone(), dtype));
-        shared::residual(x, mlp, dtype)
+            .forward(norm_seam(&self.post_norm, x.clone(), dtype));
+        residual_seam(x, mlp, dtype)
+    }
+
+    pub fn forward_latent(
+        &self,
+        x: Tensor<B, 3>,
+        cos: &Tensor<B, 3>,
+        sin: &Tensor<B, 3>,
+        cache: &mut crate::latent::LatentCache<B>,
+        factors: &crate::latent::LatentFactors<B>,
+    ) -> Tensor<B, 3> {
+        let dtype = shared::dtype(&x);
+        let normed = norm_seam(&self.input_norm, x.clone(), dtype);
+        let attended = self.attn.forward_latent(normed, cos, sin, cache, factors);
+        let x = residual_seam(x, attended, dtype);
+        let mlp = self
+            .feed_forward
+            .forward(norm_seam(&self.post_norm, x.clone(), dtype));
+        residual_seam(x, mlp, dtype)
+    }
+
+    /// Tree sibling of [`forward_with_kernel`]: attention runs once over
+    /// history plus the flattened tree with an explicit ancestor mask
+    /// instead of the causal band.
+    pub fn forward_tree(
+        &self,
+        x: Tensor<B, 3>,
+        cos: &Tensor<B, 3>,
+        sin: &Tensor<B, 3>,
+        cache: Option<&mut KvCache<B>>,
+        block_mask: Tensor<B, 4, Bool>,
+    ) -> Tensor<B, 3> {
+        let [_, seq, _] = x.dims();
+        let dtype = shared::dtype(&x);
+        let normed = norm_seam(&self.input_norm, x.clone(), dtype);
+        let attended = self.attn.forward_tree(normed, cos, sin, cache, block_mask);
+        let x = residual_seam(x, attended, dtype);
+        let mlp = self
+            .feed_forward
+            .forward(norm_seam(&self.post_norm, x.clone(), dtype));
+        residual_seam(x, mlp, dtype)
     }
 }
 
@@ -534,20 +832,43 @@ impl<B: Backend> LinearAttention<B> {
         &self,
         mixed: Tensor<B, 3>,
         tail: Option<Tensor<B, 3>>,
-    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        record: bool,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Vec<Tensor<B, 3>>) {
         let [_, seq, conv_dim] = mixed.dims();
         let dtype = shared::dtype(&mixed);
         let device = mixed.device();
         let stream_dtype = dtype;
-        let stream = mixed.permute([0, 2, 1]); // (1, conv, T)
+        let stream = mixed.permute([0, 2, 1]); // (1, conv, T), strided
+        let history = self.kernel - 1;
         let tail = tail
-            .unwrap_or_else(|| Tensor::zeros([1, conv_dim, self.kernel - 1], &device))
+            .unwrap_or_else(|| Tensor::zeros([1, conv_dim, history], &device))
             .cast(stream_dtype);
-        let padded = Tensor::cat(vec![tail, stream], 2);
+        // `stream` is a permute of the projection. `Tensor::cat` copies that
+        // strided input with the wrong strides in burn-cubecl 0.21 and scatters
+        // channels. `slice_assign` into a fresh contiguous buffer reads it correctly.
+        // A wrong copy shows up on the second token of a block, not on a one-token step.
+        let mut padded =
+            Tensor::<B, 3>::zeros([1, conv_dim, history + seq], &device).cast(stream_dtype);
+        padded = padded.slice_assign([0..1, 0..conv_dim, 0..history], tail);
+        padded = padded.slice_assign([0..1, 0..conv_dim, history..history + seq], stream);
         let [_, _, width] = padded.dims();
         let new_tail = padded
             .clone()
             .slice([0..1, 0..conv_dim, width - (self.kernel - 1)..width]);
+        // padded is [previous tail | this chunk]. After token t the tail is the
+        // last kernel-1 columns ending on that token, so a rejected suffix can
+        // be dropped without recomputing the conv.
+        let tails = if record {
+            (0..seq)
+                .map(|token| {
+                    let start = token + 1;
+                    let end = start + self.kernel - 1;
+                    padded.clone().slice([0..1, 0..conv_dim, start..end])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut output = Tensor::<B, 3>::zeros([1, conv_dim, seq], &device).cast(stream_dtype);
         for tap in 0..self.kernel {
             let weight = self
@@ -560,11 +881,12 @@ impl<B: Backend> LinearAttention<B> {
             output = output + window * weight.unsqueeze();
         }
         let activated = burn::tensor::activation::silu(output.cast(FloatDType::F32));
-        (activated.permute([0, 2, 1]).cast(dtype), new_tail)
+        (activated.permute([0, 2, 1]).cast(dtype), new_tail, tails)
     }
 
     /// The FP32 gated delta rule recurrence; `q`,`k` are already L2-normalized
     /// and scaled, `g`/`beta` per head. State `(1, H, K, V)` evolves in place.
+    #[cfg(test)]
     fn recurrence(
         &self,
         q: Tensor<B, 4>,    // (1, T, H, K) FP32
@@ -574,9 +896,39 @@ impl<B: Backend> LinearAttention<B> {
         beta: Tensor<B, 3>, // (1, T, H) FP32
         state: Tensor<B, 4>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let (output, state, _) = self.recurrence_recording(q, k, v, g, beta, state, false);
+        (output, state)
+    }
+
+    /// Same fold as [`Self::recurrence`]. When `record` is set, also keeps the
+    /// state after each token. Those tensors are the ones the loop just wrote;
+    /// the flag is off on the ordinary decode path so the graph stays the same.
+    fn recurrence_recording(
+        &self,
+        q: Tensor<B, 4>,    // (1, T, H, K) FP32
+        k: Tensor<B, 4>,    // (1, T, H, K) FP32
+        v: Tensor<B, 4>,    // (1, T, H, V) FP32
+        g: Tensor<B, 3>,    // (1, T, H) FP32
+        beta: Tensor<B, 3>, // (1, T, H) FP32
+        state: Tensor<B, 4>,
+        record: bool,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Vec<Tensor<B, 4>>) {
         let seq = q.dims()[1];
         let heads = q.dims()[2]; // expanded to value-head groups by the caller
+        #[cfg(feature = "metal")]
+        if let Some(done) = crate::gdn_scan::try_scan(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            g.clone(),
+            beta.clone(),
+            state.clone(),
+            record,
+        ) {
+            return done;
+        }
         let mut outputs = Vec::with_capacity(seq);
+        let mut steps = Vec::new();
         let mut state = state.squeeze_dim::<3>(0); // (H, K, V) FP32
         for t in 0..seq {
             let pick = |tensor: &Tensor<B, 4>| -> Tensor<B, 2> {
@@ -604,15 +956,166 @@ impl<B: Backend> LinearAttention<B> {
                 .sum_dim(1)
                 .reshape([heads, self.head_v]);
             outputs.push(out.reshape([1, 1, heads, self.head_v]));
+            if record {
+                let checkpoint: Tensor<B, 4> = state.clone().unsqueeze_dim(0);
+                steps.push(checkpoint);
+            }
         }
-        (Tensor::cat(outputs, 1), state.unsqueeze_dim(0)) // (1, T, H, V)
+        (Tensor::cat(outputs, 1), state.unsqueeze_dim(0), steps) // (1, T, H, V)
     }
 
     pub fn forward(&self, x: Tensor<B, 3>, state: Option<&mut LinearState<B>>) -> Tensor<B, 3> {
+        self.forward_recording(x, state, false).0
+    }
+
+    /// Tree sibling of [`forward_recording`]: per-token projections run
+    /// batched over the whole flattened tree; the causal conv and recurrence
+    /// are exact along each root-to-leaf path (a path is a valid linear
+    /// sequence from the incoming state), so they run per path and each
+    /// token's output and recorded state come from whichever path covers it.
+    /// Shared prefixes are recomputed per path — prototype cost, batched
+    /// per-depth segment kernels are the follow-up.
+    pub(crate) fn forward_tree_recording(
+        &self,
+        x: Tensor<B, 3>,
+        state: Option<&mut LinearState<B>>,
+        paths: &[Vec<usize>],
+    ) -> (Tensor<B, 3>, Vec<LinearState<B>>) {
         let [_, seq, _] = x.dims();
         let dtype = shared::dtype(&x);
-        let mixed = self.qkv.forward(x.clone());
-        let (conv, new_tail) = self.causal_conv(mixed, state.as_ref().map(|s| s.conv.clone()));
+        let device = x.device();
+        let mixed = self.qkv.forward_sequence(x.clone());
+        let fp32 = |t: Tensor<B, 3>| t.cast(FloatDType::F32);
+        let beta = burn::tensor::activation::sigmoid(fp32(self.b.forward_sequence(x.clone())));
+        let z = self.z.forward_sequence(x.clone());
+        let a = fp32(self.a.forward_sequence(x.clone()));
+        let a = a + self
+            .dt_bias
+            .clone()
+            .reshape([1, 1, self.heads * self.value_repeat]);
+        let softplus = a.clone().exp().log1p();
+        let softplus = softplus.mask_where(a.clone().greater_elem(20.0), a);
+        let decay = -self
+            .a_log
+            .clone()
+            .reshape([1, 1, self.heads * self.value_repeat])
+            .exp()
+            * softplus;
+        let initial = state
+            .as_ref()
+            .map(|s| s.recurrent.clone())
+            .unwrap_or_else(|| {
+                Tensor::zeros(
+                    [1, self.value_heads(), self.head_k, self.head_v],
+                    (&device, burn::tensor::DType::F32),
+                )
+            });
+        let conv_tail = state.as_ref().map(|s| s.conv.clone());
+        let pick = |tensor: &Tensor<B, 3>, idx: &Tensor<B, 1, burn::tensor::Int>| {
+            tensor.clone().select(1, idx.clone())
+        };
+
+        let mut rows: Vec<Option<Tensor<B, 4>>> = vec![None; seq];
+        let mut steps: Vec<Option<LinearState<B>>> = vec![None; seq];
+        for path in paths {
+            let len = path.len();
+            let idx = Tensor::<B, 1, burn::tensor::Int>::from_data(
+                burn::tensor::TensorData::new(path.iter().map(|&i| i as i64).collect(), [len]),
+                &device,
+            );
+            let (conv, _, tails) = self.causal_conv(pick(&mixed, &idx), conv_tail.clone(), true);
+            let q = fp32(conv.clone().slice([0..1, 0..len, 0..self.key_dim])).reshape([
+                1,
+                len,
+                self.heads,
+                self.head_k,
+            ]);
+            let k = fp32(
+                conv.clone()
+                    .slice([0..1, 0..len, self.key_dim..2 * self.key_dim]),
+            )
+            .reshape([1, len, self.heads, self.head_k]);
+            let value_end = 2 * self.key_dim + self.value_dim;
+            let v = fp32(conv.slice([0..1, 0..len, 2 * self.key_dim..value_end])).reshape([
+                1,
+                len,
+                self.heads * self.value_repeat,
+                self.head_v,
+            ]);
+            let l2 = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+                let scale = (t.clone().square().sum_dim(3) + 1e-6).sqrt().recip();
+                t * scale
+            };
+            let q = l2(q) * (self.head_k as f32).powf(-0.5);
+            let k = l2(k);
+            let interleave = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+                if self.value_repeat == 1 {
+                    return t;
+                }
+                let [b, n, h, d] = t.dims();
+                t.reshape([b, n, h, 1, d])
+                    .repeat_dim(3, self.value_repeat)
+                    .reshape([b, n, h * self.value_repeat, d])
+            };
+            let q = interleave(q);
+            let k = interleave(k);
+            let (core, _, recurrent_steps) = self.recurrence_recording(
+                q,
+                k,
+                v,
+                pick(&decay, &idx),
+                pick(&beta, &idx),
+                initial.clone(),
+                true,
+            );
+            for (pos, &block) in path.iter().enumerate() {
+                rows[block] = Some(core.clone().slice([
+                    0..1,
+                    pos..pos + 1,
+                    0..core.dims()[2],
+                    0..core.dims()[3],
+                ]));
+                steps[block] = Some(LinearState {
+                    conv: tails[pos].clone(),
+                    recurrent: recurrent_steps[pos].clone(),
+                });
+            }
+        }
+        let core = Tensor::cat(
+            rows.into_iter()
+                .map(|row| row.expect("every tree token sits on a path"))
+                .collect(),
+            1,
+        );
+        let value_heads = self.value_heads();
+        let flat = core.reshape([seq * value_heads, self.head_v]);
+        let variance = (flat.clone().square().mean_dim(1) + self.eps).sqrt();
+        let normed = flat / variance;
+        let z = z
+            .cast(FloatDType::F32)
+            .reshape([seq * value_heads, self.head_v]);
+        let gated_norm =
+            normed * self.norm_weight.clone().unsqueeze_dim(0) * burn::tensor::activation::silu(z);
+        let out = gated_norm.reshape([1, seq, self.value_dim]).cast(dtype);
+        let steps = steps
+            .into_iter()
+            .map(|step| step.expect("every tree token sits on a path"))
+            .collect();
+        (self.out.forward_sequence(out), steps)
+    }
+
+    /// Ordinary forward, plus the linear state after each token when `record`.
+    pub(crate) fn forward_recording(
+        &self,
+        x: Tensor<B, 3>,
+        state: Option<&mut LinearState<B>>,
+        record: bool,
+    ) -> (Tensor<B, 3>, Vec<LinearState<B>>) {
+        let [_, seq, _] = x.dims();
+        let dtype = shared::dtype(&x);
+        let mixed = self.qkv.forward_sequence(x.clone());
+        let (conv, new_tail, tails) =
+            self.causal_conv(mixed, state.as_ref().map(|s| s.conv.clone()), record);
 
         let fp32 = |t: Tensor<B, 3>| t.cast(FloatDType::F32);
         let q = fp32(conv.clone().slice([0..1, 0..seq, 0..self.key_dim])).reshape([
@@ -653,9 +1156,9 @@ impl<B: Backend> LinearAttention<B> {
         };
         let q = interleave(q);
         let k = interleave(k);
-        let beta = burn::tensor::activation::sigmoid(fp32(self.b.forward(x.clone())));
-        let z = self.z.forward(x.clone()).cast(FloatDType::F32);
-        let a = fp32(self.a.forward(x.clone()));
+        let beta = burn::tensor::activation::sigmoid(fp32(self.b.forward_sequence(x.clone())));
+        let z = self.z.forward_sequence(x.clone()).cast(FloatDType::F32);
+        let a = fp32(self.a.forward_sequence(x.clone()));
         // softplus(a + dt_bias) with torch's threshold at 20, then the
         // negative decay.
         let a = a + self
@@ -680,7 +1183,8 @@ impl<B: Backend> LinearAttention<B> {
                     (&x.device(), burn::tensor::DType::F32),
                 )
             });
-        let (core, recurrent) = self.recurrence(q, k, v, decay, beta, initial);
+        let (core, recurrent, recurrent_steps) =
+            self.recurrence_recording(q, k, v, decay, beta, initial, record);
         if let Some(state) = state {
             state.conv = new_tail;
             state.recurrent = recurrent;
@@ -694,7 +1198,17 @@ impl<B: Backend> LinearAttention<B> {
         let gated_norm =
             normed * self.norm_weight.clone().unsqueeze_dim(0) * burn::tensor::activation::silu(z);
         let out = gated_norm.reshape([1, seq, self.value_dim]).cast(dtype);
-        self.out.forward(out)
+        let steps = if record {
+            debug_assert_eq!(tails.len(), recurrent_steps.len());
+            tails
+                .into_iter()
+                .zip(recurrent_steps)
+                .map(|(conv, recurrent)| LinearState { conv, recurrent })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (self.out.forward_sequence(out), steps)
     }
 }
 
@@ -737,14 +1251,41 @@ impl<B: Backend> LinearLayer<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>, state: Option<&mut LinearState<B>>) -> Tensor<B, 3> {
+        self.forward_recording(x, state, false).0
+    }
+
+    pub(crate) fn forward_recording(
+        &self,
+        x: Tensor<B, 3>,
+        state: Option<&mut LinearState<B>>,
+        record: bool,
+    ) -> (Tensor<B, 3>, Vec<LinearState<B>>) {
         let dtype = shared::dtype(&x);
-        let normed = self.input_norm.forward(x.clone(), dtype);
-        let attended = self.attn.forward(normed, state);
-        let x = shared::residual(x, attended, dtype);
+        let normed = norm_seam(&self.input_norm, x.clone(), dtype);
+        let (attended, steps) = self.attn.forward_recording(normed, state, record);
+        let x = residual_seam(x, attended, dtype);
         let mlp = self
             .feed_forward
-            .forward(self.post_norm.forward(x.clone(), dtype));
-        shared::residual(x, mlp, dtype)
+            .forward(norm_seam(&self.post_norm, x.clone(), dtype));
+        (residual_seam(x, mlp, dtype), steps)
+    }
+
+    /// Tree sibling of [`forward_recording`] for the speculative tree
+    /// verify: always records per-token states along each token's own path.
+    pub(crate) fn forward_tree_recording(
+        &self,
+        x: Tensor<B, 3>,
+        state: Option<&mut LinearState<B>>,
+        paths: &[Vec<usize>],
+    ) -> (Tensor<B, 3>, Vec<LinearState<B>>) {
+        let dtype = shared::dtype(&x);
+        let normed = norm_seam(&self.input_norm, x.clone(), dtype);
+        let (attended, steps) = self.attn.forward_tree_recording(normed, state, paths);
+        let x = residual_seam(x, attended, dtype);
+        let mlp = self
+            .feed_forward
+            .forward(norm_seam(&self.post_norm, x.clone(), dtype));
+        (residual_seam(x, mlp, dtype), steps)
     }
 }
 
@@ -1183,6 +1724,68 @@ mod linear_tests {
             .unwrap()
             .to_vec()
     }
+
+    #[test]
+    fn linear_prefix_checkpoints_match_shorter_forward() {
+        type B = NdArray;
+        let device: burn::backend::ndarray::NdArrayDevice = Default::default();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/linear-attention-layer.safetensors");
+        let bytes = std::fs::read(&path).unwrap();
+        let tensors = SafeTensors::deserialize(&bytes).unwrap();
+        let weights = omni_r2t2::weights::Weights::from_bytes(vec![bytes.clone()]).unwrap();
+        let config = config();
+        let layer: LinearLayer<B> =
+            LinearLayer::load(&weights, "layers.0", &config, Precision::F32, &device).unwrap();
+
+        let seq = 40;
+        let hidden = stage(&tensors, "stage_hidden_in");
+        let x = Tensor::<B, 3>::from_data(
+            burn::tensor::TensorData::new(hidden, [1, seq, config.hidden_size]),
+            &device,
+        );
+        let normed = layer.input_norm.forward(x, FloatDType::F32);
+        let mut plain = layer.attn.new_state(&device);
+        let plain_out = layer.attn.forward(normed.clone(), Some(&mut plain));
+        let mut recorded = layer.attn.new_state(&device);
+        let (recorded_out, steps) =
+            layer
+                .attn
+                .forward_recording(normed.clone(), Some(&mut recorded), true);
+        assert_eq!(steps.len(), seq);
+        compare(
+            "recorded output",
+            &values3(recorded_out),
+            &values3(plain_out),
+        );
+        compare(
+            "recorded final recurrent",
+            &values4(recorded.recurrent.clone()),
+            &values4(steps[seq - 1].recurrent.clone()),
+        );
+        compare(
+            "recorded final conv",
+            &values3(recorded.conv.clone()),
+            &values3(steps[seq - 1].conv.clone()),
+        );
+        for token in [0usize, 6, 39] {
+            let mut prefix = layer.attn.new_state(&device);
+            let inputs = normed
+                .clone()
+                .slice([0..1, 0..token + 1, 0..config.hidden_size]);
+            let _ = layer.attn.forward(inputs, Some(&mut prefix));
+            compare(
+                &format!("checkpoint {token} recurrent"),
+                &values4(steps[token].recurrent.clone()),
+                &values4(prefix.recurrent),
+            );
+            compare(
+                &format!("checkpoint {token} conv"),
+                &values3(steps[token].conv.clone()),
+                &values3(prefix.conv),
+            );
+        }
+    }
 }
 
 /// Real 35B checkpoint seams (issue #12): embeddings through the layer-0
@@ -1272,7 +1875,7 @@ mod layer35b_tests {
         // Internals bisect — kernel seams captured from the official layer-0 run.
         let conv_dim = 2 * layer.attn.key_dim + layer.attn.value_dim;
         let mixed = layer.attn.qkv.forward(normed.clone());
-        let (conv, _tail) = layer.attn.causal_conv(mixed, None);
+        let (conv, _tail, _) = layer.attn.causal_conv(mixed, None, false);
         let conv_values = conv
             .clone()
             .into_data()

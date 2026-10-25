@@ -51,6 +51,7 @@ fn metal_f16_image_stream_matches_official() {
             model_dir: &model_dir,
             image: &image,
             prompt: case["prompt"].as_str().unwrap(),
+            enable_thinking: None,
             device: &device,
             precision: omni_r2t2::Precision::F16,
         })

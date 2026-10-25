@@ -165,9 +165,57 @@ pub fn generate<B: Backend>(
     options: Options,
     eos_ids: &[u32],
     cancel: &AtomicBool,
-    mut emit: impl FnMut(GeneratedToken) -> Result<(), String>,
+    emit: impl FnMut(GeneratedToken) -> Result<(), String>,
     decode: impl Fn(&[u32]) -> String,
 ) -> Result<Outcome, String> {
+    generate_with(model, prompt, options, eos_ids, cancel, emit, decode, None)
+}
+
+/// Same generation, with full-attention layers reading a fitted latent cache.
+pub fn generate_latent<B: Backend>(
+    model: &TextModel<B>,
+    prompt: &Prompt<B>,
+    options: Options,
+    eos_ids: &[u32],
+    cancel: &AtomicBool,
+    emit: impl FnMut(GeneratedToken) -> Result<(), String>,
+    decode: impl Fn(&[u32]) -> String,
+    factors: &[crate::latent::LatentFactors<B>],
+) -> Result<Outcome, String> {
+    generate_with(
+        model,
+        prompt,
+        options,
+        eos_ids,
+        cancel,
+        emit,
+        decode,
+        Some(factors),
+    )
+}
+
+fn generate_with<B: Backend>(
+    model: &TextModel<B>,
+    prompt: &Prompt<B>,
+    options: Options,
+    eos_ids: &[u32],
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(GeneratedToken) -> Result<(), String>,
+    decode: impl Fn(&[u32]) -> String,
+    factors: Option<&[crate::latent::LatentFactors<B>]>,
+) -> Result<Outcome, String> {
+    let mut caches = factors
+        .map(|factors| {
+            factors
+                .iter()
+                .map(|factor| {
+                    let [kv, _, rank] = factor.k_up.dims();
+                    let rope_dim = factor.rope.dims()[0] / kv.max(1);
+                    crate::latent::LatentCache::new(rank, kv, rope_dim)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut state = model.new_state(&prompt_device::<B>());
     state.rope_delta = prompt.rope_delta;
     let mut history: Vec<u32> = prompt.ids.clone();
@@ -178,14 +226,27 @@ pub fn generate<B: Backend>(
     let mut tokens = Vec::new();
     let mut finish = FinishReason::Length;
 
-    let mut logits = model
-        .forward(
-            &prompt.ids,
-            prompt.embeddings.clone(),
-            prompt.positions.as_deref(),
-            &mut state,
-        )
-        .map_err(|e| e.to_string())?;
+    let forward_step = |ids: &[u32],
+                        embeddings: Option<burn::tensor::Tensor<B, 3>>,
+                        positions: Option<&[[i64; 3]]>,
+                        state: &mut crate::model::DecodeState<B>,
+                        caches: &mut [crate::latent::LatentCache<B>]| {
+        match factors {
+            Some(factors) => model
+                .forward_latent(ids, embeddings, positions, state, factors, caches)
+                .map_err(|error| error.to_string()),
+            None => model
+                .forward(ids, embeddings, positions, state)
+                .map_err(|error| error.to_string()),
+        }
+    };
+    let mut logits = forward_step(
+        &prompt.ids,
+        prompt.embeddings.clone(),
+        prompt.positions.as_deref(),
+        &mut state,
+        &mut caches,
+    )?;
     for step in 0..options.max_new_tokens {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             finish = FinishReason::Cancelled;
@@ -221,9 +282,7 @@ pub fn generate<B: Backend>(
         if step + 1 == options.max_new_tokens {
             break;
         }
-        logits = model
-            .forward(&[token], None, None, &mut state)
-            .map_err(|e| e.to_string())?;
+        logits = forward_step(&[token], None, None, &mut state, &mut caches)?;
     }
     let text = decode(&tokens);
     Ok(Outcome {

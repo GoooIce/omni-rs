@@ -943,22 +943,30 @@ impl<R: Runtime> ComputeClient<R> {
                 // We execute `func()` which will recursibly access the server.
                 let out = func();
 
-                // Finally we get the result from the token.
-                let result = device
-                    .submit_blocking(move |server| {
-                        let mut result = server.end_profile(stream_id, token);
-
-                        match result {
-                            Ok(result) => Ok((out, result)),
-                            Err(err) => Err(err),
-                        }
-                    })
-                    .unwrap();
-
-                Ok(result)
-            })
-            .unwrap()
-            .map_err(|err| ProfileError::Unknown {
+                match device.submit_blocking(move |server| match server.end_profile(stream_id, token)
+                {
+                    Ok(result) => Ok((out, result)),
+                    Err(err) => Err(err),
+                }) {
+                    Ok(inner) => Ok(inner),
+                    Err(err) => Err(ServerError::Generic {
+                        reason: alloc::format!(
+                            "Can't finish profiling because of a call error: {err:?}"
+                        ),
+                        backtrace: BackTrace::capture(),
+                    }),
+                }
+            });
+        let mut result = match result {
+            Ok(inner) => inner,
+            Err(err) => {
+                return Err(ProfileError::Unknown {
+                    reason: alloc::format!("{err:?}"),
+                    backtrace: BackTrace::capture(),
+                });
+            }
+        }
+        .map_err(|err| ProfileError::Unknown {
                 reason: alloc::format!("{err:?}"),
                 backtrace: BackTrace::capture(),
             })?;

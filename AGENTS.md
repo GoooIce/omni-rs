@@ -4,6 +4,7 @@
 - Use [docs/agent-workflow.md](docs/agent-workflow.md) for checks, compilation directories, bounded searches and interruption recovery. The manifests in [scripts/checks.json](scripts/checks.json) are independent Cargo projects; a root Cargo command does not cover all of them.
 - Native app behavior, desktop binary `./target/makepad-native/release/r2t2-makepad`, and regression commands: [prototypes/makepad/README.md](prototypes/makepad/README.md). Numerical and hardware evidence lives in [VALIDATION.md](VALIDATION.md) and the relevant module document under `docs/`.
 - ConvRot int8 matmul: [crates/omni-kernel/src/int8_matmul.rs](crates/omni-kernel/src/int8_matmul.rs) and its Metal lowering in [vendor/cubecl-cpp/src/metal/dialect.rs](vendor/cubecl-cpp/src/metal/dialect.rs).
+- Before writing or debugging a `#[cube]` kernel, read [docs/cube-dsl-pitfalls.md](docs/cube-dsl-pitfalls.md) (macro breaks, dtype defaults, weight layouts, GPU readback landmines). Performance A/B protocol and per-kernel profiling knobs: [docs/agent-workflow.md](docs/agent-workflow.md).
 - Continue within the user's approved scope. Preserve accepted recommendations and completed checks across turns; ask only when an unresolved choice changes that scope or observable behavior.
 
 ## Agent skills

@@ -6,6 +6,30 @@ use crate::{config::TextConfig, quant};
 use burn::tensor::TensorData;
 use burn::tensor::{Tensor, activation, backend::Backend};
 use omni_r2t2::{Precision, Result, tensor as shared, weights::WeightSource};
+use std::cell::Cell;
+
+thread_local! {
+    static MATCH_DECODE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While this guard is alive, a multi-token MoE block keeps the one-token
+/// decode experts and slot-order sum, and projects each expert once.
+pub(crate) struct MatchDecodeMoe {
+    previous: bool,
+}
+
+impl MatchDecodeMoe {
+    pub(crate) fn enter() -> Self {
+        let previous = MATCH_DECODE.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for MatchDecodeMoe {
+    fn drop(&mut self) {
+        MATCH_DECODE.with(|flag| flag.set(self.previous));
+    }
+}
 
 type Linear<B> = shared::Linear<B>;
 
@@ -25,6 +49,20 @@ enum ExpertLinear<B: Backend> {
 
 impl<B: Backend> ExpertLinear<B> {
     fn matmul_transpose(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let rows = x.dims()[0];
+        if rows > 1 && shared::decode_row_gemv() {
+            let width = x.dims()[1];
+            let mut pieces = Vec::with_capacity(rows);
+            for index in 0..rows {
+                pieces
+                    .push(self.matmul_transpose_row(x.clone().slice([index..index + 1, 0..width])));
+            }
+            return Tensor::cat(pieces, 0);
+        }
+        self.matmul_transpose_row(x)
+    }
+
+    fn matmul_transpose_row(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         match self {
             ExpertLinear::Fused(weight) => x.matmul(weight.clone().transpose()),
             ExpertLinear::Packed(weight) => weight.matmul_transpose(x),
@@ -38,9 +76,47 @@ struct ExpertWeights<B: Backend> {
     down: ExpertLinear<B>,
 }
 
+/// One uploaded `PackedParts` pair.
+struct DenseExpertsUpload<B: Backend> {
+    words: Tensor<B, 1, burn::tensor::Int>,
+    scales: Tensor<B, 1>,
+}
+
+/// All experts of one layer concatenated into three raw packed payloads for
+/// launch-light multi-token forwards (speculative verify). `gate`/`up` are
+/// logical `[E * inter, hidden]`; `down` is logical `[hidden, E * inter]` with
+/// each row interleaving the experts. Words and scales live in flat 1-D
+/// tensors read linearly by the grouped kernels. The router row-major
+/// `[experts, hidden]` weight, the shared expert's projections and its sigmoid
+/// gate vector are f32 (lossless casts of the bf16 checkpoint values) so the
+/// fused kernels read them without a per-forward cast.
+pub(crate) struct DenseExperts<B: Backend> {
+    pub(crate) gate_words: Tensor<B, 1, burn::tensor::Int>,
+    pub(crate) gate_scales: Tensor<B, 1>,
+    pub(crate) up_words: Tensor<B, 1, burn::tensor::Int>,
+    pub(crate) up_scales: Tensor<B, 1>,
+    pub(crate) down_words: Tensor<B, 1, burn::tensor::Int>,
+    pub(crate) down_scales: Tensor<B, 1>,
+    pub(crate) router: Tensor<B, 2>,
+    pub(crate) shared_gate_w: Tensor<B, 2>,
+    pub(crate) shared_up_w: Tensor<B, 2>,
+    pub(crate) shared_down_w: Tensor<B, 2>,
+    pub(crate) shared_gate_vec: Tensor<B, 2>,
+    pub(crate) num_experts: usize,
+    pub(crate) top_k: usize,
+    pub(crate) expert_intermediate: usize,
+    pub(crate) shared_intermediate: usize,
+}
+
+/// Blocks at or below this many tokens take the all-experts dense path: every
+/// expert projection is one matmul, at most `2^5 x` the routed compute, and
+/// the router never syncs back to the host.
+const DENSE_MOE_MAX_TOKENS: usize = 32;
+
 pub struct SparseMoeBlock<B: Backend> {
     router: Tensor<B, 2>, // (experts, hidden)
     experts: Vec<ExpertWeights<B>>,
+    dense: Option<DenseExperts<B>>,
     shared_gate: Linear<B>,
     shared_up: Linear<B>,
     shared_down: Linear<B>,
@@ -91,7 +167,7 @@ impl<B: Backend> SparseMoeBlock<B> {
                 down: ExpertLinear::Fused(down.clone().narrow(0, expert, 1).squeeze_dim::<2>(0)),
             });
         }
-        Self::assemble(w, name, geo, hidden, experts, p, d)
+        Self::assemble_dense(w, name, geo, hidden, experts, p, d)
     }
 
     /// 35B int4 layout: per-expert `{name}.experts.{e}.{gate,up,down}_proj`
@@ -128,10 +204,100 @@ impl<B: Backend> SparseMoeBlock<B> {
                 down: load(expert, "down_proj", [hidden, intermediate])?,
             });
         }
-        Self::assemble(w, name, geo, hidden, experts, p, d)
+        let dense = if mode == quant::LoadMode::Packed {
+            let names = |projection: &str| -> Vec<String> {
+                (0..geo.num_experts)
+                    .map(|expert| format!("{name}.experts.{expert}.{projection}.weight_packed"))
+                    .collect()
+            };
+            let scale_names = |projection: &str| -> Vec<String> {
+                (0..geo.num_experts)
+                    .map(|expert| format!("{name}.experts.{expert}.{projection}.weight_scale"))
+                    .collect()
+            };
+            let upload = |parts: quant::PackedParts| -> Result<DenseExpertsUpload<B>> {
+                Ok(DenseExpertsUpload {
+                    words: Tensor::<B, 1, burn::tensor::Int>::from_data(
+                        burn::tensor::TensorData::new(
+                            parts.words.iter().map(|word| *word as i32).collect(),
+                            [parts.words.len()],
+                        ),
+                        // The kernels read i32 words linearly; the device's
+                        // default int dtype is i64 and would interleave the
+                        // payload with sign-extension halves.
+                        burn::tensor::TensorCreationOptions::<B> {
+                            device: d.clone(),
+                            dtype: Some(burn::tensor::DType::I32),
+                        },
+                    ),
+                    scales: Tensor::<B, 1>::from_data(
+                        burn::tensor::TensorData::new(parts.scales.clone(), [parts.scales.len()]),
+                        burn::tensor::TensorCreationOptions::<B> {
+                            device: d.clone(),
+                            dtype: Some(burn::tensor::DType::F32),
+                        },
+                    ),
+                })
+            };
+            let gate = upload(quant::packed_vconcat_kmajor_parts(
+                w,
+                &names("gate_proj"),
+                &scale_names("gate_proj"),
+                [intermediate, hidden],
+            )?)?;
+            let up = upload(quant::packed_vconcat_kmajor_parts(
+                w,
+                &names("up_proj"),
+                &scale_names("up_proj"),
+                [intermediate, hidden],
+            )?)?;
+            let down = upload(quant::packed_hconcat_kmajor_parts(
+                w,
+                &names("down_proj"),
+                &scale_names("down_proj"),
+                [hidden, intermediate],
+            )?)?;
+            Some((gate, up, down))
+        } else {
+            None
+        };
+        let mut block = Self::assemble_dense(w, name, geo, hidden, experts, p, d)?;
+        if let Some((gate, up, down)) = dense {
+            // The f32 copies for the fused kernels come from the tensors this
+            // block already uploaded, not a second checkpoint read. Linear
+            // keeps the executable [input, output] view; the kernels index
+            // checkpoint-style [output, input] rows, so transpose back (the
+            // cast materializes the transposed view contiguously).
+            let f32_out_in = |linear: &Linear<B>| {
+                linear
+                    .weight()
+                    .clone()
+                    .transpose()
+                    .cast(burn::tensor::FloatDType::F32)
+            };
+            block.dense = Some(DenseExperts {
+                gate_words: gate.words,
+                gate_scales: gate.scales,
+                up_words: up.words,
+                up_scales: up.scales,
+                down_words: down.words,
+                down_scales: down.scales,
+                router: block.router.clone().cast(burn::tensor::FloatDType::F32),
+                shared_gate_w: f32_out_in(&block.shared_gate),
+                shared_up_w: f32_out_in(&block.shared_up),
+                shared_down_w: f32_out_in(&block.shared_down),
+                shared_gate_vec: f32_out_in(&block.shared_expert_gate),
+                num_experts: block.geometry.num_experts,
+                top_k: block.geometry.top_k,
+                expert_intermediate: block.geometry.expert_intermediate,
+                shared_intermediate: block.geometry.shared_intermediate,
+            });
+        }
+        Ok(block)
     }
 
-    fn assemble(
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_dense(
         w: &impl WeightSource<B>,
         name: &str,
         geo: MoeGeometry,
@@ -154,6 +320,7 @@ impl<B: Backend> SparseMoeBlock<B> {
                 d,
             )?,
             experts,
+            dense: None,
             shared_gate: load(
                 "shared_expert.gate_proj.weight",
                 geo.shared_intermediate,
@@ -216,8 +383,83 @@ impl<B: Backend> SparseMoeBlock<B> {
         weights.down.matmul_transpose(activated)
     }
 
+    /// Decode routing and slot-order sum. Each expert is projected once for the
+    /// block; repeating that projection per row is what made a verify step cost
+    /// about fifteen decodes. The shared expert is the same batched projection
+    /// used for a multi-token forward.
+    fn forward_rows_matching_decode(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {
+        let [_, tokens, _] = x.dims();
+        let flat = x.reshape([tokens, self.hidden]);
+        let (experts, weights) = self.route(&flat);
+        let mut computed: Vec<Option<Tensor<B, 2>>> = Vec::with_capacity(self.geometry.num_experts);
+        computed.resize_with(self.geometry.num_experts, || None);
+        for &expert in &experts {
+            if computed[expert].is_none() {
+                computed[expert] = Some(self.expert_forward(expert, &flat));
+            }
+        }
+        let mut acc: Option<Tensor<B, 2>> = None;
+        for slot in 0..self.geometry.top_k {
+            let mut pieces = Vec::with_capacity(tokens);
+            for token in 0..tokens {
+                let expert = experts[token * self.geometry.top_k + slot];
+                let weight = weights[token * self.geometry.top_k + slot];
+                let rows = computed[expert]
+                    .as_ref()
+                    .expect("routed expert was projected")
+                    .clone();
+                pieces.push(rows.slice([token..token + 1, 0..self.hidden]) * weight);
+            }
+            let slot_out = Tensor::cat(pieces, 0);
+            acc = Some(match acc {
+                None => slot_out,
+                Some(sum) => sum + slot_out,
+            });
+        }
+        let routed = match acc {
+            Some(sum) => sum,
+            None => {
+                let zero: Tensor<B, 2> = Tensor::zeros([tokens, self.hidden], &flat.device());
+                zero.cast(shared::dtype(&flat))
+            }
+        };
+        let shared = self.shared_down.forward_rows(
+            activation::silu(self.shared_gate.forward_rows(flat.clone()))
+                * self.shared_up.forward_rows(flat.clone()),
+        );
+        let gate = activation::sigmoid(self.shared_expert_gate.forward_rows(flat));
+        routed + shared * gate
+    }
+
+    /// The grouped kernels of [`crate::moe_dense`]: four launches per layer —
+    /// router (top-k + renormalized softmax + shared sigmoid gate), packed
+    /// gate/up over the touched experts, shared gate/up, and a down that
+    /// folds the weighted combine, the shared expert and the final add.
+    /// Returns `None` when the kernels cannot run; the caller falls back to
+    /// the dispatched paths.
+    #[cfg(feature = "metal")]
+    fn forward_dense(&self, flat: Tensor<B, 2>) -> Option<Tensor<B, 2>> {
+        let dense = self.dense.as_ref()?;
+        let dtype = shared::dtype(&flat);
+        crate::moe_dense::try_dense_moe(flat, dense).map(|y| y.cast(dtype))
+    }
+
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {
         let [_, tokens, _] = x.dims();
+        if tokens > 1 && MATCH_DECODE.with(|flag| flag.get()) {
+            return self.forward_rows_matching_decode(x);
+        }
+        #[cfg(feature = "metal")]
+        if tokens > 1 && tokens <= DENSE_MOE_MAX_TOKENS && self.dense.is_some() {
+            let width = x.dims()[2];
+            let flat = x
+                .clone()
+                .slice([0..1, 0..tokens, 0..width])
+                .reshape([tokens, self.hidden]);
+            if let Some(output) = self.forward_dense(flat) {
+                return output;
+            }
+        }
         let flat = x.reshape([tokens, self.hidden]);
         let (experts, weights) = self.route(&flat);
 
@@ -260,20 +502,20 @@ impl<B: Backend> SparseMoeBlock<B> {
 
             let mut output: Tensor<B, 2> = Tensor::zeros([tokens, self.hidden], &flat.device());
             output = output.cast(shared::dtype(&flat));
-            for expert in touched {
-                let rows = self.expert_forward(expert, &flat);
-                let column = weights2d.clone().slice([0..tokens, expert..expert + 1]);
+            for expert in &touched {
+                let rows = self.expert_forward(*expert, &flat);
+                let column = weights2d.clone().slice([0..tokens, *expert..*expert + 1]);
                 output = output + rows * column;
             }
             output
         };
 
         // Shared expert with sigmoid gate.
-        let shared = self.shared_down.forward(
-            activation::silu(self.shared_gate.forward(flat.clone()))
-                * self.shared_up.forward(flat.clone()),
+        let shared = self.shared_down.forward_rows(
+            activation::silu(self.shared_gate.forward_rows(flat.clone()))
+                * self.shared_up.forward_rows(flat.clone()),
         );
-        let gate = activation::sigmoid(self.shared_expert_gate.forward(flat));
+        let gate = activation::sigmoid(self.shared_expert_gate.forward_rows(flat));
         output + shared * gate
     }
 }

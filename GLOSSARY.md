@@ -16,6 +16,12 @@ Attention keys and values retained for already processed positions in one decodi
 **Session**:
 One stream of speech recognition with its own audio history and decoding state. Sessions share a model but never share their evolving transcript.
 
+**Speculative cycle**:
+One DSpark round: propose (draft block from the markov head), verify (one target forward over the block), accept (longest prefix matching the target's greedy argmax, plus one correction token), retain (KV rollback to the accepted prefix). The draft block length adapts over the ladder 3/8/16 by measured acceptance.
+
+**τ (acceptance length)**:
+Accepted draft tokens per verify cycle (`draft_tokens_accepted / cycles`). Content-dependent — ~2 on hard-to-predict prose, ~7.7 on repetitive code for the 35B int4 model — and the dominant lever for tokens per second once verify sits at its bandwidth floor.
+
 **Transcription**:
 A complete speech-recognition run from incoming audio to committed text, including how input ends and the run's timing statistics.
 
