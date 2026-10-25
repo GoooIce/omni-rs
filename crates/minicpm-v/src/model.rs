@@ -244,6 +244,7 @@ impl<B: Backend> TextModel<B> {
             None,
             &[],
             false,
+            None,
         )
         .map(|(hidden, _, _)| hidden)
     }
@@ -268,6 +269,7 @@ impl<B: Backend> TextModel<B> {
             Some(caches),
             &[],
             false,
+            None,
         )?;
         let dtype = shared::dtype(&hidden);
         let tokens = hidden.dims()[1];
@@ -290,7 +292,14 @@ impl<B: Backend> TextModel<B> {
         mut caches: Option<&mut [crate::latent::LatentCache<B>]>,
         capture_at: &[usize],
         record_linear: bool,
+        tree: Option<&crate::dspark::TreeSpec>,
     ) -> omni_r2t2::Result<(Tensor<B, 3>, Vec<Tensor<B, 3>>, Vec<Vec<LinearState<B>>>)> {
+        debug_assert!(
+            tree.is_none() || factors.is_none(),
+            "tree verify and latent caches are exclusive"
+        );
+
+        let paths = tree.map(|tree| tree.paths());
         // The activation dtype follows the loaded weights (F16 on GPU, F32 on
         // the CPU reference path); every stage derives from `hidden`.
         let mut hidden = match embeddings {
@@ -299,18 +308,39 @@ impl<B: Backend> TextModel<B> {
         };
         let dtype = shared::dtype(&hidden);
         let tokens = hidden.dims()[1];
+        let block_mask = tree.map(|tree| {
+            Tensor::<B, 4, Bool>::from_data(
+                burn::tensor::TensorData::new(tree.ancestor_mask(), [1, 1, tokens, tokens]),
+                &hidden.device(),
+            )
+        });
         let mut kv_index = 0;
         let mut linear_index = 0;
         // Positions: text-only generation is 1-D; a multimodal prompt passes
         // its canvas table through `position_overrides`.
         let positions: Vec<[i64; 3]> = match positions {
             Some(table) => table.to_vec(),
-            None => (0..tokens)
-                .map(|offset| {
-                    let base = (state.length + offset) as i64 + state.rope_delta;
-                    [base, base, base]
-                })
-                .collect(),
+            None => {
+                let base = state.length as i64 + state.rope_delta;
+                match tree {
+                    // Tree tokens sit at their depth's position, not their
+                    // flattened slot.
+                    Some(tree) => tree
+                        .depth
+                        .iter()
+                        .map(|&depth| {
+                            let position = base + depth as i64;
+                            [position, position, position]
+                        })
+                        .collect(),
+                    None => (0..tokens)
+                        .map(|offset| {
+                            let position = base + offset as i64;
+                            [position, position, position]
+                        })
+                        .collect(),
+                }
+            }
         };
         let (cos, sin) = mrope_tables::<B>(
             &self.config.text_config,
@@ -334,7 +364,14 @@ impl<B: Backend> TextModel<B> {
                         )
                     } else {
                         let cache = &mut state.kv[kv_index];
-                        layer.forward_with_kernel(hidden, &cos, &sin, Some(cache), kernel)
+                        layer.forward_with_kernel(
+                            hidden,
+                            &cos,
+                            &sin,
+                            Some(cache),
+                            kernel,
+                            block_mask.clone(),
+                        )
                     };
                     kv_index += 1;
                     y
@@ -343,7 +380,9 @@ impl<B: Backend> TextModel<B> {
                     let cache = &mut state.linear[linear_index];
                     linear_index += 1;
                     if record_linear {
-                        let (y, steps) = layer.forward_recording(hidden, Some(cache), true);
+                        let tree_paths = paths.as_deref();
+                        let (y, steps) =
+                            layer.forward_recording(hidden, Some(cache), tree_paths, true);
                         debug_assert_eq!(steps.len(), tokens);
                         linear_after.push(steps);
                         y
@@ -383,6 +422,7 @@ impl<B: Backend> TextModel<B> {
             None,
             capture_at,
             false,
+            None,
         )?;
         let dtype = shared::dtype(&hidden);
         let tokens = hidden.dims()[1];
@@ -435,6 +475,7 @@ impl<B: Backend> TextModel<B> {
             None,
             capture_at,
             true,
+            None,
         )?;
         let dtype = shared::dtype(&hidden);
         let tokens = hidden.dims()[1];
@@ -444,11 +485,11 @@ impl<B: Backend> TextModel<B> {
         Ok((all, captured, linear_after))
     }
 
-    /// Tree sibling of [`forward_verifying_with`] (always Batched numerics):
-    /// positions follow each token's tree depth, full attention runs once
-    /// under the ancestor mask, and linear layers record per-token states
-    /// along each token's own root path. `ids` is `[bonus, tree tokens…]`
-    /// matching `tree`'s breadth-first layout.
+    /// Tree sibling of [`forward_verifying_with`] (always Batched
+    /// numerics): positions follow each token's tree depth, full attention
+    /// runs once under the ancestor mask, and linear layers record
+    /// per-token states along each token's own root path. `ids` is
+    /// `[bonus, tree tokens…]` matching `tree`'s breadth-first layout.
     pub fn forward_verifying_tree(
         &self,
         ids: &[u32],
@@ -456,57 +497,20 @@ impl<B: Backend> TextModel<B> {
         state: &mut DecodeState<B>,
         capture_at: &[usize],
     ) -> omni_r2t2::Result<(Tensor<B, 2>, Vec<Tensor<B, 3>>, Vec<Vec<LinearState<B>>>)> {
-        let mut hidden = self.embed.forward(ids)?;
+        let (hidden, captured, linear_after) = self.walk(
+            ids,
+            None,
+            None,
+            state,
+            shared::AttentionKernel::Automatic,
+            None,
+            None,
+            capture_at,
+            true,
+            Some(tree),
+        )?;
         let dtype = shared::dtype(&hidden);
         let tokens = hidden.dims()[1];
-        debug_assert_eq!(tokens, tree.parent.len());
-        let base = state.length as i64 + state.rope_delta;
-        let positions: Vec<[i64; 3]> = tree
-            .depth
-            .iter()
-            .map(|&depth| {
-                let p = base + depth as i64;
-                [p, p, p]
-            })
-            .collect();
-        let (cos, sin) = mrope_tables::<B>(
-            &self.config.text_config,
-            &positions,
-            dtype,
-            &hidden.device(),
-        );
-        let block_mask = {
-            let values = tree.ancestor_mask();
-            Tensor::<B, 4, Bool>::from_data(
-                burn::tensor::TensorData::new(values, [1, 1, tokens, tokens]),
-                &hidden.device(),
-            )
-        };
-        let paths = tree.paths();
-        let mut kv_index = 0;
-        let mut linear_index = 0;
-        let mut captured = Vec::with_capacity(capture_at.len());
-        let mut linear_after = Vec::new();
-        for (index, layer) in self.layers.iter().enumerate() {
-            hidden = match layer {
-                Layer::Full(layer) => {
-                    let cache = &mut state.kv[kv_index];
-                    kv_index += 1;
-                    layer.forward_tree(hidden, &cos, &sin, Some(cache), block_mask.clone())
-                }
-                Layer::Linear(layer) => {
-                    let cache = &mut state.linear[linear_index];
-                    linear_index += 1;
-                    let (y, steps) = layer.forward_tree_recording(hidden, Some(cache), &paths);
-                    linear_after.push(steps);
-                    y
-                }
-            };
-            if capture_at.contains(&index) {
-                captured.push(hidden.clone());
-            }
-        }
-        state.length += tokens;
         let width = hidden.dims()[2];
         let normed = self.norm.forward(hidden, dtype).reshape([tokens, width]);
         let all = self.lm_head.logits(normed);
