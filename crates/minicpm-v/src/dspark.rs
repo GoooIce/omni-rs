@@ -1171,7 +1171,7 @@ fn prompt_device<B: Backend>() -> B::Device {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_LADDER, BlockLayout, Ladder};
+    use super::{BLOCK_LADDER, BlockLayout, Ladder, TreeSpec, accept_path};
 
     #[test]
     fn ladder_grows_on_two_full_accepts() {
@@ -1248,6 +1248,69 @@ mod tests {
         pinned.observe(7, 7, false);
         assert_eq!(pinned.layout(), BlockLayout::Chain { len: 7 });
         assert_eq!(pinned.block_len(), 7);
+    }
+
+    fn small_tree() -> TreeSpec {
+        // bonus + 2 children, one level.
+        TreeSpec::binary(1, vec![11, 7])
+    }
+
+    #[test]
+    fn chain_acceptance_walks_matching_prefix() {
+        // predictions: match, match, mismatch at index 2.
+        let predictions = [5u32, 6, 9, 0];
+        let proposals = [5u32, 6, 8];
+        let mut predict = |index: usize| Ok(predictions[index]);
+        let path = accept_path(None, &proposals, &[], &mut predict).unwrap();
+        assert_eq!(path.tokens, vec![5, 6]);
+        assert_eq!(path.slots, vec![0, 1, 2]);
+        assert_eq!(path.correction, Some(9));
+        assert!(!path.draft_eos);
+    }
+
+    #[test]
+    fn chain_full_accept_takes_next_prediction() {
+        let predictions = [5u32, 6, 42];
+        let proposals = [5u32, 6];
+        let mut predict = |index: usize| Ok(predictions[index]);
+        let path = accept_path(None, &proposals, &[], &mut predict).unwrap();
+        assert_eq!(path.tokens, vec![5, 6]);
+        assert_eq!(path.correction, Some(42));
+    }
+
+    #[test]
+    fn chain_matching_eos_stops_without_committing_it() {
+        let predictions = [5u32, 99];
+        let proposals = [5u32, 99];
+        let mut predict = |index: usize| Ok(predictions[index]);
+        let path = accept_path(None, &proposals, &[99], &mut predict).unwrap();
+        assert_eq!(path.tokens, vec![5]);
+        assert!(path.draft_eos);
+        assert_eq!(path.correction, None);
+    }
+
+    #[test]
+    fn tree_acceptance_follows_matching_children() {
+        let tree = small_tree();
+        // prediction after the bonus is 7: the second child matches.
+        let predictions = [7u32, 0, 0];
+        let mut predict = |index: usize| Ok(predictions[index]);
+        let path = accept_path(Some(&tree), &[], &[], &mut predict).unwrap();
+        assert_eq!(path.tokens, vec![7]);
+        assert_eq!(path.slots, vec![0, 2]);
+        // The walk stops at the leaf: its prediction becomes the correction.
+        assert_eq!(path.correction, Some(predictions[2]));
+    }
+
+    #[test]
+    fn tree_mismatch_takes_correction_immediately() {
+        let tree = small_tree();
+        let predictions = [42u32, 0, 0];
+        let mut predict = |index: usize| Ok(predictions[index]);
+        let path = accept_path(Some(&tree), &[], &[], &mut predict).unwrap();
+        assert!(path.tokens.is_empty());
+        assert_eq!(path.slots, vec![0]);
+        assert_eq!(path.correction, Some(42));
     }
 
     #[test]

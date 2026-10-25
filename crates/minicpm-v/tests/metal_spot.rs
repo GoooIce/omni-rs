@@ -8,23 +8,16 @@ use omni_minicpm_v::{
     config::ModelDirectory, generate, model::TextModel, multimodal::Multimodal,
     tokenizer::MiniCpmTokenizer,
 };
-use std::sync::atomic::AtomicBool;
+mod common;
 
-fn reference() -> Option<serde_json::Value> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let reference = root.join("artifacts/minicpm-reference/greedy-image.json");
-    let model = root.join("models/MiniCPM-V-4.7-1B/model.safetensors");
-    if reference.is_file() && model.is_file() {
-        serde_json::from_str(&std::fs::read_to_string(reference).unwrap()).ok()
-    } else {
-        eprintln!("skipping: checkpoint or image reference not present");
-        None
-    }
-}
+use std::sync::atomic::AtomicBool;
 
 #[test]
 fn metal_f16_image_stream_matches_official() {
-    let Some(cases) = reference() else {
+    let Some(cases) = common::reference(
+        "greedy-image.json",
+        "checkpoint or image reference not present",
+    ) else {
         return;
     };
     let key = "small.png|Describe this image in one sentence.";

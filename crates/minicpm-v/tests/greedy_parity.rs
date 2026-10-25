@@ -11,25 +11,18 @@ use omni_minicpm_v::{
     multimodal::Prompt,
     tokenizer::MiniCpmTokenizer,
 };
+mod common;
+
 use std::sync::atomic::AtomicBool;
 
 type B = NdArray;
 
-fn reference() -> Option<serde_json::Value> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let reference = root.join("artifacts/minicpm-reference/greedy-text.json");
-    let model = root.join("models/MiniCPM-V-4.7-1B/model.safetensors");
-    if reference.is_file() && model.is_file() {
-        serde_json::from_str(&std::fs::read_to_string(reference).unwrap()).ok()
-    } else {
-        eprintln!("skipping: checkpoint or greedy reference not present");
-        None
-    }
-}
-
 #[test]
 fn text_only_greedy_matches_official_tokens() {
-    let Some(cases) = reference() else {
+    let Some(cases) = common::reference(
+        "greedy-text.json",
+        "checkpoint or greedy reference not present",
+    ) else {
         return;
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
