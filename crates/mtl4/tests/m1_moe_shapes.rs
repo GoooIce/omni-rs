@@ -156,3 +156,135 @@ fn m1_gate_up_stream_bandwidth() {
         bytes as f64 / per / 1e9
     );
 }
+#[test]
+fn m1_boundary_attack() {
+    // Three variables, surgically separated: proper grid coverage, static
+    // (literal) K in the descriptor instead of the dynamic sentinel, and
+    // extent growth. Kernel source is generated per combo.
+    let device = mtl4::Device::new().expect("Metal 4 device");
+    let base = r#"
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+kernel void gemm(tensor<device half, dextents<int32_t, 2>> A,
+                 tensor<device half, dextents<int32_t, 2>> B,
+                 tensor<device half, dextents<int32_t, 2>> C,
+                 uint2 tgid [[threadgroup_position_in_grid]])
+{
+    constexpr auto descriptor = matmul2d_descriptor(32, 32, {{K}});
+    matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto a = A.slice<dynamic_extent, 32>(0, tgid.y * 32);
+    auto b = B.slice<32, dynamic_extent>(tgid.x * 32, 0);
+    auto c = C.slice<32, 32>(tgid.x * 32, tgid.y * 32);
+    operation.run(a, b, c);
+}
+"#;
+    for (label, m, n, k, static_k) in [
+        ("grid2 n=64 dynK", 32usize, 64usize, 128usize, false),
+        ("grid4 n=128 dynK", 32, 128, 128, false),
+        ("k=256 staticK", 32, 32, 256, true),
+        ("n=1024 grid32 staticK", 32, 1024, 2048, true),
+        ("n=1024 grid32 dynK", 32, 1024, 2048, false),
+        ("n=262144 grid8192 staticK", 32, 262144, 2048, true),
+    ] {
+        let k_arg = if static_k {
+            k.to_string()
+        } else {
+            "static_cast<int>(dynamic_extent)".to_string()
+        };
+        let source = base.replace("{{K}}", &k_arg);
+        let pipeline = match device.compile(&source, "gemm", 128) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                eprintln!("{label}: compile failed: {error}");
+                continue;
+            }
+        };
+        let act = vec![f16::from_f32(0.125); m * k];
+        let weights = vec![f16::from_f32(0.0625); n * k];
+        let ta = device.tensor_f16([m, k], Some(&act)).unwrap();
+        let tb = device.tensor_f16([k, n], Some(&weights)).unwrap();
+        let tc = device.tensor_f16([m, n], None).unwrap();
+        let groups = [n / 32, 1];
+        if let Err(error) = device.run(&pipeline, &[&ta, &tb, &tc], groups) {
+            eprintln!("{label}: dispatch failed: {error}");
+            continue;
+        }
+        let c = tc.read_f16();
+        let nonzeros = c.iter().filter(|v| v.to_f32() != 0.0).count();
+        let expect = k as f32 * 0.125 * 0.0625;
+        let ok = nonzeros == c.len() && (c[0].to_f32() - expect).abs() < 0.05;
+        eprintln!(
+            "{label}: nonzeros {nonzeros}/{}, c0={} (expect {expect:.1}) -> {}",
+            c.len(),
+            c[0],
+            if ok { "WORKS" } else { "no" }
+        );
+    }
+}
+
+#[test]
+fn m1_doc_recipe_with_scalars() {
+    // The SDK doc examples' verbatim recipe: fully dynamic slices plus
+    // M/N/K as `constant uint&` kernel arguments (edge checking reads
+    // them), bound here by GPU address after the tensor slots.
+    let device = mtl4::Device::new().expect("Metal 4 device");
+    let msl = r#"
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+kernel void gemm_doc(tensor<device half, dextents<int32_t, 2>> A,
+                     tensor<device half, dextents<int32_t, 2>> B,
+                     tensor<device half, dextents<int32_t, 2>> C,
+                     constant uint& M,
+                     constant uint& N,
+                     constant uint& K,
+                     uint2 tgid [[threadgroup_position_in_grid]])
+{
+    constexpr auto descriptor =
+        matmul2d_descriptor(32, 32, static_cast<int>(dynamic_extent));
+    matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto mA = A.slice(0, tgid.y * 32);
+    auto mB = B.slice(tgid.x * 32, 0);
+    auto mC = C.slice(tgid.x * 32, tgid.y * 32);
+    operation.run(mA, mB, mC);
+}
+"#;
+    let pipeline = device.compile(msl, "gemm_doc", 128).expect("MSL compile");
+    for (m, n, k) in [
+        (32usize, 64usize, 128usize),
+        (32, 1024, 2048),
+        (32, 262144, 2048),
+    ] {
+        let act = vec![f16::from_f32(0.125); m * k];
+        let weights = vec![f16::from_f32(0.0625); n * k];
+        let ta = device.tensor_f16([m, k], Some(&act)).unwrap();
+        let tb = device.tensor_f16([k, n], Some(&weights)).unwrap();
+        let tc = device.tensor_f16([m, n], None).unwrap();
+        let groups = [n / 32, 1];
+        let outcome = device.run_with_scalars(
+            &pipeline,
+            &[&ta, &tb, &tc],
+            &[m as u32, n as u32, k as u32],
+            groups,
+        );
+        if let Err(error) = outcome {
+            eprintln!("doc m={m} n={n} k={k}: dispatch failed: {error}");
+            continue;
+        }
+        let c = tc.read_f16();
+        let nonzeros = c.iter().filter(|v| v.to_f32() != 0.0).count();
+        let expect = k as f32 * 0.125 * 0.0625;
+        let ok = nonzeros == c.len() && (c[0].to_f32() - expect).abs() < 0.05;
+        eprintln!(
+            "doc m={m} n={n} k={k}: nonzeros {nonzeros}/{}, c0={} (expect {expect:.1}) -> {}",
+            c.len(),
+            c[0],
+            if ok { "WORKS" } else { "no" }
+        );
+    }
+}

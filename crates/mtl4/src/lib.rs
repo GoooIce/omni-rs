@@ -66,6 +66,14 @@ pub struct Pipeline {
     threads: MTLSize,
 }
 
+impl Pipeline {
+    /// The execution width the pipeline wants (the doc's dispatch recipe
+    /// is `threadExecutionWidth * simdgroups` threads per threadgroup).
+    pub fn thread_execution_width(&self) -> usize {
+        self.state.threadExecutionWidth()
+    }
+}
+
 /// An f16 rank-2 tensor backed by a shared (host-visible) `MTLBuffer`.
 pub struct Tensor {
     tensor: Retained<ProtocolObject<dyn MTLTensor>>,
@@ -198,22 +206,6 @@ impl Device {
 
     /// Bind `tensors` at consecutive buffer indices and dispatch one
     /// threadgroup of `pipeline`'s required size.
-    fn argument_table(
-        &self,
-        tensors: &[&Tensor],
-    ) -> Result<Retained<ProtocolObject<dyn MTL4ArgumentTable>>, String> {
-        let table_descriptor = MTL4ArgumentTableDescriptor::new();
-        table_descriptor.setMaxBufferBindCount(tensors.len());
-        let table = self
-            .device
-            .newArgumentTableWithDescriptor_error(&table_descriptor)
-            .map_err(|error| format!("argument table: {error}"))?;
-        for (index, tensor) in tensors.iter().enumerate() {
-            unsafe { table.setResource_atBufferIndex(tensor.tensor.gpuResourceID(), index) };
-        }
-        Ok(table)
-    }
-
     /// MTL4 replaced host-side `waitUntilCompleted` with commit feedback: a
     /// block registered on the commit options fires when the workload
     /// completes, and this side spins on the flag.
@@ -260,7 +252,55 @@ impl Device {
         tensors: &[&Tensor],
         groups: [usize; 2],
     ) -> Result<(), String> {
-        let table = self.argument_table(tensors)?;
+        self.run_with_scalars(pipeline, tensors, &[], groups)
+    }
+
+    /// Same dispatch, plus one `constant uint` scalar per entry of
+    /// `scalars`, bound by GPU address at the buffer indices after the
+    /// tensors (the doc examples' M/N/K kernel arguments).
+    pub fn run_with_scalars(
+        &self,
+        pipeline: &Pipeline,
+        tensors: &[&Tensor],
+        scalars: &[u32],
+        groups: [usize; 2],
+    ) -> Result<(), String> {
+        let scalar_buffer = if scalars.is_empty() {
+            None
+        } else {
+            let buffer = self
+                .device
+                .newBufferWithLength_options(
+                    scalars.len() * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or("scalar buffer")?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scalars.as_ptr() as *const u8,
+                    buffer.contents().as_ptr().cast::<u8>(),
+                    scalars.len() * 4,
+                );
+            }
+            Some(buffer)
+        };
+        let table_descriptor = MTL4ArgumentTableDescriptor::new();
+        table_descriptor.setMaxBufferBindCount(tensors.len() + scalars.len());
+        let table = self
+            .device
+            .newArgumentTableWithDescriptor_error(&table_descriptor)
+            .map_err(|error| format!("argument table: {error}"))?;
+        for (index, tensor) in tensors.iter().enumerate() {
+            unsafe { table.setResource_atBufferIndex(tensor.tensor.gpuResourceID(), index) };
+        }
+        if let Some(buffer) = &scalar_buffer {
+            for (index, _) in scalars.iter().enumerate() {
+                // One `constant uint&` per entry: consecutive 4-byte GPU
+                // addresses out of the shared scalar buffer.
+                let address = buffer.gpuAddress() + (index * 4) as u64;
+                unsafe { table.setAddress_atIndex(address, tensors.len() + index) };
+            }
+        }
         let command = self.device.newCommandBuffer().ok_or("command buffer")?;
         command.beginCommandBufferWithAllocator(&self.allocator);
         let encoder = command.computeCommandEncoder().ok_or("compute encoder")?;
