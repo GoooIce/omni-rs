@@ -11,6 +11,15 @@ use omni_r2t2::{
 type Linear<B> = shared::Linear<B>;
 type Norm<B> = shared::Norm<B>;
 
+/// Split-half [`shared::rope`] through the fused verify kernel.
+fn rope_seam<B: Backend>(x: Tensor<B, 4>, cos: &Tensor<B, 4>, sin: &Tensor<B, 4>) -> Tensor<B, 4> {
+    #[cfg(feature = "metal")]
+    if let Some(rotated) = crate::glue::rope_verify_metal(x.clone(), cos, sin) {
+        return rotated;
+    }
+    shared::rope(x, cos, sin, shared::RotaryLayout::SplitHalf)
+}
+
 /// Zero-centered RMSNorm (`(1 + w)` scaling), the Qwen3.5 text convention.
 pub(crate) fn rms_norm<B: Backend>(
     w: &impl WeightSource<B>,
@@ -411,7 +420,7 @@ impl<B: Backend> FullAttention<B> {
             if self.rotary_dim == self.head_dim {
                 let cos4 = cos.clone().unsqueeze::<4>();
                 let sin4 = sin.clone().unsqueeze::<4>();
-                shared::rope(t, &cos4, &sin4, shared::RotaryLayout::SplitHalf)
+                rope_seam(t, &cos4, &sin4)
             } else {
                 let pass =
                     t.clone()
@@ -419,7 +428,7 @@ impl<B: Backend> FullAttention<B> {
                 let rot = t.slice([0..1, 0..n_heads, 0..seq, 0..self.rotary_dim]);
                 let cos4 = cos.clone().unsqueeze::<4>();
                 let sin4 = sin.clone().unsqueeze::<4>();
-                let rotated = shared::rope(rot, &cos4, &sin4, shared::RotaryLayout::SplitHalf);
+                let rotated = rope_seam(rot, &cos4, &sin4);
                 Tensor::cat(vec![rotated, pass], 3)
             }
         };

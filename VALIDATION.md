@@ -493,6 +493,29 @@ metal_spot、CPU 检查、fmt 全绿。未提交 git 变更。
 [3,11,19,27,35] 的隐状态分布强耦合）。保持默认；env 留作未来换 draft 检查点
 时的实验通道。门全绿（lib 62、verify_commit、metal_spot、CPU、fmt）。
 
+## 2026-10-26：#52 切片 1——verify 缝默认开（rope 缝新增）：verify -18~-21%
+
+靶值重锚定（#41 grill 决议）后工程线第一刀。`verify_profile` 构成（block16，
+缝关口径）：5829 发/前向，90% 为 burn 粘合逐算子。本刀三件事：
+
+1. **现成 verify 缝（Gemma norm、residual）翻默认开**（`MINICPM_GLUE=0` 杀）。
+   2026-10-24 那次「verify 融合更慢」的结论被 `verify_composition` 纠正为抽样
+   偏差后未复测——本次同窗交错 A/B（代码提示词、BLOCK=15、200 token）：
+   verify 117.7/118.8 → 90.4/96.2 ms/周期（**-21%**），墙钟 -15%。
+2. **split-half RoPE 缝上验证路径**（`rope_launch` 拆出 + `rope_verify_metal`
+   包装，算术与 draft 缝同源）。连同上项同窗复测：verify 100.3/99.6 →
+   81.8/82.2（**-18%**）；周期 ~106ms（τ 5.882 不变，≈55 tok/s 热窗）。
+   缝开构成复测：5829 → **2643 发/前向**。剩余大池：elementwise ~1193、
+   cast 693、Slice/SliceAssign ~604（gdn 卷积状态维护，切片 2 的目标）。
+3. **逐头 q/k norm（256 宽）内核化弃用**：字节门在 prose 第 61 字节抓到
+   分叉（code 200 token 仍逐字节同）——内核的 64×4 连续段归约序与 burn
+   autotune 为 [m,256] 选的 reduce 序不同（2048 宽实证一致，256 不一致）。
+   draft 路径从不需要逐字节一致（draft 漂移只改 τ），故该内核此前未经此门。
+
+字节门：缝开/关、默认翻转两配置 × prose/code 双提示词，贪心输出逐字节相同
+（分叉中间态已丢弃）。测量来源：同窗交错 CLI trace（isolated，非 CUBECL
+System 归属）。门全绿：lib 71、fmt、CPU check。
+
 ## 2026-10-16：W4A16 融合反量化路由修复（ADR-0001 目标路径落地）
 
 

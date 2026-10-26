@@ -14,7 +14,7 @@
 //! | `MINICPM_DSPARK_LAYERS` | `[3,11,19,27,35]` | draft cross-attention layers, five ascending `0..40` |
 //! | `MINICPM_DSPARK_TREE` | off | markov-tree layout (adaptive runs only) |
 //! | `MINICPM_DSPARK_MARKOV_QUANT` | off | int8 markov scoring |
-//! | `MINICPM_GLUE` | off | fused verify seams (unit tests force on) |
+//! | `MINICPM_GLUE` | on | fused verify seams (`=0` disables) |
 //! | `MINICPM_DRAFT_GLUE` | on | fused draft seams (`=0` disables) |
 
 /// The draft's cross-attention layers over the 40-layer target tower.
@@ -85,13 +85,15 @@ pub(crate) fn dspark_markov_quant() -> bool {
     })
 }
 
-/// `MINICPM_GLUE` — the fused verify seams measured slower than the burn
-/// chains (VALIDATION 2026-10-24), so they stay opt-in in production; lib
-/// unit tests exercise the kernels and force them on.
+/// `MINICPM_GLUE` — the fused verify seams (norm, residual, split-half RoPE)
+/// default ON: the verify forward is launch-bound and the seams removed ~20%
+/// of its wall in same-window interleaved A/B (#52), with greedy output
+/// byte-identical on both harness prompts. `=0` is the same-binary kill
+/// switch; lib unit tests exercise the kernels regardless.
 pub(crate) fn verify_glue() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
-        cfg!(test) || matches!(std::env::var("MINICPM_GLUE").ok().as_deref(), Some("1"))
+        cfg!(test) || !matches!(std::env::var("MINICPM_GLUE").ok().as_deref(), Some("0"))
     })
 }
 

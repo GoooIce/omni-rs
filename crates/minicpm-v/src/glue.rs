@@ -1,15 +1,19 @@
 //! Hand-fused per-layer glue kernels: the Gemma RMS-norm chain, the plain
 //! RMS norm, the split-half RoPE rotation and the residual add.
 //!
-//! Two consumers with opposite economics. In the verify forward (GPU-bound)
-//! the fused Gemma seams measured ~4% SLOWER end to end (VALIDATION.md,
-//! 2026-10-24): the replaced burn ops pipeline behind each other while the
-//! fused kernels add their full latency to the dependency chain — those stay
-//! behind `MINICPM_GLUE=1` (default off). In the DSpark draft forward
-//! (CPU-dispatch-bound: ~27 µs per burn op) every replaced op is dispatch
-//! saved, so the draft seams run by default (`MINICPM_DRAFT_GLUE=0` disables
-//! them for A/B). The kernels reproduce `Norm::forward` / `shared::rope` /
-//! `shared::residual` arithmetic with f16 in/out and f32 math.
+//! Two consumers, both launch-bound where these kernels apply. The verify
+//! forward is GPU-launch-bound (90% of its launches were burn glue chains,
+//! `verify_profile`); the fused verify seams — Gemma norms, residual adds,
+//! split-half RoPE — removed ~20% of the verify wall in same-window
+//! interleaved A/B with greedy output byte-identical (#52, 2026-10-26), so
+//! they run by default (`MINICPM_GLUE=0` is the same-binary kill switch).
+//! The DSpark draft forward is CPU-dispatch-bound (~27 µs per burn op), so
+//! its seams also run by default (`MINICPM_DRAFT_GLUE=0` disables them for
+//! A/B). The kernels reproduce `Norm::forward` / `shared::rope` /
+//! `shared::residual` arithmetic with f16 in/out and f32 math — except the
+//! per-head (256-wide) Gemma norm: burn's autotuned reduce orders the
+//! row differently there than the 2048-wide rows the kernel matches, so
+//! that site stays on the burn chain (byte gate caught it on prose).
 
 use crate::metal_bridge::take_as;
 use burn::tensor::{DType, Shape, Tensor as BurnTensor, TensorPrimitive, backend::Backend};
@@ -103,8 +107,7 @@ fn residual_add(x: &Tensor<f16>, y: &Tensor<f16>, out: &mut Tensor<f16>) {
 /// Fused `Norm::forward` for the verify seams. `None` off Metal or on shapes
 /// the kernel does not cover (f16 activations, hidden a multiple of the
 /// lane count); the caller falls back to the burn path.
-/// Opt-in switch: the fused verify seams run only with `MINICPM_GLUE=1`
-/// (they measured slower than the burn chains there; see the module doc).
+/// Default ON (`MINICPM_GLUE=0` kills) — see the module doc for the #52 A/B.
 fn verify_enabled() -> bool {
     crate::knobs::verify_glue()
 }
@@ -259,14 +262,37 @@ pub(crate) fn rope_metal<B: Backend>(
     cos: &BurnTensor<B, 4>,
     sin: &BurnTensor<B, 4>,
 ) -> Option<BurnTensor<B, 4>> {
+    if !draft_enabled() {
+        return None;
+    }
+    rope_launch(x, cos, sin)
+}
+
+/// The same launch behind the verify seams (`MINICPM_GLUE`).
+pub(crate) fn rope_verify_metal<B: Backend>(
+    x: BurnTensor<B, 4>,
+    cos: &BurnTensor<B, 4>,
+    sin: &BurnTensor<B, 4>,
+) -> Option<BurnTensor<B, 4>> {
+    if !verify_enabled() {
+        return None;
+    }
+    rope_launch(x, cos, sin)
+}
+
+/// The shared split-half RoPE launch; the seam wrappers gate it.
+fn rope_launch<B: Backend>(
+    x: BurnTensor<B, 4>,
+    cos: &BurnTensor<B, 4>,
+    sin: &BurnTensor<B, 4>,
+) -> Option<BurnTensor<B, 4>> {
     use burn::backend::wgpu::Metal;
     if !crate::metal_bridge::borrowable::<B, 4>() {
         return None;
     }
     let [batch, heads, tokens, width] = x.dims();
     let half = width / 2;
-    if !draft_enabled()
-        || batch != 1
+    if batch != 1
         || tokens == 0
         || width % 2 != 0
         || half == 0
