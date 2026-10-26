@@ -1,0 +1,30 @@
+[package]
+name = "mtl4"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+half = "2"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-metal = { version = "0.3", features = [
+    "MTL4ArgumentTable",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4Compiler",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+    "MTL4LibraryDescriptor",
+    "MTL4LibraryFunctionDescriptor",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTensor",
+] }
