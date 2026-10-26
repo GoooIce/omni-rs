@@ -671,7 +671,10 @@ pub struct LinearAttention<B: Backend> {
     b: Linear<B>,
     a: Linear<B>,
     out: Linear<B>,
-    conv_weight: Tensor<B, 3>, // (conv_dim, 1, kernel) FP32
+    /// Per-tap conv weights `(conv_dim, 1)` in the stream dtype, sliced and
+    /// cast once at load — the forward loop used to re-cast the same tap
+    /// columns on every call (three launches per tap per linear layer).
+    conv_taps: Vec<Tensor<B, 2>>,
     a_log: Tensor<B, 1>,       // (heads,) FP32
     dt_bias: Tensor<B, 1>,     // (heads,) FP32
     norm_weight: Tensor<B, 1>, // (head_v,) FP32, plain scaling (no +1)
@@ -727,12 +730,24 @@ impl<B: Backend> LinearAttention<B> {
                 )?,
                 None,
             ),
-            conv_weight: w.tensor(
-                &format!("{name}.conv1d.weight"),
-                [conv_dim, 1, kernel],
-                Precision::F32,
-                d,
-            )?,
+            conv_taps: {
+                // Loaded at the model precision: under F16 this is the same
+                // single rounding the per-tap runtime cast used to apply.
+                let weight = w.tensor(
+                    &format!("{name}.conv1d.weight"),
+                    [conv_dim, 1, kernel],
+                    p,
+                    d,
+                )?;
+                (0..kernel)
+                    .map(|tap| {
+                        weight
+                            .clone()
+                            .slice([0..conv_dim, 0..1, tap..tap + 1])
+                            .reshape([conv_dim, 1])
+                    })
+                    .collect()
+            },
             a_log: w.tensor(&format!("{name}.A_log"), [value_heads], Precision::F32, d)?,
             dt_bias: w.tensor(&format!("{name}.dt_bias"), [value_heads], Precision::F32, d)?,
             norm_weight: w.tensor(&format!("{name}.norm.weight"), [head_v], Precision::F32, d)?,
@@ -784,17 +799,20 @@ impl<B: Backend> LinearAttention<B> {
         let dtype = shared::dtype(&mixed);
         let device = mixed.device();
         let stream_dtype = dtype;
+        let elem: burn::tensor::DType = stream_dtype.into();
         let stream = mixed.permute([0, 2, 1]); // (1, conv, T), strided
         let history = self.kernel - 1;
-        let tail = tail
-            .unwrap_or_else(|| Tensor::zeros([1, conv_dim, history], &device))
-            .cast(stream_dtype);
+        let tail = match tail {
+            // Same-dtype casts launch without changing a value; skip them.
+            Some(tail) if tail.dtype() == elem => tail,
+            Some(tail) => tail.cast(stream_dtype),
+            None => Tensor::zeros([1, conv_dim, history], (&device, elem)),
+        };
         // `stream` is a permute of the projection. `Tensor::cat` copies that
         // strided input with the wrong strides in burn-cubecl 0.21 and scatters
         // channels. `slice_assign` into a fresh contiguous buffer reads it correctly.
         // A wrong copy shows up on the second token of a block, not on a one-token step.
-        let mut padded =
-            Tensor::<B, 3>::zeros([1, conv_dim, history + seq], &device).cast(stream_dtype);
+        let mut padded = Tensor::<B, 3>::zeros([1, conv_dim, history + seq], (&device, elem));
         padded = padded.slice_assign([0..1, 0..conv_dim, 0..history], tail);
         padded = padded.slice_assign([0..1, 0..conv_dim, history..history + seq], stream);
         let [_, _, width] = padded.dims();
@@ -815,16 +833,10 @@ impl<B: Backend> LinearAttention<B> {
         } else {
             Vec::new()
         };
-        let mut output = Tensor::<B, 3>::zeros([1, conv_dim, seq], &device).cast(stream_dtype);
-        for tap in 0..self.kernel {
-            let weight = self
-                .conv_weight
-                .clone()
-                .slice([0..conv_dim, 0..1, tap..tap + 1])
-                .reshape([conv_dim, 1])
-                .cast(stream_dtype);
+        let mut output = Tensor::<B, 3>::zeros([1, conv_dim, seq], (&device, elem));
+        for (tap, weight) in self.conv_taps.iter().enumerate() {
             let window = padded.clone().slice([0..1, 0..conv_dim, tap..tap + seq]);
-            output = output + window * weight.unsqueeze();
+            output = output + window * weight.clone().unsqueeze();
         }
         let activated = burn::tensor::activation::silu(output.cast(FloatDType::F32));
         (activated.permute([0, 2, 1]).cast(dtype), new_tail, tails)
@@ -963,24 +975,20 @@ impl<B: Backend> LinearAttention<B> {
                 &device,
             );
             let (conv, _, tails) = self.causal_conv(pick(&mixed, &idx), conv_tail.clone(), true);
-            let q = fp32(conv.clone().slice([0..1, 0..len, 0..self.key_dim])).reshape([
-                1,
-                len,
-                self.heads,
-                self.head_k,
-            ]);
-            let k = fp32(
-                conv.clone()
-                    .slice([0..1, 0..len, self.key_dim..2 * self.key_dim]),
-            )
-            .reshape([1, len, self.heads, self.head_k]);
+            // Same one-upcast form as the chain path.
+            let conv32 = fp32(conv);
+            let q = conv32
+                .clone()
+                .slice([0..1, 0..len, 0..self.key_dim])
+                .reshape([1, len, self.heads, self.head_k]);
+            let k = conv32
+                .clone()
+                .slice([0..1, 0..len, self.key_dim..2 * self.key_dim])
+                .reshape([1, len, self.heads, self.head_k]);
             let value_end = 2 * self.key_dim + self.value_dim;
-            let v = fp32(conv.slice([0..1, 0..len, 2 * self.key_dim..value_end])).reshape([
-                1,
-                len,
-                self.heads * self.value_repeat,
-                self.head_v,
-            ]);
+            let v = conv32
+                .slice([0..1, 0..len, 2 * self.key_dim..value_end])
+                .reshape([1, len, self.heads * self.value_repeat, self.head_v]);
             let l2 = |t: Tensor<B, 4>| -> Tensor<B, 4> {
                 let scale = (t.clone().square().sum_dim(3) + 1e-6).sqrt().recip();
                 t * scale
@@ -1066,23 +1074,21 @@ impl<B: Backend> LinearAttention<B> {
             self.causal_conv(mixed, state.as_ref().map(|s| s.conv.clone()), record);
 
         let fp32 = |t: Tensor<B, 3>| t.cast(FloatDType::F32);
-        let q = fp32(conv.clone().slice([0..1, 0..seq, 0..self.key_dim])).reshape([
-            1,
-            seq,
-            self.heads,
-            self.head_k,
-        ]);
-        let k = fp32(
-            conv.clone()
-                .slice([0..1, 0..seq, self.key_dim..2 * self.key_dim]),
-        )
-        .reshape([1, seq, self.heads, self.head_k]);
+        // One upcast covers the whole block; casting per f16 section produced
+        // the same values with two extra launches per layer.
+        let conv32 = fp32(conv);
+        let q = conv32
+            .clone()
+            .slice([0..1, 0..seq, 0..self.key_dim])
+            .reshape([1, seq, self.heads, self.head_k]);
+        let k = conv32
+            .clone()
+            .slice([0..1, 0..seq, self.key_dim..2 * self.key_dim])
+            .reshape([1, seq, self.heads, self.head_k]);
         let value_end = 2 * self.key_dim + self.value_dim;
-        let v = fp32(
-            conv.clone()
-                .slice([0..1, 0..seq, 2 * self.key_dim..value_end]),
-        )
-        .reshape([1, seq, self.heads * self.value_repeat, self.head_v]);
+        let v = conv32
+            .slice([0..1, 0..seq, 2 * self.key_dim..value_end])
+            .reshape([1, seq, self.heads * self.value_repeat, self.head_v]);
         let l2 = |t: Tensor<B, 4>| -> Tensor<B, 4> {
             // Official FLA l2norm: x * rsqrt(sum(x^2) + eps).
             let scale = (t.clone().square().sum_dim(3) + 1e-6).sqrt().recip();
