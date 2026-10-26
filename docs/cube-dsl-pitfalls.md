@@ -37,6 +37,14 @@
   直读原始线性缓冲（u32 words + f32 scales），不经过 QFloat 张量。
 - **测试数据生成在 usize 上做 `% 15 - 7` 会下溢**：先在 i32 里量化。参照里的
   scale 必须走 bf16 round-trip（`bf16::from_f32(...).to_f32()`），与加载器一致。
+- **多算子 f16 链无法在 cube 内核里逐算子复现**（cubecl 0.10 优化器）：burn 的
+  `output + window * weight` 逐语句内核是「乘积舍入 f16 → 加法再舍入 f16」，但
+  内核里 `f32::cast_from(f16::cast_from(v))` 这类位往返会被 SSA 折叠整体消除
+  （中间舍入消失）、多 tap 累加还会被收缩成 fma；给乘积加 store（无论 scratch
+  缓冲、同址输出格、还是 to_bits/from_bits 绕行）都无法强制 SSA 使用点物化。
+  #52 的 gdn 卷积内核五种写法全部位级失配后按契约回滚（2026-10-26，单测
+  `conv_matches_burn_chain` 的历史版本留存了证据）；需要逐算子 f16 精确的场
+  景只能留在 burn 侧，或等上游提供 volatile/精确舍出原语。
 
 ## GPU 调试地雷
 

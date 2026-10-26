@@ -516,6 +516,21 @@ metal_spot、CPU 检查、fmt 全绿。未提交 git 变更。
 （分叉中间态已丢弃）。测量来源：同窗交错 CLI trace（isolated，非 CUBECL
 System 归属）。门全绿：lib 71、fmt、CPU check。
 
+### 切片 2（gdn 卷积单发化）：按契约回滚——优化器不容逐算子 f16 精确
+
+按 brief 把 `causal_conv`（padded 组装 + 4 tap + 尾巴/record 写出，每层 ~40
+发 × 30 层）单发化。字节门三次拦截：①形状判据把 `[conv_dim,1,kernel]` 的
+卷积权重当批次张量验、seam 静默不点火（-79 发构成不变暴露了它）；②修好后
+prose 第 61 字节分叉——单测复刻 burn 链做位级对照，CPU `half` 算术（乘积先
+舍 f16、加法再舍 f16）与 burn 完全一致，而内核五种写法（逐算子 cast、整句
+融合、scratch store、同址输出格 store、to_bits/from_bits 位绕行）全部被
+cubecl 0.10 的 SSA 折叠/fma 收缩消掉中间舍入（一次偶然位级全对的调试编译
+不可复现、无解释，不作为依据）。按「无法精确复现的单点上报维护者、不得擅
+自放宽」回滚，conv 保持 burn 链（回滚后二进制与切片 1 参考逐字节相同，
+lib 71/71）。坑位与证据记入 `docs/cube-dsl-pitfalls.md`。剩余池（缝开构成
+复测）：elementwise ~883、cast 693、copy/slice ~621 发/前向——切片 3 的
+「全链 cast 消除」是下一个量级正确的目标。
+
 ## 2026-10-16：W4A16 融合反量化路由修复（ADR-0001 目标路径落地）
 
 
