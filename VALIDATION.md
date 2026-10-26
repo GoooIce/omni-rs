@@ -531,6 +531,19 @@ lib 71/71）。坑位与证据记入 `docs/cube-dsl-pitfalls.md`。剩余池（�
 复测）：elementwise ~883、cast 693、copy/slice ~621 发/前向——切片 3 的
 「全链 cast 消除」是下一个量级正确的目标。
 
+### 切片 3（cast 池的保值半场）：verify ~-1%，burn 侧改写边际递减
+
+只做按构造不变值的部分（commit 3637533）：tap 权重加载期预切+预 cast（F16
+下与运行期 cast 同一次 RNE）、zeros 直接按流 dtype 建（精确）、`fp32(conv)`
+一次盖住 q/k/v 三段（上行转换精确，切片序自由）、同 dtype tail 跳过 cast。
+双二进制同窗交错（旧=HEAD/新=改动，默认配置同）：verify 105.4→104.8、
+102.2→100.8（**-0.6~-1.4ms，≈-1%**）；字节门双提示词一次通过；lib 71、
+fmt、CPU check 绿。**没有做**的部分及原因：cast 池其余 + elementwise 池
+（~883 发）是语义 f32 数学链（sigmoid/exp/log1p/silu/decay）——切片 2 的
+证据表明 cubecl 会对 mul+add 模式 fma 收缩，f32 链融合内核同样不位安全；
+slice 池（~621 发）大头是 record 步骤视图（连续区段切片为纯视图不发内核）。
+轨迹：切片收益 -21% → 0（回滚）→ -1%，burn 侧改写的边际收益在快速递减。
+
 ## 2026-10-16：W4A16 融合反量化路由修复（ADR-0001 目标路径落地）
 
 
