@@ -288,3 +288,27 @@ kernel void gemm_doc(tensor<device half, dextents<int32_t, 2>> A,
         );
     }
 }
+
+#[test]
+fn m1_raw_module_reachability() {
+    // Can the runtime MSL compiler even find the layers below MPP?
+    let device = mtl4::Device::new().expect("Metal 4 device");
+    let probes = [
+        ("metal_tensor", "#include <metal_tensor>\n"),
+        (
+            "metal_cooperative_tensor",
+            "#include <metal_cooperative_tensor>\n",
+        ),
+        ("metal_matmul", "#include <metal_matmul>\n"),
+        ("metal_numeric", "#include <metal_numeric>\n"),
+    ];
+    for (name, include) in probes {
+        let source = format!(
+            "{include}#include <metal_stdlib>\nusing namespace metal;\nkernel void probe() {{ }}"
+        );
+        match device.compile(&source, "probe", 32) {
+            Ok(_) => eprintln!("{name}: REACHABLE"),
+            Err(error) => eprintln!("{name}: {error}"),
+        }
+    }
+}

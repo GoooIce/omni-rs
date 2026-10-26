@@ -98,3 +98,26 @@ MSL 逐语句定义，没有第三方优化器插手。
   [Understanding the Metal 4 core API](https://developer.apple.com/documentation/metal/understanding-the-metal-4-core-api)。
 - 带宽/字节锚点：本仓 VALIDATION（MoE 320MB/层带宽口径、τ/周期实测）、
   MLX 参照（用户实测 50 tok/s BF16）。
+
+
+## 追记（2026-10-26 夜）：M1 边界与运行时/SDK 版本错位
+
+M0 之后进入 M1（MoE 形状裁决），撞上并完整刻画了一个运行时缺陷：
+
+- **约定已锁定位级正确**（对 CPU 镜像 worst=0）：A [k,m] K 内在直用、B [n,k]
+  N 内在需一次转置、C [n,m] 读回即行主序；切片模板序 A dim0 必须 dynamic。
+- **边界**：任何父张量维度超过分块（M/N）或 4×分块（K），`matmul2d` **静默
+  零写**（不是算错）。六路假说全部实验排除：网格覆盖、静态 K 字面量、文档
+  的 M/N/K 常量配方、packed strides（官方验证：rank>0 必须 strides）、设备
+  分配张量 + copyFromTensor（官方验证：strides 必须 nil；同边界）、协作目标
+  run() 变体。`threadExecutionWidth`=32 实测，128 线程组正确。
+- **根因线索**：运行时 MPP **旧于 SDK 头文件**——SDK 文档的 `static_slice`
+  在本机编译器不存在（M0 即撞）；文档配方瞄准更新版本的库。裸层探测：
+  `metal_tensor`/`metal_cooperative_tensor`/`metal_numeric` 可 include，
+  `metal_matmul` 不存在；而 cooperative_tensor 的构造需要 MPP 私有
+  `__operand_layout`——**没有绕开 MPP 前端的公开出口**（矩阵乘真身在
+  Apple 预编译 metallib 里）。
+- **裁决**：M1 判据（≥1.5×/＜1.2×）无法在 macOS 27.0.1 上裁出
+  （`softwareupdate --list`：无更新）。项目挂起，重启条件：带新版 MPP 运行时
+  的 OS 点更新，或 Apple 修复该边界。M0 成果（crates/mtl4 管道 + 位级数值
+  验证）保留，OS 更新后 M1 从 `tests/m1_moe_shapes.rs` 的边界地图直接续跑。
