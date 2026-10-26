@@ -251,9 +251,15 @@ impl Device {
         Ok(())
     }
 
-    /// Bind `tensors` at consecutive buffer indices and dispatch one
-    /// threadgroup of `pipeline`'s required size.
-    pub fn run(&self, pipeline: &Pipeline, tensors: &[&Tensor]) -> Result<(), String> {
+    /// Bind `tensors` at consecutive buffer indices and dispatch a
+    /// `groups_x x groups_y` grid of threadgroups of `pipeline`'s required
+    /// size (the kernel's `threadgroup_position_in_grid` does the tiling).
+    pub fn run(
+        &self,
+        pipeline: &Pipeline,
+        tensors: &[&Tensor],
+        groups: [usize; 2],
+    ) -> Result<(), String> {
         let table = self.argument_table(tensors)?;
         let command = self.device.newCommandBuffer().ok_or("command buffer")?;
         command.beginCommandBufferWithAllocator(&self.allocator);
@@ -262,7 +268,11 @@ impl Device {
             encoder.setComputePipelineState(&pipeline.state);
             encoder.setArgumentTable(Some(&table));
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                mtl_size(1),
+                MTLSize {
+                    width: groups[0],
+                    height: groups[1],
+                    depth: 1,
+                },
                 MTLSize {
                     width: pipeline.threads.width,
                     height: 1,

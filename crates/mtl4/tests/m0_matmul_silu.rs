@@ -39,7 +39,9 @@ fn m0_matmul_matches_cpu_mirror() {
     let ta = device.tensor_f16([n, n], Some(&a)).unwrap();
     let tb = device.tensor_f16([n, n], Some(&b)).unwrap();
     let tc = device.tensor_f16([n, n], None).unwrap();
-    device.run(&pipeline, &[&ta, &tb, &tc]).expect("dispatch");
+    device
+        .run(&pipeline, &[&ta, &tb, &tc], [1, 1])
+        .expect("dispatch");
 
     let c = tc.read_f16();
     // The orientation of matmul2d is learned, not assumed: check both
@@ -95,12 +97,12 @@ fn m0_dispatch_timing() {
     let tc = device.tensor_f16([n, n], None).unwrap();
     // Warmup, then steady-state single-dispatch wall.
     for _ in 0..50 {
-        device.run(&pipeline, &[&ta, &tb, &tc]).unwrap();
+        device.run(&pipeline, &[&ta, &tb, &tc], [1, 1]).unwrap();
     }
     let start = std::time::Instant::now();
     const ITERS: usize = 2000;
     for _ in 0..ITERS {
-        device.run(&pipeline, &[&ta, &tb, &tc]).unwrap();
+        device.run(&pipeline, &[&ta, &tb, &tc], [1, 1]).unwrap();
     }
     let per = start.elapsed().as_secs_f64() / ITERS as f64 * 1e6;
     eprintln!("dispatch (commit+wait): {per:.1} µs/iter");
