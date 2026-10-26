@@ -35,6 +35,7 @@ fn m0_matmul_matches_cpu_mirror() {
     let b: Vec<f16> = (0..n * n)
         .map(|i| f16::from_f32(((i % 13) as f32 - 6.0) * 0.09375))
         .collect();
+    eprintln!("[net] tensors...");
     let ta = device.tensor_f16([n, n], Some(&a)).unwrap();
     let tb = device.tensor_f16([n, n], Some(&b)).unwrap();
     let tc = device.tensor_f16([n, n], None).unwrap();
@@ -88,6 +89,7 @@ fn m0_dispatch_timing() {
     let pipeline = device.compile(MSL, "matmul", 128).expect("MSL compile");
     let n = 64usize;
     let a = vec![f16::from_f32(0.5); n * n];
+    eprintln!("[net] tensors...");
     let ta = device.tensor_f16([n, n], Some(&a)).unwrap();
     let tb = device.tensor_f16([n, n], Some(&a)).unwrap();
     let tc = device.tensor_f16([n, n], None).unwrap();

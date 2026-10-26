@@ -9,6 +9,13 @@
 //!
 //! Extent order throughout is MTL's: **the first dimension is the
 //! innermost** (column-major from the host side).
+//!
+//! The `MTL4MachineLearningCommandEncoder` endpoint is deliberately absent:
+//! on this OS build its pipeline creation asks the library for a private
+//! `_MTLMLLibrary` executable (`executableWithDeviceSelection:`), which no
+//! public source-compilation path produces — it is the Core ML-model
+//! dispatch channel. Custom MSL tensor functions dispatch through the
+//! compute encoder used here, matching Apple's "inline ML" sample.
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -191,7 +198,10 @@ impl Device {
 
     /// Bind `tensors` at consecutive buffer indices and dispatch one
     /// threadgroup of `pipeline`'s required size.
-    pub fn run(&self, pipeline: &Pipeline, tensors: &[&Tensor]) -> Result<(), String> {
+    fn argument_table(
+        &self,
+        tensors: &[&Tensor],
+    ) -> Result<Retained<ProtocolObject<dyn MTL4ArgumentTable>>, String> {
         let table_descriptor = MTL4ArgumentTableDescriptor::new();
         table_descriptor.setMaxBufferBindCount(tensors.len());
         let table = self
@@ -201,7 +211,50 @@ impl Device {
         for (index, tensor) in tensors.iter().enumerate() {
             unsafe { table.setResource_atBufferIndex(tensor.tensor.gpuResourceID(), index) };
         }
+        Ok(table)
+    }
 
+    /// MTL4 replaced host-side `waitUntilCompleted` with commit feedback: a
+    /// block registered on the commit options fires when the workload
+    /// completes, and this side spins on the flag.
+    fn commit_and_wait(
+        &self,
+        command: &ProtocolObject<dyn MTL4CommandBuffer>,
+    ) -> Result<(), String> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handler = block2::RcBlock::new(move |_feedback: *mut AnyObject| {
+            flag.store(true, Ordering::SeqCst);
+        });
+        let options: Retained<AnyObject> = unsafe { msg_send![class!(MTL4CommitOptions), new] };
+        unsafe {
+            let _: () = msg_send![&options, addFeedbackHandler: &*handler];
+        }
+        let buffers: [&ProtocolObject<dyn MTL4CommandBuffer>; 1] = [command];
+        let _: () = unsafe {
+            msg_send![
+                &*self.queue,
+                commit: buffers.as_ptr(),
+                count: 1usize,
+                options: &*options
+            ]
+        };
+        let started = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) {
+            if started.elapsed().as_secs_f32() > 10.0 {
+                return Err("dispatch did not complete within 10s".into());
+            }
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    /// Bind `tensors` at consecutive buffer indices and dispatch one
+    /// threadgroup of `pipeline`'s required size.
+    pub fn run(&self, pipeline: &Pipeline, tensors: &[&Tensor]) -> Result<(), String> {
+        let table = self.argument_table(tensors)?;
         let command = self.device.newCommandBuffer().ok_or("command buffer")?;
         command.beginCommandBufferWithAllocator(&self.allocator);
         let encoder = command.computeCommandEncoder().ok_or("compute encoder")?;
@@ -219,38 +272,7 @@ impl Device {
             let _: () = msg_send![&*encoder, endEncoding];
         }
         let _: () = unsafe { msg_send![&*command, endCommandBuffer] };
-
-        // MTL4 replaced host-side `waitUntilCompleted` with commit feedback:
-        // a block registered on the commit options fires when the workload
-        // completes, and this side spins on the flag.
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
-        let handler = block2::RcBlock::new(move |_feedback: *mut AnyObject| {
-            flag.store(true, Ordering::SeqCst);
-        });
-        let options: Retained<AnyObject> = unsafe { msg_send![class!(MTL4CommitOptions), new] };
-        unsafe {
-            let _: () = msg_send![&options, addFeedbackHandler: &*handler];
-        }
-        let buffers: [&ProtocolObject<dyn MTL4CommandBuffer>; 1] = [&command];
-        let _: () = unsafe {
-            msg_send![
-                &*self.queue,
-                commit: buffers.as_ptr(),
-                count: 1usize,
-                options: &*options
-            ]
-        };
-        let started = std::time::Instant::now();
-        while !done.load(Ordering::SeqCst) {
-            if started.elapsed().as_secs_f32() > 10.0 {
-                return Err("dispatch did not complete within 10s".into());
-            }
-            std::hint::spin_loop();
-        }
-        Ok(())
+        self.commit_and_wait(&command)
     }
 }
 
