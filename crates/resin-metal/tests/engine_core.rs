@@ -193,3 +193,34 @@ fn async_step_path_drives_the_same_results() {
     assert!(!engine.has_work());
     assert_eq!(handle.take_result().unwrap(), vec![8, 9]);
 }
+
+#[test]
+fn speculative_decode_rows_advance_without_cache_layout() {
+    // Speculative contract: decode rows may carry k > 1 tokens when the
+    // runner holds no engine cache layout; k-1 tokens advance as accepted
+    // context and the last token becomes the next row's input (the cycle
+    // bonus). This is the seam the DSpark runner drives.
+    let mut engine = EngineCore::new(
+        RunnerConfig::default(),
+        4,
+        128,
+        SchedulerConfig {
+            prefill_chunk_size: NonZeroU32::new(64).unwrap(),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    let mut model = StubRunner::default();
+    model.outputs = vec![
+        Ok(vec![vec![7]]),
+        Ok(vec![vec![8, 9, 10]]),
+        Ok(vec![vec![11]]),
+    ]
+    .into();
+    let handle = engine.submit(input((0..8).collect(), 5)).unwrap();
+    drain(&mut engine, &mut model);
+    assert_eq!(handle.take_result().unwrap(), vec![7, 8, 9, 10, 11]);
+    // The second decode fed exactly the previous row's last token.
+    assert_eq!(model.plans.last().unwrap().token_ids, vec![10]);
+}

@@ -883,6 +883,7 @@ fn select_captured<B: Backend>(captured: Vec<Tensor<B, 3>>, slots: &[usize]) -> 
         .collect()
 }
 
+#[derive(Default)]
 pub struct SpecStats {
     pub cycles: u64,
     pub draft_tokens_accepted: u64,
@@ -913,6 +914,116 @@ impl SpecStats {
             self.output_tokens as f64 / self.cycles as f64
         }
     }
+}
+
+/// One speculative cycle's result: accepted draft tokens (already trimmed to
+/// the emission room), the correction that follows them when room and eos
+/// allow, and whether an untrimmed accepted draft hit eos.
+pub struct CycleOutcome {
+    pub tokens: Vec<u32>,
+    pub correction: Option<u32>,
+    pub draft_eos: bool,
+    pub trimmed: bool,
+}
+
+/// The chain-layout speculative cycle — propose, verify, greedy accept, roll
+/// both caches back to the accepted prefix — split out of [`generate`] so
+/// external engines (the resin runner in `crates/resin-metal`) drive the
+/// identical acceptance path. `history` already includes `bonus`; `room`
+/// bounds emission exactly like the generate loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_chain_cycle<B: Backend>(
+    model: &TextModel<B>,
+    draft: &Draft<B>,
+    draft_state: &mut DraftState<B>,
+    state: &mut crate::model::DecodeState<B>,
+    bonus: u32,
+    block_len: usize,
+    numerics: VerifyNumerics,
+    eos_ids: &[u32],
+    options: &Options,
+    sampler: &mut Sampler,
+    history: &[u32],
+    room: usize,
+    stats: &mut SpecStats,
+) -> std::result::Result<CycleOutcome, String> {
+    let phase = Instant::now();
+    let proposals = draft
+        .propose(model, draft_state, bonus, block_len)
+        .map_err(|error| error.to_string())?;
+    if stats.trace.enabled {
+        stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
+    }
+    let block = assemble_block(bonus, &proposals);
+    let length_before = state.length;
+    let phase = Instant::now();
+    let (position_logits, captured, linear_after) = model
+        .forward_verifying_with(&block, state, crate::knobs::dspark_layers(), numerics)
+        .map_err(|error| error.to_string())?;
+    if stats.trace.enabled {
+        stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
+    }
+    let phase = Instant::now();
+    let greedy_block: Vec<u32> = if options.temperature == 0.0
+        && options.repetition_penalty == 1.0
+        && options.presence_penalty == 0.0
+    {
+        let ids = position_logits
+            .clone()
+            .argmax(1)
+            .into_data()
+            .convert::<i32>();
+        ids.as_slice::<i32>()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|&id| id as u32)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let proposals = &block[1..];
+    let path = {
+        let mut predict = |index: usize| -> std::result::Result<u32, String> {
+            if !greedy_block.is_empty() {
+                return Ok(greedy_block[index]);
+            }
+            let mut seen = history.to_vec();
+            seen.extend_from_slice(&proposals[..index]);
+            sampler
+                .sample(row_vec(position_logits.clone(), index)?, &seen)
+                .map_err(|error| error.to_string())
+        };
+        accept_path(None, proposals, eos_ids, &mut predict)?
+    };
+    let mut path = path;
+    let mut trimmed = false;
+    if path.tokens.len() > room {
+        path.tokens.truncate(room);
+        path.slots.truncate(1 + room);
+        path.correction = None;
+        path.draft_eos = false;
+        trimmed = true;
+    } else if path.correction.is_some() && path.tokens.len() + 1 > room {
+        path.correction = None;
+        trimmed = true;
+    }
+    if stats.trace.enabled {
+        stats.trace.accept_ms += phase.elapsed().as_secs_f64() * 1000.0;
+    }
+    let phase = Instant::now();
+    state.retain_path(length_before, &path.slots, &linear_after);
+    draft
+        .extend(draft_state, select_captured(captured, &path.slots))
+        .map_err(|error| error.to_string())?;
+    if stats.trace.enabled {
+        stats.trace.retain_ms += phase.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok(CycleOutcome {
+        tokens: path.tokens,
+        correction: path.correction,
+        draft_eos: path.draft_eos,
+        trimmed,
+    })
 }
 
 pub fn generate<B: Backend>(
@@ -1018,113 +1129,111 @@ pub fn generate<B: Backend>(
         // Propose: the layout owns the block's shape; both variants share
         // the masked draft forward and the markov correction.
         let phase = Instant::now();
-        let (block, tree) = match &layout {
+        let room = options.max_new_tokens - tokens.len();
+        let outcome = match &layout {
             BlockLayout::Tree { levels } => {
+                let phase = Instant::now();
                 let (tokens, tree) = draft
                     .propose_tree(model, &mut draft_state, bonus, *levels)
                     .map_err(|error| error.to_string())?;
                 if stats.trace.enabled {
                     stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
                 }
-                (assemble_block(bonus, &tokens), Some(tree))
-            }
-            BlockLayout::Chain { len } => {
-                let proposals = draft
-                    .propose(model, &mut draft_state, bonus, *len)
+                let block = assemble_block(bonus, &tokens);
+                let length_before = state.length;
+                let phase = Instant::now();
+                let (position_logits, captured, linear_after) = model
+                    .forward_verifying_tree(
+                        &block,
+                        &tree,
+                        &mut state,
+                        crate::knobs::dspark_layers(),
+                    )
                     .map_err(|error| error.to_string())?;
                 if stats.trace.enabled {
-                    stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
+                    stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
                 }
-                (assemble_block(bonus, &proposals), None)
+                let phase = Instant::now();
+                let greedy_block: Vec<u32> = if options.temperature == 0.0
+                    && options.repetition_penalty == 1.0
+                    && options.presence_penalty == 0.0
+                {
+                    let ids = position_logits
+                        .clone()
+                        .argmax(1)
+                        .into_data()
+                        .convert::<i32>();
+                    ids.as_slice::<i32>()
+                        .map_err(|error| error.to_string())?
+                        .iter()
+                        .map(|&id| id as u32)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if greedy_block.is_empty() {
+                    return Err("tree mode verifies greedy decoding".into());
+                }
+                let proposals = &block[1..];
+                let path = {
+                    let mut predict = |index: usize| -> std::result::Result<u32, String> {
+                        Ok(greedy_block[index])
+                    };
+                    accept_path(Some(&tree), proposals, eos_ids, &mut predict)?
+                };
+                let mut path = path;
+                let mut trimmed = false;
+                if path.tokens.len() > room {
+                    path.tokens.truncate(room);
+                    path.slots.truncate(1 + room);
+                    path.correction = None;
+                    path.draft_eos = false;
+                    trimmed = true;
+                } else if path.correction.is_some() && path.tokens.len() + 1 > room {
+                    path.correction = None;
+                    trimmed = true;
+                }
+                if stats.trace.enabled {
+                    stats.trace.accept_ms += phase.elapsed().as_secs_f64() * 1000.0;
+                }
+                let phase = Instant::now();
+                state.retain_path(length_before, &path.slots, &linear_after);
+                draft
+                    .extend(&mut draft_state, select_captured(captured, &path.slots))
+                    .map_err(|error| error.to_string())?;
+                if stats.trace.enabled {
+                    stats.trace.retain_ms += phase.elapsed().as_secs_f64() * 1000.0;
+                }
+                CycleOutcome {
+                    tokens: path.tokens,
+                    correction: path.correction,
+                    draft_eos: path.draft_eos,
+                    trimmed,
+                }
             }
+            BlockLayout::Chain { len } => run_chain_cycle(
+                model,
+                draft,
+                &mut draft_state,
+                &mut state,
+                bonus,
+                *len,
+                numerics,
+                eos_ids,
+                &options,
+                &mut sampler,
+                &history,
+                room,
+                &mut stats,
+            )?,
         };
-        let length_before = state.length;
-        let phase = Instant::now();
-        let (position_logits, captured, linear_after) = match &tree {
-            Some(tree) => model
-                .forward_verifying_tree(&block, tree, &mut state, crate::knobs::dspark_layers())
-                .map_err(|error| error.to_string())?,
-            None => model
-                .forward_verifying_with(&block, &mut state, crate::knobs::dspark_layers(), numerics)
-                .map_err(|error| error.to_string())?,
-        };
-        if stats.trace.enabled {
-            stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
-        }
-        let phase = Instant::now();
-        // Greedy without penalties: the sampler is a plain argmax, so the
-        // whole block is argmaxed on the device and read back once, instead
-        // of one megabyte-wide row per position.
-        let greedy_block: Vec<u32> = if options.temperature == 0.0
-            && options.repetition_penalty == 1.0
-            && options.presence_penalty == 0.0
-        {
-            let ids = position_logits
-                .clone()
-                .argmax(1)
-                .into_data()
-                .convert::<i32>();
-            ids.as_slice::<i32>()
-                .map_err(|error| error.to_string())?
-                .iter()
-                .map(|&id| id as u32)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if tree.is_some() && greedy_block.is_empty() {
-            return Err("tree mode verifies greedy decoding".into());
-        }
-        // Acceptance walks the layout's shape: the longest prefix matching
-        // the target's prediction, then one correction token.
-        let proposals = &block[1..];
-        let path = {
-            let mut predict = |index: usize| -> std::result::Result<u32, String> {
-                if !greedy_block.is_empty() {
-                    return Ok(greedy_block[index]);
-                }
-                let mut seen = history.clone();
-                seen.extend_from_slice(&proposals[..index]);
-                sampler
-                    .sample(row_vec(position_logits.clone(), index)?, &seen)
-                    .map_err(|error| error.to_string())
-            };
-            accept_path(tree.as_ref(), proposals, eos_ids, &mut predict)?
-        };
-        let room = options.max_new_tokens - tokens.len();
-        let mut trimmed = false;
-        let mut path = path;
-        if path.tokens.len() > room {
-            path.tokens.truncate(room);
-            path.slots.truncate(1 + room);
-            path.correction = None;
-            path.draft_eos = false;
-            trimmed = true;
-        } else if path.correction.is_some() && path.tokens.len() + 1 > room {
-            path.correction = None;
-            trimmed = true;
-        }
-        if path.draft_eos && !trimmed {
+        if outcome.draft_eos {
             finish = FinishReason::Stop;
         }
-        if stats.trace.enabled {
-            stats.trace.accept_ms += phase.elapsed().as_secs_f64() * 1000.0;
-        }
-        let phase = Instant::now();
-        // Keep the bonus plus the accepted path's block slots (the chain's
-        // slots are the contiguous prefix, so one retain covers both
-        // layouts). The correction is the next bonus and stays out.
-        state.retain_path(length_before, &path.slots, &linear_after);
-        draft
-            .extend(&mut draft_state, select_captured(captured, &path.slots))
-            .map_err(|error| error.to_string())?;
-        if stats.trace.enabled {
-            stats.trace.retain_ms += phase.elapsed().as_secs_f64() * 1000.0;
-        }
-        stats.draft_tokens_accepted += path.tokens.len() as u64;
-        ladder.observe(path.tokens.len(), layout.policy_len(), trimmed);
+        stats.draft_tokens_accepted += outcome.tokens.len() as u64;
+        ladder.observe(outcome.tokens.len(), layout.policy_len(), outcome.trimmed);
 
-        for token in path.tokens {
+        for token in outcome.tokens {
             if tokens.len() == options.max_new_tokens {
                 break;
             }
@@ -1133,7 +1242,7 @@ pub fn generate<B: Backend>(
         if finish == FinishReason::Stop {
             break;
         }
-        if let Some(token) = path.correction {
+        if let Some(token) = outcome.correction {
             if eos_ids.contains(&token) {
                 finish = FinishReason::Stop;
             } else if tokens.len() < options.max_new_tokens {

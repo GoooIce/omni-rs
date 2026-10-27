@@ -38,7 +38,7 @@ pub(crate) fn dspark_block() -> Option<usize> {
 }
 
 /// `MINICPM_DSPARK_LAYERS`
-pub(crate) fn dspark_layers() -> &'static [usize; 5] {
+pub fn dspark_layers() -> &'static [usize; 5] {
     static VALUE: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
     VALUE.get_or_init(|| {
         let parsed: Option<Vec<usize>> =
