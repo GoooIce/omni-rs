@@ -115,9 +115,6 @@ impl crate::engine_harness::Adapter for Worker {
         }
         Ok(())
     }
-    fn initialize() {
-        crate::gpu::initialize();
-    }
     fn is_cancelled(error: &Error) -> bool {
         matches!(error, Error::Cancelled)
     }

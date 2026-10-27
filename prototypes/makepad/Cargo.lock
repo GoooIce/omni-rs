@@ -639,8 +639,6 @@ dependencies = [
 [[package]]
 name = "burn-cubecl"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26efbec96ca3f691593c966fa90f98ef8a72867f62627904920b619ba3a9e6b6"
 dependencies = [
  "burn-backend",
  "burn-cubecl-fusion",
@@ -1490,8 +1488,6 @@ dependencies = [
 [[package]]
 name = "cubecl-common"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc956c2dcc993f16f748d03bfdbd900f75cab4d469f4e5d8924f8ee128e861ad"
 dependencies = [
  "backtrace",
  "bytemuck 1.25.2",
@@ -4717,6 +4713,7 @@ dependencies = [
  "burn-cubecl",
  "burn-fusion",
  "burn-tensor",
+ "cubecl",
  "half",
  "image",
  "omni-r2t2",

@@ -77,9 +77,6 @@ impl Adapter for Worker {
     fn check_files(_: &Path) -> Result<(), String> {
         Ok(())
     }
-    fn initialize() {
-        crate::gpu::initialize();
-    }
     fn load(&mut self, _: &Path, _: &Context<Update>) -> omni_music::Result<Update> {
         unreachable!("music loads the models needed by each operation")
     }

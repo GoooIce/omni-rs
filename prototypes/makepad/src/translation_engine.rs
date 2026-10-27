@@ -59,9 +59,6 @@ impl Adapter for Worker {
     fn check_files(path: &Path) -> Result<(), String> {
         crate::model_location::check_files(path)
     }
-    fn initialize() {
-        crate::gpu::initialize();
-    }
     fn is_cancelled(error: &Error) -> bool {
         matches!(error, Error::Interrupted)
     }

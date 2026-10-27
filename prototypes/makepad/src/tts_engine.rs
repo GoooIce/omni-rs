@@ -81,11 +81,13 @@ pub enum Command {
         prompt: String,
         seeds: [u64; 3],
         checkpoint: PathBuf,
+        prefill: enhancement::Prefill,
     },
     Draft {
         request: enhancement::DraftRequest,
         seed: u64,
         checkpoint: PathBuf,
+        prefill: enhancement::Prefill,
     },
     Remember {
         audio: Arc<[f32]>,
@@ -232,9 +234,6 @@ impl crate::engine_harness::Adapter for Worker {
     fn check_files(path: &Path) -> Result<(), String> {
         check_files(path)
     }
-    fn initialize() {
-        gpu::initialize();
-    }
     fn after_command(&self) {
         gpu::log_stats(&self.device, "tts");
     }
@@ -304,6 +303,7 @@ impl crate::engine_harness::Adapter for Worker {
                 prompt,
                 seeds,
                 checkpoint,
+                prefill,
             } => {
                 enhancement::checkpoint_available(&checkpoint)?;
                 if enhancer.is_none() {
@@ -319,6 +319,7 @@ impl crate::engine_harness::Adapter for Worker {
                     &prompt,
                     &source,
                     seeds,
+                    prefill,
                     stop,
                 )?;
                 let consideration =
@@ -340,6 +341,7 @@ impl crate::engine_harness::Adapter for Worker {
                 request,
                 seed,
                 checkpoint,
+                prefill,
             } => {
                 enhancement::checkpoint_available(&checkpoint)?;
                 if enhancer.is_none() {
@@ -353,6 +355,7 @@ impl crate::engine_harness::Adapter for Worker {
                     &request.system,
                     &request.user,
                     seed,
+                    prefill,
                     stop,
                 )?;
                 if text.trim().is_empty() {

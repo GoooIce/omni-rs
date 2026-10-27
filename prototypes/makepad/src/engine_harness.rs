@@ -87,7 +87,15 @@ pub trait Adapter: 'static {
     fn unload(&mut self);
     fn load_path(command: &Self::Command) -> Option<&Path>;
     fn check_files(path: &Path) -> Result<(), String>;
-    fn initialize();
+    /// Backend one-time setup; every adapter today shares the same device
+    /// initialization, so it defaults to that. A runtime engine switch
+    /// (omni-rs #55) adds a second adapter behind the same Command/Update
+    /// protocol at the panel level — the seam is the protocol, not the
+    /// concrete Engine<A> type; keep this trait monomorphic until a second
+    /// engine actually ships (one adapter means a hypothetical seam).
+    fn initialize() {
+        crate::gpu::initialize();
+    }
     fn load(
         &mut self,
         path: &Path,
