@@ -150,13 +150,15 @@ impl<B: Backend> Runner<DsparkRequest> for MinicpmDsparkRunner<B> {
                     .drafts
                     .get_mut(&sequence)
                     .ok_or_else(|| Error::internal("draft state missing"))?;
-                let outcome = dspark::run_chain_cycle(
+                let outcome = dspark::run_cycle(
                     &self.model,
                     &self.draft,
                     draft_state,
                     state,
+                    &dspark::BlockLayout::Chain {
+                        len: self.block_len,
+                    },
                     bonus,
-                    self.block_len,
                     self.numerics,
                     &self.eos_ids,
                     &self.options,

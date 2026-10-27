@@ -44,7 +44,7 @@ const BLOCK_LADDER: [usize; 3] = [3, 8, 16];
 
 /// One speculative cycle's proposal layout, chosen by the [`Ladder`].
 #[derive(Debug, PartialEq, Eq)]
-enum BlockLayout {
+pub enum BlockLayout {
     /// A linear chain of `len` draft tokens (the markov argmax path).
     Chain { len: usize },
     /// A full binary markov tree of `levels` child depths; the ladder's
@@ -926,19 +926,55 @@ pub struct CycleOutcome {
     pub trimmed: bool,
 }
 
-/// The chain-layout speculative cycle — propose, verify, greedy accept, roll
-/// both caches back to the accepted prefix — split out of [`generate`] so
-/// external engines (the resin runner in `crates/resin-metal`) drive the
-/// identical acceptance path. `history` already includes `bonus`; `room`
-/// bounds emission exactly like the generate loop.
+/// Trim an accepted path to the emission room: tokens beyond `room` drop
+/// together with their correction; the correction alone drops when it would
+/// exceed the room. Returns whether anything was trimmed.
+fn trim_to_room(path: &mut AcceptedPath, room: usize) -> bool {
+    if path.tokens.len() > room {
+        path.tokens.truncate(room);
+        path.slots.truncate(1 + room);
+        path.correction = None;
+        path.draft_eos = false;
+        true
+    } else if path.correction.is_some() && path.tokens.len() + 1 > room {
+        path.correction = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Device-side greedy block: one argmax per verify position, read back once,
+/// instead of one megabyte-wide row per position.
+fn greedy_argmax_block<B: Backend>(
+    position_logits: &burn::tensor::Tensor<B, 2>,
+) -> std::result::Result<Vec<u32>, String> {
+    let ids = position_logits
+        .clone()
+        .argmax(1)
+        .into_data()
+        .convert::<i32>();
+    Ok(ids
+        .as_slice::<i32>()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|&id| id as u32)
+        .collect())
+}
+
+/// The speculative cycle — propose, verify, greedy accept, roll both caches
+/// back to the accepted prefix — over either proposal layout. Split out of
+/// [`generate`] so external engines (the resin runner in `crates/resin-metal`)
+/// drive the identical acceptance path. `history` already includes `bonus`;
+/// `room` bounds emission exactly like the generate loop.
 #[allow(clippy::too_many_arguments)]
-pub fn run_chain_cycle<B: Backend>(
+pub fn run_cycle<B: Backend>(
     model: &TextModel<B>,
     draft: &Draft<B>,
     draft_state: &mut DraftState<B>,
     state: &mut crate::model::DecodeState<B>,
+    layout: &BlockLayout,
     bonus: u32,
-    block_len: usize,
     numerics: VerifyNumerics,
     eos_ids: &[u32],
     options: &Options,
@@ -948,18 +984,33 @@ pub fn run_chain_cycle<B: Backend>(
     stats: &mut SpecStats,
 ) -> std::result::Result<CycleOutcome, String> {
     let phase = Instant::now();
-    let proposals = draft
-        .propose(model, draft_state, bonus, block_len)
-        .map_err(|error| error.to_string())?;
+    let (block, tree) = match layout {
+        BlockLayout::Tree { levels } => {
+            let (tokens, tree) = draft
+                .propose_tree(model, draft_state, bonus, *levels)
+                .map_err(|error| error.to_string())?;
+            (assemble_block(bonus, &tokens), Some(tree))
+        }
+        BlockLayout::Chain { len } => {
+            let proposals = draft
+                .propose(model, draft_state, bonus, *len)
+                .map_err(|error| error.to_string())?;
+            (assemble_block(bonus, &proposals), None)
+        }
+    };
     if stats.trace.enabled {
         stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
     }
-    let block = assemble_block(bonus, &proposals);
     let length_before = state.length;
     let phase = Instant::now();
-    let (position_logits, captured, linear_after) = model
-        .forward_verifying_with(&block, state, crate::knobs::dspark_layers(), numerics)
-        .map_err(|error| error.to_string())?;
+    let (position_logits, captured, linear_after) = match &tree {
+        Some(tree) => model
+            .forward_verifying_tree(&block, tree, state, crate::knobs::dspark_layers())
+            .map_err(|error| error.to_string())?,
+        None => model
+            .forward_verifying_with(&block, state, crate::knobs::dspark_layers(), numerics)
+            .map_err(|error| error.to_string())?,
+    };
     if stats.trace.enabled {
         stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
     }
@@ -968,21 +1019,15 @@ pub fn run_chain_cycle<B: Backend>(
         && options.repetition_penalty == 1.0
         && options.presence_penalty == 0.0
     {
-        let ids = position_logits
-            .clone()
-            .argmax(1)
-            .into_data()
-            .convert::<i32>();
-        ids.as_slice::<i32>()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .map(|&id| id as u32)
-            .collect()
+        greedy_argmax_block(&position_logits)?
     } else {
         Vec::new()
     };
+    if tree.is_some() && greedy_block.is_empty() {
+        return Err("tree mode verifies greedy decoding".into());
+    }
     let proposals = &block[1..];
-    let path = {
+    let mut path = {
         let mut predict = |index: usize| -> std::result::Result<u32, String> {
             if !greedy_block.is_empty() {
                 return Ok(greedy_block[index]);
@@ -993,20 +1038,9 @@ pub fn run_chain_cycle<B: Backend>(
                 .sample(row_vec(position_logits.clone(), index)?, &seen)
                 .map_err(|error| error.to_string())
         };
-        accept_path(None, proposals, eos_ids, &mut predict)?
+        accept_path(tree.as_ref(), proposals, eos_ids, &mut predict)?
     };
-    let mut path = path;
-    let mut trimmed = false;
-    if path.tokens.len() > room {
-        path.tokens.truncate(room);
-        path.slots.truncate(1 + room);
-        path.correction = None;
-        path.draft_eos = false;
-        trimmed = true;
-    } else if path.correction.is_some() && path.tokens.len() + 1 > room {
-        path.correction = None;
-        trimmed = true;
-    }
+    let trimmed = trim_to_room(&mut path, room);
     if stats.trace.enabled {
         stats.trace.accept_ms += phase.elapsed().as_secs_f64() * 1000.0;
     }
@@ -1130,103 +1164,21 @@ pub fn generate<B: Backend>(
         // the masked draft forward and the markov correction.
         let phase = Instant::now();
         let room = options.max_new_tokens - tokens.len();
-        let outcome = match &layout {
-            BlockLayout::Tree { levels } => {
-                let phase = Instant::now();
-                let (tokens, tree) = draft
-                    .propose_tree(model, &mut draft_state, bonus, *levels)
-                    .map_err(|error| error.to_string())?;
-                if stats.trace.enabled {
-                    stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
-                }
-                let block = assemble_block(bonus, &tokens);
-                let length_before = state.length;
-                let phase = Instant::now();
-                let (position_logits, captured, linear_after) = model
-                    .forward_verifying_tree(
-                        &block,
-                        &tree,
-                        &mut state,
-                        crate::knobs::dspark_layers(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if stats.trace.enabled {
-                    stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
-                }
-                let phase = Instant::now();
-                let greedy_block: Vec<u32> = if options.temperature == 0.0
-                    && options.repetition_penalty == 1.0
-                    && options.presence_penalty == 0.0
-                {
-                    let ids = position_logits
-                        .clone()
-                        .argmax(1)
-                        .into_data()
-                        .convert::<i32>();
-                    ids.as_slice::<i32>()
-                        .map_err(|error| error.to_string())?
-                        .iter()
-                        .map(|&id| id as u32)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if greedy_block.is_empty() {
-                    return Err("tree mode verifies greedy decoding".into());
-                }
-                let proposals = &block[1..];
-                let path = {
-                    let mut predict = |index: usize| -> std::result::Result<u32, String> {
-                        Ok(greedy_block[index])
-                    };
-                    accept_path(Some(&tree), proposals, eos_ids, &mut predict)?
-                };
-                let mut path = path;
-                let mut trimmed = false;
-                if path.tokens.len() > room {
-                    path.tokens.truncate(room);
-                    path.slots.truncate(1 + room);
-                    path.correction = None;
-                    path.draft_eos = false;
-                    trimmed = true;
-                } else if path.correction.is_some() && path.tokens.len() + 1 > room {
-                    path.correction = None;
-                    trimmed = true;
-                }
-                if stats.trace.enabled {
-                    stats.trace.accept_ms += phase.elapsed().as_secs_f64() * 1000.0;
-                }
-                let phase = Instant::now();
-                state.retain_path(length_before, &path.slots, &linear_after);
-                draft
-                    .extend(&mut draft_state, select_captured(captured, &path.slots))
-                    .map_err(|error| error.to_string())?;
-                if stats.trace.enabled {
-                    stats.trace.retain_ms += phase.elapsed().as_secs_f64() * 1000.0;
-                }
-                CycleOutcome {
-                    tokens: path.tokens,
-                    correction: path.correction,
-                    draft_eos: path.draft_eos,
-                    trimmed,
-                }
-            }
-            BlockLayout::Chain { len } => run_chain_cycle(
-                model,
-                draft,
-                &mut draft_state,
-                &mut state,
-                bonus,
-                *len,
-                numerics,
-                eos_ids,
-                &options,
-                &mut sampler,
-                &history,
-                room,
-                &mut stats,
-            )?,
-        };
+        let outcome = run_cycle(
+            model,
+            draft,
+            &mut draft_state,
+            &mut state,
+            &layout,
+            bonus,
+            numerics,
+            eos_ids,
+            &options,
+            &mut sampler,
+            &history,
+            room,
+            &mut stats,
+        )?;
         if outcome.draft_eos {
             finish = FinishReason::Stop;
         }
@@ -1437,5 +1389,60 @@ mod tests {
             Ladder::new(Some(3), true).layout(),
             BlockLayout::Chain { len: 3 }
         );
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+
+    fn path(
+        tokens: Vec<u32>,
+        slots: Vec<usize>,
+        correction: Option<u32>,
+        draft_eos: bool,
+    ) -> AcceptedPath {
+        AcceptedPath {
+            tokens,
+            slots,
+            correction,
+            draft_eos,
+        }
+    }
+
+    #[test]
+    fn trim_truncates_tokens_slots_and_clears_tail() {
+        let mut accepted = path(vec![1, 2, 3, 4], vec![0, 1, 2, 3, 4], Some(9), true);
+        assert!(trim_to_room(&mut accepted, 2));
+        assert_eq!(accepted.tokens, vec![1, 2]);
+        assert_eq!(accepted.slots, vec![0, 1, 2]);
+        assert_eq!(accepted.correction, None);
+        assert!(!accepted.draft_eos);
+    }
+
+    #[test]
+    fn trim_drops_only_the_overflowing_correction() {
+        let mut accepted = path(vec![1, 2], vec![0, 1, 2], Some(9), false);
+        assert!(trim_to_room(&mut accepted, 2));
+        assert_eq!(accepted.tokens, vec![1, 2]);
+        assert_eq!(accepted.correction, None);
+        assert!(!accepted.draft_eos);
+    }
+
+    #[test]
+    fn trim_keeps_a_fitting_path() {
+        let mut accepted = path(vec![1, 2], vec![0, 1, 2], Some(9), false);
+        assert!(!trim_to_room(&mut accepted, 3));
+        assert_eq!(accepted.correction, Some(9));
+    }
+
+    #[test]
+    fn greedy_block_argmaxes_each_position() {
+        use burn::backend::NdArray;
+        let logits = burn::tensor::Tensor::<NdArray, 2>::from_floats(
+            [[0.1, 0.9, 0.5], [0.7, 0.1, 0.3]],
+            &Default::default(),
+        );
+        assert_eq!(greedy_argmax_block(&logits).unwrap(), vec![1, 0]);
     }
 }
