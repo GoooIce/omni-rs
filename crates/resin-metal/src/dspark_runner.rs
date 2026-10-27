@@ -82,7 +82,11 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
             drafts: HashMap::new(),
             histories: HashMap::new(),
             emitted: HashMap::new(),
-            stats: SpecStats::default(),
+            stats: {
+                let mut stats = SpecStats::default();
+                stats.trace.enabled = omni_minicpm_v::knobs::dspark_trace();
+                stats
+            },
         }
     }
 
@@ -146,7 +150,6 @@ impl<B: Backend> Runner<DsparkRequest> for MinicpmDsparkRunner<B> {
                     .drafts
                     .get_mut(&sequence)
                     .ok_or_else(|| Error::internal("draft state missing"))?;
-                let mut scratch = SpecStats::default();
                 let outcome = dspark::run_chain_cycle(
                     &self.model,
                     &self.draft,
@@ -160,7 +163,7 @@ impl<B: Backend> Runner<DsparkRequest> for MinicpmDsparkRunner<B> {
                     &mut Sampler::new(self.options.clone()),
                     history.as_slice(),
                     room,
-                    &mut scratch,
+                    &mut self.stats,
                 )
                 .map_err(Error::execution)?;
                 self.stats.cycles += 1;

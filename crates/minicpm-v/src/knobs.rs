@@ -21,7 +21,7 @@
 pub(crate) const DEFAULT_LAYERS: [usize; 5] = [3, 11, 19, 27, 35];
 
 /// `MINICPM_DSPARK_TRACE`
-pub(crate) fn dspark_trace() -> bool {
+pub fn dspark_trace() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| std::env::var_os("MINICPM_DSPARK_TRACE").is_some())
 }
