@@ -42,20 +42,10 @@ impl<B: Backend> DecodeState<B> {
     ) {
         assert!(accepted > 0, "accepted prefix is empty");
         assert_eq!(linear_after.len(), self.linear.len());
-        let keep = length_before + accepted;
-        for cache in &mut self.kv {
-            assert!(
-                cache.len() >= keep,
-                "kv cache is shorter than the accepted prefix"
-            );
-            if cache.len() > keep {
-                *cache = cache.copy_range(0, keep);
-            }
-        }
-        for (index, steps) in linear_after.iter().enumerate() {
-            self.linear[index] = steps[accepted - 1].clone();
-        }
-        self.length = keep;
+        // Keeping the first `accepted` block slots is the contiguous-prefix
+        // special case of retain_path.
+        let slots: Vec<usize> = (0..accepted).collect();
+        self.retain_path(length_before, &slots, linear_after);
     }
 
     /// Tree variant of [`retain_accepted`]: keep the KV rows of the history

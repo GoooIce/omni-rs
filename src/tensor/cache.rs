@@ -61,13 +61,6 @@ impl<B: Backend> KvCache<B> {
             tensors: Some((select(k), select(v))),
         }
     }
-    /// Append an immutable cached segment. Tensor ownership keeps active
-    /// requests valid even when the radix tree evicts its copy of the segment.
-    pub fn append_cache(&mut self, segment: &Self) {
-        if let Some((k, v)) = &segment.tensors {
-            self.append(k.clone(), v.clone(), self.len());
-        }
-    }
     /// Concatenate a logical prefix without changing the retained cache.
     pub fn concat(
         &self,
