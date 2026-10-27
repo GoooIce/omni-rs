@@ -14,7 +14,7 @@
 //! the accepted tokens again. The new bonus stays out of this cache. The chat
 //! think block is a prompt choice shared with plain decode.
 use crate::{
-    generate::{FinishReason, GeneratedToken, Options, Outcome, Sampler},
+    generate::{FinishReason, GeneratedToken, Options, Outcome, Sampler, prompt_device},
     model::{TextModel, VerifyNumerics},
     multimodal::Prompt,
 };
@@ -1080,12 +1080,8 @@ pub fn generate<B: Backend>(
 ) -> std::result::Result<(Outcome, SpecStats), String> {
     let mut state = model.new_state(&prompt_device::<B>());
     state.rope_delta = prompt.rope_delta;
-    let mut history = prompt.ids.clone();
+    let mut emission = crate::generate::Emission::new(&prompt.ids);
     let mut sampler = Sampler::new(options.clone());
-    let start = Instant::now();
-    let mut previous = Instant::now();
-    let mut first_token_ms = None;
-    let mut tokens = Vec::new();
     let mut finish = FinishReason::Length;
     let mut stats = SpecStats {
         cycles: 0,
@@ -1118,7 +1114,7 @@ pub fn generate<B: Backend>(
     // The prefill sample is the first bonus. It stays out of the KV cache until
     // the verify forward that also consumes the drafts predicting what follows it.
     let first = sampler
-        .sample(row_vec(logits, 0)?, &history)
+        .sample(row_vec(logits, 0)?, emission.history())
         .map_err(|error| error.to_string())?;
     let mut pending = if eos_ids.contains(&first) {
         finish = FinishReason::Stop;
@@ -1126,26 +1122,6 @@ pub fn generate<B: Backend>(
     } else {
         Some(first)
     };
-
-    macro_rules! commit {
-        ($token:expr) => {{
-            let token: u32 = $token;
-            history.push(token);
-            tokens.push(token);
-            let delta = decode(&[token]);
-            let step_ms = previous.elapsed().as_secs_f64() * 1000.0;
-            previous = Instant::now();
-            if first_token_ms.is_none() {
-                first_token_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-            }
-            emit(GeneratedToken {
-                token,
-                delta,
-                step_ms,
-            })?;
-            stats.output_tokens += 1;
-        }};
-    }
 
     while let Some(bonus) = pending.take() {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1156,11 +1132,11 @@ pub fn generate<B: Backend>(
             finish = FinishReason::Stop;
             break;
         }
-        if tokens.len() == options.max_new_tokens {
+        if emission.committed() == options.max_new_tokens {
             break;
         }
-        commit!(bonus);
-        if tokens.len() == options.max_new_tokens {
+        emission.commit(bonus, decode(&[bonus]), &mut emit)?;
+        if emission.committed() == options.max_new_tokens {
             break;
         }
 
@@ -1170,7 +1146,7 @@ pub fn generate<B: Backend>(
         // Propose: the layout owns the block's shape; both variants share
         // the masked draft forward and the markov correction.
         let phase = Instant::now();
-        let room = options.max_new_tokens - tokens.len();
+        let room = options.max_new_tokens - emission.committed();
         let outcome = run_cycle(
             model,
             draft,
@@ -1182,7 +1158,7 @@ pub fn generate<B: Backend>(
             eos_ids,
             &options,
             &mut sampler,
-            &history,
+            emission.history(),
             room,
             &mut stats,
         )?;
@@ -1193,10 +1169,10 @@ pub fn generate<B: Backend>(
         ladder.observe(outcome.tokens.len(), layout.policy_len(), outcome.trimmed);
 
         for token in outcome.tokens {
-            if tokens.len() == options.max_new_tokens {
+            if emission.committed() == options.max_new_tokens {
                 break;
             }
-            commit!(token);
+            emission.commit(token, decode(&[token]), &mut emit)?;
         }
         if finish == FinishReason::Stop {
             break;
@@ -1204,12 +1180,13 @@ pub fn generate<B: Backend>(
         if let Some(token) = outcome.correction {
             if eos_ids.contains(&token) {
                 finish = FinishReason::Stop;
-            } else if tokens.len() < options.max_new_tokens {
+            } else if emission.committed() < options.max_new_tokens {
                 pending = Some(token);
             }
         }
     }
-    let text = decode(&tokens);
+    stats.output_tokens = emission.committed() as u64;
+    let outcome = emission.into_outcome(decode, finish);
     if stats.trace.enabled && stats.cycles > 0 {
         let cycles = stats.cycles as f64;
         eprintln!(
@@ -1221,20 +1198,7 @@ pub fn generate<B: Backend>(
             block_sum as f64 / cycles
         );
     }
-    Ok((
-        Outcome {
-            tokens,
-            text,
-            finish_reason: finish,
-            compute_ms: start.elapsed().as_secs_f64() * 1000.0,
-            first_token_ms,
-        },
-        stats,
-    ))
-}
-
-fn prompt_device<B: Backend>() -> B::Device {
-    Default::default()
+    Ok((outcome, stats))
 }
 
 #[cfg(test)]

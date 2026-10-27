@@ -221,12 +221,8 @@ fn generate_with<B: Backend>(
         .unwrap_or_default();
     let mut state = model.new_state(&prompt_device::<B>());
     state.rope_delta = prompt.rope_delta;
-    let mut history: Vec<u32> = prompt.ids.clone();
+    let mut emission = Emission::new(&prompt.ids);
     let mut sampler = Sampler::new(options.clone());
-    let start = Instant::now();
-    let mut first_token_ms = None;
-    let mut previous_step = Instant::now();
-    let mut tokens = Vec::new();
     let mut finish = FinishReason::Length;
 
     let forward_step = |ids: &[u32],
@@ -262,44 +258,94 @@ fn generate_with<B: Backend>(
             .as_slice::<f32>()
             .map_err(|e| e.to_string())?
             .to_vec();
-        let token = sampler.sample(values, &history)?;
+        let token = sampler.sample(values, emission.history())?;
         if eos_ids.contains(&token) {
             finish = FinishReason::Stop;
             break;
         }
-        history.push(token);
-        tokens.push(token);
-        let delta = decode(&[token]);
-        // A step spans sampling, emission and the forward that produced this
-        // token's logits (the forward runs at the end of the previous loop).
-        let step_ms = previous_step.elapsed().as_secs_f64() * 1000.0;
-        previous_step = Instant::now();
-        if first_token_ms.is_none() {
-            first_token_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-        }
-        emit(GeneratedToken {
-            token,
-            delta: delta.clone(),
-            step_ms,
-        })?;
+        emission.commit(token, decode(&[token]), &mut emit)?;
         if step + 1 == options.max_new_tokens {
             break;
         }
         logits = forward_step(&[token], None, None, &mut state, &mut caches)?;
     }
-    let text = decode(&tokens);
-    Ok(Outcome {
-        tokens,
-        text,
-        finish_reason: finish,
-        compute_ms: start.elapsed().as_secs_f64() * 1000.0,
-        first_token_ms,
-    })
+    Ok(emission.into_outcome(decode, finish))
 }
 
-#[allow(dead_code)]
-fn prompt_device<B: Backend>() -> B::Device {
+pub(crate) fn prompt_device<B: Backend>() -> B::Device {
     Default::default()
+}
+
+/// Shared emission bookkeeping for generation loops: the committed-token
+/// history both loops sample against, per-step and first-token timing, and
+/// the Outcome assembly. One implementation behind `generate_with` and
+/// `dspark::generate` so emission semantics change once.
+pub(crate) struct Emission {
+    history: Vec<u32>,
+    tokens: Vec<u32>,
+    start: Instant,
+    previous: Instant,
+    first_token_ms: Option<f64>,
+}
+
+impl Emission {
+    pub(crate) fn new(prompt_ids: &[u32]) -> Self {
+        Self {
+            history: prompt_ids.to_vec(),
+            tokens: Vec::new(),
+            start: Instant::now(),
+            previous: Instant::now(),
+            first_token_ms: None,
+        }
+    }
+
+    /// The committed-token history samplers predict against: the prompt
+    /// plus every emitted token.
+    pub(crate) fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    pub(crate) fn committed(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Commit one token: history, timing, and the caller's emit callback.
+    /// A step spans sampling, emission and the forward that produced this
+    /// token's logits (the forward runs at the end of the previous loop).
+    pub(crate) fn commit(
+        &mut self,
+        token: u32,
+        delta: String,
+        emit: &mut impl FnMut(GeneratedToken) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.history.push(token);
+        self.tokens.push(token);
+        let step_ms = self.previous.elapsed().as_secs_f64() * 1000.0;
+        self.previous = Instant::now();
+        if self.first_token_ms.is_none() {
+            self.first_token_ms = Some(self.start.elapsed().as_secs_f64() * 1000.0);
+        }
+        emit(GeneratedToken {
+            token,
+            delta,
+            step_ms,
+        })
+    }
+
+    pub(crate) fn into_outcome(
+        mut self,
+        decode: impl Fn(&[u32]) -> String,
+        finish_reason: FinishReason,
+    ) -> Outcome {
+        let text = decode(&self.tokens);
+        Outcome {
+            tokens: std::mem::take(&mut self.tokens),
+            text,
+            finish_reason,
+            compute_ms: self.start.elapsed().as_secs_f64() * 1000.0,
+            first_token_ms: self.first_token_ms,
+        }
+    }
 }
 
 #[cfg(test)]
