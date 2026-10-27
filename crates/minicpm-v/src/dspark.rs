@@ -916,6 +916,13 @@ impl SpecStats {
     }
 }
 
+/// Draft-state buffer capacity: prompt plus emission budget plus the
+/// largest block layout, plus one for the pending bonus. Shared by the
+/// generate loop and the resin runner so both reserve alike.
+pub fn draft_capacity(prompt_len: usize, budget: usize, max_block: usize) -> usize {
+    prompt_len + budget + max_block + 1
+}
+
 /// One speculative cycle's result: accepted draft tokens (already trimmed to
 /// the emission room), the correction that follows them when room and eos
 /// allow, and whether an untrimmed accepted draft hit eos.
@@ -1099,7 +1106,7 @@ pub fn generate<B: Backend>(
             false,
         )
         .map_err(|error| error.to_string())?;
-    let capacity = prompt.ids.len() + options.max_new_tokens + BLOCK_LADDER[2] + 1;
+    let capacity = draft_capacity(prompt.ids.len(), options.max_new_tokens, BLOCK_LADDER[2]);
     // The ladder picks each cycle's layout: a linear chain of the block
     // budget, or (adaptive runs only; a pinned MINICPM_DSPARK_BLOCK stays
     // linear for experiments) a markov tree.

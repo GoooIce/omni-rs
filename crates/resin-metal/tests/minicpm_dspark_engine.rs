@@ -11,7 +11,8 @@ use omni_minicpm_v::{
     tokenizer::MiniCpmTokenizer,
 };
 use resin_core::engine::{EngineCore, Runner, RunnerConfig, SchedulerConfig, Submission};
-use resin_metal::dspark_runner::{DsparkRequest, MinicpmDsparkRunner};
+use resin_metal::dspark_runner::MinicpmDsparkRunner;
+use resin_metal::session::DecodeRequest;
 use std::sync::atomic::AtomicBool;
 
 type B = Metal;
@@ -72,7 +73,7 @@ fn engine_dspark_matches_plain_greedy() {
     .unwrap();
     let mut input = Submission::new(
         ids,
-        DsparkRequest {
+        DecodeRequest {
             max_new_tokens: MAX_NEW_TOKENS,
         },
     );

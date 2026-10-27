@@ -15,3 +15,4 @@
 
 pub mod dspark_runner;
 pub mod minicpm;
+pub mod session;

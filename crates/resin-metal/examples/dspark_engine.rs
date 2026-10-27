@@ -14,7 +14,8 @@ use omni_minicpm_v::{
     config::ModelDirectory, dspark::Draft, model::TextModel, tokenizer::MiniCpmTokenizer,
 };
 use resin_core::engine::{EngineCore, Runner, RunnerConfig, SchedulerConfig, Submission};
-use resin_metal::dspark_runner::{DsparkRequest, MinicpmDsparkRunner};
+use resin_metal::dspark_runner::MinicpmDsparkRunner;
+use resin_metal::session::DecodeRequest;
 use std::io::Write as _;
 
 fn main() -> Result<(), String> {
@@ -61,7 +62,7 @@ fn main() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let mut input = Submission::new(
         ids,
-        DsparkRequest {
+        DecodeRequest {
             max_new_tokens: max_tokens,
         },
     );

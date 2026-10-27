@@ -12,6 +12,7 @@ use burn::tensor::backend::Backend as _;
 use omni_minicpm_v::{config::ModelDirectory, model::TextModel, tokenizer::MiniCpmTokenizer};
 use resin_core::engine::{EngineCore, RunnerConfig, SchedulerConfig, Submission};
 use resin_metal::minicpm::MinicpmRunner;
+use resin_metal::session::DecodeRequest;
 use std::io::Write as _;
 
 fn main() -> Result<(), String> {
@@ -54,7 +55,7 @@ fn main() -> Result<(), String> {
         false,
     )
     .map_err(|error| error.to_string())?;
-    let mut input = Submission::new(ids, ());
+    let mut input = Submission::new(ids, DecodeRequest { max_new_tokens });
     input.max_output_tokens = Some(max_tokens);
     input.stop_token_ids = eos;
     let handle = engine.submit(input).map_err(|error| error.to_string())?;

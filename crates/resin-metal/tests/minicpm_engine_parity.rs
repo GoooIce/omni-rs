@@ -14,6 +14,7 @@ use omni_minicpm_v::{
 };
 use resin_core::engine::{EngineCore, Runner, RunnerConfig, SchedulerConfig, Submission};
 use resin_metal::minicpm::MinicpmRunner;
+use resin_metal::session::DecodeRequest;
 use std::sync::atomic::AtomicBool;
 
 type B = NdArray;
@@ -71,7 +72,12 @@ fn engine_driven_greedy_matches_direct_generate() {
     )
     .unwrap();
     for (prompt, ids, reference) in cases {
-        let mut input = Submission::new(ids, ());
+        let mut input = Submission::new(
+            ids,
+            DecodeRequest {
+                max_new_tokens: MAX_NEW_TOKENS,
+            },
+        );
         input.max_output_tokens = Some(MAX_NEW_TOKENS);
         input.stop_token_ids = eos.clone();
         let handle = engine.submit(input).unwrap();
