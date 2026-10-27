@@ -1,0 +1,36 @@
+[package]
+name = "resin-metal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Resin EngineCore serving stack driven from Rust with local model runners"
+
+[workspace]
+
+[features]
+default = ["metal"]
+metal = ["omni-minicpm-v/metal", "burn/metal", "burn/autotune", "burn/ndarray"]
+cpu = ["omni-minicpm-v/cpu", "burn/ndarray"]
+
+[dependencies]
+resin-core = { path = "../../vendor/resin-core" }
+omni-minicpm-v = { path = "../minicpm-v", default-features = false }
+omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+
+[[example]]
+name = "greedy_engine"
+required-features = ["metal"]
+
+[patch.crates-io]
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }

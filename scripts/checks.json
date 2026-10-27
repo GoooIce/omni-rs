@@ -77,6 +77,12 @@
       "cpu_features": "",
       "target": "target/mtl4",
       "metal": true
+    },
+    {
+      "path": "crates/resin-metal/Cargo.toml",
+      "cpu_features": "cpu",
+      "target": "target/resin-metal",
+      "metal": true
     }
   ],
   "forbidden_runtime_packages": [

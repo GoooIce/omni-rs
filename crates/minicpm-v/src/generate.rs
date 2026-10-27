@@ -69,7 +69,10 @@ pub struct Outcome {
 
 /// SplitMix64 sampler with the translation module's semantics: repetition
 /// penalty first, then greedy or temperature/top-k/top-p sampling.
-pub(crate) struct Sampler {
+///
+/// Public so out-of-crate engines (the resin runner in `crates/resin-metal`)
+/// reuse the exact sampling path and stay token-for-token comparable.
+pub struct Sampler {
     options: Options,
     state: u64,
 }
