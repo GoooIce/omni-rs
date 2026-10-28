@@ -9,7 +9,8 @@
 //! in `tests/engine_core.rs`.
 //!
 //! Multi-sequence batching (#72) is opt-in per [`crate::config::ResinConfig`]:
-//! when enabled, every decode row of one plan goes through
+//! when `multi_sequence_batch` or the composite `tree_batch` switch (#73) is
+//! enabled, every decode row of one plan goes through
 //! [`DecodeAdapter::decode_batch`] in one call. The participating slots are
 //! temporarily taken out of the map so the adapter can borrow all of them at
 //! once; they are reinserted on success and on error alike.
@@ -108,6 +109,11 @@ pub trait DecodeAdapter {
         Ok(outputs)
     }
 
+    /// The session's resolved switches changed. Adapters that read a switch
+    /// inside [`Self::decode_batch`] (the composite tree+batch mode, #73)
+    /// update their copy here; everything else ignores the notification.
+    fn config_changed(&mut self, _config: &ResinConfig) {}
+
     /// Snapshot `slot` at its current history, or `None` when this adapter
     /// has no checkpoint support (the default). The snapshot must not mutate
     /// the slot.
@@ -191,6 +197,16 @@ impl<A: DecodeAdapter> DecodeSession<A> {
     /// The resolved engine switches (environment overrides folded in).
     pub fn config(&self) -> &ResinConfig {
         &self.config
+    }
+
+    /// Replace the switches at runtime, folding the environment overrides
+    /// again (they are idempotent). The measurement harnesses use this to run
+    /// several arms of one experiment in one process with the same loaded
+    /// weights; the adapter is told so a switch it reads inside
+    /// [`DecodeAdapter::decode_batch`] follows.
+    pub fn set_config(&mut self, config: ResinConfig) {
+        self.config = config.with_env_overrides();
+        self.adapter.config_changed(&self.config);
     }
 
     /// Prefill tokens fed and checkpoint hit/miss counters (#74).
@@ -355,7 +371,7 @@ impl<A: DecodeAdapter> Runner<DecodeRequest> for DecodeSession<A> {
     fn forward(&mut self, plan: ExecutionPlan<DecodeRequest>) -> Result<OwnedTokenRows, Error> {
         match plan.phase {
             Phase::Prefill => self.forward_sequential(plan),
-            _ if self.config.multi_sequence_batch && plan.sequence_ids.len() >= 2 => {
+            _ if self.config.co_batches(plan.sequence_ids.len()) => {
                 self.forward_batched_decode(plan)
             }
             _ => self.forward_sequential(plan),

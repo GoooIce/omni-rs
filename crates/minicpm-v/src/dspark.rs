@@ -62,7 +62,7 @@ pub(crate) const MAX_TREE_LIVE: usize = 15;
 pub(crate) const MAX_TREE_ROWS: usize = MAX_TREE_LIVE + 1;
 
 /// One speculative cycle's proposal layout, chosen by the [`Ladder`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockLayout {
     /// A linear chain of `len` draft tokens (the markov argmax path).
     Chain { len: usize },
@@ -84,6 +84,18 @@ impl BlockLayout {
             BlockLayout::Chain { len } => *len,
             BlockLayout::Tree { levels } => *levels,
             BlockLayout::BestTree { levels, live } => (*levels).min(*live),
+        }
+    }
+
+    /// The verify block's row count this layout produces, bonus included.
+    /// Best-first selection may return fewer rows than `live` when the
+    /// candidate grid is exhausted; this is the upper bound a row budget
+    /// must reserve.
+    pub fn rows(&self) -> usize {
+        match self {
+            BlockLayout::Chain { len } => len + 1,
+            BlockLayout::Tree { levels } => full_binary_live(*levels) + 1,
+            BlockLayout::BestTree { live, .. } => live + 1,
         }
     }
 
@@ -1055,6 +1067,34 @@ impl<B: Backend> Draft<B> {
         Ok((tree.tokens.clone(), tree))
     }
 
+    /// Propose one block under `layout`, returning the draft token ids (the
+    /// bonus excluded) and, for a tree layout, the [`TreeSpec`] the verify
+    /// forward and accept walk consume.
+    ///
+    /// Both cycle drivers share this seam: [`run_cycle`] for one sequence and
+    /// [`crate::dspark_batch::run_cycle_batch`] for a plan whose members may
+    /// mix chain and tree layouts (#73).
+    pub(crate) fn propose_layout(
+        &self,
+        target: &TextModel<B>,
+        state: &mut DraftState<B>,
+        anchor: u32,
+        layout: &BlockLayout,
+    ) -> Result<(Vec<u32>, Option<TreeSpec>)> {
+        match layout {
+            BlockLayout::Tree { levels } => {
+                let (tokens, tree) = self.propose_tree(target, state, anchor, *levels)?;
+                Ok((tokens, Some(tree)))
+            }
+            BlockLayout::BestTree { levels, live } => {
+                let (tokens, tree) =
+                    self.propose_tree_best(target, state, anchor, *levels, *live)?;
+                Ok((tokens, Some(tree)))
+            }
+            BlockLayout::Chain { len } => Ok((self.propose(target, state, anchor, *len)?, None)),
+        }
+    }
+
     /// Chain-mode propose: the draft forward runs on `block_len` masked
     /// tokens, then the markov head walks `block_len` serial argmax steps.
     pub(crate) fn propose(
@@ -1315,7 +1355,9 @@ fn row_vec<B: Backend>(logits: Tensor<B, 2>, row: usize) -> std::result::Result<
         .map_err(|error| error.to_string())
 }
 
-fn assemble_block(bonus: u32, drafts: &[u32]) -> Vec<u32> {
+/// The verify block's ids: the bonus first, then the proposed drafts (chain
+/// positions or tree breadth-first positions).
+pub(crate) fn assemble_block(bonus: u32, drafts: &[u32]) -> Vec<u32> {
     let mut block = Vec::with_capacity(1 + drafts.len());
     block.push(bonus);
     block.extend_from_slice(drafts);
@@ -1456,26 +1498,10 @@ pub fn run_cycle<B: Backend>(
     stats: &mut SpecStats,
 ) -> std::result::Result<CycleOutcome, String> {
     let phase = Instant::now();
-    let (block, tree) = match layout {
-        BlockLayout::Tree { levels } => {
-            let (tokens, tree) = draft
-                .propose_tree(model, draft_state, bonus, *levels)
-                .map_err(|error| error.to_string())?;
-            (assemble_block(bonus, &tokens), Some(tree))
-        }
-        BlockLayout::BestTree { levels, live } => {
-            let (tokens, tree) = draft
-                .propose_tree_best(model, draft_state, bonus, *levels, *live)
-                .map_err(|error| error.to_string())?;
-            (assemble_block(bonus, &tokens), Some(tree))
-        }
-        BlockLayout::Chain { len } => {
-            let proposals = draft
-                .propose(model, draft_state, bonus, *len)
-                .map_err(|error| error.to_string())?;
-            (assemble_block(bonus, &proposals), None)
-        }
-    };
+    let (tokens, tree) = draft
+        .propose_layout(model, draft_state, bonus, layout)
+        .map_err(|error| error.to_string())?;
+    let block = assemble_block(bonus, &tokens);
     if stats.trace.enabled {
         stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
     }
