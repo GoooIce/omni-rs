@@ -374,6 +374,23 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         )))
     }
 
+    /// Resident target state plus the draft K/V buffers of one slot (#76).
+    fn slot_bytes(&self, slot: &Self::Slot) -> usize {
+        usize::try_from(
+            crate::memory::state_bytes(&slot.state)
+                .saturating_add(crate::memory::draft_state_bytes(&slot.draft_state)),
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    fn checkpoint_bytes(&self, checkpoint: &Self::Checkpoint) -> usize {
+        usize::try_from(
+            crate::memory::state_bytes(&checkpoint.state)
+                .saturating_add(crate::memory::draft_state_bytes(&checkpoint.draft_state)),
+        )
+        .unwrap_or(usize::MAX)
+    }
+
     /// DSpark checkpoint as named tensors (#75): target KV/linear state, the
     /// filled draft K/V rows and the pending token plus draft length.
     fn encode_checkpoint(&self, checkpoint: &Self::Checkpoint) -> Option<CheckpointPayload> {
@@ -615,6 +632,11 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
     /// Disk cache counters, when a cache is attached (#75).
     pub fn state_cache_stats(&self) -> Option<crate::state_cache::StateCacheStats> {
         self.session.state_cache_stats()
+    }
+
+    /// Resident KV bytes, budget and release-order counters (#76).
+    pub fn memory_stats(&self) -> crate::memory::MemoryStats {
+        self.session.memory_stats()
     }
 
     /// Encode and write queued checkpoints now (#75).

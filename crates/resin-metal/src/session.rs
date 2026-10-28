@@ -45,6 +45,24 @@
 //! runner thread at the idle boundary — at the start of the next `forward` or
 //! after `release` — because encoding reads device tensors back. With the
 //! switch off the session never opens or touches the cache.
+//!
+//! The KV memory budget (#76) is `kv_budget_mb`, off by default. When it is
+//! set, the session measures live slot bytes and in-memory checkpoint bytes
+//! (adapter-reported tensor shapes × dtype widths) after every checkpoint
+//! insertion and slot creation and enforces the #65 release order:
+//!
+//! 1. **self-drop** — a keyed whole-prompt request that finds no usable
+//!    prefix checkpoint releases that key's checkpoints before its prefill;
+//! 2. **image embedding cache** — this runner holds none (skipped, named in
+//!    the experiment header);
+//! 3. **idle slot KV** — stored checkpoints, least recently used first; with
+//!    `state_cache` on each is spilled to SSD before it leaves memory;
+//! 4. **pending-prefill KV** — none survives across requests here (skipped);
+//! 5. **ANE split** — out of scope for this map.
+//!
+//! Live slots are never evicted. If they alone exceed the budget the request
+//! still runs and [`DecodeSession::memory_stats`] reports the honest
+//! over-budget remainder.
 
 use std::collections::HashMap;
 
@@ -54,6 +72,8 @@ use resin_core::engine::{Error, ExecutionPlan, OwnedTokenRows, Runner};
 use crate::config::ResinConfig;
 pub use crate::conversation::ConversationStats;
 use crate::conversation::ConversationStore;
+use crate::memory::MemoryCounters;
+pub use crate::memory::MemoryStats;
 use crate::state_cache::{CheckpointPayload, StateCache, StateCacheStats, content_key};
 
 /// Per-request payload the engine echoes into every plan row: the emission
@@ -183,6 +203,20 @@ pub trait DecodeAdapter {
     ) -> Option<Self::Checkpoint> {
         None
     }
+
+    /// Resident bytes of one live slot's KV state (#76): target KV, linear
+    /// states and, for speculative adapters, the draft K/V buffers. The
+    /// default reports zero, which keeps an adapter that does not opt in
+    /// outside the budget ledger.
+    fn slot_bytes(&self, _slot: &Self::Slot) -> usize {
+        0
+    }
+
+    /// Resident bytes of one in-memory checkpoint (#76), same units as
+    /// [`Self::slot_bytes`]. The default reports zero.
+    fn checkpoint_bytes(&self, _checkpoint: &Self::Checkpoint) -> usize {
+        0
+    }
 }
 
 /// A checkpoint queued for the next idle-boundary disk drain (#75).
@@ -203,6 +237,8 @@ pub struct DecodeSession<A: DecodeAdapter> {
     state_cache: Option<StateCache>,
     pending_states: Vec<PendingState<A::Checkpoint>>,
     stats: ConversationStats,
+    /// Release-order counters behind [`Self::memory_stats`] (#76).
+    memory: MemoryCounters,
 }
 
 impl<A: DecodeAdapter> DecodeSession<A> {
@@ -239,6 +275,7 @@ impl<A: DecodeAdapter> DecodeSession<A> {
             state_cache,
             pending_states: Vec::new(),
             stats: ConversationStats::default(),
+            memory: MemoryCounters::default(),
         }
     }
 
@@ -272,11 +309,47 @@ impl<A: DecodeAdapter> DecodeSession<A> {
             self.pending_states.clear();
         }
         self.adapter.config_changed(&self.config);
+        // A runtime arm switch may lower the budget; release idle checkpoints
+        // now so the next measurement starts inside it.
+        self.enforce_memory_budget();
     }
 
     /// Prefill tokens fed and checkpoint hit/miss counters (#74, #75).
     pub fn conversation_stats(&self) -> ConversationStats {
         self.stats
+    }
+
+    /// Resident KV bytes and the release-order counters (#76). The budget is
+    /// the resolved config value; live and checkpoint bytes are measured now.
+    pub fn memory_stats(&self) -> MemoryStats {
+        MemoryStats {
+            budget_bytes: self.config.kv_budget_bytes(),
+            live_bytes: self.live_slot_bytes(),
+            checkpoint_bytes: self.conversation_checkpoint_bytes(),
+            spilled_checkpoints: self.memory.spilled_checkpoints,
+            spilled_bytes: self.memory.spilled_bytes,
+            dropped_self_checkpoints: self.memory.dropped_self_checkpoints,
+            dropped_self_bytes: self.memory.dropped_self_bytes,
+            dropped_idle_checkpoints: self.memory.dropped_idle_checkpoints,
+            dropped_idle_bytes: self.memory.dropped_idle_bytes,
+            over_budget_bytes: self.memory.over_budget_bytes,
+        }
+    }
+
+    fn live_slot_bytes(&self) -> u64 {
+        self.slots
+            .values()
+            .map(|slot| u64::try_from(self.adapter.slot_bytes(slot)).unwrap_or(u64::MAX))
+            .sum()
+    }
+
+    fn conversation_checkpoint_bytes(&self) -> u64 {
+        let adapter = &self.adapter;
+        u64::try_from(
+            self.conversation
+                .sum_checkpoint_bytes(|checkpoint| adapter.checkpoint_bytes(checkpoint)),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     /// The SSD state cache, when this session was built with one and the
@@ -336,10 +409,127 @@ impl<A: DecodeAdapter> DecodeSession<A> {
         }
         self.stats.checkpoint_misses += 1;
         self.stats.prefill_tokens += input.len() as u64;
+        // Tier 1 (#65/#76): this key's stored checkpoints cannot serve the
+        // new request, so release them before the prefill allocates the new
+        // slot. Only a whole-prompt row can consult the store; a continuation
+        // chunk keeps the documented single-chunk assumption and drops
+        // nothing.
+        if full_prompt && self.config.kv_budget_bytes().is_some() {
+            self.self_drop_key(key);
+        }
         let (slot, row_tokens) = self.adapter.prefill(input, budget)?;
         self.request_keys.insert(sequence, key);
         self.save_prefix_checkpoint(key, &slot, true);
         Ok((slot, row_tokens))
+    }
+
+    /// Tier 1 of the #65 release order: drop every checkpoint of `key` after
+    /// its new request missed (no usable prefix checkpoint). Queued disk
+    /// writes for the same histories are cancelled too, so the released
+    /// checkpoints do not stay resident until the next drain.
+    fn self_drop_key(&mut self, key: u64) {
+        let taken = self.conversation.take_key(key);
+        if taken.is_empty() {
+            return;
+        }
+        let mut bytes = 0u64;
+        for (tokens, checkpoint) in &taken {
+            bytes = bytes.saturating_add(
+                u64::try_from(self.adapter.checkpoint_bytes(checkpoint)).unwrap_or(u64::MAX),
+            );
+            self.pending_states
+                .retain(|pending| pending.tokens.as_slice() != tokens);
+        }
+        self.memory.dropped_self_checkpoints += taken.len() as u64;
+        self.memory.dropped_self_bytes = self.memory.dropped_self_bytes.saturating_add(bytes);
+        eprintln!(
+            "resin memory: tier=self_drop key={key} checkpoints={} bytes={bytes}",
+            taken.len()
+        );
+    }
+
+    /// Enforce the KV budget after a checkpoint insertion or slot creation
+    /// (#76). Tiers 2 and 4 of the #65 order do not exist in this runner
+    /// (image embedding cache and pending-prefill KV are named in the
+    /// experiment header); tier 5 is out of scope. Tier 3 releases idle-slot
+    /// checkpoints least recently used first, spilling to the SSD cache when
+    /// one is attached and dropping otherwise. Live slots are never evicted:
+    /// when they alone exceed the budget the remainder is recorded and the
+    /// request continues.
+    fn enforce_memory_budget(&mut self) {
+        let Some(budget) = self.config.kv_budget_bytes() else {
+            self.memory.over_budget_bytes = 0;
+            return;
+        };
+        loop {
+            let total = self
+                .live_slot_bytes()
+                .saturating_add(self.conversation_checkpoint_bytes());
+            if total <= budget {
+                self.memory.over_budget_bytes = 0;
+                return;
+            }
+            let Some((key, tokens, checkpoint)) = self.conversation.take_lru() else {
+                break;
+            };
+            let bytes =
+                u64::try_from(self.adapter.checkpoint_bytes(&checkpoint)).unwrap_or(u64::MAX);
+            if self.spill_checkpoint(&tokens, &checkpoint, bytes) {
+                eprintln!(
+                    "resin memory: tier=idle_slot action=spill key={key} tokens={} bytes={bytes}",
+                    tokens.len()
+                );
+                continue;
+            }
+            self.memory.dropped_idle_checkpoints += 1;
+            self.memory.dropped_idle_bytes = self.memory.dropped_idle_bytes.saturating_add(bytes);
+            eprintln!(
+                "resin memory: tier=idle_slot action=drop key={key} tokens={} bytes={bytes}",
+                tokens.len()
+            );
+        }
+        let total = self
+            .live_slot_bytes()
+            .saturating_add(self.conversation_checkpoint_bytes());
+        self.memory.over_budget_bytes = total.saturating_sub(budget);
+        if self.memory.over_budget_bytes > 0 {
+            eprintln!(
+                "resin memory: over_budget bytes={} budget_bytes={budget} \
+                 (live slots alone exceed the budget; plan continues)",
+                self.memory.over_budget_bytes
+            );
+        }
+    }
+
+    /// Write one evicted checkpoint to the SSD cache (#75) before it leaves
+    /// memory. Returns `false` when there is no cache, the adapter cannot
+    /// encode the state, or the write failed — the caller then drops it.
+    fn spill_checkpoint(&mut self, tokens: &[u32], checkpoint: &A::Checkpoint, bytes: u64) -> bool {
+        if self.state_cache.is_none() {
+            return false;
+        }
+        let Some(payload) = self.adapter.encode_checkpoint(checkpoint) else {
+            return false;
+        };
+        let Some(cache) = self.state_cache.as_mut() else {
+            return false;
+        };
+        match cache.save(tokens, &payload) {
+            Ok(()) => {
+                self.stats.disk_writes += 1;
+                self.memory.spilled_checkpoints += 1;
+                self.memory.spilled_bytes = self.memory.spilled_bytes.saturating_add(bytes);
+                // The spilled history no longer needs its queued copy; it is
+                // already durable under the same content key.
+                self.pending_states
+                    .retain(|pending| pending.tokens.as_slice() != tokens);
+                true
+            }
+            Err(error) => {
+                eprintln!("resin state cache: spill failed: {error}");
+                false
+            }
+        }
     }
 
     /// Memory first, then SSD (#75). The SSD search takes the longest strict
@@ -464,6 +654,9 @@ impl<A: DecodeAdapter> DecodeSession<A> {
                     let (slot, row_tokens) =
                         self.prefill_row(sequence, input, budget, key, full_prompt)?;
                     self.slots.insert(sequence, slot);
+                    // Slot creation and the checkpoint insertion inside
+                    // `prefill_row` are the budget enforcement points (#76).
+                    self.enforce_memory_budget();
                     row_tokens
                 }
                 _ => {
@@ -575,6 +768,9 @@ impl<A: DecodeAdapter> Runner<DecodeRequest> for DecodeSession<A> {
             self.slots.remove(&id);
             self.emitted.remove(&id);
         }
+        // The turn-boundary checkpoints just inserted are a budget enforcement
+        // point (#76); the finished slots no longer count as live.
+        self.enforce_memory_budget();
         // The release itself is an idle boundary; write now so a process that
         // exits after releasing still made its checkpoints durable.
         self.drain_state_cache();

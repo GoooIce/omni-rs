@@ -3,6 +3,25 @@
 记录日期：2026-10-15（历史基线保留原日期）。设备：Apple M5 Max，40 核 GPU，128 GB RAM，macOS 27.0.1。
 工具链：rustc/cargo 1.99.0，Burn 0.21.0；依赖版本保存在 Cargo.lock。
 
+## 2026-10-28：#76 KV 额度与释放次序 + #66 测量脚本
+
+`crates/resin-metal` 新增 `ResinConfig.kv_budget_mb`（默认 `None`，实验覆盖 `RESIN_KV_BUDGET_MB`）。额度按适配器报告的张量字节（目标 KV + 线性状态 + DSpark 草稿 K/V 缓冲）记账；超额度时按 #65 次序释放：本槽自弃 → 空闲检查点 LRU（`state_cache` 开时先落盘再丢弃）→ 其余层级本 runner 不持有，在实验头注明。live slot 不淘汰，差额记入 `memory_stats().over_budget_bytes`，请求照常完成。
+
+本轮验证（权重-free，`cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu --lib --tests` 全绿）：
+
+- `tests/kv_budget.rs`：无额度路径不动；自弃先于空闲释放且只作用于缺失 key；空闲检查点按 LRU 逐个释放；`state_cache` 开时先 spill 再移出内存，随后同一前缀从 SSD 命中、只预填后缀；live 单独超额度时请求完成且差额正确。
+- `src/config.rs`：默认关、`RESIN_KV_BUDGET_MB` 解析（0/非法视为关）、实验头包含额度与释放次序说明。
+- 1B 权重门（`two-turn`、`quota-batch` 脚本与 `tests/minicpm_quota.rs`）本轮**未运行**：机器已预留，权重不在本工作树。脚本在无权重时打印 `gate=skip` 退出。
+
+复现：
+
+```sh
+scripts/state-reuse-two-turn.sh
+scripts/state-reuse-quota-batch.sh --prefix 128 --suffix 16 --tokens 32
+cargo test --manifest-path crates/resin-metal/Cargo.toml \
+  --no-default-features --features cpu --test minicpm_quota -- --ignored --nocapture
+```
+
 ## 2026-10-23：DSpark 投机解码首次反超普通解码（分组 MoE 内核）
 
 `crates/minicpm-v` 的 DSpark 路径从“比普通贪心慢 4.6 倍”改到“快 1.5–1.9 倍”。
