@@ -340,6 +340,57 @@ mod session_tests {
         );
     }
 
+    /// A continuation prefill row (prefix-cache hit or chunk) is scheduled
+    /// with `sample = false`. The adapter still returns a token, but the
+    /// engine ignores it; the session must not charge it to the emission
+    /// budget or the next decode row is asked for zero room.
+    #[test]
+    fn continuation_prefill_does_not_consume_the_emission_budget() {
+        let adapter = ScriptedAdapter {
+            prefill_rows: vec![vec![7]],
+            decode_rows: vec![vec![8]],
+            rooms: Vec::new(),
+            bonuses: Vec::new(),
+        };
+        let mut session = DecodeSession::new(adapter);
+        let plan = |phase, context, prefill_length, ids: Vec<u32>, mask: bool| {
+            let end = ids.len() as u32;
+            resin_core::engine::ExecutionPlan {
+                prompt_score_indices: Vec::new(),
+                prompt_score_token_ids: Vec::new(),
+                prompt_score_indptr: Vec::new(),
+                prompt_score_top_counts: Vec::new(),
+                prompt_target_indptr: Vec::new(),
+                prompt_target_token_ids: Vec::new(),
+                batch_id: 1,
+                batch_key: None,
+                phase,
+                sequence_ids: vec![7],
+                context_lengths: vec![context],
+                prefill_lengths: vec![prefill_length],
+                token_ids: ids,
+                token_indptr: vec![0, end],
+                sampling_mask: vec![mask],
+                cache_groups: Vec::new(),
+                payloads: vec![DecodeRequest {
+                    max_new_tokens: 5,
+                    slot: None,
+                }],
+            }
+        };
+        session
+            .forward(plan(resin_core::Phase::Prefill, 0, 3, vec![0, 1, 2], false))
+            .unwrap();
+        session
+            .forward(plan(resin_core::Phase::Decode, 3, 0, vec![7], true))
+            .unwrap();
+        assert_eq!(
+            session.adapter().rooms,
+            vec![5],
+            "the discarded continuation token must not shrink the room"
+        );
+    }
+
     use resin_core::engine::Submission;
 }
 

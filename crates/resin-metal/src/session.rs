@@ -637,6 +637,16 @@ impl<A: DecodeAdapter> DecodeSession<A> {
             let input = &plan.token_ids[bounds[0] as usize..bounds[1] as usize];
             let budget = plan.payloads[row].max_new_tokens;
             let emitted = *self.emitted.entry(sequence).or_insert(0);
+            // A continuation prefill row (a prefix-cache hit or a chunk) is
+            // scheduled with `sample = false`; the engine does not count the
+            // adapter's return value as a generated token, so neither may the
+            // emission budget. Counting it shrinks the room and eventually
+            // asks a decode row for zero tokens, which the engine rejects.
+            let sampled = plan
+                .sampling_mask
+                .get(row)
+                .copied()
+                .unwrap_or(plan.phase != Phase::Prefill);
             let row_tokens = match plan.phase {
                 Phase::Prefill => {
                     let key = plan.payloads[row]
@@ -668,7 +678,9 @@ impl<A: DecodeAdapter> DecodeSession<A> {
                         .decode(slot, input, budget.saturating_sub(emitted), budget)?
                 }
             };
-            *self.emitted.get_mut(&sequence).expect("entry just created") += row_tokens.len();
+            if sampled {
+                *self.emitted.get_mut(&sequence).expect("entry just created") += row_tokens.len();
+            }
             token_ids.extend_from_slice(&row_tokens);
             let length =
                 u32::try_from(token_ids.len()).map_err(|_| Error::internal("token overflow"))?;
