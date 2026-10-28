@@ -632,6 +632,32 @@ fn select_best_first(grid: &CandidateGrid, live: usize) -> TreeSpec {
     TreeSpec::new(tokens, parent, depth, children, levels)
 }
 
+/// Packs one depth level's candidates for the single-grid readback: one
+/// `[token id as f32, log-softmax transition score]` row per child,
+/// breadth-first (parent-major). Token ids stay below 2^24 and are exact in
+/// f32, so ids and scores share one transfer. Returns the rows together with
+/// the `[parents, K]` picks the next level expands from.
+fn pack_candidate_rows<B: Backend>(
+    scores: Tensor<B, 2>,
+) -> (Tensor<B, 2>, Tensor<B, 2, burn::tensor::Int>) {
+    let count = scores.dims()[0];
+    let logp = burn::tensor::activation::log_softmax(scores, 1);
+    let (values, picks) = logp.topk_with_indices(TREE_CANDIDATE_K, 1);
+    let rows = Tensor::cat(
+        vec![
+            picks
+                .clone()
+                .cast(burn::tensor::FloatDType::F32)
+                .reshape([count * TREE_CANDIDATE_K, 1]),
+            values
+                .cast(burn::tensor::FloatDType::F32)
+                .reshape([count * TREE_CANDIDATE_K, 1]),
+        ],
+        1,
+    );
+    (rows, picks)
+}
+
 /// The draft's cross-attention context over accepted target history.
 ///
 /// `fc`, the hidden norm and each layer's K/V projections are folded in as
@@ -964,18 +990,9 @@ impl<B: Backend> Draft<B> {
             let count = previous.dims()[0];
             let depth_base = base.clone().slice([depth..depth + 1, 0..VOCAB]);
             let scores = self.markov_scores(depth_base, &previous);
-            let logp = burn::tensor::activation::log_softmax(scores, 1);
-            let (values, picks) = logp.topk_with_indices(TREE_CANDIDATE_K, 1);
-            previous = picks.clone().reshape([count * TREE_CANDIDATE_K, 1]);
-            let ids = picks.cast(burn::tensor::FloatDType::F32);
-            let values = values.cast(burn::tensor::FloatDType::F32);
-            grid_rows.push(Tensor::cat(
-                vec![
-                    ids.reshape([count * TREE_CANDIDATE_K, 1]),
-                    values.reshape([count * TREE_CANDIDATE_K, 1]),
-                ],
-                1,
-            ));
+            let (rows, picks) = pack_candidate_rows(scores);
+            previous = picks.reshape([count * TREE_CANDIDATE_K, 1]);
+            grid_rows.push(rows);
         }
         let t_markov = t_markov.elapsed();
         let t_readback = Instant::now();
@@ -1692,7 +1709,7 @@ pub fn generate<B: Backend>(
 mod tests {
     use super::{
         BLOCK_LADDER, BlockLayout, CandidateGrid, Ladder, MAX_TREE_LIVE, TREE_CANDIDATE_K,
-        TREE_GRID_LEVELS, TreeSpec, accept_path, select_best_first,
+        TREE_GRID_LEVELS, TreeSpec, accept_path, pack_candidate_rows, select_best_first,
     };
 
     #[test]
@@ -1918,6 +1935,41 @@ mod tests {
     const SKEWED: [f32; 14] = [
         -1.0, -0.5, -0.5, -0.5, -0.4, -0.4, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -0.01, -1.0,
     ];
+
+    #[test]
+    fn candidate_rows_pack_ids_and_log_probabilities_breadth_first() {
+        use burn::backend::NdArray;
+        let device = Default::default();
+        // Two parents, four vocabulary entries each.
+        let scores = burn::tensor::Tensor::<NdArray, 2>::from_floats(
+            [[0.0, 2.0, 1.0, -1.0], [3.0, 0.0, 1.0, 2.0]],
+            &device,
+        );
+        let (rows, picks) = pack_candidate_rows(scores);
+        let rows = rows.into_data().convert::<f32>();
+        let rows = rows.as_slice::<f32>().unwrap();
+        let picks = picks.into_data().convert::<i32>();
+        let picks = picks.as_slice::<i32>().unwrap();
+        // Parent-major: parent 0's top two, then parent 1's top two.
+        assert_eq!(picks, [1, 2, 0, 3]);
+        let reference = [[0.0f32, 2.0, 1.0, -1.0], [3.0, 0.0, 1.0, 2.0]];
+        let logp = |values: &[f32], id: usize| {
+            let max = values
+                .iter()
+                .fold(f32::NEG_INFINITY, |best, &value| best.max(value));
+            let sum: f32 = values.iter().map(|&value| (value - max).exp()).sum();
+            values[id] - max - sum.ln()
+        };
+        for (index, &id) in picks.iter().enumerate() {
+            let expected = logp(&reference[index / TREE_CANDIDATE_K], id as usize);
+            assert_eq!(rows[index * 2], id as f32);
+            assert!(
+                (rows[index * 2 + 1] - expected).abs() < 1e-6,
+                "row {index}: {} != {expected}",
+                rows[index * 2 + 1]
+            );
+        }
+    }
 
     #[test]
     fn candidate_grid_reconstructs_breadth_first_path_scores() {
