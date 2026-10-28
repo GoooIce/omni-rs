@@ -8,6 +8,11 @@
 //! so engine-driven streams stay token-for-token identical to the direct
 //! path by construction.
 //!
+//! Co-batched decode (#63/#72): with `multi_sequence_batch` on, every decode
+//! row of a plan shares one [`TextModel::forward_verifying_multi`] forward;
+//! each row is one pending token and is sampled through its own sampler and
+//! history, so the batched stream is the per-row stream by construction.
+//!
 //! Conversation checkpoints (#74) snapshot the decode state plus the
 //! KV-aligned history (`history[..state.length]`): the pending sampled token
 //! is not in the KV state, so it is left out and replayed by the next prompt
@@ -15,21 +20,24 @@
 //! encodes the same checkpoint as named tensors, keeping every dtype as-is.
 
 use burn::tensor::{TensorData, backend::Backend};
+use omni_minicpm_v::dspark_batch;
 use omni_minicpm_v::generate::{Options, Sampler};
-use omni_minicpm_v::model::{DecodeState, TextModel};
+use omni_minicpm_v::model::{DecodeState, TextModel, VerifyBlock};
 use omni_minicpm_v::text::LinearState;
 use omni_r2t2::tensor::KvCache;
 use resin_core::engine::{Error, Runner};
 
 use crate::config::ResinConfig;
 use crate::conversation::ConversationStats;
-use crate::session::{DecodeAdapter, DecodeRequest, DecodeSession};
+use crate::session::{DecodeAdapter, DecodeRequest, DecodeRow, DecodeSession};
 use crate::state_cache::{CheckpointPayload, tensor_from};
 
 struct GreedyAdapter<B: Backend> {
     model: TextModel<B>,
     device: B::Device,
     options: Options,
+    /// Number of `decode_batch` calls that shared one multi-sequence verify.
+    batched_cycles: u64,
 }
 
 /// One greedy slot's conversation checkpoint.
@@ -41,6 +49,18 @@ struct GreedyCheckpoint<B: Backend> {
     /// The sampled token that had not entered the KV state (#75): a disk
     /// entry matching the whole prompt emits it without a forward.
     pending: Option<u32>,
+}
+
+/// Record a decode row's input unless it is already the tail of the history.
+///
+/// The engine feeds the previous row's sampled token back, and that token is
+/// already the last history entry; appending it again would desynchronise the
+/// history from the KV state and move checkpoint tokens off the prompt
+/// prefix. A row carrying anything else (a caller-built suffix) is recorded.
+fn record_decode_input(history: &mut Vec<u32>, input: &[u32]) {
+    if input.len() != 1 || history.last() != input.first() {
+        history.extend_from_slice(input);
+    }
 }
 
 /// Greedy sampler over one logits row, shared with the direct loop.
@@ -83,13 +103,7 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         _budget: usize,
     ) -> Result<Vec<u32>, Error> {
         let (state, history) = slot;
-        // The engine feeds the previous row's sampled token back; it is
-        // already the last element of `history`. Appending it again would
-        // desynchronise the history from the KV state and move checkpoint
-        // tokens off the prompt prefix.
-        if input.len() != 1 || history.last() != input.first() {
-            history.extend_from_slice(input);
-        }
+        record_decode_input(history, input);
         let logits = self
             .model
             .forward(input, None, None, state)
@@ -97,6 +111,53 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         let token = sample_greedy(&self.options, logits, history)?;
         history.push(token);
         Ok(vec![token])
+    }
+
+    /// One plan's decode rows through one multi-sequence verify (#63/#72).
+    ///
+    /// Each row is a single pending token; the shared forward returns that
+    /// row's logits, and every sequence samples through its own [`Sampler`]
+    /// and history exactly like [`Self::decode`]. The state advances by the
+    /// one row the block appends, so history and KV stay aligned. Rows that
+    /// are not single tokens, a solo row, or a plan above the #59 eight-row
+    /// budget keep the per-row path (the batching contract is one token per
+    /// sequence).
+    fn decode_batch(
+        &mut self,
+        rows: &mut [DecodeRow<'_, Self::Slot>],
+    ) -> Result<Vec<Vec<u32>>, Error> {
+        let fits = rows.len() >= 2
+            && rows.iter().all(|row| row.input.len() == 1)
+            && dspark_batch::batch_fits(rows.len(), 1);
+        if !fits {
+            let mut outputs = Vec::with_capacity(rows.len());
+            for row in rows {
+                outputs.push(self.decode(&mut *row.slot, row.input, row.room, row.budget)?);
+            }
+            return Ok(outputs);
+        }
+        let capture: [usize; 0] = [];
+        let mut histories = Vec::with_capacity(rows.len());
+        let mut blocks = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let (state, history) = &mut *row.slot;
+            record_decode_input(history, row.input);
+            histories.push(history);
+            blocks.push(VerifyBlock::new(row.input, state, &capture));
+        }
+        let outputs = self
+            .model
+            .forward_verifying_multi(&mut blocks)
+            .map_err(|error| Error::execution(error.to_string()))?;
+        self.batched_cycles += 1;
+        let mut result = Vec::with_capacity(outputs.len());
+        for (output, history) in outputs.into_iter().zip(histories) {
+            debug_assert_eq!(output.logits.dims()[0], 1, "one decode row per block");
+            let token = sample_greedy(&self.options, output.logits, history)?;
+            history.push(token);
+            result.push(vec![token]);
+        }
+        Ok(result)
     }
 
     fn checkpoint(&self, slot: &Self::Slot) -> Option<Self::Checkpoint> {
@@ -279,6 +340,7 @@ impl<B: Backend> MinicpmRunner<B> {
                         temperature: 0.0,
                         ..Default::default()
                     },
+                    batched_cycles: 0,
                 },
                 config,
                 cache,
@@ -295,6 +357,12 @@ impl<B: Backend> MinicpmRunner<B> {
     /// The resolved engine switches (environment overrides folded in).
     pub fn config(&self) -> &ResinConfig {
         self.session.config()
+    }
+
+    /// Batched verify forwards run so far (0 when `multi_sequence_batch` is
+    /// off or no plan had two rows).
+    pub fn batch_cycles(&self) -> u64 {
+        self.session.adapter().batched_cycles
     }
 
     /// Prefill tokens fed and checkpoint hit/miss counters (#74, #75).

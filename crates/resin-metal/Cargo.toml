@@ -29,6 +29,14 @@ name = "greedy_engine"
 required-features = ["metal"]
 
 [[example]]
+name = "dspark_engine"
+required-features = ["metal"]
+
+[[example]]
+name = "resin_batch_ab"
+required-features = ["metal"]
+
+[[example]]
 name = "state_cache_cold"
 required-features = ["cpu"]
 

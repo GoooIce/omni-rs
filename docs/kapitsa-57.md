@@ -45,10 +45,10 @@ Rejected or removed:
 
 | Mechanism | Where it lives |
 | --- | --- |
-| Calibrated ledger + size rule | `crates/minicpm-v/src/ledger.rs`; selected in `dspark::generate` (`Ledger::load`, `choose`, `observe`). `E(n) = 1 + Σ Π p_d`, cost basis `host-wall-clock`; allowed sets `[3,8,16]` (chain) and `[2,6,14]` (best-first tree); JSON keyed by model, drafter, precision, block policy and chip. |
+| Calibrated ledger + size rule | `crates/minicpm-v/src/ledger.rs`; selected in `dspark::generate` and in the resin DSpark runner's solo `decode` (`Ledger::load`, `choose`, `observe`). `E(n) = 1 + Σ Π p_d`, cost basis `host-wall-clock`; allowed sets `[3,8,16]` (chain) and `[2,6,14]` (best-first tree); JSON keyed by model, drafter, precision, block policy and chip. The CLI and the runner drive the same acceptance code, `run_cycle`; the co-batched path keeps its fixed chain size (per-member sizing is out of scope). |
 | Best-first tree + confidence prefix | `crates/minicpm-v/src/dspark.rs`: `CandidateGrid` (top-2 children per depth, three levels, one packed readback), `select_best_first`, `BlockLayout::BestTree`, `TreeSpec` remap; verify/accept/retain reuse `forward_verifying_tree`, `accept_path`, `retain_path`. |
 | Multi-sequence verify API | `crates/minicpm-v/src/model.rs`: `VerifyBlock`, `TextModel::forward_verifying_multi`, `MultiVerifyOutput`; `text.rs` shares projections/MLP/MoE/LM head across rows and keeps per-sequence KV/linear state. |
-| Resin chain batch | `crates/resin-metal/src/config.rs` (`ResinConfig::multi_sequence_batch`), `session.rs` (`forward_batched_decode`), `dspark_runner.rs` (`DsparkAdapter::decode_batch`), `crates/minicpm-v/src/dspark_batch.rs` (`run_cycle_batch`, `MAX_PLAN_ROWS = 8`). |
+| Resin chain batch | `crates/resin-metal/src/config.rs` (`ResinConfig::multi_sequence_batch`), `session.rs` (`forward_batched_decode`), `dspark_runner.rs` (`DsparkAdapter::decode_batch`), `crates/minicpm-v/src/dspark_batch.rs` (`run_cycle_batch`, `MAX_PLAN_ROWS = 8`); the greedy text runner shares the same plan seam through `GreedyAdapter::decode_batch` (one token per row, one `forward_verifying_multi`). |
 | Conversation slots | `crates/resin-metal/src/session.rs` (`DecodeRequest::slot`, resume path), `conversation.rs` (three checkpoints per key: two turn boundaries plus one append-only prefix). |
 | SSD state cache | `crates/resin-metal/src/state_cache.rs`: namespace fingerprint, token-prefix content chain, versioned binary format, quota/LRU eviction, atomic rename; session queues writes and drains at the idle boundary. |
 | KV budget and release order | `crates/resin-metal/src/config.rs` (`kv_budget_mb`), `memory.rs` (adapter-reported bytes and counters), `session.rs` (`enforce_memory_budget`, `self_drop_key`, `spill_checkpoint`). |
@@ -69,9 +69,9 @@ KV release order and measurement basis.
 | `MINICPM_DSPARK_TREE_BEST` | model | off | best-first tree with the confidence prefix; implies tree mode | `=1` |
 | `MINICPM_DSPARK_MARKOV_QUANT` | model | off | int8 markov scoring | `=1` |
 | `MINICPM_DSPARK_LEDGER` | model | off | calibrated verify-size ledger | `=1` |
-| `MINICPM_DSPARK_LEDGER_PATH` | model | `target/dspark-ledger/` | ledger JSON directory | `=path` |
+| `MINICPM_DSPARK_LEDGER_PATH` | model | `target/dspark-ledger/<fingerprint>.json` | exact ledger JSON **file** path, written verbatim | `=path` |
 | `MINICPM_DSPARK_CHIP` | model | arch/OS | ledger chip fingerprint | `=name` |
-| `multi_sequence_batch` | `ResinConfig` | off | chain co-batch of every decode row in one plan | `RESIN_MULTI_SEQUENCE_BATCH=1` |
+| `multi_sequence_batch` | `ResinConfig` | off | one multi-sequence forward for every decode row of a plan (greedy DSpark chain cycles and greedy one-token rows) | `RESIN_MULTI_SEQUENCE_BATCH=1` |
 | `conversation_slots` | `ResinConfig` | off | restore a stored conversation checkpoint and prefill the suffix | `RESIN_CONVERSATION_SLOTS=1` |
 | `state_cache` | `ResinConfig` | off | persist checkpoints through the SSD cache | `RESIN_STATE_CACHE=1` (needs `conversation_slots`) |
 | `kv_budget_mb` | `ResinConfig` | `None` | KV budget plus the #65 release order | `RESIN_KV_BUDGET_MB=<MiB>` |
@@ -84,9 +84,11 @@ best-first tree only exists in adaptive runs.
 
 ## Default and gate status
 
-Correctness gates passed. The performance gates did not justify a default flip: chain co-batch missed
-its 0.8x gate, tree and ledger lost per accepted token, two-turn missed its TTFT gate, and stacking
-failed. Cold restart and quota-batch passed, but the map still ships every new mechanism off.
+The correctness gates that were run passed; the two gates added by the review (1B greedy co-batch,
+DSpark two-turn checkpoint) are compiled and were not run in the review worktree. The performance
+gates did not justify a default flip: chain co-batch missed its 0.8x gate, tree and ledger lost per
+accepted token, two-turn missed its TTFT gate, and stacking failed. Cold restart and quota-batch
+passed, but the map still ships every new mechanism off.
 
 | Gate (load) | Result | Evidence |
 | --- | --- | --- |
@@ -102,9 +104,16 @@ failed. Cold restart and quota-batch passed, but the map still ships every new m
 | Two-turn state reuse (1B CPU) | **partial**: suffix + question prefill and token-identical output pass; TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL** | `state_two_turn.log` |
 | Quota-constrained co-batch (1B CPU) | pass; 0.502 vs 0.501 tok/s (1.002x), 3 spills, evicted prefix reusable | `state_quota.log` |
 | Chain co-batch cost (35B, block 3, 24 tokens) | **near miss**: 43.99 vs 52.05 ms per accepted token = **0.845x**, above the #63 0.8x gate | `stacking_ab_24b.log` |
-| Best-first tree cost (35B, 24 tokens) | **loses**: 64.8–67.9 vs 51.1 ms/token; τ 1.714 vs 2.0 on the measured prose prompt | `tree_fast1.log`, `tree_fast2.log` |
-| Ledger cost (35B, 48 tokens) | **loses**: 65.2 vs 56.0 ms/token warm (block average 4.0 vs 3.0); first on-run 106.6 ms included exploration/autotune | `ledger_off.log`, `ledger_on2.log` |
+| Best-first tree cost (35B, 24 tokens; single-arm, not interleaved) | **loses**: 64.8–67.9 vs 51.1 ms/token; τ 1.714 vs 2.0 on the measured prose prompt | `tree_fast1.log`, `tree_fast2.log` |
+| Ledger cost (35B, 48 tokens; single-arm, not interleaved) | **loses**: 65.2 vs 56.0 ms/token warm (block average 4.0 vs 3.0); first on-run 106.6 ms included exploration/autotune | `ledger_off.log`, `ledger_on2.log` |
+| 1B greedy co-batch (1B CPU, 2 requests) | gate added (`minicpm_greedy_batch`): stream parity plus a printed batched-vs-per-row ratio; not run in the review worktree, run after merge | — |
+| DSpark two-turn checkpoint (35B Metal) | gate added (`minicpm_dspark_conversation`): suffix prefill and stream parity vs full re-prefill; not run in the review worktree, run after merge | — |
 | Tree + batch stacking (35B, block 3, 24 tokens) | **FAIL**: stacked 72.256 vs chain_batch 43.993 = 1.64x; solo_tree 147.716 | `stacking_ab_24b.log` |
+
+The tree and ledger rows are **single-arm runs** on the stated load (an off run and an on run,
+not an interleaved same-state pair), so they are indicative negative results — enough to keep a
+default off, not gate-quality A/B evidence. The chain co-batch and stacking numbers come from the
+three-arm interleaved run (`stacking_ab_24b.log`).
 
 Status by mechanism:
 
@@ -113,9 +122,11 @@ Status by mechanism:
   a default (#68 allows a flip only after the maintainer's same-load landing decision).
 - **Quota-batch**: throughput-neutral and preserves prefix reuse; off.
 - **Two-turn**: fails its TTFT gate; off.
-- **Chain co-batch**: 0.845x is an improvement but above the 0.8x gate; off. Against the #61
-  block-16 direct baseline (136.0 ms) it is 0.32x, but block 16 cannot co-batch (see below); the
-  same-block number is the honest one.
+- **Chain co-batch**: 0.845x is an improvement but above the 0.8x gate; off. The block-16 target
+  load cannot co-batch under the 8-row cap (two block-16 chains are 34 rows), so the same-block
+  0.845x is the only honest comparison; there is no valid cross-block ratio.
+- **1B greedy co-batch**: wired through the same switch; the `minicpm_greedy_batch` gate exists
+  but was not run in the review worktree, so the switch stays off and no 1B ratio is claimed.
 - **Best-first tree** and **ledger**: lose per accepted token on the measured prompt; off.
 - **Stacking**: removed, not just disabled.
 
@@ -138,7 +149,8 @@ idle machine. The model-side manifest is not a root workspace member, so run its
 `crates/minicpm-v`.
 
 ```sh
-# Model side (crates/minicpm-v).
+# Model side (crates/minicpm-v). multi_verify_parity also runs the tree-block
+# multi gate (2 sequences, per-node sequential-path reference).
 cargo test --no-default-features --features native,cpu --test multi_verify_parity -- --ignored --nocapture
 cargo test --release --features metal --test multi_verify_parity -- --ignored --nocapture
 cargo test --no-default-features --features native,cpu --test tree_best_parity -- --ignored --nocapture
@@ -153,6 +165,10 @@ cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features me
   --test minicpm_dspark_engine -- --ignored --nocapture
 cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal \
   --test minicpm_dspark_batch -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal \
+  --test minicpm_dspark_conversation -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu \
+  --test minicpm_greedy_batch -- --ignored --nocapture
 
 # State protocols (#66): two processes for cold start; each prints gate=pass|fail|skip.
 scripts/state-cache-cold-start.sh
@@ -181,15 +197,32 @@ over a config `false`, and a set variable would corrupt an arm.
 - **SSD writes are not a background thread.** Checkpoints are queued and encoded synchronously on the
   runner thread at the idle boundary (after `release` or before the next `forward`), because encoding
   reads device tensors back with `into_data()`.
+- **SSD persistence hangs off the conversation-checkpoint seam, not resin-core pages.** The runner
+  still owns the model KV and has no `cache_layout`, so the engine's paged-KV path cannot persist it;
+  `state_cache` serializes the adapter's checkpoints (`CheckpointPayload`) and keys them by the token
+  content chain. The cold-start gate (0.001x TTFT) passes on this checkpoint seam, not on engine page
+  persistence.
 - **Single-chunk prefill assumption.** The checkpoint path only runs for a prefill row that starts at
   context 0 and ends at the prefill endpoint. Continuation chunks and prefix-cache hits carry a suffix
   and take the unchanged full prefill; the adapter's single-chunk `prefill` semantics are unchanged.
 - **Release-order tiers 2 and 4 are empty here.** This runner holds no image embedding cache and
   single-chunk prefill keeps no pending KV across requests; the ANE split is out of scope. The
   experiment header names all three rather than silently omitting them.
-- **No 1B greedy batch validation.** The batch path is DSpark-only: `MinicpmRunner` keeps the default
-  per-row `decode_batch`, and `DsparkAdapter::decode_batch` refuses non-greedy requests and falls back
-  per row. A 1B greedy co-batch has no code path to exercise.
+- **1B greedy co-batch is wired but not measured here.** `GreedyAdapter::decode_batch` sends every
+  single-token decode row of a plan through one `forward_verifying_multi` (up to the 8-row cap;
+  anything else falls back per row), and `minicpm_greedy_batch` asserts stream parity and prints the
+  batched-vs-per-row ratio. The gate needs the 1B checkpoint and was not run in the review worktree;
+  the switch stays off and no 1B ratio is claimed. `DsparkAdapter::decode_batch` still refuses
+  non-greedy requests and falls back per row.
+- **KV budget contract.** The budget releases checkpoints, never live KV: after a checkpoint
+  insertion or slot creation the session runs self-drop, then idle-checkpoint LRU (spill to SSD when
+  `state_cache` is on, otherwise drop). Live slot KV is never evicted; if live slots alone exceed the
+  budget, `memory_stats().over_budget_bytes` reports the remainder and the plan continues. Tiers the
+  runner does not hold (image embedding cache, pending-prefill KV) and the out-of-scope ANE split are
+  named in the experiment header.
+- **One drafter behind a trait.** `dspark::Drafter<B>` is the construction-time seam the cycle
+  drivers consume; `Draft<B>` is its only implementation (#62 declined a second drafter). The ledger
+  sizes solo rows only; co-batched members keep the fixed chain block.
 - **No multi-row `MatchingDecode`.** The multi-sequence path is the batched contract only.
 - **Tree modes are adaptive-only.** Pinning `MINICPM_DSPARK_BLOCK` keeps the chain path.
 - **The 8-row cap is a hard limit.** Block sizes whose co-batched rows exceed 8 fall back to per-row;

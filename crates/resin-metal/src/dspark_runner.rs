@@ -27,10 +27,12 @@ use burn::tensor::{Tensor, TensorData, backend::Backend};
 use omni_minicpm_v::dspark::{self, BlockLayout, Draft, DraftState, SpecStats};
 use omni_minicpm_v::dspark_batch::{self, BatchCycleMember};
 use omni_minicpm_v::generate::{Options, Sampler};
+use omni_minicpm_v::ledger::{CycleObservation, Ledger, LedgerKey};
 use omni_minicpm_v::model::{DecodeState, TextModel, VerifyNumerics};
 use omni_minicpm_v::text::LinearState;
 use omni_r2t2::tensor::KvCache;
 use resin_core::engine::{Error, Runner};
+use std::time::Instant;
 
 use crate::config::ResinConfig;
 use crate::conversation::ConversationStats;
@@ -46,6 +48,11 @@ struct DsparkAdapter<B: Backend> {
     numerics: VerifyNumerics,
     eos_ids: Vec<u32>,
     stats: SpecStats,
+    /// Calibrated verify-size ledger (#69/#65), `Some` only when
+    /// `MINICPM_DSPARK_LEDGER=1`. Solo rows choose their chain length from it;
+    /// the co-batched path keeps its fixed-size chain (per-member sizing is
+    /// out of scope for #65).
+    ledger: Option<Ledger>,
     /// Number of `decode_batch` calls that ran one shared verify forward.
     batched_cycles: u64,
 }
@@ -58,6 +65,15 @@ impl<B: Backend> DsparkAdapter<B> {
             && self.options.repetition_penalty == 1.0
             && self.options.presence_penalty == 0.0
     }
+
+    /// The largest chain the drafter's K/V buffers must hold: the fixed block
+    /// or the ledger's largest allowed size, whichever is larger.
+    fn max_block(&self) -> usize {
+        self.ledger
+            .as_ref()
+            .and_then(|ledger| ledger.allowed().iter().copied().max())
+            .map_or(self.block_len, |size| size.max(self.block_len))
+    }
 }
 
 /// One sequence's private decode state: target state, draft state and the
@@ -66,6 +82,27 @@ struct DsparkSlot<B: Backend> {
     state: DecodeState<B>,
     draft_state: DraftState<B>,
     history: Vec<u32>,
+}
+
+/// Record a decode row's bonus in the slot history exactly once.
+///
+/// The slot invariant is KV alignment: after prefill (or a resumed prefill)
+/// `history.len() == state.length + 1`, because the prefill sample is the
+/// pending bonus and is already in the history; after a cycle
+/// `history.len() == state.length`, because the pending correction is in
+/// neither. The engine feeds that pending token back as the next decode
+/// row's input, so a bonus belongs in the history only when the state
+/// already covers it. Recording by KV alignment rather than token identity
+/// keeps a legitimate repeat (a correction equal to the last accepted token)
+/// recorded; the prefill sample itself is never pushed twice.
+fn record_bonus(history: &mut Vec<u32>, state_length: usize, bonus: u32) {
+    debug_assert!(
+        history.len() <= state_length + 1,
+        "history ran ahead of the KV state"
+    );
+    if history.len() <= state_length {
+        history.push(bonus);
+    }
 }
 
 /// One DSpark slot's conversation checkpoint (#74).
@@ -120,7 +157,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             sampler.sample(values, &history).map_err(Error::execution)?
         };
         history.push(first);
-        let capacity = dspark::draft_capacity(input.len(), budget, self.block_len);
+        let capacity = dspark::draft_capacity(input.len(), budget, self.max_block());
         let draft_state = self
             .draft
             .prepare(captured, capacity)
@@ -144,17 +181,24 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         _budget: usize,
     ) -> Result<Vec<u32>, Error> {
         // Decode rows carry exactly the last sampled token: the bonus the
-        // cycle proposes from.
+        // cycle proposes from. After prefill that token is already the last
+        // history entry (the prefill sample), so record it only when the KV
+        // state has caught up to the history.
         let bonus = input[0];
-        slot.history.push(bonus);
+        record_bonus(&mut slot.history, slot.state.length, bonus);
+        // `MINICPM_DSPARK_LEDGER=1` replaces the fixed block with the
+        // calibrated size rule; the observed cycle feeds the estimates back.
+        let chosen = self.ledger.as_mut().map(Ledger::choose);
+        let layout = dspark::BlockLayout::Chain {
+            len: chosen.unwrap_or(self.block_len),
+        };
+        let cycle = Instant::now();
         let outcome = dspark::run_cycle(
             &self.model,
             &self.draft,
             &mut slot.draft_state,
             &mut slot.state,
-            &dspark::BlockLayout::Chain {
-                len: self.block_len,
-            },
+            &layout,
             bonus,
             self.numerics,
             &self.eos_ids,
@@ -165,6 +209,17 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             &mut self.stats,
         )
         .map_err(Error::execution)?;
+        let cycle_ms = cycle.elapsed().as_secs_f64() * 1000.0;
+        if let (Some(ledger), Some(size)) = (self.ledger.as_mut(), chosen) {
+            ledger.observe(CycleObservation {
+                size,
+                rows: outcome.rows,
+                accepted: outcome.tokens.len(),
+                verify_ms: outcome.verify_ms,
+                cycle_ms,
+                trimmed: outcome.trimmed,
+            });
+        }
         self.stats.cycles += 1;
         self.stats.draft_tokens_accepted += outcome.tokens.len() as u64;
         self.stats.output_tokens += outcome.tokens.len() as u64 + 1;
@@ -216,9 +271,11 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         for (row, layout) in rows.iter_mut().zip(layouts.iter()) {
             let slot = &mut *row.slot;
             // Every decode row carries exactly the bonus; the history the
-            // accept walk predicts against includes it, like the per-row path.
+            // accept walk predicts against includes it, like the per-row path,
+            // and the same KV-alignment guard keeps the prefill sample from
+            // being recorded twice after the first decode.
             let bonus = row.input[0];
-            slot.history.push(bonus);
+            record_bonus(&mut slot.history, slot.state.length, bonus);
             members.push(BatchCycleMember {
                 draft_state: &mut slot.draft_state,
                 state: &mut slot.state,
@@ -300,7 +357,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             let Some(pending) = pending else {
                 return Ok(None);
             };
-            draft_state.ensure_capacity(tokens.len() + budget + self.block_len + 1);
+            draft_state.ensure_capacity(tokens.len() + budget + self.max_block() + 1);
             let mut history = tokens;
             history.push(pending);
             return Ok(Some((
@@ -312,7 +369,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
                 vec![pending],
             )));
         }
-        draft_state.ensure_capacity(tokens.len() + input.len() + budget + self.block_len + 1);
+        draft_state.ensure_capacity(tokens.len() + input.len() + budget + self.max_block() + 1);
         let (logits, _, captured) = self
             .model
             .forward_capturing(
@@ -545,6 +602,16 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         // Resolve the environment once; the session folds the overrides
         // again, which is idempotent.
         let config = config.with_env_overrides();
+        // `MINICPM_DSPARK_LEDGER=1` turns the calibrated ledger on for solo
+        // rows. The default identity is the engine's, not the weight file's
+        // (the runner does not see the precision); callers with a real model
+        // pair override it through `with_ledger_key`.
+        let ledger = omni_minicpm_v::knobs::dspark_ledger().then(|| {
+            Ledger::load(
+                omni_minicpm_v::ledger::ALLOWED_SIZES.to_vec(),
+                LedgerKey::new("resin", "dspark", "engine", "adaptive"),
+            )
+        });
         Self {
             session: DecodeSession::with_config_and_state_cache(
                 DsparkAdapter {
@@ -563,12 +630,26 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
                         stats.trace.enabled = omni_minicpm_v::knobs::dspark_trace();
                         stats
                     },
+                    ledger,
                     batched_cycles: 0,
                 },
                 config,
                 cache,
             ),
         }
+    }
+
+    /// Override the ledger checkpoint identity (`MINICPM_DSPARK_LEDGER=1`).
+    /// The default identity is model `resin`, drafter `dspark`, precision
+    /// `engine` and block `adaptive`; pass the real model/drafter/precision
+    /// labels so estimates are keyed like the CLI's. Ignored while the
+    /// switch is off.
+    pub fn with_ledger_key(mut self, key: LedgerKey) -> Self {
+        if let Some(ledger) = self.session.adapter_mut().ledger.as_mut() {
+            let allowed = ledger.allowed().to_vec();
+            *ledger = Ledger::load(allowed, key);
+        }
+        self
     }
 
     /// Replace the experimental switches at runtime (same-process A/B arms).
@@ -629,6 +710,73 @@ impl<B: Backend> Runner<DecodeRequest> for MinicpmDsparkRunner<B> {
     }
 
     fn release(&mut self, request_ids: &[u64]) -> Result<(), Error> {
-        self.session.release(request_ids)
+        self.session.release(request_ids)?;
+        // The release is the idle boundary: persist the ledger estimates the
+        // solo cycles produced (the CLI saves at the end of `generate`).
+        if let Some(ledger) = self.session.adapter().ledger.as_ref()
+            && ledger.cycles() > 0
+        {
+            ledger.save();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_bonus;
+
+    /// The prefill sample is the first decode's bonus and is already in the
+    /// history; a second push would shift `history[..state.length]` off the
+    /// KV-aligned checkpoint prefix.
+    #[test]
+    fn prefill_sample_is_not_recorded_twice() {
+        // Prompt [1, 2, 3], prefill state covers it, sample 10 pending.
+        let mut history = vec![1, 2, 3, 10];
+        record_bonus(&mut history, 3, 10);
+        assert_eq!(history, vec![1, 2, 3, 10], "prefill sample pushed twice");
+        // The checkpoint token prefix is the prompt, and the pending sample
+        // is what the checkpoint stores as `pending`.
+        assert_eq!(&history[..3], &[1, 2, 3]);
+        assert_eq!(history.get(3), Some(&10));
+    }
+
+    /// After a cycle the history has caught up to the KV state and the
+    /// correction is pending; it must be recorded, even when it repeats the
+    /// last accepted token.
+    #[test]
+    fn cycle_correction_is_recorded_even_when_it_repeats() {
+        // State covers prompt + bonus + accepted [10, 11]; history matches.
+        let mut history = vec![1, 2, 3, 10, 11];
+        record_bonus(&mut history, 5, 11);
+        assert_eq!(history, vec![1, 2, 3, 10, 11, 11]);
+        assert_eq!(history.len(), 6);
+    }
+
+    /// End-to-end alignment over the engine's row sequence: prefill, one
+    /// cycle that accepts two drafts and emits a correction, then that
+    /// correction's cycle.
+    #[test]
+    fn checkpoint_history_stays_kv_aligned_across_cycles() {
+        let mut state_length = 3usize; // prompt
+        let mut history = vec![1, 2, 3, 10]; // prefill sample 10
+        assert_eq!(history.len(), state_length + 1);
+
+        // Cycle 1: the engine feeds the prefill sample back as the bonus.
+        record_bonus(&mut history, state_length, 10);
+        assert_eq!(history, vec![1, 2, 3, 10], "first row is not a duplicate");
+        // Two drafts accepted, correction 13 pending.
+        history.extend_from_slice(&[11, 12]);
+        state_length += 3; // bonus + two accepted
+        assert_eq!(history.len(), state_length, "correction stays pending");
+        assert_eq!(&history[..state_length], &[1, 2, 3, 10, 11, 12]);
+
+        // Cycle 2: the correction is the next row's bonus.
+        record_bonus(&mut history, state_length, 13);
+        assert_eq!(history.len(), state_length + 1);
+        history.extend_from_slice(&[14]); // one draft accepted, correction 15
+        state_length += 2; // bonus + one accepted
+        assert_eq!(history.len(), state_length);
+        assert_eq!(&history[..state_length], &[1, 2, 3, 10, 11, 12, 13, 14]);
     }
 }

@@ -766,6 +766,92 @@ impl<B: Backend> DraftState<B> {
     }
 }
 
+/// The drafter seam behind the speculative cycle (#62: one drafter, no
+/// wrapper enum).
+///
+/// [`Draft`] is the only implementation: DSpark's markov-headed draft model,
+/// built by [`Draft::load`]. The trait names the capability the cycle drivers
+/// consume — prepare a context from the prompt capture, extend it with
+/// accepted tokens, and propose a chain or tree block — so the cycle code
+/// does not name the loader's concrete type. An engine chooses its
+/// implementation at construction; adding a second drafter means implementing
+/// this trait, which #62 explicitly declined to do.
+///
+/// `State` is the drafter's per-sequence context. The cycle drivers pin it to
+/// [`DraftState`] because both the capacity rule ([`draft_capacity`]) and the
+/// resin checkpoint encoder name that buffer layout; a future drafter with a
+/// different context would widen those seams first.
+pub trait Drafter<B: Backend> {
+    /// The drafter's per-sequence context.
+    type State;
+
+    /// Build the context from the prompt capture. `capacity` bounds the
+    /// accepted history the context must hold.
+    fn prepare(&self, captured: Vec<Tensor<B, 3>>, capacity: usize) -> Result<Self::State>;
+
+    /// Extend the context with the accepted tokens of a verify block.
+    fn extend(&self, state: &mut Self::State, fresh: Vec<Tensor<B, 3>>) -> Result<()>;
+
+    /// Chain proposal: `len` draft token ids after `anchor`.
+    fn propose_chain(
+        &self,
+        target: &TextModel<B>,
+        state: &mut Self::State,
+        anchor: u32,
+        len: usize,
+    ) -> Result<Vec<u32>>;
+
+    /// Full-binary markov tree proposal: the verify block's tree token ids
+    /// and the layout the tree verify/accept path consumes.
+    fn propose_tree(
+        &self,
+        target: &TextModel<B>,
+        state: &mut Self::State,
+        anchor: u32,
+        levels: usize,
+    ) -> Result<(Vec<u32>, TreeSpec)>;
+
+    /// Best-first tree proposal over `live` selected nodes.
+    fn propose_tree_best(
+        &self,
+        target: &TextModel<B>,
+        state: &mut Self::State,
+        anchor: u32,
+        levels: usize,
+        live: usize,
+    ) -> Result<(Vec<u32>, TreeSpec)>;
+
+    /// Propose one block under `layout`, returning the draft token ids (the
+    /// bonus excluded) and, for a tree layout, the [`TreeSpec`] the verify
+    /// forward and accept walk consume.
+    ///
+    /// Both cycle drivers share this seam: [`run_cycle`] for one sequence and
+    /// [`crate::dspark_batch::run_cycle_batch`] for a plan whose members may
+    /// mix chain and tree layouts.
+    fn propose_layout(
+        &self,
+        target: &TextModel<B>,
+        state: &mut Self::State,
+        anchor: u32,
+        layout: &BlockLayout,
+    ) -> Result<(Vec<u32>, Option<TreeSpec>)> {
+        match layout {
+            BlockLayout::Tree { levels } => {
+                let (tokens, tree) = self.propose_tree(target, state, anchor, *levels)?;
+                Ok((tokens, Some(tree)))
+            }
+            BlockLayout::BestTree { levels, live } => {
+                let (tokens, tree) =
+                    self.propose_tree_best(target, state, anchor, *levels, *live)?;
+                Ok((tokens, Some(tree)))
+            }
+            BlockLayout::Chain { len } => {
+                Ok((self.propose_chain(target, state, anchor, *len)?, None))
+            }
+        }
+    }
+}
+
 pub struct Draft<B: Backend> {
     layers: Vec<Layer<B>>,
     fc: shared::Linear<B>,
@@ -1115,34 +1201,6 @@ impl<B: Backend> Draft<B> {
         Ok((tree.tokens.clone(), tree))
     }
 
-    /// Propose one block under `layout`, returning the draft token ids (the
-    /// bonus excluded) and, for a tree layout, the [`TreeSpec`] the verify
-    /// forward and accept walk consume.
-    ///
-    /// Both cycle drivers share this seam: [`run_cycle`] for one sequence and
-    /// [`crate::dspark_batch::run_cycle_batch`] for a plan whose members may
-    /// mix chain and tree layouts.
-    pub(crate) fn propose_layout(
-        &self,
-        target: &TextModel<B>,
-        state: &mut DraftState<B>,
-        anchor: u32,
-        layout: &BlockLayout,
-    ) -> Result<(Vec<u32>, Option<TreeSpec>)> {
-        match layout {
-            BlockLayout::Tree { levels } => {
-                let (tokens, tree) = self.propose_tree(target, state, anchor, *levels)?;
-                Ok((tokens, Some(tree)))
-            }
-            BlockLayout::BestTree { levels, live } => {
-                let (tokens, tree) =
-                    self.propose_tree_best(target, state, anchor, *levels, *live)?;
-                Ok((tokens, Some(tree)))
-            }
-            BlockLayout::Chain { len } => Ok((self.propose(target, state, anchor, *len)?, None)),
-        }
-    }
-
     /// Chain-mode propose: the draft forward runs on `block_len` masked
     /// tokens, then the markov head walks `block_len` serial argmax steps.
     pub(crate) fn propose(
@@ -1296,6 +1354,49 @@ impl<B: Backend> Draft<B> {
             .clone()
             .gather(0, previous.clone().repeat_dim(1, RANK));
         self.markov_w2.forward(embed) + base_row
+    }
+}
+
+impl<B: Backend> Drafter<B> for Draft<B> {
+    type State = DraftState<B>;
+
+    fn prepare(&self, captured: Vec<Tensor<B, 3>>, capacity: usize) -> Result<DraftState<B>> {
+        Draft::prepare(self, captured, capacity)
+    }
+
+    fn extend(&self, state: &mut DraftState<B>, fresh: Vec<Tensor<B, 3>>) -> Result<()> {
+        Draft::extend(self, state, fresh)
+    }
+
+    fn propose_chain(
+        &self,
+        target: &TextModel<B>,
+        state: &mut DraftState<B>,
+        anchor: u32,
+        len: usize,
+    ) -> Result<Vec<u32>> {
+        self.propose(target, state, anchor, len)
+    }
+
+    fn propose_tree(
+        &self,
+        target: &TextModel<B>,
+        state: &mut DraftState<B>,
+        anchor: u32,
+        levels: usize,
+    ) -> Result<(Vec<u32>, TreeSpec)> {
+        Draft::propose_tree(self, target, state, anchor, levels)
+    }
+
+    fn propose_tree_best(
+        &self,
+        target: &TextModel<B>,
+        state: &mut DraftState<B>,
+        anchor: u32,
+        levels: usize,
+        live: usize,
+    ) -> Result<(Vec<u32>, TreeSpec)> {
+        Draft::propose_tree_best(self, target, state, anchor, levels, live)
     }
 }
 
@@ -1530,9 +1631,9 @@ pub(crate) fn greedy_argmax_block<B: Backend>(
 /// drive the identical acceptance path. `history` already includes `bonus`;
 /// `room` bounds emission exactly like the generate loop.
 #[allow(clippy::too_many_arguments)]
-pub fn run_cycle<B: Backend>(
+pub fn run_cycle<B: Backend, D: Drafter<B, State = DraftState<B>>>(
     model: &TextModel<B>,
-    draft: &Draft<B>,
+    draft: &D,
     draft_state: &mut DraftState<B>,
     state: &mut crate::model::DecodeState<B>,
     layout: &BlockLayout,
@@ -1622,9 +1723,9 @@ pub fn run_cycle<B: Backend>(
 ///
 /// `identity` names the checkpoint pair the ledger's persisted estimates are
 /// keyed under; it is only read when `MINICPM_DSPARK_LEDGER=1`.
-pub fn generate<B: Backend>(
+pub fn generate<B: Backend, D: Drafter<B, State = DraftState<B>>>(
     model: &TextModel<B>,
-    draft: &Draft<B>,
+    draft: &D,
     prompt: &Prompt<B>,
     options: Options,
     eos_ids: &[u32],

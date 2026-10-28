@@ -25,19 +25,24 @@
 ### 失败与未达门槛
 
 - **两轮状态复用**：后缀+问题预填与逐 token 相同均通过，但第二轮 TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL**（`state_two_turn.log`）。默认保持关。
-- **链式合批成本**：35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**，高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。相对 #61 的 block-16 直连 136.0 ms 为 0.32×，但 block 不同，不作为过门依据。默认保持关。
-- **best-first 树**：64.8–67.9 vs 51.1 ms/token（24 token，τ 1.714 vs 2.0，prose 提示）——按接受 token 更慢（`tree_fast1.log`、`tree_fast2.log`）。默认保持关。
-- **标定账本**：48 token，warm 65.2 vs 56.0 ms/token（block 均值 4.0 vs 3.0）；首次开启 106.6 ms 含探索与新形状 autotune（`ledger_off.log`、`ledger_on2.log`）。默认保持关。
+- **链式合批成本**：35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**，高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。block-16 目标负载在 8 行上限下无法合批（两条 block-16 链是 34 行），因此只有同 block 的 0.845× 是可比较数字，不存在有效的跨 block 比值。默认保持关。
+- **best-first 树**（单臂运行，非交错 A/B，仅作默认关的指示性负结果）：64.8–67.9 vs 51.1 ms/token（24 token，τ 1.714 vs 2.0，prose 提示）——按接受 token 更慢（`tree_fast1.log`、`tree_fast2.log`）。默认保持关。
+- **标定账本**（单臂运行，非交错 A/B，仅作默认关的指示性负结果）：48 token，warm 65.2 vs 56.0 ms/token（block 均值 4.0 vs 3.0）；首次开启 106.6 ms 含探索与新形状 autotune（`ledger_off.log`、`ledger_on2.log`）。默认保持关。
 - **树 + 合批叠加**：三臂交错 A/B、2 轮、block 3、24 token：chain_batch 43.993、solo_tree 147.716、stacked 72.256 ms/接受 token。stacked < chain_batch **FAIL（1.64×）**（`stacking_ab_24b.log`）；按 #67 删除叠加开关，只保留互斥。
 
 ### 数值与行预算边界
 
 - **既有 close-argmax**：`VerifyNumerics::Batched` 下，既有链式 verify 在 64 token 运行的第 49 token 对普通贪心翻转一次 argmax（`tree_best_35b_64.log`），与树/合批无关。直连贪心 parity 门固定 24 token；长程检查只比较同一数值口径下的布局。
 - **8 行上限**：一次多序列 verify 最多 8 行（#59）。两个 block-16 链是 34 行，超出契约：该形状走 >32 行的 MoE 回退，cubek-matmul 在 worker 线程 panic 12 次（测试仍通过），因此 runner 在预算外退回逐行。已测合批/叠加形状为 block 3（两成员各 4 行）；block 16 无法合批。
+- **SSD 持久化接缝**：`state_cache` 挂在会话检查点接缝上，而不是 resin-core 页缓存——runner 仍自持 KV，没有 `cache_layout`。冷启动门（0.001× TTFT）验证的是该检查点接缝，不是引擎页持久化。
+- **KV 额度契约**：额度只释放检查点，不淘汰 live slot KV；先自弃、再按 LRU 释放空闲检查点（`state_cache` 开时先落盘）。live 单独超额度时请求照常完成，差额记入 `memory_stats().over_budget_bytes`；本 runner 不持有的层级（图像 embedding 缓存、pending-prefill KV）与 ANE split 在实验头注明。
 
 ### 未运行
 
-- **1B 贪心合批门未运行**：合批路径只在 DSpark runner（`DsparkAdapter::decode_batch`）；贪心 `MinicpmRunner` 保留默认逐行 `decode_batch`，当前没有可执行的 1B 贪心合批代码路径，故不伪造该门。
+- **1B 贪心合批已接通但本轮未测**：`GreedyAdapter::decode_batch` 把一计划内每个单 token 解码行送入一次 `forward_verifying_multi`（≤8 行，否则逐行回退）；新增 `minicpm_greedy_batch` 门做流逐 token 对比并打印合批/逐行耗时比。该门需要 1B 权重，本轮工作树未运行；开关保持关，不声称 1B 比值。
+- **DSpark 两轮对话检查点门**：新增 `minicpm_dspark_conversation`（35B int4 + DSpark，Metal），断言后缀预填与对流全量重预填逐 token 相同；本轮工作树只编译、未运行（权重在主检出）。
+- **树块多序列 verify 的独立参考**：新增 1B CPU 门（`multi_verify_parity` 内，两个树块逐节点对顺序 `forward` 比较，并校验 retain 后的续算）；本轮只编译、未运行。
+- **账本接到 resin runner 的 solo `decode`**：`MINICPM_DSPARK_LEDGER=1` 时 runner 用 `Ledger::choose` 选链长并在 `release` 落盘；批处理行保持固定链长。CLI 的账本 A/B 数字不因这次接线重跑，runner 端权重门未测。
 - ANE split 与图像 embedding 缓存层级按地图 Out of scope，未测、也未实现；`memory_stats()` 与实验头如实注明这些层级在本 runner 为空。
 - SSD 写盘按空闲边界在 runner 线程同步 drain（编码需 `into_data()` 读回设备），不是后台线程；未测独立后台写的吞吐。
 
@@ -53,8 +58,10 @@ cargo test --release --features metal --test tree_best_parity -- --ignored --noc
 # 引擎侧
 cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu --test minicpm_conversation -- --ignored --nocapture
 cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu --test minicpm_quota -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu --test minicpm_greedy_batch -- --ignored --nocapture
 cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal --test minicpm_dspark_engine -- --ignored --nocapture
 cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal --test minicpm_dspark_batch -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal --test minicpm_dspark_conversation -- --ignored --nocapture
 
 # 状态协议与 A/B（无 1B 权重时 gate=skip）
 scripts/state-cache-cold-start.sh
@@ -73,7 +80,7 @@ MINICPM_DSPARK_TRACE=1 MINICPM_DSPARK_TREE_BEST=1 cargo run --manifest-path crat
 
 - `tests/kv_budget.rs`：无额度路径不动；自弃先于空闲释放且只作用于缺失 key；空闲检查点按 LRU 逐个释放；`state_cache` 开时先 spill 再移出内存，随后同一前缀从 SSD 命中、只预填后缀；live 单独超额度时请求完成且差额正确。
 - `src/config.rs`：默认关、`RESIN_KV_BUDGET_MB` 解析（0/非法视为关）、实验头包含额度与释放次序说明。
-- 1B 权重门（`two-turn`、`quota-batch` 脚本与 `tests/minicpm_quota.rs`）本轮**未运行**：机器已预留，权重不在本工作树。脚本在无权重时打印 `gate=skip` 退出。
+- 1B 权重门（`two-turn`、`quota-batch` 脚本与 `tests/minicpm_quota.rs`）在 #76 实现阶段未运行（权重不在当时工作树）；**随后 #57 收口轮已在 1B 权重上运行**：quota-batch 通过，two-turn 未达 TTFT 门，结果与日志见上方 #57 条目（`gates/state_quota.log`、`gates/state_two_turn.log`）。脚本在无权重时打印 `gate=skip` 退出。
 
 复现：
 
