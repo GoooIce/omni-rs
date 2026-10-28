@@ -1,12 +1,10 @@
-//! Weight-free routing for the tree+batch stacking switch (#73).
+//! Weight-free routing for the multi-sequence batch switch (#72).
 //!
-//! `ResinConfig::tree_batch` is the composite switch: it turns on the
-//! co-batched path for plans with two or more decode rows (where every member
-//! then gets a capped best-first tree), and it changes nothing for solo rows.
-//! The scripted adapter records which session path ran, so these assertions
-//! are about observable routing, not internals. The per-member layout choice
-//! and row budget live in `omni_minicpm_v::dspark_batch` and are covered
-//! there.
+//! `ResinConfig::multi_sequence_batch` turns on the co-batched path for plans
+//! with two or more decode rows and changes nothing for solo rows. The
+//! scripted adapter records which session path ran, so these assertions are
+//! about observable routing, not internals. The row budget lives in
+//! `omni_minicpm_v::dspark_batch` and is covered there.
 
 use resin_core::Phase;
 use resin_core::engine::{Error, ExecutionPlan, OwnedTokenRows, Runner};
@@ -118,9 +116,9 @@ fn two_decode_rows() -> Vec<(u64, Vec<u32>)> {
 }
 
 #[test]
-fn tree_batch_alone_routes_co_batched_rows_to_one_batch() {
+fn multi_sequence_batch_routes_co_batched_rows_to_one_batch() {
     let mut session = session(ResinConfig {
-        tree_batch: true,
+        multi_sequence_batch: true,
         ..ResinConfig::default()
     });
     let output = session.forward(decode(&two_decode_rows())).unwrap();
@@ -130,21 +128,9 @@ fn tree_batch_alone_routes_co_batched_rows_to_one_batch() {
 }
 
 #[test]
-fn multi_sequence_batch_keeps_routing_co_batched_rows_to_one_batch() {
+fn solo_decode_rows_stay_on_the_per_row_path_with_batching_on() {
     let mut session = session(ResinConfig {
         multi_sequence_batch: true,
-        ..ResinConfig::default()
-    });
-    let output = session.forward(decode(&two_decode_rows())).unwrap();
-    assert_eq!(session.adapter().batch_row_counts, vec![2]);
-    assert_eq!(rows(output), vec![vec![102], vec![103]]);
-}
-
-#[test]
-fn solo_decode_rows_stay_on_the_per_row_path_with_stacking_on() {
-    let mut session = session(ResinConfig {
-        multi_sequence_batch: true,
-        tree_batch: true,
         ..ResinConfig::default()
     });
     let output = session.forward(decode(&[(11, vec![201])])).unwrap();

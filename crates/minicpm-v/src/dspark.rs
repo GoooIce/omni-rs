@@ -72,7 +72,7 @@ pub enum BlockLayout {
     /// A best-first markov tree: `levels` candidate depths feed a
     /// best-first selection of `live` ancestor-closed nodes. The verify
     /// block holds the bonus plus `live` rows, so `live + 1 <=
-    /// MAX_TREE_ROWS`; `#73`'s 2x4 budget is `live: 3`.
+    /// MAX_TREE_ROWS`.
     BestTree { levels: usize, live: usize },
 }
 
@@ -84,18 +84,6 @@ impl BlockLayout {
             BlockLayout::Chain { len } => *len,
             BlockLayout::Tree { levels } => *levels,
             BlockLayout::BestTree { levels, live } => (*levels).min(*live),
-        }
-    }
-
-    /// The verify block's row count this layout produces, bonus included.
-    /// Best-first selection may return fewer rows than `live` when the
-    /// candidate grid is exhausted; this is the upper bound a row budget
-    /// must reserve.
-    pub fn rows(&self) -> usize {
-        match self {
-            BlockLayout::Chain { len } => len + 1,
-            BlockLayout::Tree { levels } => full_binary_live(*levels) + 1,
-            BlockLayout::BestTree { live, .. } => live + 1,
         }
     }
 
@@ -282,8 +270,7 @@ pub(crate) fn accept_path(
 ///
 /// The full-binary [`TreeSpec::binary`] and the best-first selector build
 /// this type; the fields stay crate-private, and the public accessors plus
-/// [`TreeSpec::new`] are the construction seam for external engines (the
-/// resin tree+batch stacking ticket).
+/// [`TreeSpec::new`] are the construction seam for external engines.
 pub struct TreeSpec {
     /// Tree token ids (the bonus excluded), breadth-first.
     pub(crate) tokens: Vec<u32>,
@@ -1113,7 +1100,7 @@ impl<B: Backend> Draft<B> {
     ///
     /// Both cycle drivers share this seam: [`run_cycle`] for one sequence and
     /// [`crate::dspark_batch::run_cycle_batch`] for a plan whose members may
-    /// mix chain and tree layouts (#73).
+    /// mix chain and tree layouts.
     pub(crate) fn propose_layout(
         &self,
         target: &TextModel<B>,
@@ -2233,7 +2220,7 @@ mod tests {
         assert_eq!(all.tokens().len(), 14);
         assert_eq!(all.rows(), 15);
         assert!(all.rows() <= 16);
-        // #73's 2x4 per-sequence budget is live 3 (bonus + 3 rows).
+        // A small capped selection: live 3 (bonus + 3 rows).
         let capped = select_best_first(&grid, 3);
         assert_eq!(capped.tokens().len(), 3);
         assert_eq!(capped.rows(), 4);

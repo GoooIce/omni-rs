@@ -8,14 +8,16 @@
 //! like the per-row path — and acceptance, trimming and cache retention run
 //! once per member in plan order.
 //!
-//! Every member carries its own [`BlockLayout`] (#73): a chain, or a
-//! best-first tree whose verify rows sit at their tree depth under the
-//! ancestor mask. Tree members take the same [`VerifyBlock::with_tree`]
-//! contract as the single-sequence tree path — per-sequence positions,
-//! per-sequence path states, `retain_path` with the accepted tree slots — so
-//! one target forward can verify mixed chain and tree blocks. A best-first
-//! verify block reserves its bonus plus `live` rows; [`co_batch_layouts`]
-//! applies the first stacking budget (2 sequences x 4 rows, total ≤ 8).
+//! Every member carries its own [`BlockLayout`], so one target forward can
+//! verify mixed chain and tree blocks: tree members take the same
+//! [`VerifyBlock::with_tree`] contract as the single-sequence tree path —
+//! per-sequence positions, per-sequence path states, `retain_path` with the
+//! accepted tree slots. The resin runner passes a chain layout for every
+//! member (the production path); the per-member seam stays so the
+//! multi-sequence tree support covered by the model tests keeps its
+//! one-forward contract. The composite tree+batch mode was measured against
+//! #67's gate and removed (#73): per accepted token it was 1.64x slower than
+//! chain batching on the 35B int4 + DSpark load.
 //!
 //! Greedy only: acceptance reads each verify row's argmax, matching
 //! `run_cycle`'s greedy branch. Callers with a temperature or a penalty stay
@@ -30,111 +32,16 @@ use crate::dspark::{
 };
 use crate::model::{DecodeState, TextModel, VerifyBlock};
 
-/// The live-node cap per sequence in a stacked plan: the bonus plus these
-/// rows is #73's 4-row budget (`live <= 3`).
-pub const STACKED_TREE_LIVE: usize = 3;
-
-/// The per-sequence row budget in a stacked plan, bonus included.
-pub const STACKED_TREE_ROWS: usize = STACKED_TREE_LIVE + 1;
-
-/// The total row budget for one stacked plan: two sequences of
-/// [`STACKED_TREE_ROWS`] rows. The same 8-row ceiling is the #59 contract for
-/// one multi-sequence verify, so a chain plan must fit it too.
-pub const STACKED_MAX_ROWS: usize = 2 * STACKED_TREE_ROWS;
+/// The row ceiling for one multi-sequence verify (#59). The runner falls
+/// back to the per-row path when the members' blocks do not fit; a block-16
+/// chain pair (34 rows) is outside the mechanism's contract.
+pub const MAX_PLAN_ROWS: usize = 8;
 
 /// Whether one plan's members fit the multi-sequence verify row budget.
-/// The runner falls back to the per-row path when this is false; a block-16
-/// chain pair (34 rows) is outside the mechanism's contract.
 pub fn batch_fits(members: usize, rows_per_member: usize) -> bool {
     members
         .checked_mul(rows_per_member)
-        .is_some_and(|rows| rows <= STACKED_MAX_ROWS)
-}
-
-/// Draft rows one propose occupies past the draft context: the chain's block
-/// length, or at least the best-first candidate grid's depth (its draft
-/// forward runs one masked row per level). Callers reserve draft K/V capacity
-/// with this so a stacked plan fits even when `block_len` is smaller than the
-/// grid.
-pub fn propose_rows(tree_batch: bool, block_len: usize) -> usize {
-    if tree_batch {
-        block_len.max(crate::dspark::TREE_GRID_LEVELS)
-    } else {
-        block_len
-    }
-}
-
-/// The per-sequence layout of a stacked plan: a best-first tree over the
-/// candidate grid, capped at [`STACKED_TREE_LIVE`] live nodes (4 rows with
-/// the bonus).
-///
-/// `ledger_live` is the calibrated size rule's choice when the ledger is
-/// enabled; it is clamped here so no sizing rule can exceed the first
-/// version's budget. The resin runner has no ledger yet, so it passes
-/// `None` and every stacked sequence uses the fixed 3-node confidence
-/// prefix (ticket #73).
-pub fn stacked_tree_layout(ledger_live: Option<usize>) -> BlockLayout {
-    BlockLayout::BestTree {
-        levels: crate::dspark::TREE_GRID_LEVELS,
-        live: ledger_live
-            .unwrap_or(STACKED_TREE_LIVE)
-            .min(STACKED_TREE_LIVE),
-    }
-}
-
-/// Check a co-batched plan against the stacking row budget: no member over
-/// [`STACKED_TREE_ROWS`] rows and no plan over [`STACKED_MAX_ROWS`]. Returns
-/// the plan's total row count.
-///
-/// This is the fixed even split of #67 — there is no survival × marginal-cost
-/// allocator yet, so an over-budget plan is rejected instead of reshaped.
-pub fn validate_stacked_plan(layouts: &[BlockLayout]) -> Result<usize, String> {
-    if layouts.is_empty() {
-        return Err("stacked plan needs at least one member".into());
-    }
-    let mut total = 0usize;
-    for (index, layout) in layouts.iter().enumerate() {
-        let rows = layout.rows();
-        if rows > STACKED_TREE_ROWS {
-            return Err(format!(
-                "stacked member {index} needs {rows} rows; the per-sequence budget is \
-                 {STACKED_TREE_ROWS} including the bonus ({layout:?})"
-            ));
-        }
-        total += rows;
-    }
-    if total > STACKED_MAX_ROWS {
-        return Err(format!(
-            "stacked plan needs {total} rows; the budget is {STACKED_MAX_ROWS} \
-             (2 sequences x {STACKED_TREE_ROWS} rows)"
-        ));
-    }
-    Ok(total)
-}
-
-/// The layouts for one co-batched cycle.
-///
-/// With `tree_batch` on, every member of a genuine co-batch (`>= 2` rows)
-/// takes a capped best-first tree and the plan must fit
-/// [`validate_stacked_plan`]. A single member keeps the chain layout: solo
-/// rows never change behavior, and the stacking switch only shapes plans the
-/// per-row path never sees. With `tree_batch` off every member keeps the
-/// chain layout #72 ships (uncapped, exactly like the per-row cycle).
-pub fn co_batch_layouts(
-    members: usize,
-    tree_batch: bool,
-    block_len: usize,
-) -> Result<Vec<BlockLayout>, String> {
-    if members == 0 {
-        return Err("batched cycle needs at least one member".into());
-    }
-    if tree_batch && members >= 2 {
-        let layouts = vec![stacked_tree_layout(None); members];
-        validate_stacked_plan(&layouts)?;
-        Ok(layouts)
-    } else {
-        Ok(vec![BlockLayout::Chain { len: block_len }; members])
-    }
+        .is_some_and(|rows| rows <= MAX_PLAN_ROWS)
 }
 
 /// One sequence's slice of a batched speculative cycle.
@@ -268,111 +175,14 @@ pub fn run_cycle_batch<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        STACKED_MAX_ROWS, STACKED_TREE_LIVE, batch_fits, co_batch_layouts, propose_rows,
-        stacked_tree_layout, validate_stacked_plan,
-    };
-    use crate::dspark::{BlockLayout, TREE_GRID_LEVELS};
-
-    fn tree() -> BlockLayout {
-        BlockLayout::BestTree {
-            levels: TREE_GRID_LEVELS,
-            live: STACKED_TREE_LIVE,
-        }
-    }
-
-    #[test]
-    fn layout_rows_include_the_bonus() {
-        assert_eq!(BlockLayout::Chain { len: 3 }.rows(), 4);
-        assert_eq!(BlockLayout::Tree { levels: 1 }.rows(), 3);
-        assert_eq!(BlockLayout::BestTree { levels: 3, live: 3 }.rows(), 4);
-        assert_eq!(BlockLayout::BestTree { levels: 3, live: 6 }.rows(), 7);
-    }
+    use super::{MAX_PLAN_ROWS, batch_fits};
 
     #[test]
     fn chain_pairs_outside_the_eight_row_contract_do_not_batch() {
+        assert!(batch_fits(1, MAX_PLAN_ROWS), "one chain fits the ceiling");
         assert!(batch_fits(2, 4), "two block-3 chains are eight rows");
         assert!(!batch_fits(2, 17), "two block-16 chains are 34 rows");
         assert!(!batch_fits(3, 4), "a third four-row member exceeds eight");
         assert!(!batch_fits(usize::MAX, 2), "overflow is not a fit");
-    }
-
-    #[test]
-    fn two_sequences_get_two_capped_trees_totalling_eight_rows() {
-        let layouts = co_batch_layouts(2, true, 16).unwrap();
-        assert_eq!(layouts, vec![tree(), tree()]);
-        assert_eq!(validate_stacked_plan(&layouts), Ok(STACKED_MAX_ROWS));
-    }
-
-    #[test]
-    fn stacking_rejects_plans_over_eight_rows() {
-        // A third sequence would add a fourth row past the total budget.
-        let error = co_batch_layouts(3, true, 16).unwrap_err();
-        assert!(error.contains("8"), "{error}");
-        // Two chains of five rows each are already over the total.
-        let plan = [BlockLayout::Chain { len: 4 }, BlockLayout::Chain { len: 4 }];
-        assert!(validate_stacked_plan(&plan).is_err());
-    }
-
-    #[test]
-    fn stacking_rejects_a_member_over_the_four_row_budget() {
-        let plan = [tree(), BlockLayout::BestTree { levels: 3, live: 4 }];
-        let error = validate_stacked_plan(&plan).unwrap_err();
-        assert!(error.contains("4"), "{error}");
-        assert!(validate_stacked_plan(&[]).is_err());
-    }
-
-    #[test]
-    fn mixed_chain_and_tree_members_fit_the_budget() {
-        let plan = [BlockLayout::Chain { len: 2 }, tree()];
-        assert_eq!(validate_stacked_plan(&plan), Ok(7));
-    }
-
-    #[test]
-    fn stacking_off_keeps_the_chain_layouts_unchanged() {
-        let layouts = co_batch_layouts(2, false, 16).unwrap();
-        assert_eq!(
-            layouts,
-            vec![
-                BlockLayout::Chain { len: 16 },
-                BlockLayout::Chain { len: 16 }
-            ]
-        );
-    }
-
-    #[test]
-    fn a_solo_member_keeps_the_chain_even_with_stacking_on() {
-        assert_eq!(
-            co_batch_layouts(1, true, 8).unwrap(),
-            vec![BlockLayout::Chain { len: 8 }]
-        );
-    }
-
-    #[test]
-    fn stacked_propose_reserves_at_least_the_candidate_grid() {
-        assert_eq!(propose_rows(true, 1), TREE_GRID_LEVELS);
-        assert_eq!(propose_rows(true, 16), 16);
-        assert_eq!(propose_rows(false, 1), 1);
-    }
-
-    #[test]
-    fn a_ledger_tree_choice_is_capped_at_the_four_row_budget() {
-        let capped = stacked_tree_layout(Some(6));
-        assert_eq!(capped, tree());
-        assert_eq!(capped.rows(), 4);
-        assert_eq!(
-            stacked_tree_layout(None),
-            BlockLayout::BestTree {
-                levels: TREE_GRID_LEVELS,
-                live: STACKED_TREE_LIVE,
-            }
-        );
-        assert_eq!(
-            stacked_tree_layout(Some(2)),
-            BlockLayout::BestTree {
-                levels: TREE_GRID_LEVELS,
-                live: 2,
-            }
-        );
     }
 }

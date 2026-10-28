@@ -101,7 +101,6 @@ fn parse() -> Result<Args, String> {
         "RESIN_CONVERSATION_SLOTS",
         "RESIN_STATE_CACHE",
         "RESIN_MULTI_SEQUENCE_BATCH",
-        "RESIN_TREE_BATCH",
         "RESIN_KV_BUDGET_MB",
     ] {
         if std::env::var_os(name).is_some() {
