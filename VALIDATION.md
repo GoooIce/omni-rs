@@ -29,7 +29,7 @@
 
 - **两轮状态复用**：Greedy 路径后缀+问题预填与逐 token 相同均通过，但第二轮 TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL**（`state_two_turn.log`）。默认保持关。
 - **DSpark 两轮检查点（35B Metal）**：第一轮与后缀预填通过，但恢复后的第二轮与全量重预填在**第 8/16 个 token** 分叉（`dspark_conversation_35b.log`）。检查点前缀由 verify 块内核写出，参考是全量 prefill；F16 KV 数值差可翻转 close argmax。该适配器的 `conversation_slots` / `state_cache` 保持关；SSD 冷启动的通过结论只覆盖 Greedy 路径。
-- **链式合批成本**：1B 贪心双请求同进程交错两轮为 **0.507–0.508×**（通过 #63 的 1B 前置门，`greedy_batch_1b.log`）；35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**，高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。#63 规定只赢一个规模时以 35B 为准，故默认保持关。block-16 目标负载在 8 行上限下无法合批（两条 block-16 链是 34 行），因此只有同 block 的 0.845× 是可比较数字，不存在有效的跨 block 比值。
+- **链式合批成本**：1B 贪心双请求同进程交错两轮为 **0.507–0.508×**（通过 #63 的 1B 前置门，`greedy_batch_1b.log`）；35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**（跨进程 harness-vs-CLI，指示性），高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。#63 规定只赢一个规模时以 35B 为准，故默认保持关。block-16 目标负载在 8 行上限下无法合批（两条 block-16 链是 34 行），因此只有同 block 的 0.845× 是可比较数字，不存在有效的跨 block 比值。
 - **best-first 树**（单臂运行，非交错 A/B，仅作默认关的指示性负结果）：64.8–67.9 vs 51.1 ms/token（24 token，τ 1.714 vs 2.0，prose 提示）——按接受 token 更慢（`tree_fast1.log`、`tree_fast2.log`）。默认保持关。
 - **标定账本**（单臂运行，非交错 A/B，仅作默认关的指示性负结果）：48 token，warm 65.2 vs 56.0 ms/token（block 均值 4.0 vs 3.0）；首次开启 106.6 ms 含探索与新形状 autotune（`ledger_off.log`、`ledger_on2.log`）。默认保持关。
 - **树 + 合批叠加**：三臂交错 A/B、2 轮、block 3、24 token：chain_batch 43.993、solo_tree 147.716、stacked 72.256 ms/接受 token。stacked < chain_batch **FAIL（1.64×）**（`stacking_ab_24b.log`）；按 #67 删除叠加开关，只保留互斥。

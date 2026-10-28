@@ -106,7 +106,7 @@ quota-batch passed, but the map still ships every new mechanism off.
 | SSD cold restart (1B CPU, 272-token prompt) | pass; full TTFT 7010.7 ms, restored 3.6 ms (0.001x), 272 tokens skipped, first token identical | `state_cold.log` |
 | Two-turn state reuse (1B CPU) | **partial**: suffix + question prefill and token-identical output pass; TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL** | `state_two_turn.log` |
 | Quota-constrained co-batch (1B CPU) | pass; 0.502 vs 0.501 tok/s (1.002x), 3 spills, evicted prefix reusable | `state_quota.log` |
-| Chain co-batch cost (35B, block 3, 24 tokens) | **near miss**: 43.99 vs 52.05 ms per accepted token = **0.845x**, above the #63 0.8x gate | `stacking_ab_24b.log` |
+| Chain co-batch cost (35B, block 3, 24 tokens) | **near miss**: 43.99 vs 52.05 ms per accepted token = **0.845x**, above the #63 0.8x gate; cross-process harness-vs-CLI comparison, indicative | `stacking_ab_24b.log` |
 | Best-first tree cost (35B, 24 tokens; single-arm, not interleaved) | **loses**: 64.8–67.9 vs 51.1 ms/token; τ 1.714 vs 2.0 on the measured prose prompt | `tree_fast1.log`, `tree_fast2.log` |
 | Ledger cost (35B, 48 tokens; single-arm, not interleaved) | **loses**: 65.2 vs 56.0 ms/token warm (block average 4.0 vs 3.0); first on-run 106.6 ms included exploration/autotune | `ledger_off.log`, `ledger_on2.log` |
 | 1B greedy co-batch (1B CPU, 2 requests) | **pass**: stream parity; batched 810.3–812.2 vs sequential 1598.9–1599.4 ms/row = **0.507–0.508x** | `greedy_batch_1b.log` |
