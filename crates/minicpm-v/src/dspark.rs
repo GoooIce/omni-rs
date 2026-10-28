@@ -694,6 +694,46 @@ impl<B: Backend> DraftState<B> {
         self.keys.first().map_or(0, |keys| keys.dims()[2])
     }
 
+    /// Target tokens folded into the draft context.
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// The preallocated key buffers, one `[1, KV_HEADS, capacity, HEAD_DIM]`
+    /// per layer (#75 checkpoint snapshot seam). Only rows `0..len()` have
+    /// been written.
+    pub fn keys(&self) -> &[Tensor<B, 4>] {
+        &self.keys
+    }
+
+    /// The preallocated value buffers, paired with [`Self::keys`].
+    pub fn values(&self) -> &[Tensor<B, 4>] {
+        &self.values
+    }
+
+    /// Rebuild a draft context from restored K/V buffers (#75). The buffer
+    /// length is the capacity; `length` is the filled prefix.
+    pub fn from_buffers(keys: Vec<Tensor<B, 4>>, values: Vec<Tensor<B, 4>>, length: usize) -> Self {
+        assert_eq!(keys.len(), values.len(), "one key buffer per value buffer");
+        for (key, value) in keys.iter().zip(&values) {
+            assert_eq!(key.dims(), value.dims(), "key and value buffers must match");
+            assert!(
+                length <= key.dims()[2],
+                "length {length} exceeds buffer capacity {}",
+                key.dims()[2]
+            );
+        }
+        Self {
+            keys,
+            values,
+            length,
+        }
+    }
+
     /// Grow the K/V buffers to `capacity`, preserving the filled prefix. A
     /// restored conversation checkpoint was sized for the request that made
     /// it; the next request's prompt plus budget can be longer (#74).
@@ -2308,5 +2348,32 @@ mod cycle_tests {
             &Default::default(),
         );
         assert_eq!(greedy_argmax_block(&logits).unwrap(), vec![1, 0]);
+    }
+}
+
+/// Weight-free tests of the draft checkpoint seam (#75).
+#[cfg(test)]
+mod draft_state_tests {
+    use super::DraftState;
+    use burn::backend::NdArray;
+    use burn::tensor::Tensor;
+
+    type B = NdArray;
+
+    #[test]
+    fn from_buffers_keeps_the_filled_prefix() {
+        let device = Default::default();
+        let keys: Vec<Tensor<B, 4>> = (0..2)
+            .map(|_| Tensor::zeros([1, 2, 4, 3], &device))
+            .collect();
+        let values = keys.clone();
+        let state = DraftState::from_buffers(keys, values, 2);
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.capacity(), 4);
+        assert_eq!(state.keys().len(), 2);
+        assert_eq!(state.values()[0].dims(), [1, 2, 4, 3]);
+        let empty = DraftState::<B>::from_buffers(Vec::new(), Vec::new(), 0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.capacity(), 0);
     }
 }

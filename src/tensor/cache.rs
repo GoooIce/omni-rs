@@ -119,4 +119,17 @@ impl<B: Backend> KvCache<B> {
             tensors: Some((copy(k), copy(v))),
         }
     }
+    /// Read-only access to the resident K/V pair for a checkpoint snapshot
+    /// (#75); `None` when this cache has never been written.
+    pub fn snapshot(&self) -> Option<(&Tensor<B, 4>, &Tensor<B, 4>)> {
+        self.tensors.as_ref().map(|(k, v)| (k, v))
+    }
+    /// Rebuild a cache from snapshot tensors (#75). Shape and dtype are the
+    /// adapter's contract; the pair must match.
+    pub fn from_tensors(k: Tensor<B, 4>, v: Tensor<B, 4>) -> Self {
+        assert_eq!(k.dims(), v.dims());
+        Self {
+            tensors: Some((k, v)),
+        }
+    }
 }

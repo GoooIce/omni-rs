@@ -1,19 +1,21 @@
-//! Engine-side experiment switches for the resin runners (#72, #73, #74).
+//! Engine-side experiment switches for the resin runners (#72, #73, #74, #75).
 //!
 //! One mechanism, one switch: `multi_sequence_batch` lets every decode row of
 //! one plan share a single multi-sequence verify forward; `tree_batch` stacks
 //! a capped best-first tree per co-batched sequence in that same forward;
 //! `conversation_slots` lets a request resume a stored conversation
-//! checkpoint instead of prefilling the whole prompt. All three are default
-//! off; the config field is the durable switch and
+//! checkpoint instead of prefilling the whole prompt; `state_cache` persists
+//! those checkpoints to SSD so a later process can restore them (#75). All
+//! are default off; the config field is the durable switch and
 //! `RESIN_MULTI_SEQUENCE_BATCH=1` / `RESIN_TREE_BATCH=1` /
-//! `RESIN_CONVERSATION_SLOTS=1` are the same-binary experimental overrides the
-//! A/B protocol asks for (docs/agent-workflow.md, "Performance measurement").
-//! `tree_batch` is the composite (tree + batching) switch, not a master
-//! switch for either solo mechanism: it changes only co-batched rows, never
-//! the per-row path and never the model-side single-stream tree mode. The
-//! header names the switches and the measurement basis once per process when
-//! a switch is enabled or `OMNI_AB_HEADER=1` is set.
+//! `RESIN_CONVERSATION_SLOTS=1` / `RESIN_STATE_CACHE=1` are the same-binary
+//! experimental overrides the A/B protocol asks for (docs/agent-workflow.md,
+//! "Performance measurement"). `tree_batch` is the composite (tree + batching)
+//! switch, not a master switch for either solo mechanism: it changes only
+//! co-batched rows, never the per-row path and never the model-side
+//! single-stream tree mode. The header names the switches and the measurement
+//! basis once per process when a switch is enabled or `OMNI_AB_HEADER=1` is
+//! set.
 
 use std::sync::Once;
 
@@ -32,6 +34,12 @@ pub struct ResinConfig {
     /// resume the deepest prefix-matching one (#74). No slot key means the
     /// unchanged full prefill.
     pub conversation_slots: bool,
+    /// Persist conversation checkpoints through
+    /// [`crate::state_cache::StateCache`] (#75). Requires
+    /// `conversation_slots` and a cache built with a caller-supplied
+    /// namespace; without one the session stays memory-only. Off means no
+    /// cache reads or writes.
+    pub state_cache: bool,
 }
 
 impl ResinConfig {
@@ -40,14 +48,16 @@ impl ResinConfig {
         Self::default().with_env_overrides()
     }
 
-    /// Fold `RESIN_MULTI_SEQUENCE_BATCH=1`, `RESIN_TREE_BATCH=1` and
-    /// `RESIN_CONVERSATION_SLOTS=1` into this config. The environment is an
-    /// experimental override: when set it wins over an explicit `false`, so
-    /// one binary can A/B a switch (same-binary kill switch).
+    /// Fold `RESIN_MULTI_SEQUENCE_BATCH=1`, `RESIN_TREE_BATCH=1`,
+    /// `RESIN_CONVERSATION_SLOTS=1` and `RESIN_STATE_CACHE=1` into this
+    /// config. The environment is an experimental override: when set it wins
+    /// over an explicit `false`, so one binary can A/B a switch (same-binary
+    /// kill switch).
     pub fn with_env_overrides(mut self) -> Self {
         self.multi_sequence_batch |= env_flag("RESIN_MULTI_SEQUENCE_BATCH");
         self.tree_batch |= env_flag("RESIN_TREE_BATCH");
         self.conversation_slots |= env_flag("RESIN_CONVERSATION_SLOTS");
+        self.state_cache |= env_flag("RESIN_STATE_CACHE");
         self
     }
 
@@ -61,14 +71,17 @@ impl ResinConfig {
 /// One header line naming every switch and the measurement basis.
 pub fn experiment_header(config: &ResinConfig) -> String {
     format!(
-        "resin experiment: multi_sequence_batch={} tree_batch={} conversation_slots={} | \
-         tree_batch is the composite tree+batch mode (co-batched rows only: <=4 rows per \
-         sequence, <=8 per plan); basis: host wall clock at the runner seam \
+        "resin experiment: multi_sequence_batch={} tree_batch={} conversation_slots={} \
+         state_cache={} | tree_batch is the composite tree+batch mode (co-batched rows only: \
+         <=4 rows per sequence, <=8 per plan); basis: host wall clock at the runner seam \
          (prepare/forward/complete); per-row decode cost = forward time / plan rows; prefill \
-         tokens and checkpoint hits/misses come from the session counters; no device timestamps",
+         tokens and checkpoint hits/misses come from the session counters; SSD state-cache \
+         writes drain synchronously on the runner thread at the idle boundary (after release / \
+         before the next forward); no device timestamps",
         on_off(config.multi_sequence_batch),
         on_off(config.tree_batch),
-        on_off(config.conversation_slots)
+        on_off(config.conversation_slots),
+        on_off(config.state_cache)
     )
 }
 
@@ -78,6 +91,7 @@ pub fn print_header(config: &ResinConfig) {
     if !config.multi_sequence_batch
         && !config.tree_batch
         && !config.conversation_slots
+        && !config.state_cache
         && !env_flag("OMNI_AB_HEADER")
     {
         return;
@@ -104,6 +118,7 @@ mod tests {
         assert!(!ResinConfig::default().multi_sequence_batch);
         assert!(!ResinConfig::default().tree_batch);
         assert!(!ResinConfig::default().conversation_slots);
+        assert!(!ResinConfig::default().state_cache);
     }
 
     #[test]
@@ -128,9 +143,11 @@ mod tests {
         assert!(off.contains("multi_sequence_batch=off"), "{off}");
         assert!(off.contains("tree_batch=off"), "{off}");
         assert!(off.contains("conversation_slots=off"), "{off}");
+        assert!(off.contains("state_cache=off"), "{off}");
         assert!(off.contains("host wall"), "{off}");
         assert!(off.contains("per-row decode cost"), "{off}");
         assert!(off.contains("checkpoint hits/misses"), "{off}");
+        assert!(off.contains("idle boundary"), "{off}");
         assert!(off.contains("no device timestamps"), "{off}");
         assert!(off.contains("composite tree+batch mode"), "{off}");
         assert!(off.contains("<=4 rows per sequence"), "{off}");
@@ -139,9 +156,11 @@ mod tests {
             multi_sequence_batch: true,
             tree_batch: true,
             conversation_slots: true,
+            state_cache: true,
         });
         assert!(on.contains("multi_sequence_batch=on"), "{on}");
         assert!(on.contains("tree_batch=on"), "{on}");
         assert!(on.contains("conversation_slots=on"), "{on}");
+        assert!(on.contains("state_cache=on"), "{on}");
     }
 }

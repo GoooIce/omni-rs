@@ -407,3 +407,26 @@ fn metal_fused_linear_gelu_matches_cpu() {
     .unwrap();
     close(&actual, &expected, 2e-6);
 }
+
+#[test]
+fn kv_cache_snapshot_restores_a_checkpoint_copy() {
+    let mut cache = KvCache::default();
+    assert!(cache.snapshot().is_none());
+    let k = tensor(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 2, 2]);
+    let v = tensor(vec![5.0, 6.0, 7.0, 8.0], [1, 1, 2, 2]);
+    cache.append(k.clone(), v.clone(), 0);
+
+    let (snapshot_k, snapshot_v) = cache.snapshot().unwrap();
+    assert_eq!(snapshot_k.dims(), [1, 1, 2, 2]);
+    assert_eq!(values(snapshot_k.clone()), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(values(snapshot_v.clone()), vec![5.0, 6.0, 7.0, 8.0]);
+
+    let restored = KvCache::from_tensors(snapshot_k.clone(), snapshot_v.clone());
+    assert_eq!(restored.len(), cache.len());
+    let next_k = tensor(vec![9.0, 10.0], [1, 1, 1, 2]);
+    let next_v = tensor(vec![11.0, 12.0], [1, 1, 1, 2]);
+    let (joined_k, joined_v) = restored.concat(next_k, next_v, 2);
+    assert_eq!(values(joined_k), vec![1.0, 2.0, 3.0, 4.0, 9.0, 10.0]);
+    assert_eq!(values(joined_v), vec![5.0, 6.0, 7.0, 8.0, 11.0, 12.0]);
+    assert_eq!(cache.len(), 2, "the snapshot must not alias new appends");
+}
