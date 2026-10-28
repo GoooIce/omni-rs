@@ -1,39 +1,62 @@
-//! Chain-batch A/B harness for the resin co-batch load (#72).
+//! Three-arm A/B harness for the resin co-batch load (#72, #73).
 //!
 //! Two requests share a prompt prefix (the #61 load shape): A decodes alone
 //! for a few steps, then B joins and both decode rows land in one plan. The
-//! harness times each engine step across the runner seam — `prepare_step`,
-//! `runner.forward`, `complete_step_with` — and reports the median per-row
-//! decode cost. It does not compare tokens: the correctness gate is
-//! `tests/minicpm_dspark_batch.rs`.
+//! harness runs three arms interleaved in one process on the same loaded
+//! weights:
 //!
-//! The switch is the same-binary experimental override, so alternate two
-//! invocations back to back (docs/agent-workflow.md, interleaved A/B):
+//! - `chain_batch`: one multi-sequence verify, every member a chain (#72).
+//! - `solo_tree`: the model-side single-stream best-first tree mode
+//!   (`MINICPM_DSPARK_TREE_BEST=1`), each request generated alone through
+//!   `dspark::generate`.
+//! - `stacked`: one multi-sequence verify, every co-batched member a capped
+//!   best-first tree (#73).
+//!
+//! Cost is charged per accepted token: model work host-milliseconds divided
+//! by emitted tokens (bonus included). Engine arms sum the decode
+//! `runner.forward` wall clock; the solo-tree arm sums the trace's
+//! propose+verify+accept+retain phases, because `generate`'s wall clock also
+//! covers prefill. Both bases are host wall clock inside one cycle, never
+//! device timestamps; prefill is excluded from every arm.
+//!
+//! The #67 decision gate: stacking must be faster per accepted token than
+//! *both* solo modes. The harness prints an explicit PASS/FAIL line; a FAIL
+//! means the composite switch is removed rather than kept (decision #67).
 //!
 //! ```text
-//! # batched arm, then direct arm, same window
-//! RESIN_MULTI_SEQUENCE_BATCH=1 cargo run --release --features metal \
-//!   --example resin_batch_ab -- <model-dir> <draft-dir> [rounds=3] \
-//!   [new-tokens=128] [prefix=256] [suffix=16] [block=16]
+//! MINICPM_DSPARK_TRACE=1 MINICPM_DSPARK_TREE_BEST=1 \
+//! cargo run --release --features metal --example resin_batch_ab -- \
+//!   <model-dir> <draft-dir> [rounds=3] [new-tokens=128] [prefix=256] \
+//!   [suffix=16] [block=16]
 //! ```
 //!
-//! The engine's prefix cache is on for this harness: B's prefill feeds only
-//! the unmatched suffix, which is the co-batch scheduling shape being
-//! measured. The runner keeps its own KV, so cached prefix restore is out of
-//! scope here (#74) and the streams are not a correctness oracle.
+//! Unset `RESIN_MULTI_SEQUENCE_BATCH` / `RESIN_TREE_BATCH`: the harness owns
+//! the arm definitions (the environment is an override, so a set variable
+//! would corrupt an arm). `MINICPM_DSPARK_BLOCK` and `MINICPM_DSPARK_LEDGER`
+//! must also stay unset so the solo-tree arm is the shipped adaptive tree
+//! mode. This harness does not compare tokens: the correctness gates are
+//! `tests/minicpm_dspark_batch.rs` and `tests/minicpm_dspark_stack.rs`.
+//!
+//! The engine's prefix cache is on: B's prefill feeds only the unmatched
+//! suffix, which is the co-batch scheduling shape being measured. The runner
+//! keeps its own KV, so cached prefix restore is out of scope here (#74) and
+//! the streams are not a correctness oracle.
 #![cfg(feature = "metal")]
 
 use burn::backend::wgpu::{Metal, WgpuDevice};
 use omni_minicpm_v::config::ModelDirectory;
-use omni_minicpm_v::dspark::Draft;
+use omni_minicpm_v::dspark::{self, Draft};
+use omni_minicpm_v::generate::{FinishReason, Options};
 use omni_minicpm_v::model::TextModel;
+use omni_minicpm_v::multimodal::Prompt;
 use omni_minicpm_v::tokenizer::MiniCpmTokenizer;
 use resin_core::Phase;
 use resin_core::engine::{EngineCore, Runner, RunnerConfig, SchedulerConfig, Submission};
 use resin_core::resources::kv::{KvGroupLayout, KvLayout, KvRetention};
-use resin_metal::config::experiment_header;
+use resin_metal::config::{ResinConfig, experiment_header};
 use resin_metal::dspark_runner::MinicpmDsparkRunner;
 use resin_metal::session::DecodeRequest;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 type B = Metal;
@@ -55,9 +78,21 @@ fn median(values: &mut [f64]) -> f64 {
 
 struct Step {
     prefill: bool,
-    rows: usize,
     forward_ms: f64,
-    total_ms: f64,
+}
+
+/// One arm's measurement for one round.
+struct Measurement {
+    /// Model work summed over the two requests, host milliseconds.
+    work_ms: f64,
+    /// Emitted tokens over the two requests (bonus included).
+    tokens: u64,
+}
+
+impl Measurement {
+    fn per_token_ms(&self) -> f64 {
+        self.work_ms / self.tokens as f64
+    }
 }
 
 fn new_engine(block: usize) -> Result<EngineCore<DecodeRequest>, String> {
@@ -95,30 +130,21 @@ fn step_once<R: Runner<DecodeRequest>>(
     engine: &mut EngineCore<DecodeRequest>,
     runner: &mut R,
 ) -> Result<Step, String> {
-    let start = Instant::now();
     let plan = engine
         .prepare_step(runner, None)
         .map_err(|error| error.to_string())?
         .ok_or("engine has work but no plan")?;
-    let prepare_ms = ms(start.elapsed());
     let step = Step {
         prefill: plan.phase == Phase::Prefill,
-        rows: plan.sequence_ids.len(),
         forward_ms: 0.0,
-        total_ms: 0.0,
     };
     let start = Instant::now();
     let rows = runner.forward(plan).map_err(|error| error.to_string())?;
     let forward_ms = ms(start.elapsed());
-    let start = Instant::now();
     engine
         .complete_step_with(runner, Ok(rows.view()), Ok)
         .map_err(|error| error.to_string())?;
-    Ok(Step {
-        forward_ms,
-        total_ms: prepare_ms + forward_ms + ms(start.elapsed()),
-        ..step
-    })
+    Ok(Step { forward_ms, ..step })
 }
 
 /// One engine pass: A solo, B joins with the shared prefix, drain both.
@@ -137,7 +163,7 @@ fn engine_pass(
     let mut solo = 0usize;
     while engine.has_work() && solo < SOLO_STEPS {
         let step = step_once(&mut engine, runner)?;
-        if !step.prefill && step.rows == 1 {
+        if !step.prefill {
             solo += 1;
         }
         steps.push(step);
@@ -160,6 +186,85 @@ fn engine_pass(
         .len();
     eprintln!("pass done: tokens_a={tokens_a} tokens_b={tokens_b}");
     Ok(steps)
+}
+
+/// One engine arm: set the switches, run one pass, charge every decode
+/// forward's host wall clock against the tokens the runner committed.
+fn engine_arm(
+    runner: &mut MinicpmDsparkRunner<B>,
+    config: ResinConfig,
+    prefix: &[u32],
+    suffix: &[u32],
+    new_tokens: usize,
+    block: usize,
+) -> Result<Measurement, String> {
+    runner.set_config(config);
+    let tokens_before = runner.stats().output_tokens;
+    let trees_before = runner.tree_batch_cycles();
+    let steps = engine_pass(runner, prefix, suffix, new_tokens, block)?;
+    let work_ms = steps
+        .iter()
+        .filter(|step| !step.prefill)
+        .map(|step| step.forward_ms)
+        .sum();
+    let tokens = runner.stats().output_tokens - tokens_before;
+    let trees = runner.tree_batch_cycles() - trees_before;
+    if config.tree_batch && trees == 0 {
+        return Err("stacked arm never verified a tree; check the switch wiring".into());
+    }
+    if !config.tree_batch && trees != 0 {
+        return Err("chain arm ran tree cycles".into());
+    }
+    Ok(Measurement { work_ms, tokens })
+}
+
+/// The model-side single-stream tree arm: both requests generated alone
+/// through the shipped DSpark loop with `MINICPM_DSPARK_TREE_BEST=1`, cost
+/// read from the trace's cycle phases (wall clock excludes prefill).
+fn solo_tree_arm(
+    runner: &MinicpmDsparkRunner<B>,
+    prompts: &[Vec<u32>],
+    new_tokens: usize,
+    eos: &[u32],
+    tokenizer: &MiniCpmTokenizer,
+) -> Result<Measurement, String> {
+    let (model, draft) = runner.model_and_draft();
+    let mut work_ms = 0.0;
+    let mut tokens = 0u64;
+    for prompt in prompts {
+        let cancel = AtomicBool::new(false);
+        let (outcome, stats) = dspark::generate(
+            model,
+            draft,
+            &Prompt::text(prompt.clone()),
+            Options {
+                max_new_tokens: new_tokens,
+                temperature: 0.0,
+                ..Default::default()
+            },
+            eos,
+            omni_minicpm_v::model::VerifyNumerics::Batched,
+            &cancel,
+            |_| Ok(()),
+            |ids| tokenizer.decode(ids),
+            omni_minicpm_v::ledger::RunIdentity {
+                model: "resin_batch_ab",
+                drafter: "resin_batch_ab",
+                precision: "f16",
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        if outcome.finish_reason != FinishReason::Length {
+            return Err("solo-tree arm hit eos; pick a longer prompt or budget".into());
+        }
+        let trace = &stats.trace;
+        if !trace.enabled {
+            return Err("solo-tree arm needs MINICPM_DSPARK_TRACE=1".into());
+        }
+        work_ms += trace.propose_ms + trace.verify_ms + trace.accept_ms + trace.retain_ms;
+        tokens += stats.output_tokens;
+    }
+    Ok(Measurement { work_ms, tokens })
 }
 
 fn corpus(tokenizer: &MiniCpmTokenizer, len: usize) -> Vec<u32> {
@@ -199,6 +304,30 @@ fn main() -> Result<(), String> {
         ));
     }
 
+    // The harness owns the arm definitions; the env overrides would silently
+    // reshape an arm.
+    for name in ["RESIN_MULTI_SEQUENCE_BATCH", "RESIN_TREE_BATCH"] {
+        if std::env::var_os(name).is_some() {
+            return Err(format!(
+                "{name} must be unset: the harness sets each arm's switches"
+            ));
+        }
+    }
+    if !omni_minicpm_v::knobs::dspark_trace() {
+        return Err("MINICPM_DSPARK_TRACE=1 is required for the cycle-phase cost basis".into());
+    }
+    if !omni_minicpm_v::knobs::dspark_tree_best() {
+        return Err("MINICPM_DSPARK_TREE_BEST=1 is required for the single-stream tree arm".into());
+    }
+    if omni_minicpm_v::knobs::dspark_block().is_some() {
+        return Err("MINICPM_DSPARK_BLOCK must be unset: a pinned block disables tree mode".into());
+    }
+    if omni_minicpm_v::knobs::dspark_ledger() {
+        return Err(
+            "MINICPM_DSPARK_LEDGER must be off so every arm is the same sizing rule".into(),
+        );
+    }
+
     let device = WgpuDevice::default();
     let directory = ModelDirectory::new(&model_dir);
     let config = directory.config().map_err(|error| error.to_string())?;
@@ -220,57 +349,102 @@ fn main() -> Result<(), String> {
     }
     let prefix = ids[..prefix_len].to_vec();
     let suffix = ids[prefix_len..].to_vec();
+    let mut prompt_b = prefix.clone();
+    prompt_b.extend_from_slice(&suffix);
+    let prompts = [prefix.clone(), prompt_b];
 
     let mut runner = MinicpmDsparkRunner::new(model, draft, device, block, Vec::new());
+    let chain = ResinConfig {
+        multi_sequence_batch: true,
+        ..ResinConfig::default()
+    };
+    let stacked = ResinConfig {
+        multi_sequence_batch: true,
+        tree_batch: true,
+        ..ResinConfig::default()
+    };
     println!(
         "# resin_batch_ab rounds={rounds} new_tokens={new_tokens} prefix={prefix_len} \
          suffix={suffix_len} block={block} solo_steps={SOLO_STEPS} kv_block={BLOCK_TOKENS}"
     );
-    println!("# {}", experiment_header(runner.config()));
+    println!("# arm chain_batch: {}", experiment_header(&chain));
+    println!("# arm stacked: {}", experiment_header(&stacked));
+    println!("# arm solo_tree: model-side MINICPM_DSPARK_TREE_BEST=1, dspark::generate per prompt");
+    omni_minicpm_v::knobs::experiment_header();
+    println!(
+        "# basis: per-accepted-token = model-work host ms / emitted tokens (bonus included); \
+         engine arms sum decode runner.forward, solo_tree sums MINICPM_DSPARK_TRACE cycle \
+         phases; prefill excluded"
+    );
 
-    let mut single_row_totals = Vec::new();
-    let mut cobatch_forwards = Vec::new();
-    let mut cobatch_totals = Vec::new();
+    let mut chain_rounds = Vec::new();
+    let mut tree_rounds = Vec::new();
+    let mut stacked_rounds = Vec::new();
     for round in 0..=rounds {
-        let steps = engine_pass(&mut runner, &prefix, &suffix, new_tokens, block)?;
-        let mut round_cobatch = 0usize;
-        for step in &steps {
-            if step.prefill {
-                continue;
-            }
-            if step.rows >= 2 {
-                round_cobatch += 1;
-                if round > 0 {
-                    cobatch_forwards.push(step.forward_ms);
-                    cobatch_totals.push(step.total_ms);
-                }
-            } else if round > 0 {
-                // One-row decode steps: A solo before B joins, and B's tail
-                // after A retires.
-                single_row_totals.push(step.total_ms);
-            }
-        }
+        let chain_measurement =
+            engine_arm(&mut runner, chain, &prefix, &suffix, new_tokens, block)?;
         println!(
-            "round={round} cobatch_plans={round_cobatch} batch_cycles={} cycles={} tau={:.3}",
-            runner.batch_cycles(),
-            runner.stats().cycles,
-            runner.stats().acceptance_length()
+            "round={round} arm=chain_batch work_ms={:.1} tokens={} per_token_ms={:.3}",
+            chain_measurement.work_ms,
+            chain_measurement.tokens,
+            chain_measurement.per_token_ms()
         );
-        if round_cobatch == 0 {
-            eprintln!("WARNING: no 2-row decode plan; co-batching did not happen");
+        let tree_measurement = solo_tree_arm(
+            &runner,
+            &prompts,
+            new_tokens,
+            &directory.eos_ids(),
+            &tokenizer,
+        )?;
+        println!(
+            "round={round} arm=solo_tree work_ms={:.1} tokens={} per_token_ms={:.3}",
+            tree_measurement.work_ms,
+            tree_measurement.tokens,
+            tree_measurement.per_token_ms()
+        );
+        let stacked_measurement =
+            engine_arm(&mut runner, stacked, &prefix, &suffix, new_tokens, block)?;
+        println!(
+            "round={round} arm=stacked work_ms={:.1} tokens={} per_token_ms={:.3} \
+             tree_batch_cycles={}",
+            stacked_measurement.work_ms,
+            stacked_measurement.tokens,
+            stacked_measurement.per_token_ms(),
+            runner.tree_batch_cycles()
+        );
+        if round > 0 {
+            chain_rounds.push(chain_measurement.per_token_ms());
+            tree_rounds.push(tree_measurement.per_token_ms());
+            stacked_rounds.push(stacked_measurement.per_token_ms());
         }
     }
-    let cobatch_fwd = median(&mut cobatch_forwards);
-    let cobatch_total = median(&mut cobatch_totals);
+
+    let chain_ms = median(&mut chain_rounds);
+    let tree_ms = median(&mut tree_rounds);
+    let stacked_ms = median(&mut stacked_rounds);
     println!(
-        "SUMMARY multi_sequence_batch={} rounds_measured={rounds} \
-         cobatch_n={} cobatch_forward_p50_ms={cobatch_fwd:.3} \
-         cobatch_step_p50_ms={cobatch_total:.3} per_row_step_p50_ms={:.3} \
-         single_row_step_p50_ms={:.3}",
-        runner.config().multi_sequence_batch,
-        cobatch_totals.len(),
-        cobatch_total / 2.0,
-        median(&mut single_row_totals),
+        "SUMMARY per_accepted_token_ms chain_batch={chain_ms:.3} solo_tree={tree_ms:.3} \
+         stacked={stacked_ms:.3} rounds_measured={rounds}"
     );
+    let beats_chain = stacked_ms < chain_ms;
+    let beats_tree = stacked_ms < tree_ms;
+    println!(
+        "GATE stacked<chain_batch {} (ratio {:.3})",
+        if beats_chain { "PASS" } else { "FAIL" },
+        stacked_ms / chain_ms
+    );
+    println!(
+        "GATE stacked<solo_tree {} (ratio {:.3})",
+        if beats_tree { "PASS" } else { "FAIL" },
+        stacked_ms / tree_ms
+    );
+    if beats_chain && beats_tree {
+        println!("GATE PASS: stacking beats both solo modes per accepted token");
+    } else {
+        println!(
+            "GATE FAIL: stacking does not beat both solo modes; per decision #67 the \
+             composite switch is removed rather than kept (record the numbers in VALIDATION.md)"
+        );
+    }
     Ok(())
 }

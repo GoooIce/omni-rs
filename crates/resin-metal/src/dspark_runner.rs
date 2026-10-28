@@ -10,13 +10,20 @@
 //! the model-side knowledge (draft, captured layers, capacity, numerics)
 //! stays here, next to the model types it names.
 //!
+//! Co-batched plans (#72) verify every decode row in one target forward
+//! (`dspark_batch::run_cycle_batch`). With the composite `tree_batch` switch
+//! (#73) on, each co-batched member proposes a capped best-first tree instead
+//! of a chain and the same forward verifies one tree per sequence; solo rows
+//! keep the per-row chain either way. The first version's budget is 4 rows
+//! per sequence including the bonus and 8 per plan.
+//!
 //! Conversation checkpoints (#74) carry the target decode state, the draft
 //! context and the KV-aligned token history (`history[..state.length]`). The
 //! draft context grows to the new request's prompt plus budget on restore,
 //! because the checkpoint was sized for the request that produced it.
 
 use burn::tensor::backend::Backend;
-use omni_minicpm_v::dspark::{self, Draft, DraftState, SpecStats};
+use omni_minicpm_v::dspark::{self, BlockLayout, Draft, DraftState, SpecStats};
 use omni_minicpm_v::dspark_batch::{self, BatchCycleMember};
 use omni_minicpm_v::generate::{Options, Sampler};
 use omni_minicpm_v::model::{DecodeState, TextModel, VerifyNumerics};
@@ -35,8 +42,13 @@ struct DsparkAdapter<B: Backend> {
     numerics: VerifyNumerics,
     eos_ids: Vec<u32>,
     stats: SpecStats,
+    /// The composite tree+batch switch (#73), mirrored from the session's
+    /// resolved config so `decode_batch` can pick the members' layouts.
+    tree_batch: bool,
     /// Number of `decode_batch` calls that ran one shared verify forward.
     batched_cycles: u64,
+    /// Batched cycles whose members verified as capped best-first trees.
+    tree_batched_cycles: u64,
 }
 
 impl<B: Backend> DsparkAdapter<B> {
@@ -97,7 +109,11 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             sampler.sample(values, &history).map_err(Error::execution)?
         };
         history.push(first);
-        let capacity = dspark::draft_capacity(input.len(), budget, self.block_len);
+        let capacity = dspark::draft_capacity(
+            input.len(),
+            budget,
+            dspark_batch::propose_rows(self.tree_batch, self.block_len),
+        );
         let draft_state = self
             .draft
             .prepare(captured, capacity)
@@ -160,6 +176,12 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
     /// run per member in plan order. The greedy gate is the same one
     /// `dspark::run_cycle` applies; anything else falls back to the default
     /// per-row loop so numerics never change silently.
+    ///
+    /// With `tree_batch` on (#73) every co-batched member takes a capped
+    /// best-first tree, so the same forward verifies one tree per sequence;
+    /// the row budget (4 per sequence, 8 per plan) is enforced by
+    /// [`dspark_batch::co_batch_layouts`]. Off, every member keeps the chain
+    /// layout #72 ships. Solo rows never reach this method.
     fn decode_batch(
         &mut self,
         rows: &mut [DecodeRow<'_, Self::Slot>],
@@ -171,8 +193,13 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             }
             return Ok(outputs);
         }
+        let layouts = dspark_batch::co_batch_layouts(rows.len(), self.tree_batch, self.block_len)
+            .map_err(Error::execution)?;
+        let tree_members = layouts
+            .iter()
+            .any(|layout| !matches!(layout, BlockLayout::Chain { .. }));
         let mut members = Vec::with_capacity(rows.len());
-        for row in rows.iter_mut() {
+        for (row, layout) in rows.iter_mut().zip(layouts.iter()) {
             let slot = &mut *row.slot;
             // Every decode row carries exactly the bonus; the history the
             // accept walk predicts against includes it, like the per-row path.
@@ -183,12 +210,12 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
                 state: &mut slot.state,
                 bonus,
                 room: row.room,
+                layout,
             });
         }
         let outcomes = dspark_batch::run_cycle_batch(
             &self.model,
             &self.draft,
-            self.block_len,
             &self.eos_ids,
             &mut members,
             &mut self.stats,
@@ -196,6 +223,9 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         .map_err(Error::execution)?;
         drop(members);
         self.batched_cycles += 1;
+        if tree_members {
+            self.tree_batched_cycles += 1;
+        }
         let mut outputs = Vec::with_capacity(rows.len());
         for (row, outcome) in rows.iter_mut().zip(outcomes) {
             let slot = &mut *row.slot;
@@ -210,6 +240,12 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             outputs.push(tokens);
         }
         Ok(outputs)
+    }
+
+    /// Keep the composite switch in sync when the harness flips configs at
+    /// runtime (same-process A/B arms, #73).
+    fn config_changed(&mut self, config: &ResinConfig) {
+        self.tree_batch = config.tree_batch;
     }
 
     fn checkpoint(&self, slot: &Self::Slot) -> Option<Self::Checkpoint> {
@@ -253,7 +289,13 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             mut draft_state,
             tokens,
         } = checkpoint;
-        draft_state.ensure_capacity(tokens.len() + input.len() + budget + self.block_len + 1);
+        draft_state.ensure_capacity(
+            tokens.len()
+                + input.len()
+                + budget
+                + dspark_batch::propose_rows(self.tree_batch, self.block_len)
+                + 1,
+        );
         let (logits, _, captured) = self
             .model
             .forward_capturing(
@@ -318,7 +360,8 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
     }
 
     /// Explicit engine config. `multi_sequence_batch` hands every decode row
-    /// of a plan to [`DsparkAdapter::decode_batch`].
+    /// of a plan to [`DsparkAdapter::decode_batch`]; `tree_batch` does the
+    /// same and gives every co-batched member a capped best-first tree.
     pub fn with_config(
         model: TextModel<B>,
         draft: Draft<B>,
@@ -327,6 +370,10 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         eos_ids: Vec<u32>,
         config: ResinConfig,
     ) -> Self {
+        // Resolve the environment once so the adapter's copy matches the
+        // session's (the session folds the overrides again; that is
+        // idempotent).
+        let config = config.with_env_overrides();
         Self {
             session: DecodeSession::with_config(
                 DsparkAdapter {
@@ -345,11 +392,18 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
                         stats.trace.enabled = omni_minicpm_v::knobs::dspark_trace();
                         stats
                     },
+                    tree_batch: config.tree_batch,
                     batched_cycles: 0,
+                    tree_batched_cycles: 0,
                 },
                 config,
             ),
         }
+    }
+
+    /// Replace the experimental switches at runtime (same-process A/B arms).
+    pub fn set_config(&mut self, config: ResinConfig) {
+        self.session.set_config(config);
     }
 
     /// The resolved engine switches (environment overrides folded in).
@@ -357,9 +411,23 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         self.session.config()
     }
 
-    /// Batched verify forwards run so far (0 when the switch is off).
+    /// Batched verify forwards run so far (0 when the switches are off).
     pub fn batch_cycles(&self) -> u64 {
         self.session.adapter().batched_cycles
+    }
+
+    /// Batched cycles whose members verified as trees (#73; 0 unless
+    /// `tree_batch` is on).
+    pub fn tree_batch_cycles(&self) -> u64 {
+        self.session.adapter().tree_batched_cycles
+    }
+
+    /// The loaded target model and drafter. The #73 measurement example
+    /// drives the model-side single-stream tree mode on the same loaded
+    /// weights; production callers go through [`Runner::forward`].
+    pub fn model_and_draft(&self) -> (&TextModel<B>, &Draft<B>) {
+        let adapter = self.session.adapter();
+        (&adapter.model, &adapter.draft)
     }
 
     /// Prefill tokens fed and checkpoint hit/miss counters (#74).
