@@ -139,24 +139,24 @@ impl Ladder {
 /// The acceptance walk's outcome over one verified block: the longest
 /// prefix whose tokens match the target's prediction, plus the correction
 /// from the stop node (the next bonus).
-struct AcceptedPath {
+pub(crate) struct AcceptedPath {
     /// Accepted draft tokens in path order.
-    tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u32>,
     /// Block slots to retain, bonus at 0 included, in path order (the chain
     /// walks a contiguous prefix; the tree walks root-to-leaf slots).
-    slots: Vec<usize>,
+    pub(crate) slots: Vec<usize>,
     /// The stop node's prediction when the walk stopped on a mismatch or a
     /// fully accepted chain.
-    correction: Option<u32>,
+    pub(crate) correction: Option<u32>,
     /// A matched draft token was an EOS token (finish reason Stop).
-    draft_eos: bool,
+    pub(crate) draft_eos: bool,
 }
 
 /// Walk one verified block under `layout`: `predict(i)` returns the target's
 /// prediction after block token `i`. Both layouts commit the longest
 /// matching prefix and take one correction token; the chain walks positions
 /// 0..n in order, the tree follows children whose token matches.
-fn accept_path(
+pub(crate) fn accept_path(
     tree: Option<&TreeSpec>,
     proposals: &[u32],
     eos_ids: &[u32],
@@ -600,7 +600,7 @@ impl<B: Backend> Draft<B> {
 
     /// Chain-mode propose: the draft forward runs on `block_len` masked
     /// tokens, then the markov head walks `block_len` serial argmax steps.
-    fn propose(
+    pub(crate) fn propose(
         &self,
         target: &TextModel<B>,
         state: &mut DraftState<B>,
@@ -867,7 +867,10 @@ fn assemble_block(bonus: u32, drafts: &[u32]) -> Vec<u32> {
 
 /// [`slice_captured`]'s tree variant: keep the given block slots, in path
 /// order (slot 0 is the bonus).
-fn select_captured<B: Backend>(captured: Vec<Tensor<B, 3>>, slots: &[usize]) -> Vec<Tensor<B, 3>> {
+pub(crate) fn select_captured<B: Backend>(
+    captured: Vec<Tensor<B, 3>>,
+    slots: &[usize],
+) -> Vec<Tensor<B, 3>> {
     captured
         .into_iter()
         .map(|hidden| {
@@ -936,7 +939,7 @@ pub struct CycleOutcome {
 /// Trim an accepted path to the emission room: tokens beyond `room` drop
 /// together with their correction; the correction alone drops when it would
 /// exceed the room. Returns whether anything was trimmed.
-fn trim_to_room(path: &mut AcceptedPath, room: usize) -> bool {
+pub(crate) fn trim_to_room(path: &mut AcceptedPath, room: usize) -> bool {
     if path.tokens.len() > room {
         path.tokens.truncate(room);
         path.slots.truncate(1 + room);
@@ -953,7 +956,7 @@ fn trim_to_room(path: &mut AcceptedPath, room: usize) -> bool {
 
 /// Device-side greedy block: one argmax per verify position, read back once,
 /// instead of one megabyte-wide row per position.
-fn greedy_argmax_block<B: Backend>(
+pub(crate) fn greedy_argmax_block<B: Backend>(
     position_logits: &burn::tensor::Tensor<B, 2>,
 ) -> std::result::Result<Vec<u32>, String> {
     let ids = position_logits

@@ -4,6 +4,7 @@ pub mod chat;
 pub mod config;
 pub mod doctor;
 pub mod dspark;
+pub mod dspark_batch;
 #[cfg(feature = "metal")]
 mod gdn_scan;
 pub mod generate;

@@ -332,3 +332,283 @@ mod session_tests {
 
     use resin_core::engine::Submission;
 }
+
+mod batch_tests {
+    use resin_core::Phase;
+    use resin_core::engine::{Error, ExecutionPlan, Runner};
+    use resin_metal::config::ResinConfig;
+    use resin_metal::session::{DecodeAdapter, DecodeRequest, DecodeRow, DecodeSession};
+
+    /// One `decode`/`decode_batch` call as the scripted adapter saw it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Call {
+        slot: usize,
+        input: Vec<u32>,
+        room: usize,
+        budget: usize,
+    }
+
+    /// Scripted model side for the batching seam. `decode` and `decode_batch`
+    /// answer the same function of (slot, input), so the batched and
+    /// sequential sessions must produce identical rows and accounting.
+    #[derive(Default)]
+    struct BatchScripted {
+        prefill_rows: Vec<Vec<u32>>,
+        next_slot: usize,
+        sequential: Vec<Call>,
+        batches: Vec<Vec<Call>>,
+        fail_next_batch: bool,
+    }
+
+    impl DecodeAdapter for BatchScripted {
+        type Slot = usize;
+
+        fn prefill(
+            &mut self,
+            _input: &[u32],
+            _budget: usize,
+        ) -> Result<(Self::Slot, Vec<u32>), Error> {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            Ok((slot, self.prefill_rows.remove(0)))
+        }
+
+        fn decode(
+            &mut self,
+            slot: &mut Self::Slot,
+            input: &[u32],
+            room: usize,
+            budget: usize,
+        ) -> Result<Vec<u32>, Error> {
+            self.sequential.push(Call {
+                slot: *slot,
+                input: input.to_vec(),
+                room,
+                budget,
+            });
+            Ok(vec![*slot as u32 * 100 + input[0]])
+        }
+
+        fn decode_batch(
+            &mut self,
+            rows: &mut [DecodeRow<'_, Self::Slot>],
+        ) -> Result<Vec<Vec<u32>>, Error> {
+            self.batches.push(
+                rows.iter()
+                    .map(|row| Call {
+                        slot: *row.slot,
+                        input: row.input.to_vec(),
+                        room: row.room,
+                        budget: row.budget,
+                    })
+                    .collect(),
+            );
+            if self.fail_next_batch {
+                self.fail_next_batch = false;
+                return Err(Error::internal("scripted batch failure"));
+            }
+            Ok(rows
+                .iter()
+                .map(|row| vec![*row.slot as u32 * 100 + row.input[0]])
+                .collect())
+        }
+    }
+
+    fn plan(
+        phase: Phase,
+        rows: Vec<(u64, Vec<u32>)>,
+        budget: usize,
+    ) -> ExecutionPlan<DecodeRequest> {
+        let mut sequence_ids = Vec::with_capacity(rows.len());
+        let mut token_ids = Vec::new();
+        let mut indptr = vec![0u32];
+        let mut payloads = Vec::with_capacity(rows.len());
+        for (sequence, tokens) in rows {
+            sequence_ids.push(sequence);
+            token_ids.extend(tokens);
+            indptr.push(u32::try_from(token_ids.len()).unwrap());
+            payloads.push(DecodeRequest {
+                max_new_tokens: budget,
+            });
+        }
+        ExecutionPlan {
+            prompt_score_indices: Vec::new(),
+            prompt_score_token_ids: Vec::new(),
+            prompt_score_indptr: Vec::new(),
+            prompt_score_top_counts: Vec::new(),
+            prompt_target_indptr: Vec::new(),
+            prompt_target_token_ids: Vec::new(),
+            batch_id: 1,
+            batch_key: None,
+            phase,
+            context_lengths: vec![1; sequence_ids.len()],
+            sequence_ids,
+            prefill_lengths: Vec::new(),
+            token_ids,
+            token_indptr: indptr,
+            sampling_mask: vec![true; payloads.len()],
+            cache_groups: Vec::new(),
+            payloads,
+        }
+    }
+
+    fn rows(output: resin_core::engine::OwnedTokenRows) -> Vec<Vec<u32>> {
+        output.view().iter().map(|row| row.to_vec()).collect()
+    }
+
+    fn batched() -> ResinConfig {
+        ResinConfig {
+            multi_sequence_batch: true,
+        }
+    }
+
+    fn seeded(config: ResinConfig) -> DecodeSession<BatchScripted> {
+        DecodeSession::with_config(
+            BatchScripted {
+                prefill_rows: vec![vec![1], vec![2]],
+                ..BatchScripted::default()
+            },
+            config,
+        )
+    }
+
+    fn prefill_both(session: &mut DecodeSession<BatchScripted>, budget: usize) {
+        let output = session
+            .forward(plan(
+                Phase::Prefill,
+                vec![(10, vec![1]), (20, vec![2])],
+                budget,
+            ))
+            .unwrap();
+        assert_eq!(rows(output), vec![vec![1], vec![2]]);
+    }
+
+    /// The enabling seam: a two-row decode plan reaches `decode_batch` as one
+    /// call carrying both rows in plan order, and the returned rows map back
+    /// to the sequences by plan position.
+    #[test]
+    fn decode_session_cobatches_every_plan_row_in_order() {
+        let mut session = seeded(batched());
+        prefill_both(&mut session, 10);
+        let output = session
+            .forward(plan(Phase::Decode, vec![(10, vec![7]), (20, vec![8])], 10))
+            .unwrap();
+        assert_eq!(rows(output), vec![vec![7], vec![108]]);
+        assert_eq!(
+            session.adapter().batches,
+            vec![vec![
+                Call {
+                    slot: 0,
+                    input: vec![7],
+                    room: 9,
+                    budget: 10
+                },
+                Call {
+                    slot: 1,
+                    input: vec![8],
+                    room: 9,
+                    budget: 10
+                },
+            ]]
+        );
+        assert!(
+            session.adapter().sequential.is_empty(),
+            "rows bypassed the batch"
+        );
+
+        // A single decode row keeps the per-row path even with batching on.
+        let output = session
+            .forward(plan(Phase::Decode, vec![(10, vec![9])], 10))
+            .unwrap();
+        assert_eq!(rows(output), vec![vec![9]]);
+        assert_eq!(
+            session.adapter().sequential,
+            vec![Call {
+                slot: 0,
+                input: vec![9],
+                room: 8,
+                budget: 10
+            }]
+        );
+    }
+
+    /// The borrow strategy keeps the slots alive across an adapter error: the
+    /// failed plan reports the error, leaves emission untouched, and the next
+    /// plan decodes the same slots.
+    #[test]
+    fn decode_session_reinserts_slots_after_a_batch_error() {
+        let mut session = seeded(batched());
+        prefill_both(&mut session, 10);
+        session.adapter_mut().fail_next_batch = true;
+        let failed = session.forward(plan(Phase::Decode, vec![(10, vec![7]), (20, vec![8])], 10));
+        assert_eq!(failed.unwrap_err().to_string(), "scripted batch failure");
+
+        let output = session
+            .forward(plan(Phase::Decode, vec![(10, vec![7]), (20, vec![8])], 10))
+            .unwrap();
+        assert_eq!(rows(output), vec![vec![7], vec![108]]);
+        // The failed batch did not consume the emission budget: both retried
+        // rows still see the room left after prefill.
+        assert_eq!(
+            session.adapter().batches.last().unwrap(),
+            &vec![
+                Call {
+                    slot: 0,
+                    input: vec![7],
+                    room: 9,
+                    budget: 10
+                },
+                Call {
+                    slot: 1,
+                    input: vec![8],
+                    room: 9,
+                    budget: 10
+                },
+            ]
+        );
+
+        session.release(&[10, 20]).unwrap();
+        assert!(
+            session
+                .forward(plan(Phase::Decode, vec![(10, vec![9])], 10))
+                .is_err(),
+            "release must purge the slots"
+        );
+    }
+
+    /// Batching must be invisible above the session: same rows, same rooms,
+    /// same release semantics as the default sequential loop.
+    #[test]
+    fn decode_session_batching_matches_the_sequential_path() {
+        let script = [
+            plan(Phase::Decode, vec![(10, vec![7]), (20, vec![8])], 8),
+            plan(Phase::Decode, vec![(10, vec![9]), (20, vec![10])], 8),
+        ];
+        let run = |config: ResinConfig| {
+            let mut session = seeded(config);
+            prefill_both(&mut session, 8);
+            let mut outputs = Vec::new();
+            for plan in script.to_vec() {
+                outputs.push(rows(session.forward(plan).unwrap()));
+            }
+            let mut calls = session.adapter().sequential.clone();
+            calls.extend(session.adapter().batches.iter().flatten().cloned());
+            (outputs, calls)
+        };
+        let (sequential_rows, sequential_calls) = run(ResinConfig::default());
+        let (batched_rows, batched_calls) = run(batched());
+        assert_eq!(batched_rows, sequential_rows);
+        assert_eq!(batched_calls, sequential_calls);
+        assert_eq!(
+            sequential_rows,
+            vec![vec![vec![7], vec![108]], vec![vec![9], vec![110]]]
+        );
+        assert_eq!(
+            sequential_calls
+                .iter()
+                .map(|call| call.room)
+                .collect::<Vec<_>>(),
+            vec![7, 7, 6, 6]
+        );
+    }
+}
