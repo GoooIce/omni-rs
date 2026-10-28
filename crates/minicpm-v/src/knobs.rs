@@ -14,8 +14,12 @@
 //! | `MINICPM_DSPARK_LAYERS` | `[3,11,19,27,35]` | draft cross-attention layers, five ascending `0..40` |
 //! | `MINICPM_DSPARK_TREE` | off | markov-tree layout (adaptive runs only) |
 //! | `MINICPM_DSPARK_MARKOV_QUANT` | off | int8 markov scoring |
+//! | `MINICPM_DSPARK_LEDGER` | off | calibrated verify-size ledger (`=1`) |
+//! | `MINICPM_DSPARK_LEDGER_PATH` | `target/dspark-ledger/` | ledger JSON path override |
+//! | `MINICPM_DSPARK_CHIP` | arch/OS | ledger chip fingerprint override |
 //! | `MINICPM_GLUE` | on | fused verify seams (`=0` disables) |
 //! | `MINICPM_DRAFT_GLUE` | on | fused draft seams (`=0` disables) |
+//! | `OMNI_AB_HEADER` | off | print the one-line A/B header (`=1`) |
 
 /// The draft's cross-attention layers over the 40-layer target tower.
 pub(crate) const DEFAULT_LAYERS: [usize; 5] = [3, 11, 19, 27, 35];
@@ -85,6 +89,63 @@ pub(crate) fn dspark_markov_quant() -> bool {
     })
 }
 
+/// `MINICPM_DSPARK_LEDGER` — the calibrated verify-size ledger. Default off:
+/// with the switch off, `dspark::generate` runs the unchanged AIMD ladder and
+/// reads or writes no ledger file.
+pub fn dspark_ledger() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        matches!(
+            std::env::var("MINICPM_DSPARK_LEDGER").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
+/// `OMNI_AB_HEADER` — the A/B run header without the per-cycle trace.
+fn ab_header() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| matches!(std::env::var("OMNI_AB_HEADER").ok().as_deref(), Some("1")))
+}
+
+/// The A/B run header: every DSpark switch, the ledger's allowed set and
+/// cost basis, the fused-seam switches and the build's git hash when the
+/// build provided one. Printed once per process when `MINICPM_DSPARK_TRACE`
+/// or `OMNI_AB_HEADER=1` is set; callers invoke it at a run's entry.
+pub fn experiment_header() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if !(dspark_trace() || ab_header()) {
+        return;
+    }
+    ONCE.call_once(|| eprintln!("{}", header_line()));
+}
+
+fn header_line() -> String {
+    let block = dspark_block().map_or_else(|| "adaptive".to_owned(), |size| size.to_string());
+    let allowed = dspark_block()
+        .map(|size| vec![size])
+        .unwrap_or_else(|| crate::ledger::ALLOWED_SIZES.to_vec());
+    let layers = dspark_layers()
+        .iter()
+        .map(|layer| layer.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "dspark ab-header: trace={} block={} layers={} tree={} markov_quant={} ledger={} ledger_allowed={:?} ledger_basis={} glue={} draft_glue={} git={}",
+        dspark_trace(),
+        block,
+        layers,
+        dspark_tree(),
+        dspark_markov_quant(),
+        dspark_ledger(),
+        allowed,
+        crate::ledger::COST_BASIS,
+        verify_glue(),
+        draft_glue(),
+        option_env!("OMNI_GIT_HASH").unwrap_or("unknown"),
+    )
+}
+
 /// `MINICPM_GLUE` — the fused verify seams (norm, residual, split-half RoPE)
 /// default ON: the verify forward is launch-bound and the seams removed ~20%
 /// of its wall in same-window interleaved A/B (#52), with greedy output
@@ -107,4 +168,27 @@ pub(crate) fn draft_glue() -> bool {
             Some("0")
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn header_lists_switches_allowed_set_and_basis() {
+        let line = super::header_line();
+        for field in [
+            "trace=",
+            "block=",
+            "layers=",
+            "tree=",
+            "markov_quant=",
+            "ledger=",
+            "ledger_allowed=",
+            "ledger_basis=host-wall-clock",
+            "glue=",
+            "draft_glue=",
+            "git=",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
+    }
 }

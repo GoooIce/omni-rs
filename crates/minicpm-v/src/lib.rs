@@ -13,6 +13,7 @@ pub(crate) mod glue;
 pub mod image;
 pub mod knobs;
 pub mod latent;
+pub mod ledger;
 #[cfg(feature = "metal")]
 pub(crate) mod markov;
 #[cfg(feature = "metal")]
