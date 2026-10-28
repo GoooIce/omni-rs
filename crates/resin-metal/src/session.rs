@@ -33,6 +33,17 @@
 //!   its state snapshot; a prompt may only restore it when
 //!   `tokens.len() <= prompt.len() - 1`, so the final prompt token is always
 //!   replayed and sampling at prefill end stays defined.
+//!
+//! SSD persistence (#75) is a third opt-in (`state_cache`) layered on the same
+//! checkpoints through [`crate::state_cache::StateCache`]. On a memory miss
+//! the session walks the on-disk content chain from the longest strict prefix
+//! down and restores the first entry the adapter can decode; an entry whose
+//! token history equals the whole prompt is also accepted (the adapter emits
+//! the stored pending token without a forward, the cold-start path). Writes
+//! are queued when a checkpoint is saved and drained synchronously on the
+//! runner thread at the idle boundary — at the start of the next `forward` or
+//! after `release` — because encoding reads device tensors back. With the
+//! switch off the session never opens or touches the cache.
 
 use std::collections::HashMap;
 
@@ -42,6 +53,7 @@ use resin_core::engine::{Error, ExecutionPlan, OwnedTokenRows, Runner};
 use crate::config::ResinConfig;
 pub use crate::conversation::ConversationStats;
 use crate::conversation::ConversationStore;
+use crate::state_cache::{CheckpointPayload, StateCache, StateCacheStats, content_key};
 
 /// Per-request payload the engine echoes into every plan row: the emission
 /// budget and, when conversation slots are on, the caller's slot key. The
@@ -133,8 +145,11 @@ pub trait DecodeAdapter {
     /// Restore `checkpoint` and prefill only `input`, the prompt suffix after
     /// the checkpoint's token history; returns the new slot and the sampled
     /// token, or `None` when this adapter cannot resume (the default) and the
-    /// session must fall back to a full [`Self::prefill`]. `input` is never
-    /// empty: the session keeps at least the final prompt token to replay.
+    /// session must fall back to a full [`Self::prefill`]. `input` is empty
+    /// only for a disk entry whose token history is the whole prompt: an
+    /// adapter that stored the pending sampled token may then rebuild the
+    /// slot and return that token without a forward (#75); adapters that
+    /// cannot return `Ok(None)`.
     fn prefill_resume(
         &mut self,
         _checkpoint: Self::Checkpoint,
@@ -143,6 +158,31 @@ pub trait DecodeAdapter {
     ) -> Result<Option<(Self::Slot, Vec<u32>)>, Error> {
         Ok(None)
     }
+
+    /// Encode `checkpoint` into named, device-free tensors for SSD persistence
+    /// (#75). Called on the runner thread at an idle boundary, so reading
+    /// device tensors back here is safe. The default disables disk writes for
+    /// this adapter.
+    fn encode_checkpoint(&self, _checkpoint: &Self::Checkpoint) -> Option<CheckpointPayload> {
+        None
+    }
+
+    /// Rebuild a checkpoint from a stored payload plus the token history the
+    /// session read from the file header (#75). The default disables disk
+    /// restores for this adapter.
+    fn decode_checkpoint(
+        &self,
+        _tokens: &[u32],
+        _payload: CheckpointPayload,
+    ) -> Option<Self::Checkpoint> {
+        None
+    }
+}
+
+/// A checkpoint queued for the next idle-boundary disk drain (#75).
+struct PendingState<C> {
+    tokens: Vec<u32>,
+    checkpoint: C,
 }
 
 pub struct DecodeSession<A: DecodeAdapter> {
@@ -153,6 +193,9 @@ pub struct DecodeSession<A: DecodeAdapter> {
     /// Request id -> caller's conversation slot key.
     request_keys: HashMap<u64, u64>,
     conversation: ConversationStore<A::Checkpoint>,
+    /// SSD persistence; `None` keeps the session memory-only (#75).
+    state_cache: Option<StateCache>,
+    pending_states: Vec<PendingState<A::Checkpoint>>,
     stats: ConversationStats,
 }
 
@@ -166,8 +209,20 @@ impl<A: DecodeAdapter> DecodeSession<A> {
     /// Explicit config. Environment overrides win over `false` fields so one
     /// binary can A/B a switch (see [`crate::config::ResinConfig`]).
     pub fn with_config(adapter: A, config: ResinConfig) -> Self {
+        Self::with_config_and_state_cache(adapter, config, None)
+    }
+
+    /// Explicit config plus the SSD state cache (#75). The cache is ignored
+    /// (and never touched) when `config.state_cache` is off; the caller builds
+    /// it with a namespace it derived from the model directory.
+    pub fn with_config_and_state_cache(
+        adapter: A,
+        config: ResinConfig,
+        cache: Option<StateCache>,
+    ) -> Self {
         let config = config.with_env_overrides();
         crate::config::print_header(&config);
+        let state_cache = if config.state_cache { cache } else { None };
         Self {
             adapter,
             config,
@@ -175,6 +230,8 @@ impl<A: DecodeAdapter> DecodeSession<A> {
             emitted: HashMap::new(),
             request_keys: HashMap::new(),
             conversation: ConversationStore::default(),
+            state_cache,
+            pending_states: Vec::new(),
             stats: ConversationStats::default(),
         }
     }
@@ -193,14 +250,33 @@ impl<A: DecodeAdapter> DecodeSession<A> {
         &self.config
     }
 
-    /// Prefill tokens fed and checkpoint hit/miss counters (#74).
+    /// Prefill tokens fed and checkpoint hit/miss counters (#74, #75).
     pub fn conversation_stats(&self) -> ConversationStats {
         self.stats
     }
 
+    /// The SSD state cache, when this session was built with one and the
+    /// switch is on (#75).
+    pub fn state_cache(&self) -> Option<&StateCache> {
+        self.state_cache.as_ref()
+    }
+
+    pub fn state_cache_stats(&self) -> Option<StateCacheStats> {
+        self.state_cache.as_ref().map(StateCache::stats)
+    }
+
+    /// Encode and write every queued checkpoint now (the engine-idle
+    /// boundary); returns the number of entries written. `release` and the
+    /// start of `forward` call this on their own, so explicit calls are only
+    /// needed before tearing the session down.
+    pub fn flush_state_cache(&mut self) -> usize {
+        self.drain_state_cache()
+    }
+
     /// Prefill one row, restoring a conversation checkpoint when the row
     /// carries the whole prompt and a stored checkpoint is a strict prefix of
-    /// it. `key` is the caller's slot key (already gated on the switch).
+    /// it (or, from SSD, exactly the prompt). `key` is the caller's slot key
+    /// (already gated on the switch).
     fn prefill_row(
         &mut self,
         sequence: u64,
@@ -213,14 +289,18 @@ impl<A: DecodeAdapter> DecodeSession<A> {
             self.stats.prefill_tokens += input.len() as u64;
             return self.adapter.prefill(input, budget);
         };
-        if full_prompt && let Some((tokens, checkpoint)) = self.conversation.deepest_prefix(input) {
+        if full_prompt && let Some((tokens, checkpoint, from_disk)) = self.resume_candidate(input) {
             let suffix = &input[tokens..];
             match self.adapter.prefill_resume(checkpoint, suffix, budget) {
                 Ok(Some((slot, row_tokens))) => {
                     self.stats.checkpoint_hits += 1;
+                    self.stats.disk_hits += u64::from(from_disk);
                     self.stats.prefill_tokens += suffix.len() as u64;
                     self.request_keys.insert(sequence, key);
-                    self.save_prefix_checkpoint(key, &slot);
+                    // An exact disk restore already is the deepest prefix; any
+                    // other hit persists the deeper state it just built.
+                    let queue_disk = !(from_disk && suffix.is_empty());
+                    self.save_prefix_checkpoint(key, &slot, queue_disk);
                     return Ok((slot, row_tokens));
                 }
                 Ok(None) => {}
@@ -234,18 +314,102 @@ impl<A: DecodeAdapter> DecodeSession<A> {
         self.stats.prefill_tokens += input.len() as u64;
         let (slot, row_tokens) = self.adapter.prefill(input, budget)?;
         self.request_keys.insert(sequence, key);
-        self.save_prefix_checkpoint(key, &slot);
+        self.save_prefix_checkpoint(key, &slot, true);
         Ok((slot, row_tokens))
     }
 
-    /// Store the prefill-end prefix snapshot (append-only, see the store).
-    fn save_prefix_checkpoint(&mut self, key: u64, slot: &A::Slot) {
+    /// Memory first, then SSD (#75). The SSD search takes the longest strict
+    /// prefix (the final prompt token must be replayed); if nothing shorter
+    /// matches, an entry whose token history is the whole prompt is tried —
+    /// the adapter emits its stored pending token without a forward.
+    fn resume_candidate(&mut self, prompt: &[u32]) -> Option<(usize, A::Checkpoint, bool)> {
+        if let Some((tokens, checkpoint)) = self.conversation.deepest_prefix(prompt) {
+            return Some((tokens, checkpoint, false));
+        }
+        if prompt.is_empty() {
+            return None;
+        }
+        if let Some(cache) = self.state_cache.as_mut() {
+            let max = prompt.len().saturating_sub(1);
+            if let Some((tokens, stored)) = cache.load_deepest_prefix(prompt, max)
+                && let Some(checkpoint) = self
+                    .adapter
+                    .decode_checkpoint(&stored.tokens, stored.payload)
+            {
+                return Some((tokens, checkpoint, true));
+            }
+        }
+        let cache = self.state_cache.as_mut()?;
+        let stored = cache.load(&content_key(prompt))?;
+        if stored.tokens != prompt {
+            return None;
+        }
+        let checkpoint = self
+            .adapter
+            .decode_checkpoint(&stored.tokens, stored.payload)?;
+        Some((prompt.len(), checkpoint, true))
+    }
+
+    /// Store the prefill-end prefix snapshot (append-only, see the store) and
+    /// queue the same checkpoint for the next disk drain when `queue_disk`.
+    fn save_prefix_checkpoint(&mut self, key: u64, slot: &A::Slot, queue_disk: bool) {
         if let Some(checkpoint) = self.adapter.checkpoint(slot) {
             let tokens = self.adapter.checkpoint_tokens(&checkpoint).to_vec();
             if !tokens.is_empty() {
+                if queue_disk {
+                    self.queue_state(tokens.clone(), checkpoint.clone());
+                }
                 self.conversation.save_prefix(key, checkpoint, tokens);
             }
         }
+    }
+
+    /// Queue a turn-boundary checkpoint for the next idle-boundary drain. A
+    /// queued checkpoint with the same token history is replaced: the same
+    /// history describes the same deterministic state, so writing it twice
+    /// would only repeat the readback.
+    fn queue_state(&mut self, tokens: Vec<u32>, checkpoint: A::Checkpoint) {
+        if !self.config.state_cache || self.state_cache.is_none() {
+            return;
+        }
+        if let Some(existing) = self
+            .pending_states
+            .iter_mut()
+            .find(|pending| pending.tokens == tokens)
+        {
+            existing.checkpoint = checkpoint;
+            return;
+        }
+        self.pending_states
+            .push(PendingState { tokens, checkpoint });
+    }
+
+    /// Encode and write queued checkpoints on the calling (runner) thread.
+    /// Encoding reads device tensors back, which is why this is not a
+    /// background writer. Errors are logged and never fail a plan.
+    fn drain_state_cache(&mut self) -> usize {
+        if self.pending_states.is_empty() {
+            return 0;
+        }
+        let Some(cache) = self.state_cache.as_mut() else {
+            self.pending_states.clear();
+            return 0;
+        };
+        let pending = std::mem::take(&mut self.pending_states);
+        let mut written = 0;
+        for entry in pending {
+            let Some(payload) = self.adapter.encode_checkpoint(&entry.checkpoint) else {
+                continue;
+            };
+            match cache.save(&entry.tokens, &payload) {
+                Ok(()) => {
+                    written += 1;
+                    self.stats.disk_writes += 1;
+                }
+                Err(error) => eprintln!("resin state cache: write failed: {error}"),
+            }
+        }
+        written
     }
 
     fn forward_sequential(
@@ -353,6 +517,9 @@ impl<A: DecodeAdapter> DecodeSession<A> {
 
 impl<A: DecodeAdapter> Runner<DecodeRequest> for DecodeSession<A> {
     fn forward(&mut self, plan: ExecutionPlan<DecodeRequest>) -> Result<OwnedTokenRows, Error> {
+        // Idle boundary: any checkpoint queued by an earlier release or
+        // prefill is encoded and written before this plan touches the state.
+        self.drain_state_cache();
         match plan.phase {
             Phase::Prefill => self.forward_sequential(plan),
             _ if self.config.multi_sequence_batch && plan.sequence_ids.len() >= 2 => {
@@ -377,12 +544,16 @@ impl<A: DecodeAdapter> Runner<DecodeRequest> for DecodeSession<A> {
             if let (Some(key), Some(checkpoint)) = (key, checkpoint) {
                 let tokens = self.adapter.checkpoint_tokens(&checkpoint).to_vec();
                 if !tokens.is_empty() {
+                    self.queue_state(tokens.clone(), checkpoint.clone());
                     self.conversation.save_turn(key, checkpoint, tokens);
                 }
             }
             self.slots.remove(&id);
             self.emitted.remove(&id);
         }
+        // The release itself is an idle boundary; write now so a process that
+        // exits after releasing still made its checkpoints durable.
+        self.drain_state_cache();
         Ok(())
     }
 }

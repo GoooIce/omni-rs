@@ -13,18 +13,23 @@
 //! Conversation checkpoints (#74) carry the target decode state, the draft
 //! context and the KV-aligned token history (`history[..state.length]`). The
 //! draft context grows to the new request's prompt plus budget on restore,
-//! because the checkpoint was sized for the request that produced it.
+//! because the checkpoint was sized for the request that produced it. SSD
+//! persistence (#75) encodes the target state, the filled draft K/V rows and
+//! the pending token as named tensors.
 
-use burn::tensor::backend::Backend;
+use burn::tensor::{Tensor, TensorData, backend::Backend};
 use omni_minicpm_v::dspark::{self, Draft, DraftState, SpecStats};
 use omni_minicpm_v::dspark_batch::{self, BatchCycleMember};
 use omni_minicpm_v::generate::{Options, Sampler};
 use omni_minicpm_v::model::{DecodeState, TextModel, VerifyNumerics};
+use omni_minicpm_v::text::LinearState;
+use omni_r2t2::tensor::KvCache;
 use resin_core::engine::{Error, Runner};
 
 use crate::config::ResinConfig;
 use crate::conversation::ConversationStats;
 use crate::session::{DecodeAdapter, DecodeRequest, DecodeRow, DecodeSession};
+use crate::state_cache::{CheckpointPayload, tensor_from};
 
 struct DsparkAdapter<B: Backend> {
     model: TextModel<B>,
@@ -64,6 +69,18 @@ struct DsparkCheckpoint<B: Backend> {
     draft_state: DraftState<B>,
     /// `history[..state.length]`; the pending bonus is excluded.
     tokens: Vec<u32>,
+    /// The sampled token that had not entered the KV state (#75).
+    pending: Option<u32>,
+}
+
+/// The filled prefix of a draft K/V buffer (#75). The saved entry only keeps
+/// `length` rows; `DraftState::ensure_capacity` grows it on restore.
+fn prefix_rows<B: Backend>(tensor: &Tensor<B, 4>, rows: usize) -> Tensor<B, 4> {
+    let [batch, heads, capacity, width] = tensor.dims();
+    assert!(rows <= capacity, "draft context length exceeds its buffer");
+    tensor
+        .clone()
+        .slice([0..batch, 0..heads, 0..rows, 0..width])
 }
 
 impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
@@ -221,6 +238,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             state: slot.state.clone(),
             draft_state: slot.draft_state.clone(),
             tokens: slot.history[..aligned].to_vec(),
+            pending: slot.history.get(aligned).copied(),
         })
     }
 
@@ -239,20 +257,37 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
     /// Restore the target and draft state, extend both by the prompt suffix
     /// and sample at prefill end. The draft buffers grow first when the new
     /// request's prompt plus budget no longer fits the checkpoint's capacity.
+    /// An empty suffix is the exact-length disk restore (#75): the target and
+    /// draft already cover the prompt, and the stored pending token is the
+    /// prefill-end sample.
     fn prefill_resume(
         &mut self,
         checkpoint: Self::Checkpoint,
         input: &[u32],
         budget: usize,
     ) -> Result<Option<(Self::Slot, Vec<u32>)>, Error> {
-        if input.is_empty() {
-            return Ok(None);
-        }
         let DsparkCheckpoint {
             mut state,
             mut draft_state,
             tokens,
+            pending,
         } = checkpoint;
+        if input.is_empty() {
+            let Some(pending) = pending else {
+                return Ok(None);
+            };
+            draft_state.ensure_capacity(tokens.len() + budget + self.block_len + 1);
+            let mut history = tokens;
+            history.push(pending);
+            return Ok(Some((
+                DsparkSlot {
+                    state,
+                    draft_state,
+                    history,
+                },
+                vec![pending],
+            )));
+        }
         draft_state.ensure_capacity(tokens.len() + input.len() + budget + self.block_len + 1);
         let (logits, _, captured) = self
             .model
@@ -291,6 +326,125 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             vec![first],
         )))
     }
+
+    /// DSpark checkpoint as named tensors (#75): target KV/linear state, the
+    /// filled draft K/V rows and the pending token plus draft length.
+    fn encode_checkpoint(&self, checkpoint: &Self::Checkpoint) -> Option<CheckpointPayload> {
+        let state = &checkpoint.state;
+        let draft_state = &checkpoint.draft_state;
+        let draft_length = draft_state.len();
+        let draft_layers = draft_state.keys().len();
+        if draft_layers != draft_state.values().len() {
+            return None;
+        }
+        let mut payload = CheckpointPayload::new(
+            state.length,
+            state.rope_delta,
+            checkpoint.pending,
+            Some(serde_json::json!({
+                "kv_layers": state.kv_caches().len(),
+                "linear_layers": state.linear_states().len(),
+                "draft_layers": draft_layers,
+                "draft_length": draft_length,
+            })),
+        );
+        for (index, cache) in state.kv_caches().iter().enumerate() {
+            if let Some((key, value)) = cache.snapshot() {
+                payload.push(format!("kv.{index}.k"), key);
+                payload.push(format!("kv.{index}.v"), value);
+            }
+        }
+        for (index, linear) in state.linear_states().iter().enumerate() {
+            payload.push(format!("linear.{index}.conv"), &linear.conv);
+            payload.push(format!("linear.{index}.recurrent"), &linear.recurrent);
+        }
+        for (index, (key, value)) in draft_state
+            .keys()
+            .iter()
+            .zip(draft_state.values())
+            .enumerate()
+        {
+            payload.push(format!("draft.{index}.k"), &prefix_rows(key, draft_length));
+            payload.push(
+                format!("draft.{index}.v"),
+                &prefix_rows(value, draft_length),
+            );
+        }
+        Some(payload)
+    }
+
+    fn decode_checkpoint(
+        &self,
+        tokens: &[u32],
+        payload: CheckpointPayload,
+    ) -> Option<Self::Checkpoint> {
+        if tokens.len() != payload.length {
+            return None;
+        }
+        let (length, rope_delta, pending, meta, mut tensors) = payload.into_parts();
+        let meta = meta?;
+        let kv_layers = usize::try_from(meta.get("kv_layers")?.as_u64()?).ok()?;
+        let linear_layers = usize::try_from(meta.get("linear_layers")?.as_u64()?).ok()?;
+        let draft_layers = usize::try_from(meta.get("draft_layers")?.as_u64()?).ok()?;
+        let draft_length = usize::try_from(meta.get("draft_length")?.as_u64()?).ok()?;
+        if kv_layers == 0
+            || kv_layers != linear_layers
+            || kv_layers > 1024
+            || draft_layers == 0
+            || draft_layers > 1024
+            || draft_length > length
+        {
+            return None;
+        }
+        let mut kv = Vec::with_capacity(kv_layers);
+        for index in 0..kv_layers {
+            let key = tensors.remove(&format!("kv.{index}.k"));
+            let value = tensors.remove(&format!("kv.{index}.v"));
+            match (key, value) {
+                (Some(key), Some(value)) => kv.push(KvCache::from_tensors(
+                    tensor_from(key, &self.device)?,
+                    tensor_from(value, &self.device)?,
+                )),
+                (None, None) => kv.push(KvCache::default()),
+                _ => return None,
+            }
+        }
+        let mut linear = Vec::with_capacity(linear_layers);
+        for index in 0..linear_layers {
+            let conv: TensorData = tensors.remove(&format!("linear.{index}.conv"))?;
+            let recurrent: TensorData = tensors.remove(&format!("linear.{index}.recurrent"))?;
+            linear.push(LinearState {
+                conv: tensor_from(conv, &self.device)?,
+                recurrent: tensor_from(recurrent, &self.device)?,
+            });
+        }
+        let mut keys = Vec::with_capacity(draft_layers);
+        let mut values = Vec::with_capacity(draft_layers);
+        for index in 0..draft_layers {
+            let key = tensor_from(tensors.remove(&format!("draft.{index}.k"))?, &self.device)?;
+            let value = tensor_from(tensors.remove(&format!("draft.{index}.v"))?, &self.device)?;
+            let [batch, heads, capacity, width] = key.dims();
+            if key.dims() != value.dims()
+                || batch != 1
+                || heads == 0
+                || capacity < draft_length
+                || width == 0
+            {
+                return None;
+            }
+            keys.push(key);
+            values.push(value);
+        }
+        if !tensors.is_empty() {
+            return None;
+        }
+        Some(DsparkCheckpoint {
+            state: DecodeState::from_parts(kv, linear, length, rope_delta),
+            draft_state: DraftState::from_buffers(keys, values, draft_length),
+            tokens: tokens.to_vec(),
+            pending,
+        })
+    }
 }
 
 pub struct MinicpmDsparkRunner<B: Backend> {
@@ -327,8 +481,24 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         eos_ids: Vec<u32>,
         config: ResinConfig,
     ) -> Self {
+        Self::with_state_cache(model, draft, device, block_len, eos_ids, config, None)
+    }
+
+    /// Explicit config plus the SSD state cache (#75). The caller derives the
+    /// cache namespace from the model and drafter directories plus the block
+    /// row count; the session never guesses a path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_state_cache(
+        model: TextModel<B>,
+        draft: Draft<B>,
+        device: B::Device,
+        block_len: usize,
+        eos_ids: Vec<u32>,
+        config: ResinConfig,
+        cache: Option<crate::state_cache::StateCache>,
+    ) -> Self {
         Self {
-            session: DecodeSession::with_config(
+            session: DecodeSession::with_config_and_state_cache(
                 DsparkAdapter {
                     model,
                     draft,
@@ -348,6 +518,7 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
                     batched_cycles: 0,
                 },
                 config,
+                cache,
             ),
         }
     }
@@ -362,9 +533,19 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         self.session.adapter().batched_cycles
     }
 
-    /// Prefill tokens fed and checkpoint hit/miss counters (#74).
+    /// Prefill tokens fed and checkpoint hit/miss counters (#74, #75).
     pub fn conversation_stats(&self) -> ConversationStats {
         self.session.conversation_stats()
+    }
+
+    /// Disk cache counters, when a cache is attached (#75).
+    pub fn state_cache_stats(&self) -> Option<crate::state_cache::StateCacheStats> {
+        self.session.state_cache_stats()
+    }
+
+    /// Encode and write queued checkpoints now (#75).
+    pub fn flush_state_cache(&mut self) -> usize {
+        self.session.flush_state_cache()
     }
 
     /// Aggregate cycle stats (τ via `acceptance_length`).

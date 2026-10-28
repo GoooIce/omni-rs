@@ -4593,6 +4593,9 @@ dependencies = [
  "omni-minicpm-v",
  "omni-r2t2",
  "resin-core",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

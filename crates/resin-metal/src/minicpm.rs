@@ -11,16 +11,20 @@
 //! Conversation checkpoints (#74) snapshot the decode state plus the
 //! KV-aligned history (`history[..state.length]`): the pending sampled token
 //! is not in the KV state, so it is left out and replayed by the next prompt
-//! (see the alignment note in [`crate::session`]).
+//! (see the alignment note in [`crate::session`]). SSD persistence (#75)
+//! encodes the same checkpoint as named tensors, keeping every dtype as-is.
 
-use burn::tensor::backend::Backend;
+use burn::tensor::{TensorData, backend::Backend};
 use omni_minicpm_v::generate::{Options, Sampler};
 use omni_minicpm_v::model::{DecodeState, TextModel};
+use omni_minicpm_v::text::LinearState;
+use omni_r2t2::tensor::KvCache;
 use resin_core::engine::{Error, Runner};
 
 use crate::config::ResinConfig;
 use crate::conversation::ConversationStats;
 use crate::session::{DecodeAdapter, DecodeRequest, DecodeSession};
+use crate::state_cache::{CheckpointPayload, tensor_from};
 
 struct GreedyAdapter<B: Backend> {
     model: TextModel<B>,
@@ -34,6 +38,9 @@ struct GreedyCheckpoint<B: Backend> {
     state: DecodeState<B>,
     /// `history[..state.length]`; the pending bonus is excluded.
     tokens: Vec<u32>,
+    /// The sampled token that had not entered the KV state (#75): a disk
+    /// entry matching the whole prompt emits it without a forward.
+    pending: Option<u32>,
 }
 
 /// Greedy sampler over one logits row, shared with the direct loop.
@@ -95,6 +102,7 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         Some(GreedyCheckpoint {
             state: state.clone(),
             tokens: history[..aligned].to_vec(),
+            pending: history.get(aligned).copied(),
         })
     }
 
@@ -108,17 +116,29 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
 
     /// Replay the prompt suffix over the restored state. The final prompt
     /// token is always part of `input` (the session's prefix rule), so the
-    /// forward produces the same prefill-end logits a full prefill would.
+    /// forward produces the same prefill-end logits a full prefill would. An
+    /// empty suffix is the exact-length disk restore (#75): the state already
+    /// covers the prompt, so the stored pending token is the prefill-end
+    /// sample and is emitted without a forward.
     fn prefill_resume(
         &mut self,
         checkpoint: Self::Checkpoint,
         input: &[u32],
         _budget: usize,
     ) -> Result<Option<(Self::Slot, Vec<u32>)>, Error> {
+        let GreedyCheckpoint {
+            mut state,
+            tokens,
+            pending,
+        } = checkpoint;
         if input.is_empty() {
-            return Ok(None);
+            let Some(pending) = pending else {
+                return Ok(None);
+            };
+            let mut history = tokens;
+            history.push(pending);
+            return Ok(Some(((state, history), vec![pending])));
         }
-        let GreedyCheckpoint { mut state, tokens } = checkpoint;
         let logits = self
             .model
             .forward(input, None, None, &mut state)
@@ -128,6 +148,80 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         let token = sample_greedy(&self.options, logits, &history)?;
         history.push(token);
         Ok(Some(((state, history), vec![token])))
+    }
+
+    /// Greedy checkpoint as named tensors (#75): one `kv.<layer>.k/v` pair per
+    /// full-attention layer and `linear.<layer>.conv/recurrent` per linear
+    /// layer, in the state's own dtype.
+    fn encode_checkpoint(&self, checkpoint: &Self::Checkpoint) -> Option<CheckpointPayload> {
+        let state = &checkpoint.state;
+        let mut payload = CheckpointPayload::new(
+            state.length,
+            state.rope_delta,
+            checkpoint.pending,
+            Some(serde_json::json!({
+                "kv_layers": state.kv_caches().len(),
+                "linear_layers": state.linear_states().len(),
+            })),
+        );
+        for (index, cache) in state.kv_caches().iter().enumerate() {
+            if let Some((key, value)) = cache.snapshot() {
+                payload.push(format!("kv.{index}.k"), key);
+                payload.push(format!("kv.{index}.v"), value);
+            }
+        }
+        for (index, linear) in state.linear_states().iter().enumerate() {
+            payload.push(format!("linear.{index}.conv"), &linear.conv);
+            payload.push(format!("linear.{index}.recurrent"), &linear.recurrent);
+        }
+        Some(payload)
+    }
+
+    fn decode_checkpoint(
+        &self,
+        tokens: &[u32],
+        payload: CheckpointPayload,
+    ) -> Option<Self::Checkpoint> {
+        if tokens.len() != payload.length {
+            return None;
+        }
+        let (length, rope_delta, pending, meta, mut tensors) = payload.into_parts();
+        let meta = meta?;
+        let layers = usize::try_from(meta.get("kv_layers")?.as_u64()?).ok()?;
+        let linear_layers = usize::try_from(meta.get("linear_layers")?.as_u64()?).ok()?;
+        if layers == 0 || layers != linear_layers || layers > 1024 {
+            return None;
+        }
+        let mut kv = Vec::with_capacity(layers);
+        for index in 0..layers {
+            let key = tensors.remove(&format!("kv.{index}.k"));
+            let value = tensors.remove(&format!("kv.{index}.v"));
+            match (key, value) {
+                (Some(key), Some(value)) => kv.push(KvCache::from_tensors(
+                    tensor_from(key, &self.device)?,
+                    tensor_from(value, &self.device)?,
+                )),
+                (None, None) => kv.push(KvCache::default()),
+                _ => return None,
+            }
+        }
+        let mut linear = Vec::with_capacity(linear_layers);
+        for index in 0..linear_layers {
+            let conv: TensorData = tensors.remove(&format!("linear.{index}.conv"))?;
+            let recurrent: TensorData = tensors.remove(&format!("linear.{index}.recurrent"))?;
+            linear.push(LinearState {
+                conv: tensor_from(conv, &self.device)?,
+                recurrent: tensor_from(recurrent, &self.device)?,
+            });
+        }
+        if !tensors.is_empty() {
+            return None;
+        }
+        Some(GreedyCheckpoint {
+            state: DecodeState::from_parts(kv, linear, length, rope_delta),
+            tokens: tokens.to_vec(),
+            pending,
+        })
     }
 }
 
@@ -145,8 +239,20 @@ impl<B: Backend> MinicpmRunner<B> {
 
     /// Explicit engine config (`conversation_slots` enables #74 checkpoints).
     pub fn with_config(model: TextModel<B>, device: B::Device, config: ResinConfig) -> Self {
+        Self::with_state_cache(model, device, config, None)
+    }
+
+    /// Explicit config plus the SSD state cache (#75). The caller derives the
+    /// cache namespace from the model directory; the session never guesses a
+    /// path.
+    pub fn with_state_cache(
+        model: TextModel<B>,
+        device: B::Device,
+        config: ResinConfig,
+        cache: Option<crate::state_cache::StateCache>,
+    ) -> Self {
         Self {
-            session: DecodeSession::with_config(
+            session: DecodeSession::with_config_and_state_cache(
                 GreedyAdapter {
                     model,
                     device,
@@ -156,6 +262,7 @@ impl<B: Backend> MinicpmRunner<B> {
                     },
                 },
                 config,
+                cache,
             ),
         }
     }
@@ -165,9 +272,19 @@ impl<B: Backend> MinicpmRunner<B> {
         self.session.config()
     }
 
-    /// Prefill tokens fed and checkpoint hit/miss counters (#74).
+    /// Prefill tokens fed and checkpoint hit/miss counters (#74, #75).
     pub fn conversation_stats(&self) -> ConversationStats {
         self.session.conversation_stats()
+    }
+
+    /// Disk cache counters, when a cache is attached (#75).
+    pub fn state_cache_stats(&self) -> Option<crate::state_cache::StateCacheStats> {
+        self.session.state_cache_stats()
+    }
+
+    /// Encode and write queued checkpoints now (#75).
+    pub fn flush_state_cache(&mut self) -> usize {
+        self.session.flush_state_cache()
     }
 }
 

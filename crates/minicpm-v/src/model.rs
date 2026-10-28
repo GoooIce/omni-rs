@@ -28,6 +28,38 @@ impl<B: Backend> DecodeState<B> {
         self.length == 0
     }
 
+    /// Per-layer KV caches, indexed like the model's layers (#75 checkpoint
+    /// snapshot seam). A linear-attention layer's cache stays empty.
+    pub fn kv_caches(&self) -> &[KvCache<B>] {
+        &self.kv
+    }
+
+    /// Per-layer linear-attention states, indexed like the model's layers.
+    pub fn linear_states(&self) -> &[LinearState<B>] {
+        &self.linear
+    }
+
+    /// Rebuild a state from restored parts (#75): one KV cache and one linear
+    /// state per layer, plus the KV-aligned length and rope offset.
+    pub fn from_parts(
+        kv: Vec<KvCache<B>>,
+        linear: Vec<LinearState<B>>,
+        length: usize,
+        rope_delta: i64,
+    ) -> Self {
+        assert_eq!(
+            kv.len(),
+            linear.len(),
+            "one KV cache and one linear state per layer"
+        );
+        Self {
+            kv,
+            linear,
+            length,
+            rope_delta,
+        }
+    }
+
     /// Drop the rejected suffix of a speculative forward.
     ///
     /// `linear_after[layer][token]` is the conv and recurrent state once that
@@ -1261,5 +1293,47 @@ mod multi_verify_tests {
         assert!(outputs[0].captured.is_empty());
         assert_eq!(outputs[1].captured.len(), 1);
         assert_eq!(outputs[2].captured.len(), 2);
+    }
+}
+
+/// Weight-free tests of the checkpoint seam (#75): the accessors and rebuild
+/// constructor the SSD state cache uses must preserve the state layout.
+#[cfg(test)]
+mod checkpoint_seam_tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::tensor::TensorData;
+
+    type B = NdArray;
+
+    fn linear_state() -> LinearState<B> {
+        let device = Default::default();
+        LinearState {
+            conv: Tensor::from_data(TensorData::new(vec![0.5_f32; 6], [1, 2, 3]), &device),
+            recurrent: Tensor::from_data(TensorData::new(vec![0.25_f32; 8], [1, 2, 1, 4]), &device),
+        }
+    }
+
+    #[test]
+    fn from_parts_keeps_the_per_layer_layout() {
+        let device = Default::default();
+        let kv = KvCache::from_tensors(
+            Tensor::zeros([1, 1, 3, 2], &device),
+            Tensor::zeros([1, 1, 3, 2], &device),
+        );
+        let state = DecodeState::from_parts(
+            vec![kv, KvCache::default()],
+            vec![linear_state(), linear_state()],
+            3,
+            -2,
+        );
+        assert_eq!(state.len(), 3);
+        assert_eq!(state.rope_delta, -2);
+        assert_eq!(state.kv_caches().len(), 2);
+        assert_eq!(state.kv_caches()[0].len(), 3);
+        assert!(state.kv_caches()[1].is_empty());
+        assert_eq!(state.linear_states().len(), 2);
+        assert_eq!(state.linear_states()[0].conv.dims(), [1, 2, 3]);
+        assert_eq!(state.linear_states()[0].recurrent.dims(), [1, 2, 1, 4]);
     }
 }

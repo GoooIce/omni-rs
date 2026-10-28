@@ -12,9 +12,10 @@
 //! prompt token to replay (`tokens.len() <= prompt.len() - 1`), because a
 //! forward over an empty suffix would never produce the sampled token.
 //!
-//! The store is memory-only here; SSD persistence is #75 and memory release
-//! order is #76. The checkpoint payload is owned by the adapter (it holds the
-//! model state), so the store keys only on the token history and recency.
+//! The store is memory-only here; SSD persistence is #75
+//! ([`crate::state_cache`]) and memory release order is #76. The checkpoint
+//! payload is owned by the adapter (it holds the model state), so the store
+//! keys only on the token history and recency.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -30,12 +31,16 @@ pub const MAX_CHECKPOINTS_PER_SLOT: usize = MAX_TURN_CHECKPOINTS + MAX_PREFIX_CH
 /// `prefill_tokens` counts every token handed to the adapter's prefill paths
 /// (full prefill and resumed suffix alike), so a gate can assert that a
 /// second turn fed only the suffix. Hits and misses count only prefill rows
-/// that carried a slot key while the switch was on.
+/// that carried a slot key while the switch was on. `disk_hits` counts the
+/// hits served by SSD entries (#75); `disk_writes` counts checkpoints that
+/// were encoded and written at an idle boundary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConversationStats {
     pub prefill_tokens: u64,
     pub checkpoint_hits: u64,
     pub checkpoint_misses: u64,
+    pub disk_hits: u64,
+    pub disk_writes: u64,
 }
 
 struct StoredCheckpoint<C> {
