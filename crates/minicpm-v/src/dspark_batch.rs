@@ -69,6 +69,7 @@ pub fn run_cycle_batch<B: Backend>(
     }
 
     let length_before: Vec<usize> = members.iter().map(|member| member.state.length).collect();
+    let rows: Vec<usize> = blocks.iter().map(Vec::len).collect();
     let phase = Instant::now();
     let outputs = {
         let mut verify: Vec<VerifyBlock<'_, B>> = members
@@ -118,6 +119,8 @@ pub fn run_cycle_batch<B: Backend>(
             correction: path.correction,
             draft_eos: path.draft_eos,
             trimmed,
+            verify_ms,
+            rows: rows[index],
         });
     }
     if stats.trace.enabled {
