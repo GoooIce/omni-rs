@@ -9,11 +9,10 @@
 //! in `tests/engine_core.rs`.
 //!
 //! Multi-sequence batching (#72) is opt-in per [`crate::config::ResinConfig`]:
-//! when `multi_sequence_batch` or the composite `tree_batch` switch (#73) is
-//! enabled, every decode row of one plan goes through
-//! [`DecodeAdapter::decode_batch`] in one call. The participating slots are
-//! temporarily taken out of the map so the adapter can borrow all of them at
-//! once; they are reinserted on success and on error alike.
+//! when `multi_sequence_batch` is enabled, every decode row of one plan goes
+//! through [`DecodeAdapter::decode_batch`] in one call. The participating
+//! slots are temporarily taken out of the map so the adapter can borrow all
+//! of them at once; they are reinserted on success and on error alike.
 //!
 //! Conversation slot checkpoints (#74) are also opt-in per `ResinConfig`
 //! (`conversation_slots`). When enabled, a prefill row whose
@@ -140,11 +139,6 @@ pub trait DecodeAdapter {
         }
         Ok(outputs)
     }
-
-    /// The session's resolved switches changed. Adapters that read a switch
-    /// inside [`Self::decode_batch`] (the composite tree+batch mode, #73)
-    /// update their copy here; everything else ignores the notification.
-    fn config_changed(&mut self, _config: &ResinConfig) {}
 
     /// Snapshot `slot` at its current history, or `None` when this adapter
     /// has no checkpoint support (the default). The snapshot must not mutate
@@ -296,8 +290,7 @@ impl<A: DecodeAdapter> DecodeSession<A> {
     /// Replace the switches at runtime, folding the environment overrides
     /// again (they are idempotent). The measurement harnesses use this to run
     /// several arms of one experiment in one process with the same loaded
-    /// weights; the adapter is told so a switch it reads inside
-    /// [`DecodeAdapter::decode_batch`] follows.
+    /// weights.
     ///
     /// The config replaces the switches wholesale, so turning `state_cache`
     /// off also drops the attached cache and any queued writes: the session
@@ -308,7 +301,6 @@ impl<A: DecodeAdapter> DecodeSession<A> {
             self.state_cache = None;
             self.pending_states.clear();
         }
-        self.adapter.config_changed(&self.config);
         // A runtime arm switch may lower the budget; release idle checkpoints
         // now so the next measurement starts inside it.
         self.enforce_memory_budget();

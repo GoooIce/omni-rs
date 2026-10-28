@@ -58,9 +58,8 @@ pub const ALLOWED_SIZES: [usize; 3] = crate::dspark::BLOCK_LADDER;
 /// 1/2/3-level depth mapping, i.e. verify blocks of 3/7/15 rows. These are
 /// exactly the shapes the existing tree path already pays autotune for, so
 /// the tree ledger searches a finite set instead of inventing a shape for
-/// every live count. The set respects the block cap (every live count is at
-/// most `MAX_TREE_LIVE`, every block at most `MAX_TREE_ROWS`); #73's 2x4
-/// budget is below the smallest member and passes its own capped live count.
+/// every live count. The set respects the block cap: every live count is at
+/// most `MAX_TREE_LIVE`, every block at most `MAX_TREE_ROWS`.
 pub const TREE_ALLOWED_SIZES: [usize; 3] = [2, 6, 14];
 
 /// The cost basis label attached to every ledger decision (decision #65).

@@ -11,11 +11,10 @@
 //! stays here, next to the model types it names.
 //!
 //! Co-batched plans (#72) verify every decode row in one target forward
-//! (`dspark_batch::run_cycle_batch`). With the composite `tree_batch` switch
-//! (#73) on, each co-batched member proposes a capped best-first tree instead
-//! of a chain and the same forward verifies one tree per sequence; solo rows
-//! keep the per-row chain either way. The first version's budget is 4 rows
-//! per sequence including the bonus and 8 per plan.
+//! (`dspark_batch::run_cycle_batch`), each member a chain block; solo rows
+//! keep the per-row path. The composite tree+batch mode failed #67's gate and
+//! was removed (#73); the model-side single-stream tree mode is independent
+//! and unchanged.
 //!
 //! Conversation checkpoints (#74) carry the target decode state, the draft
 //! context and the KV-aligned token history (`history[..state.length]`). The
@@ -47,13 +46,8 @@ struct DsparkAdapter<B: Backend> {
     numerics: VerifyNumerics,
     eos_ids: Vec<u32>,
     stats: SpecStats,
-    /// The composite tree+batch switch (#73), mirrored from the session's
-    /// resolved config so `decode_batch` can pick the members' layouts.
-    tree_batch: bool,
     /// Number of `decode_batch` calls that ran one shared verify forward.
     batched_cycles: u64,
-    /// Batched cycles whose members verified as capped best-first trees.
-    tree_batched_cycles: u64,
 }
 
 impl<B: Backend> DsparkAdapter<B> {
@@ -126,11 +120,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             sampler.sample(values, &history).map_err(Error::execution)?
         };
         history.push(first);
-        let capacity = dspark::draft_capacity(
-            input.len(),
-            budget,
-            dspark_batch::propose_rows(self.tree_batch, self.block_len),
-        );
+        let capacity = dspark::draft_capacity(input.len(), budget, self.block_len);
         let draft_state = self
             .draft
             .prepare(captured, capacity)
@@ -192,13 +182,8 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
     /// forward runs once over every member's block, and accept/trim/retain
     /// run per member in plan order. The greedy gate is the same one
     /// `dspark::run_cycle` applies; anything else falls back to the default
-    /// per-row loop so numerics never change silently.
-    ///
-    /// With `tree_batch` on (#73) every co-batched member takes a capped
-    /// best-first tree, so the same forward verifies one tree per sequence;
-    /// the row budget (4 per sequence, 8 per plan) is enforced by
-    /// [`dspark_batch::co_batch_layouts`]. Off, every member keeps the chain
-    /// layout #72 ships. Solo rows never reach this method.
+    /// per-row loop so numerics never change silently. Every member keeps the
+    /// chain layout #72 ships; solo rows never reach this method.
     fn decode_batch(
         &mut self,
         rows: &mut [DecodeRow<'_, Self::Slot>],
@@ -214,23 +199,19 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         // contract (two block-16 chains are 34 rows) takes the per-row path:
         // the >32-row MoE fallback is the wrong shape for this batch and the
         // multi-row mechanism was never specified for it.
-        let per_member = if self.tree_batch {
-            dspark_batch::STACKED_TREE_ROWS
-        } else {
-            self.block_len + 1
-        };
-        if !dspark_batch::batch_fits(rows.len(), per_member) {
+        if !dspark_batch::batch_fits(rows.len(), self.block_len + 1) {
             let mut outputs = Vec::with_capacity(rows.len());
             for row in rows {
                 outputs.push(self.decode(&mut *row.slot, row.input, row.room, row.budget)?);
             }
             return Ok(outputs);
         }
-        let layouts = dspark_batch::co_batch_layouts(rows.len(), self.tree_batch, self.block_len)
-            .map_err(Error::execution)?;
-        let tree_members = layouts
-            .iter()
-            .any(|layout| !matches!(layout, BlockLayout::Chain { .. }));
+        let layouts = vec![
+            BlockLayout::Chain {
+                len: self.block_len
+            };
+            rows.len()
+        ];
         let mut members = Vec::with_capacity(rows.len());
         for (row, layout) in rows.iter_mut().zip(layouts.iter()) {
             let slot = &mut *row.slot;
@@ -256,9 +237,6 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         .map_err(Error::execution)?;
         drop(members);
         self.batched_cycles += 1;
-        if tree_members {
-            self.tree_batched_cycles += 1;
-        }
         let mut outputs = Vec::with_capacity(rows.len());
         for (row, outcome) in rows.iter_mut().zip(outcomes) {
             let slot = &mut *row.slot;
@@ -273,12 +251,6 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             outputs.push(tokens);
         }
         Ok(outputs)
-    }
-
-    /// Keep the composite switch in sync when the harness flips configs at
-    /// runtime (same-process A/B arms, #73).
-    fn config_changed(&mut self, config: &ResinConfig) {
-        self.tree_batch = config.tree_batch;
     }
 
     fn checkpoint(&self, slot: &Self::Slot) -> Option<Self::Checkpoint> {
@@ -328,12 +300,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             let Some(pending) = pending else {
                 return Ok(None);
             };
-            draft_state.ensure_capacity(
-                tokens.len()
-                    + budget
-                    + dspark_batch::propose_rows(self.tree_batch, self.block_len)
-                    + 1,
-            );
+            draft_state.ensure_capacity(tokens.len() + budget + self.block_len + 1);
             let mut history = tokens;
             history.push(pending);
             return Ok(Some((
@@ -345,13 +312,7 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
                 vec![pending],
             )));
         }
-        draft_state.ensure_capacity(
-            tokens.len()
-                + input.len()
-                + budget
-                + dspark_batch::propose_rows(self.tree_batch, self.block_len)
-                + 1,
-        );
+        draft_state.ensure_capacity(tokens.len() + input.len() + budget + self.block_len + 1);
         let (logits, _, captured) = self
             .model
             .forward_capturing(
@@ -555,8 +516,7 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
     }
 
     /// Explicit engine config. `multi_sequence_batch` hands every decode row
-    /// of a plan to [`DsparkAdapter::decode_batch`]; `tree_batch` does the
-    /// same and gives every co-batched member a capped best-first tree.
+    /// of a plan to [`DsparkAdapter::decode_batch`].
     pub fn with_config(
         model: TextModel<B>,
         draft: Draft<B>,
@@ -582,9 +542,8 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         config: ResinConfig,
         cache: Option<crate::state_cache::StateCache>,
     ) -> Self {
-        // Resolve the environment once so the adapter's copy matches the
-        // session's (the session folds the overrides again; that is
-        // idempotent).
+        // Resolve the environment once; the session folds the overrides
+        // again, which is idempotent.
         let config = config.with_env_overrides();
         Self {
             session: DecodeSession::with_config_and_state_cache(
@@ -604,9 +563,7 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
                         stats.trace.enabled = omni_minicpm_v::knobs::dspark_trace();
                         stats
                     },
-                    tree_batch: config.tree_batch,
                     batched_cycles: 0,
-                    tree_batched_cycles: 0,
                 },
                 config,
                 cache,
@@ -629,15 +586,9 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
         self.session.adapter().batched_cycles
     }
 
-    /// Batched cycles whose members verified as trees (#73; 0 unless
-    /// `tree_batch` is on).
-    pub fn tree_batch_cycles(&self) -> u64 {
-        self.session.adapter().tree_batched_cycles
-    }
-
-    /// The loaded target model and drafter. The #73 measurement example
-    /// drives the model-side single-stream tree mode on the same loaded
-    /// weights; production callers go through [`Runner::forward`].
+    /// The loaded target model and drafter. The co-batch A/B example drives
+    /// the model-side single-stream tree mode on the same loaded weights;
+    /// production callers go through [`Runner::forward`].
     pub fn model_and_draft(&self) -> (&TextModel<B>, &Draft<B>) {
         let adapter = self.session.adapter();
         (&adapter.model, &adapter.draft)

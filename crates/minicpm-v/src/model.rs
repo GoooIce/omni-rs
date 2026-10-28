@@ -1240,10 +1240,10 @@ mod multi_verify_tests {
         assert_close("tree continuation", &values(next), &values(next_reference));
     }
 
-    /// #73's stacked shape: bonus + three live nodes (four rows), with one
-    /// node at depth two so positions-by-depth and the ancestor mask differ
-    /// from a flat block.
-    fn stacked_tree() -> crate::dspark::TreeSpec {
+    /// A deep tree block: bonus + three live nodes (four rows), with one node
+    /// at depth two so positions-by-depth and the ancestor mask differ from a
+    /// flat block.
+    fn deep_tree() -> crate::dspark::TreeSpec {
         crate::dspark::TreeSpec::new(
             vec![11, 7, 21],
             vec![0, 0, 0, 1],
@@ -1254,14 +1254,14 @@ mod multi_verify_tests {
     }
 
     #[test]
-    fn multi_verify_stacked_tree_and_chain_blocks_match_single_forwards() {
+    fn multi_verify_deep_tree_and_chain_blocks_match_single_forwards() {
         let (model, device) = tiny_model();
         let history = [4u32, 8, 2, 6];
         let mut state = model.new_state(&device);
         model.forward(&history, None, None, &mut state).unwrap();
 
-        let tree = stacked_tree();
-        assert_eq!(tree.rows(), 4, "stacked tree stays inside the #73 budget");
+        let tree = deep_tree();
+        assert_eq!(tree.rows(), 4, "the deep tree block stays at four rows");
         let tree_ids = [5u32, 11, 7, 21];
         let chain_ids = [12u32, 13, 14];
         let capture = [0usize, 1];
@@ -1288,8 +1288,8 @@ mod multi_verify_tests {
         ];
         let outputs = model.forward_verifying_multi(&mut blocks).unwrap();
 
-        assert_output("stacked tree", &outputs[0], &single_tree_out);
-        assert_output("stacked chain", &outputs[1], &single_chain_out);
+        assert_output("deep tree", &outputs[0], &single_tree_out);
+        assert_output("chain", &outputs[1], &single_chain_out);
         assert_eq!(multi_tree.length, state.length + tree_ids.len());
         assert_eq!(multi_chain.length, state.length + chain_ids.len());
 
@@ -1305,7 +1305,7 @@ mod multi_verify_tests {
         let next = model.forward(&[19], None, None, &mut multi_tree).unwrap();
         let next_reference = model.forward(&[19], None, None, &mut single_tree).unwrap();
         assert_close(
-            "stacked tree continuation",
+            "deep tree continuation",
             &values(next),
             &values(next_reference),
         );
