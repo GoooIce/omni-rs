@@ -5,6 +5,7 @@
 - Native app behavior, desktop binary `./target/makepad-native/release/r2t2-makepad`, and regression commands: [prototypes/makepad/README.md](prototypes/makepad/README.md). Numerical and hardware evidence lives in [VALIDATION.md](VALIDATION.md) and the relevant module document under `docs/`.
 - ConvRot int8 matmul: [crates/omni-kernel/src/int8_matmul.rs](crates/omni-kernel/src/int8_matmul.rs) and its Metal lowering in [vendor/cubecl-cpp/src/metal/dialect.rs](vendor/cubecl-cpp/src/metal/dialect.rs).
 - Before writing or debugging a `#[cube]` kernel, read [docs/cube-dsl-pitfalls.md](docs/cube-dsl-pitfalls.md) (macro breaks, dtype defaults, weight layouts, GPU readback landmines). Performance A/B protocol and per-kernel profiling knobs: [docs/agent-workflow.md](docs/agent-workflow.md).
+- Resin engine integration: runner/adapter architecture and gates in [crates/resin-metal/README.md](crates/resin-metal/README.md); vendored-core discipline in [vendor/resin-core/LOCAL-CHANGES.md](vendor/resin-core/LOCAL-CHANGES.md). Adding or optimizing a runner: `skills/add-resin-runner/` and `skills/optimize-resin-in-metal/`.
 - Continue within the user's approved scope. Preserve accepted recommendations and completed checks across turns; ask only when an unresolved choice changes that scope or observable behavior.
 
 ## Agent skills
@@ -20,6 +21,10 @@ Default triage vocabulary: `needs-triage` / `needs-info` / `ready-for-agent` / `
 ### Domain docs
 
 Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Resin runners
+
+`skills/add-resin-runner/` (implement and qualify a `DecodeAdapter` behind the resin `EngineCore`) and `skills/optimize-resin-in-metal/` (route a cycle-time symptom to the right lever and the repo's measurement protocol).
 
 ## Cursor Cloud specific instructions
 
