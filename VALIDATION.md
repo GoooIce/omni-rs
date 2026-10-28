@@ -5,7 +5,7 @@
 
 ## 2026-10-28：#57 Kapitsa 开关、文档与测量记录
 
-#57 地图收口。落地机制：标定校验尺寸账本（`MINICPM_DSPARK_LEDGER`）、best-first 树与置信前缀（`MINICPM_DSPARK_TREE_BEST`）、多序列 verify API、resin 链式合批（`multi_sequence_batch`）、对话槽检查点（`conversation_slots`）、SSD 状态缓存（`state_cache`）、KV 额度与释放次序（`kv_budget_mb`）。树 + 合批叠加按 #67 终局门槛失败后移除（`e2ddbd4`），代码与文档中不再有 `RESIN_TREE_BATCH`。**所有新机制默认关**；机制、代码接缝与限制见 [docs/kapitsa-57.md](docs/kapitsa-57.md)，原始日志在 `artifacts/kapitsa-57/gates/`（本地、gitignored，不随 checkout 提供）。
+#57 地图收口。落地机制：标定校验尺寸账本（`MINICPM_DSPARK_LEDGER`）、best-first 树与置信前缀（`MINICPM_DSPARK_TREE_BEST`）、多序列 verify API、resin 链式合批（`multi_sequence_batch`）、对话槽检查点（`conversation_slots`）、SSD 状态缓存（`state_cache`）、KV 额度与释放次序（`kv_budget_mb`）。树 + 合批叠加按 #67 终局门槛失败后移除（`e2ddbd4`）；叠加开关不再存在，文档中的 `RESIN_TREE_BATCH` 只作为「已移除」的历史说明。**所有新机制默认关**；机制、代码接缝与限制见 [docs/kapitsa-57.md](docs/kapitsa-57.md)，原始日志在 `artifacts/kapitsa-57/gates/`（本地、gitignored，不随 checkout 提供）。
 
 ### 通过的门
 
@@ -19,13 +19,17 @@
 | 引擎贪心 parity（1B CPU） | 通过 | `engine_parity_1b.log` |
 | DSpark 引擎 vs 普通贪心（35B，24 token） | 通过；τ=1.917 | `dspark_engine_35b.log` |
 | 链式合批（35B，block 3，24 token） | 通过；τ=3.429，worker 线程无 panic | `dspark_batch_35b_fix.log` |
+| 链式合批（35B，history 修复后） | 通过；τ=3.429，0 panic | `dspark_batch_35b_final.log` |
+| 1B 贪心合批（2 请求） | 通过；流逐 token 相同；810.3–812.2 vs 1598.9–1599.4 ms/行 = **0.507–0.508×** | `greedy_batch_1b.log` |
+| 树块多序列 verify vs 顺序 root-path（1B CPU，2 棵不规则树） | 通过；逐节点 logits 最大差 ≤ 0.000012，retain 后续算相同 | `multi_verify_1b_final.log` |
 | SSD 冷重启（1B CPU，272-token prompt） | 通过；全量 TTFT 7010.7 ms，恢复 3.6 ms（0.001×），跳过 272 token，首 token 相同 | `state_cold.log` |
 | 额度受限合批（1B CPU） | 通过；0.502 vs 0.501 tok/s（1.002×），3 次 spill，被淘汰前缀可复用 | `state_quota.log` |
 
 ### 失败与未达门槛
 
-- **两轮状态复用**：后缀+问题预填与逐 token 相同均通过，但第二轮 TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL**（`state_two_turn.log`）。默认保持关。
-- **链式合批成本**：35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**，高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。block-16 目标负载在 8 行上限下无法合批（两条 block-16 链是 34 行），因此只有同 block 的 0.845× 是可比较数字，不存在有效的跨 block 比值。默认保持关。
+- **两轮状态复用**：Greedy 路径后缀+问题预填与逐 token 相同均通过，但第二轮 TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL**（`state_two_turn.log`）。默认保持关。
+- **DSpark 两轮检查点（35B Metal）**：第一轮与后缀预填通过，但恢复后的第二轮与全量重预填在**第 8/16 个 token** 分叉（`dspark_conversation_35b.log`）。检查点前缀由 verify 块内核写出，参考是全量 prefill；F16 KV 数值差可翻转 close argmax。该适配器的 `conversation_slots` / `state_cache` 保持关；SSD 冷启动的通过结论只覆盖 Greedy 路径。
+- **链式合批成本**：1B 贪心双请求同进程交错两轮为 **0.507–0.508×**（通过 #63 的 1B 前置门，`greedy_batch_1b.log`）；35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**，高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。#63 规定只赢一个规模时以 35B 为准，故默认保持关。block-16 目标负载在 8 行上限下无法合批（两条 block-16 链是 34 行），因此只有同 block 的 0.845× 是可比较数字，不存在有效的跨 block 比值。
 - **best-first 树**（单臂运行，非交错 A/B，仅作默认关的指示性负结果）：64.8–67.9 vs 51.1 ms/token（24 token，τ 1.714 vs 2.0，prose 提示）——按接受 token 更慢（`tree_fast1.log`、`tree_fast2.log`）。默认保持关。
 - **标定账本**（单臂运行，非交错 A/B，仅作默认关的指示性负结果）：48 token，warm 65.2 vs 56.0 ms/token（block 均值 4.0 vs 3.0）；首次开启 106.6 ms 含探索与新形状 autotune（`ledger_off.log`、`ledger_on2.log`）。默认保持关。
 - **树 + 合批叠加**：三臂交错 A/B、2 轮、block 3、24 token：chain_batch 43.993、solo_tree 147.716、stacked 72.256 ms/接受 token。stacked < chain_batch **FAIL（1.64×）**（`stacking_ab_24b.log`）；按 #67 删除叠加开关，只保留互斥。
@@ -39,10 +43,9 @@
 
 ### 未运行
 
-- **1B 贪心合批已接通但本轮未测**：`GreedyAdapter::decode_batch` 把一计划内每个单 token 解码行送入一次 `forward_verifying_multi`（≤8 行，否则逐行回退）；新增 `minicpm_greedy_batch` 门做流逐 token 对比并打印合批/逐行耗时比。该门需要 1B 权重，本轮工作树未运行；开关保持关，不声称 1B 比值。
-- **DSpark 两轮对话检查点门**：新增 `minicpm_dspark_conversation`（35B int4 + DSpark，Metal），断言后缀预填与对流全量重预填逐 token 相同；本轮工作树只编译、未运行（权重在主检出）。
-- **树块多序列 verify 的独立参考**：新增 1B CPU 门（`multi_verify_parity` 内，两个树块逐节点对顺序 `forward` 比较，并校验 retain 后的续算）；本轮只编译、未运行。
 - **账本接到 resin runner 的 solo `decode`**：`MINICPM_DSPARK_LEDGER=1` 时 runner 用 `Ledger::choose` 选链长并在 `release` 落盘；批处理行保持固定链长。CLI 的账本 A/B 数字不因这次接线重跑，runner 端权重门未测。
+- **1B 贪心合批的 runner 端 0.8× 门**：`minicpm_greedy_batch` 已运行并通过（0.507–0.508×，`greedy_batch_1b.log`）；35B 的同一门按上文 0.845× 未过。
+- **DSpark 检查点的全量重预填 token 一致性**：门已运行并失败（第 8/16 token 分叉）；未继续做数值归因或 MatchingDecode 回退实验。
 - ANE split 与图像 embedding 缓存层级按地图 Out of scope，未测、也未实现；`memory_stats()` 与实验头如实注明这些层级在本 runner 为空。
 - SSD 写盘按空闲边界在 runner 线程同步 drain（编码需 `into_data()` 读回设备），不是后台线程；未测独立后台写的吞吐。
 

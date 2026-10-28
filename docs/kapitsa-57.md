@@ -84,11 +84,14 @@ best-first tree only exists in adaptive runs.
 
 ## Default and gate status
 
-The correctness gates that were run passed; the two gates added by the review (1B greedy co-batch,
-DSpark two-turn checkpoint) are compiled and were not run in the review worktree. The performance
-gates did not justify a default flip: chain co-batch missed its 0.8x gate, tree and ledger lost per
-accepted token, two-turn missed its TTFT gate, and stacking failed. Cold restart and quota-batch
-passed, but the map still ships every new mechanism off.
+The post-review gates were run. The 1B greedy co-batch passes at **0.507–0.508x** with stream
+parity, and the 1B tree-block multi-verify gate passes against sequential root-path forwards. The
+DSpark two-turn checkpoint gate is **red**: the first turn and suffix prefill pass, but the resumed
+second turn diverges from full re-prefill at token 8 of 16 (F16 KV prefix built by verify-block
+kernels versus a full-prefill reference; the target Greedy checkpoint path passes). The performance
+gates still did not justify a default flip: the 35B chain co-batch missed its 0.8x gate, tree and
+ledger lost per accepted token, two-turn missed its TTFT gate, and stacking failed. Cold restart and
+quota-batch passed, but the map still ships every new mechanism off.
 
 | Gate (load) | Result | Evidence |
 | --- | --- | --- |
@@ -106,8 +109,10 @@ passed, but the map still ships every new mechanism off.
 | Chain co-batch cost (35B, block 3, 24 tokens) | **near miss**: 43.99 vs 52.05 ms per accepted token = **0.845x**, above the #63 0.8x gate | `stacking_ab_24b.log` |
 | Best-first tree cost (35B, 24 tokens; single-arm, not interleaved) | **loses**: 64.8–67.9 vs 51.1 ms/token; τ 1.714 vs 2.0 on the measured prose prompt | `tree_fast1.log`, `tree_fast2.log` |
 | Ledger cost (35B, 48 tokens; single-arm, not interleaved) | **loses**: 65.2 vs 56.0 ms/token warm (block average 4.0 vs 3.0); first on-run 106.6 ms included exploration/autotune | `ledger_off.log`, `ledger_on2.log` |
-| 1B greedy co-batch (1B CPU, 2 requests) | gate added (`minicpm_greedy_batch`): stream parity plus a printed batched-vs-per-row ratio; not run in the review worktree, run after merge | — |
-| DSpark two-turn checkpoint (35B Metal) | gate added (`minicpm_dspark_conversation`): suffix prefill and stream parity vs full re-prefill; not run in the review worktree, run after merge | — |
+| 1B greedy co-batch (1B CPU, 2 requests) | **pass**: stream parity; batched 810.3–812.2 vs sequential 1598.9–1599.4 ms/row = **0.507–0.508x** | `greedy_batch_1b.log` |
+| Tree-block multi-verify vs sequential root paths (1B CPU, 2 irregular trees) | pass; per-node logits max delta ≤ 0.000012, retained-state continuation matches | `multi_verify_1b_final.log` |
+| DSpark two-turn checkpoint (35B Metal) | **FAIL**: first turn and suffix prefill pass; resumed second turn diverges from full re-prefill at token 8 of 16 | `dspark_conversation_35b.log` |
+| DSpark co-batch after the history fix (35B, block 3, 24 tokens) | pass; τ=3.429, zero worker-thread panics | `dspark_batch_35b_final.log` |
 | Tree + batch stacking (35B, block 3, 24 tokens) | **FAIL**: stacked 72.256 vs chain_batch 43.993 = 1.64x; solo_tree 147.716 | `stacking_ab_24b.log` |
 
 The tree and ledger rows are **single-arm runs** on the stated load (an off run and an on run,
@@ -122,11 +127,16 @@ Status by mechanism:
   a default (#68 allows a flip only after the maintainer's same-load landing decision).
 - **Quota-batch**: throughput-neutral and preserves prefix reuse; off.
 - **Two-turn**: fails its TTFT gate; off.
-- **Chain co-batch**: 0.845x is an improvement but above the 0.8x gate; off. The block-16 target
-  load cannot co-batch under the 8-row cap (two block-16 chains are 34 rows), so the same-block
-  0.845x is the only honest comparison; there is no valid cross-block ratio.
-- **1B greedy co-batch**: wired through the same switch; the `minicpm_greedy_batch` gate exists
-  but was not run in the review worktree, so the switch stays off and no 1B ratio is claimed.
+- **Chain co-batch**: the 1B greedy gate is a clear win (0.507–0.508x, interleaved same-process
+  rounds, stream parity); the 35B DSpark same-block result is 0.845x, an improvement but above the
+  0.8x gate. Decision #63 says the 35B scale decides when only one scale wins, so the switch stays
+  off. The block-16 target load cannot co-batch under the 8-row cap (two block-16 chains are 34
+  rows); the same-block 0.845x is the only honest 35B comparison.
+- **1B greedy co-batch**: wired through the same switch and measured at 0.507–0.508x; it inherits
+  the map's default-off rule.
+- **Two-turn**: the Greedy checkpoint path passes suffix-only and token identity but fails its TTFT
+  gate (0.804 > 0.5); the DSpark checkpoint gate fails token identity (diverges at token 8 of 16).
+  Both switches stay off; `state_cache` cold restart is proven on the Greedy path only.
 - **Best-first tree** and **ledger**: lose per accepted token on the measured prompt; off.
 - **Stacking**: removed, not just disabled.
 
@@ -208,11 +218,12 @@ over a config `false`, and a set variable would corrupt an arm.
 - **Release-order tiers 2 and 4 are empty here.** This runner holds no image embedding cache and
   single-chunk prefill keeps no pending KV across requests; the ANE split is out of scope. The
   experiment header names all three rather than silently omitting them.
-- **1B greedy co-batch is wired but not measured here.** `GreedyAdapter::decode_batch` sends every
+- **1B greedy co-batch is wired and measured.** `GreedyAdapter::decode_batch` sends every
   single-token decode row of a plan through one `forward_verifying_multi` (up to the 8-row cap;
-  anything else falls back per row), and `minicpm_greedy_batch` asserts stream parity and prints the
-  batched-vs-per-row ratio. The gate needs the 1B checkpoint and was not run in the review worktree;
-  the switch stays off and no 1B ratio is claimed. `DsparkAdapter::decode_batch` still refuses
+  anything else falls back per row). `minicpm_greedy_batch` passes stream parity at **0.507–0.508x**
+  per row versus sequential in the same process. The DSpark checkpoint path is the red one: its
+  two-turn gate diverges from full re-prefill at token 8 of 16, so `state_cache` and
+  `conversation_slots` stay off for that adapter. `DsparkAdapter::decode_batch` still refuses
   non-greedy requests and falls back per row.
 - **KV budget contract.** The budget releases checkpoints, never live KV: after a checkpoint
   insertion or slot creation the session runs self-drop, then idle-checkpoint LRU (spill to SSD when
