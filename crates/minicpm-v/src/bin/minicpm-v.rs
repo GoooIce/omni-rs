@@ -263,6 +263,7 @@ fn run_generate<B: burn::tensor::backend::Backend + omni_minicpm_v::quant::Exper
     };
     let decode = |ids: &[u32]| tokenizer.decode(ids);
     let outcome = if let Some(path) = &options.dspark {
+        omni_minicpm_v::knobs::experiment_header();
         if generate_options.temperature != 0.0 {
             return Err("DSpark in this build verifies greedy decoding".into());
         }
@@ -275,6 +276,13 @@ fn run_generate<B: burn::tensor::backend::Backend + omni_minicpm_v::quant::Exper
         } else {
             omni_minicpm_v::model::VerifyNumerics::Batched
         };
+        let model_name = options.model.display().to_string();
+        let drafter_name = path.display().to_string();
+        let identity = omni_minicpm_v::ledger::RunIdentity {
+            model: &model_name,
+            drafter: &drafter_name,
+            precision: options.precision.as_str(),
+        };
         let (outcome, spec) = omni_minicpm_v::dspark::generate(
             &model,
             &draft,
@@ -285,6 +293,7 @@ fn run_generate<B: burn::tensor::backend::Backend + omni_minicpm_v::quant::Exper
             &cancel,
             &mut emit,
             decode,
+            identity,
         )?;
         eprintln!(
             "dspark cycles {} output {} acceptance_length {:.3}",
