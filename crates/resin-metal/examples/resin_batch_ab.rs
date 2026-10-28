@@ -84,6 +84,7 @@ fn submission(ids: Vec<u32>, new_tokens: usize) -> Submission<DecodeRequest> {
         ids,
         DecodeRequest {
             max_new_tokens: new_tokens,
+            slot: None,
         },
     );
     input.max_output_tokens = Some(new_tokens);

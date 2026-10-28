@@ -14,6 +14,7 @@
 //! model (`minicpm` module), the serving target of omni-rs issue #55 M0-R.
 
 pub mod config;
+pub mod conversation;
 pub mod dspark_runner;
 pub mod minicpm;
 pub mod session;

@@ -55,7 +55,13 @@ fn main() -> Result<(), String> {
         false,
     )
     .map_err(|error| error.to_string())?;
-    let mut input = Submission::new(ids, DecodeRequest { max_new_tokens });
+    let mut input = Submission::new(
+        ids,
+        DecodeRequest {
+            max_new_tokens,
+            slot: None,
+        },
+    );
     input.max_output_tokens = Some(max_tokens);
     input.stop_token_ids = eos;
     let handle = engine.submit(input).map_err(|error| error.to_string())?;

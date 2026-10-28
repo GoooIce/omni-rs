@@ -75,6 +75,7 @@ fn engine_dspark_matches_plain_greedy() {
         ids,
         DecodeRequest {
             max_new_tokens: MAX_NEW_TOKENS,
+            slot: None,
         },
     );
     input.max_output_tokens = Some(MAX_NEW_TOKENS);
