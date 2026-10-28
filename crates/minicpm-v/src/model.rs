@@ -705,7 +705,10 @@ impl<'a, B: Backend> VerifyBlock<'a, B> {
         }
     }
 
-    pub(crate) fn with_tree(
+    /// A tree block: rows sit at their tree depth and attention follows the
+    /// ancestor mask. `ids` is `[bonus, tree tokens…]` in the tree's
+    /// breadth-first layout; the tree's tables must have one row per id.
+    pub fn with_tree(
         ids: &'a [u32],
         state: &'a mut DecodeState<B>,
         capture_at: &'a [usize],
@@ -1109,13 +1112,13 @@ mod multi_verify_tests {
     /// Bonus + two depth-1 children, the shape `TreeSpec::binary(1, …)`
     /// builds for a one-level block.
     fn small_tree() -> crate::dspark::TreeSpec {
-        crate::dspark::TreeSpec {
-            tokens: vec![11, 7],
-            parent: vec![0, 0, 0],
-            depth: vec![0, 1, 1],
-            children: vec![vec![1, 2], Vec::new(), Vec::new()],
-            levels: 1,
-        }
+        crate::dspark::TreeSpec::new(
+            vec![11, 7],
+            vec![0, 0, 0],
+            vec![0, 1, 1],
+            vec![vec![1, 2], Vec::new(), Vec::new()],
+            1,
+        )
     }
 
     fn assert_output(
