@@ -26,6 +26,7 @@ use omni_r2t2::{
 };
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 const DEFAULT_LAYERS: [usize; 5] = [3, 11, 19, 27, 35];
 const MASK_TOKEN: u32 = 248076;
@@ -43,6 +44,23 @@ const VOCAB: usize = 248144;
 /// and the top covers repetitive text.
 pub(crate) const BLOCK_LADDER: [usize; 3] = [3, 8, 16];
 
+/// The best-first candidate grid's branching factor: the markov head returns
+/// this many children per node at every depth (`MINICPM_DSPARK_TREE_BEST`).
+pub(crate) const TREE_CANDIDATE_K: usize = 2;
+
+/// The best-first candidate grid's depth. The grid is deeper than the
+/// smallest verify budgets so depth->size selection and the ledger both
+/// choose nodes from the same three-level candidate set; the draft forward
+/// still runs one masked row per level.
+pub(crate) const TREE_GRID_LEVELS: usize = 3;
+
+/// The largest live-row count a best-first tree may select. The verify block
+/// holds the bonus plus these rows, so [`MAX_TREE_ROWS`] bounds a propose.
+pub(crate) const MAX_TREE_LIVE: usize = 15;
+
+/// The hard cap on a best-first verify block's rows (bonus included).
+pub(crate) const MAX_TREE_ROWS: usize = MAX_TREE_LIVE + 1;
+
 /// One speculative cycle's proposal layout, chosen by the [`Ladder`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockLayout {
@@ -51,17 +69,38 @@ pub enum BlockLayout {
     /// A full binary markov tree of `levels` child depths; the ladder's
     /// token budget maps to depth (3/8/16 → 1/2/3).
     Tree { levels: usize },
+    /// A best-first markov tree: `levels` candidate depths feed a
+    /// best-first selection of `live` ancestor-closed nodes. The verify
+    /// block holds the bonus plus `live` rows, so `live + 1 <=
+    /// MAX_TREE_ROWS`; `#73`'s 2x4 budget is `live: 3`.
+    BestTree { levels: usize, live: usize },
 }
 
 impl BlockLayout {
     /// The acceptance cap this layout offers: the chain length, or the
-    /// tree depth.
+    /// deepest path a tree's selected nodes can form.
     fn policy_len(&self) -> usize {
         match self {
             BlockLayout::Chain { len } => *len,
             BlockLayout::Tree { levels } => *levels,
+            BlockLayout::BestTree { levels, live } => (*levels).min(*live),
         }
     }
+
+    /// The key the verify-size ledger records: chain length, or a tree's
+    /// live-row count.
+    fn ledger_size(&self) -> usize {
+        match self {
+            BlockLayout::Chain { len } => *len,
+            BlockLayout::Tree { levels } => full_binary_live(*levels),
+            BlockLayout::BestTree { live, .. } => *live,
+        }
+    }
+}
+
+/// The full binary tree's live-node count at `levels` child depths.
+fn full_binary_live(levels: usize) -> usize {
+    2 * (1 << levels) - 2
 }
 
 /// The adaptive ladder over [`BLOCK_LADDER`] with hysteresis AIMD: grow one
@@ -76,16 +115,18 @@ struct Ladder {
     low_streak: usize,
     fixed: Option<usize>,
     tree: bool,
+    best: bool,
 }
 
 impl Ladder {
-    fn new(fixed: Option<usize>, tree: bool) -> Self {
+    fn new(fixed: Option<usize>, tree: bool, best: bool) -> Self {
         Self {
             index: 0,
             full_streak: 0,
             low_streak: 0,
             fixed,
             tree,
+            best,
         }
     }
 
@@ -97,7 +138,18 @@ impl Ladder {
                 1 => 2,
                 _ => 3,
             };
-            BlockLayout::Tree { levels }
+            if self.best {
+                // The depth->size mapping holds the full-binary tree's verify
+                // rows (2/6/14 live nodes); the deeper candidate grid lets
+                // the best-first selection spend the same rows on better
+                // nodes.
+                BlockLayout::BestTree {
+                    levels: TREE_GRID_LEVELS,
+                    live: full_binary_live(levels),
+                }
+            } else {
+                BlockLayout::Tree { levels }
+            }
         } else {
             BlockLayout::Chain {
                 len: self.block_len(),
@@ -215,24 +267,106 @@ pub(crate) fn accept_path(
 /// A candidate tree over one speculative block, flattened breadth-first:
 /// block position 0 is the bonus (root, depth 0), then every node of depth
 /// 1, then depth 2, and so on. Positions in all tables are block indices.
-pub(crate) struct TreeSpec {
+///
+/// The full-binary [`TreeSpec::binary`] and the best-first selector build
+/// this type; the fields stay crate-private, and the public accessors plus
+/// [`TreeSpec::new`] are the construction seam for external engines (the
+/// resin tree+batch stacking ticket).
+pub struct TreeSpec {
     /// Tree token ids (the bonus excluded), breadth-first.
-    pub tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u32>,
     /// Parent block index per position; the root points to itself.
-    pub parent: Vec<usize>,
+    pub(crate) parent: Vec<usize>,
     /// Depth per position (root = 0).
-    pub depth: Vec<usize>,
+    pub(crate) depth: Vec<usize>,
     /// Child block indices per position, best candidate first.
-    pub children: Vec<Vec<usize>>,
+    pub(crate) children: Vec<Vec<usize>>,
     /// Tree depth (deepest level).
-    pub levels: usize,
+    pub(crate) levels: usize,
 }
 
 impl TreeSpec {
+    /// Builds a tree from its breadth-first tables.
+    ///
+    /// `tokens` holds the non-root block positions in breadth-first order;
+    /// `parent`, `depth` and `children` are indexed by block position and
+    /// include the root at 0. Panics unless the tables describe one
+    /// connected breadth-first tree: every non-root's parent precedes it,
+    /// depths follow the parent chain, every non-root appears exactly once
+    /// in its parent's child list, and `levels` is the deepest depth.
+    pub fn new(
+        tokens: Vec<u32>,
+        parent: Vec<usize>,
+        depth: Vec<usize>,
+        children: Vec<Vec<usize>>,
+        levels: usize,
+    ) -> Self {
+        let rows = tokens.len() + 1;
+        assert_eq!(parent.len(), rows, "tree parent table length");
+        assert_eq!(depth.len(), rows, "tree depth table length");
+        assert_eq!(children.len(), rows, "tree children table length");
+        assert_eq!(parent[0], 0, "tree root parent");
+        assert_eq!(depth[0], 0, "tree root depth");
+        for node in 1..rows {
+            let parent_node = parent[node];
+            assert!(parent_node < node, "tree parent after child at {node}");
+            assert_eq!(depth[node], depth[parent_node] + 1, "tree depth at {node}");
+        }
+        let mut listed = vec![false; rows];
+        listed[0] = true;
+        for list in &children {
+            for &child in list {
+                assert!(child > 0 && child < rows, "tree child index");
+                assert!(!listed[child], "tree child listed twice");
+                listed[child] = true;
+            }
+        }
+        assert!(listed.iter().all(|&seen| seen), "tree child missing");
+        let deepest = depth.iter().copied().max().unwrap_or(0);
+        assert_eq!(levels, deepest, "tree levels must be the deepest depth");
+        Self {
+            tokens,
+            parent,
+            depth,
+            children,
+            levels,
+        }
+    }
+
+    /// Tree token ids (the bonus excluded), breadth-first.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Parent block index per position; the root points to itself.
+    pub fn parent(&self) -> &[usize] {
+        &self.parent
+    }
+
+    /// Depth per position (root = 0).
+    pub fn depth(&self) -> &[usize] {
+        &self.depth
+    }
+
+    /// Child block indices per position, best candidate first.
+    pub fn children(&self) -> &[Vec<usize>] {
+        &self.children
+    }
+
+    /// Tree depth (deepest level).
+    pub fn levels(&self) -> usize {
+        self.levels
+    }
+
+    /// Block rows, bonus included (the verify block's row count).
+    pub fn rows(&self) -> usize {
+        self.tokens.len() + 1
+    }
+
     /// Full binary tree of `levels` child levels from breadth-first
     /// `tokens` (2 + 4 + … + 2^levels entries).
     fn binary(levels: usize, tokens: Vec<u32>) -> Self {
-        let expected = 2 * (1 << levels) - 2;
+        let expected = full_binary_live(levels);
         assert_eq!(tokens.len(), expected, "tree token count mismatch");
         let mut parent = vec![0usize];
         let mut depth = vec![0usize];
@@ -250,13 +384,7 @@ impl TreeSpec {
                 }
             }
         }
-        Self {
-            tokens,
-            parent,
-            depth,
-            children,
-            levels,
-        }
+        Self::new(tokens, parent, depth, children, levels)
     }
 
     /// Block-internal exclusion mask (burn convention: true = masked out),
@@ -301,6 +429,233 @@ impl TreeSpec {
         }
         paths
     }
+}
+
+/// One propose's candidate grid, read back in one transfer: per depth
+/// `1..=levels`, `k` children per parent, all in breadth-first order. Index 0
+/// is the bonus root (score 0, the confidence bonus); every other node's
+/// score is the sum of log-softmax transition scores along its root path.
+struct CandidateGrid {
+    /// Token ids per node; index 0 is an unused placeholder for the root.
+    tokens: Vec<u32>,
+    /// Root-path log scores per node; index 0 is 0.
+    scores: Vec<f32>,
+    /// Depth per node (root = 0).
+    depths: Vec<usize>,
+    /// First node index per depth; `starts[d]` begins depth `d`.
+    starts: Vec<usize>,
+    /// Children per parent.
+    k: usize,
+}
+
+impl CandidateGrid {
+    /// Builds the grid from the packed readback: one `[token, transition]`
+    /// row per non-root node in breadth-first order. Transition scores must
+    /// be finite; they are clamped to at most zero so a child never scores
+    /// above its parent (log-probabilities are non-positive, and the clamp
+    /// absorbs a positive f32 rounding residue).
+    fn new(levels: usize, k: usize, packed: &[f32]) -> std::result::Result<Self, String> {
+        if levels == 0 || k == 0 {
+            return Err("candidate grid needs a depth and children".into());
+        }
+        let mut counts = Vec::with_capacity(levels + 1);
+        counts.push(1usize);
+        for _ in 0..levels {
+            counts.push(
+                counts
+                    .last()
+                    .copied()
+                    .expect("root count")
+                    .checked_mul(k)
+                    .ok_or_else(|| "candidate grid overflow".to_string())?,
+            );
+        }
+        let mut starts = Vec::with_capacity(levels + 1);
+        let mut total = 0usize;
+        for &count in &counts {
+            starts.push(total);
+            total += count;
+        }
+        if packed.len() != (total - 1) * 2 {
+            return Err(format!(
+                "candidate grid readback has {} values, expected {}",
+                packed.len(),
+                (total - 1) * 2
+            ));
+        }
+        let mut tokens = vec![0u32; total];
+        let mut scores = vec![0.0f32; total];
+        let mut depths = vec![0usize; total];
+        let mut row = 0usize;
+        for depth in 1..=levels {
+            for index in 0..counts[depth] {
+                let node = starts[depth] + index;
+                let parent = if depth == 1 {
+                    0
+                } else {
+                    starts[depth - 1] + index / k
+                };
+                let id = packed[row * 2];
+                let transition = packed[row * 2 + 1];
+                row += 1;
+                if !id.is_finite() || id < 0.0 || id.fract() != 0.0 {
+                    return Err(format!("candidate grid token id {id}"));
+                }
+                if !transition.is_finite() {
+                    return Err("candidate grid scored a node non-finite".into());
+                }
+                tokens[node] = id as u32;
+                depths[node] = depth;
+                scores[node] = scores[parent] + transition.min(0.0);
+            }
+        }
+        Ok(Self {
+            tokens,
+            scores,
+            depths,
+            starts,
+            k,
+        })
+    }
+
+    fn depth(&self, node: usize) -> usize {
+        self.depths[node]
+    }
+
+    fn parent(&self, node: usize) -> usize {
+        let depth = self.depths[node];
+        if depth == 0 {
+            0
+        } else {
+            self.starts[depth - 1] + (node - self.starts[depth]) / self.k
+        }
+    }
+
+    fn children(&self, node: usize) -> std::ops::Range<usize> {
+        let depth = self.depths[node];
+        if depth + 1 >= self.starts.len() {
+            return 0..0;
+        }
+        let start = self.starts[depth + 1] + (node - self.starts[depth]) * self.k;
+        start..start + self.k
+    }
+}
+
+/// A max-heap entry: higher path score first, breadth-first index on ties.
+#[derive(Debug, Clone, Copy)]
+struct Frontier {
+    score: f32,
+    node: usize,
+}
+
+impl PartialEq for Frontier {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Frontier {}
+
+impl PartialOrd for Frontier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Frontier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+
+/// Selects `live` nodes (root excluded) by best-first expansion: pop the
+/// highest-scoring frontier node, only children of selected nodes enter the
+/// frontier, so the result is ancestor-closed and — because a child never
+/// scores above its parent — the first `n` pops are the optimal ancestor-
+/// closed set of size `n`. The selected set is the confidence prefix.
+///
+/// Selected nodes are remapped breadth-first into a new [`TreeSpec`]; tokens,
+/// parents, children and depths follow the remapped block indices.
+fn select_best_first(grid: &CandidateGrid, live: usize) -> TreeSpec {
+    let nodes = grid.tokens.len();
+    // The verify block is the bonus plus every live row, so the hard cap on
+    // live nodes is one below the block row cap.
+    let n = live.min(nodes - 1).min(MAX_TREE_ROWS - 1);
+    let mut frontier = BinaryHeap::new();
+    let mut selected = vec![false; nodes];
+    selected[0] = true;
+    for child in grid.children(0) {
+        frontier.push(Frontier {
+            score: grid.scores[child],
+            node: child,
+        });
+    }
+    let mut picks = Vec::with_capacity(n);
+    while picks.len() < n {
+        let Some(next) = frontier.pop() else {
+            break;
+        };
+        debug_assert!(!selected[next.node], "frontier node selected twice");
+        selected[next.node] = true;
+        picks.push(next.node);
+        for child in grid.children(next.node) {
+            frontier.push(Frontier {
+                score: grid.scores[child],
+                node: child,
+            });
+        }
+    }
+    // Breadth-first remap: grid indices grow breadth-first, so ascending
+    // order is the depth-major order the tables require.
+    picks.sort_unstable();
+    let mut remap = vec![usize::MAX; nodes];
+    remap[0] = 0;
+    for (position, &node) in picks.iter().enumerate() {
+        remap[node] = position + 1;
+    }
+    let tokens = picks.iter().map(|&node| grid.tokens[node]).collect();
+    let mut parent = vec![0usize];
+    parent.extend(picks.iter().map(|&node| remap[grid.parent(node)]));
+    let mut depth = vec![0usize];
+    depth.extend(picks.iter().map(|&node| grid.depth(node)));
+    let mut children = vec![Vec::new(); n + 1];
+    for (position, &node) in picks.iter().enumerate() {
+        children[remap[grid.parent(node)]].push(position + 1);
+    }
+    let levels = picks
+        .iter()
+        .map(|&node| grid.depth(node))
+        .max()
+        .unwrap_or(0);
+    TreeSpec::new(tokens, parent, depth, children, levels)
+}
+
+/// Packs one depth level's candidates for the single-grid readback: one
+/// `[token id as f32, log-softmax transition score]` row per child,
+/// breadth-first (parent-major). Token ids stay below 2^24 and are exact in
+/// f32, so ids and scores share one transfer. Returns the rows together with
+/// the `[parents, K]` picks the next level expands from.
+fn pack_candidate_rows<B: Backend>(
+    scores: Tensor<B, 2>,
+) -> (Tensor<B, 2>, Tensor<B, 2, burn::tensor::Int>) {
+    let count = scores.dims()[0];
+    let logp = burn::tensor::activation::log_softmax(scores, 1);
+    let (values, picks) = logp.topk_with_indices(TREE_CANDIDATE_K, 1);
+    let rows = Tensor::cat(
+        vec![
+            picks
+                .clone()
+                .cast(burn::tensor::FloatDType::F32)
+                .reshape([count * TREE_CANDIDATE_K, 1]),
+            values
+                .cast(burn::tensor::FloatDType::F32)
+                .reshape([count * TREE_CANDIDATE_K, 1]),
+        ],
+        1,
+    );
+    (rows, picks)
 }
 
 /// The draft's cross-attention context over accepted target history.
@@ -631,6 +986,73 @@ impl<B: Backend> Draft<B> {
             .collect();
         let tree = TreeSpec::binary(levels, tokens.clone());
         Ok((tokens, tree))
+    }
+
+    /// Best-first propose (`MINICPM_DSPARK_TREE_BEST`): the same masked draft
+    /// forward, then per depth the markov head's top-K children with
+    /// log-softmax transition scores. The whole candidate grid — ids and
+    /// scores — is read back in one transfer, and the host best-first
+    /// selection keeps `live` ancestor-closed nodes (the confidence prefix)
+    /// remapped into a [`TreeSpec`] that the unchanged tree verify/accept
+    /// path consumes.
+    ///
+    /// One readback per propose is what this shape reaches: expanding and
+    /// sizing the tree on device would need a custom kernel, which is out of
+    /// scope for this ticket. The win is measured in wall clock, not in
+    /// round-trip count.
+    fn propose_tree_best(
+        &self,
+        target: &TextModel<B>,
+        state: &mut DraftState<B>,
+        anchor: u32,
+        levels: usize,
+        live: usize,
+    ) -> Result<(Vec<u32>, TreeSpec)> {
+        let device = state.keys[0].device();
+        let (base, timing) = self.draft_logits(target, state, anchor, levels)?;
+        let t_markov = Instant::now();
+        // Level-batched expansion. Each level packs `[token, transition]`
+        // rows for every child; ids ride as f32 because token ids stay
+        // below 2^24 and are exact there, so ids and scores share one
+        // readback.
+        let mut previous = Tensor::<B, 2, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(vec![anchor as i64], [1, 1]),
+            &device,
+        );
+        let mut grid_rows: Vec<Tensor<B, 2>> = Vec::with_capacity(levels);
+        for depth in 0..levels {
+            let count = previous.dims()[0];
+            let depth_base = base.clone().slice([depth..depth + 1, 0..VOCAB]);
+            let scores = self.markov_scores(depth_base, &previous);
+            let (rows, picks) = pack_candidate_rows(scores);
+            previous = picks.reshape([count * TREE_CANDIDATE_K, 1]);
+            grid_rows.push(rows);
+        }
+        let t_markov = t_markov.elapsed();
+        let t_readback = Instant::now();
+        let packed = Tensor::cat(grid_rows, 0).into_data().convert::<f32>();
+        let rows = packed.shape[0];
+        let values = packed
+            .as_slice::<f32>()
+            .map_err(|error| omni_r2t2::Error::Inference(error.to_string()))?
+            .to_vec();
+        let grid = CandidateGrid::new(levels, TREE_CANDIDATE_K, &values)
+            .map_err(omni_r2t2::Error::Inference)?;
+        let tree = select_best_first(&grid, live);
+        if crate::knobs::dspark_trace() {
+            eprintln!(
+                "propose_split: draft {:.2} logits {:.2} markov {:.2} readback {:.2} (best tree {} levels, {} of {} candidates, {} rows)",
+                timing.draft.as_secs_f64() * 1000.0,
+                timing.logits.as_secs_f64() * 1000.0,
+                t_markov.as_secs_f64() * 1000.0,
+                t_readback.elapsed().as_secs_f64() * 1000.0,
+                levels,
+                tree.tokens.len(),
+                rows,
+                tree.rows()
+            );
+        }
+        Ok((tree.tokens.clone(), tree))
     }
 
     /// Chain-mode propose: the draft forward runs on `block_len` masked
@@ -1041,6 +1463,12 @@ pub fn run_cycle<B: Backend>(
                 .map_err(|error| error.to_string())?;
             (assemble_block(bonus, &tokens), Some(tree))
         }
+        BlockLayout::BestTree { levels, live } => {
+            let (tokens, tree) = draft
+                .propose_tree_best(model, draft_state, bonus, *levels, *live)
+                .map_err(|error| error.to_string())?;
+            (assemble_block(bonus, &tokens), Some(tree))
+        }
         BlockLayout::Chain { len } => {
             let proposals = draft
                 .propose(model, draft_state, bonus, *len)
@@ -1159,20 +1587,29 @@ pub fn generate<B: Backend>(
     let capacity = draft_capacity(prompt.ids.len(), options.max_new_tokens, BLOCK_LADDER[2]);
     // The ladder picks each cycle's layout: a linear chain of the block
     // budget, or (adaptive runs only; a pinned MINICPM_DSPARK_BLOCK stays
-    // linear for experiments) a markov tree.
-    let mut ladder = Ladder::new(crate::knobs::dspark_block(), crate::knobs::dspark_tree());
+    // linear for experiments) a markov tree. `MINICPM_DSPARK_TREE_BEST`
+    // selects the best-first tree, which subsumes tree mode.
+    let best = crate::knobs::dspark_tree_best() && crate::knobs::dspark_block().is_none();
+    let tree = crate::knobs::dspark_tree() || best;
+    let mut ladder = Ladder::new(crate::knobs::dspark_block(), tree, best);
     // `MINICPM_DSPARK_LEDGER=1` swaps the AIMD ladder for the calibrated
-    // size rule over chain lengths. Tree row sets arrive with the best-first
-    // builder (#70), so a tree run keeps the ladder; when the switch is off
-    // this is `None` and the loop below is the unchanged AIMD path.
-    let mut ledger = (crate::knobs::dspark_ledger() && !crate::knobs::dspark_tree()).then(|| {
+    // size rule over chain lengths, or over the best-first tree's allowed
+    // live-row set when BEST is on. A full-binary tree run keeps the ladder
+    // (its row set is fixed by the ladder). When the switch is off this is
+    // `None` and the loop below is the unchanged AIMD path.
+    let mut ledger = (crate::knobs::dspark_ledger() && (!tree || best)).then(|| {
         let block = match crate::knobs::dspark_block() {
             Some(size) => format!("fixed:{size}"),
+            None if best => "tree-best".to_owned(),
             None => "adaptive".to_owned(),
         };
-        let allowed = crate::knobs::dspark_block()
-            .map(|size| vec![size])
-            .unwrap_or_else(|| crate::ledger::ALLOWED_SIZES.to_vec());
+        let allowed = if best {
+            crate::ledger::TREE_ALLOWED_SIZES.to_vec()
+        } else {
+            crate::knobs::dspark_block()
+                .map(|size| vec![size])
+                .unwrap_or_else(|| crate::ledger::ALLOWED_SIZES.to_vec())
+        };
         Ledger::load(
             allowed,
             LedgerKey::new(identity.model, identity.drafter, identity.precision, block),
@@ -1213,13 +1650,17 @@ pub fn generate<B: Backend>(
 
         stats.cycles += 1;
         let layout = match ledger.as_mut() {
+            Some(ledger) if best => BlockLayout::BestTree {
+                levels: TREE_GRID_LEVELS,
+                live: ledger.choose(),
+            },
             Some(ledger) => BlockLayout::Chain {
                 len: ledger.choose(),
             },
             None => ladder.layout(),
         };
         block_sum += if ledger.is_some() {
-            layout.policy_len()
+            layout.ledger_size()
         } else {
             ladder.block_len()
         };
@@ -1249,7 +1690,7 @@ pub fn generate<B: Backend>(
         stats.draft_tokens_accepted += outcome.tokens.len() as u64;
         if let Some(ledger) = ledger.as_mut() {
             ledger.observe(CycleObservation {
-                size: layout.policy_len(),
+                size: layout.ledger_size(),
                 rows: outcome.rows,
                 accepted: outcome.tokens.len(),
                 verify_ms: outcome.verify_ms,
@@ -1300,11 +1741,14 @@ pub fn generate<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_LADDER, BlockLayout, Ladder, TreeSpec, accept_path};
+    use super::{
+        BLOCK_LADDER, BlockLayout, CandidateGrid, Ladder, MAX_TREE_LIVE, TREE_CANDIDATE_K,
+        TREE_GRID_LEVELS, TreeSpec, accept_path, pack_candidate_rows, select_best_first,
+    };
 
     #[test]
     fn ladder_grows_on_two_full_accepts() {
-        let mut ladder = Ladder::new(None, false);
+        let mut ladder = Ladder::new(None, false, false);
         assert_eq!(
             ladder.layout(),
             BlockLayout::Chain {
@@ -1352,7 +1796,7 @@ mod tests {
 
     #[test]
     fn ladder_shrinks_after_two_lows_only() {
-        let mut ladder = Ladder::new(None, false);
+        let mut ladder = Ladder::new(None, false, false);
         ladder.observe(3, 3, false);
         ladder.observe(3, 3, false); // rung 1
         ladder.observe(8, 8, false);
@@ -1365,14 +1809,14 @@ mod tests {
 
     #[test]
     fn ladder_floor_and_trimmed_and_fixed() {
-        let mut ladder = Ladder::new(None, false);
+        let mut ladder = Ladder::new(None, false, false);
         ladder.observe(0, 3, false);
         ladder.observe(0, 3, false); // floor holds at the bottom rung
         assert_eq!(ladder.block_len(), BLOCK_LADDER[0]);
         ladder.observe(3, 3, true); // trimmed cycles carry no signal
         assert_eq!(ladder.block_len(), BLOCK_LADDER[0]);
 
-        let mut pinned = Ladder::new(Some(7), false);
+        let mut pinned = Ladder::new(Some(7), false, false);
         pinned.observe(7, 7, false);
         pinned.observe(7, 7, false);
         assert_eq!(pinned.layout(), BlockLayout::Chain { len: 7 });
@@ -1444,7 +1888,7 @@ mod tests {
 
     #[test]
     fn ladder_tree_maps_budget_to_depth() {
-        let mut ladder = Ladder::new(None, true);
+        let mut ladder = Ladder::new(None, true, false);
         assert_eq!(ladder.layout(), BlockLayout::Tree { levels: 1 });
         ladder.observe(1, 1, false);
         ladder.observe(1, 1, false);
@@ -1454,8 +1898,334 @@ mod tests {
         assert_eq!(ladder.layout(), BlockLayout::Tree { levels: 3 });
         // A pinned block stays linear even with tree mode requested.
         assert_eq!(
-            Ladder::new(Some(3), true).layout(),
+            Ladder::new(Some(3), true, false).layout(),
             BlockLayout::Chain { len: 3 }
+        );
+    }
+
+    #[test]
+    fn ladder_best_keeps_the_verify_rows_of_the_tree_rungs() {
+        // The depth->size mapping holds the verify block's row count of the
+        // full-binary tree (3/7/15 rows); the candidate grid stays three
+        // levels deep so the selector always has the same candidates.
+        let mut ladder = Ladder::new(None, true, true);
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::BestTree {
+                levels: TREE_GRID_LEVELS,
+                live: 2
+            }
+        );
+        ladder.observe(2, 2, false);
+        ladder.observe(2, 2, false);
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::BestTree {
+                levels: TREE_GRID_LEVELS,
+                live: 6
+            }
+        );
+        ladder.observe(3, 3, false);
+        ladder.observe(3, 3, false);
+        assert_eq!(
+            ladder.layout(),
+            BlockLayout::BestTree {
+                levels: TREE_GRID_LEVELS,
+                live: 14
+            }
+        );
+        // A pinned block stays linear even with best-first requested.
+        assert_eq!(
+            Ladder::new(Some(3), true, true).layout(),
+            BlockLayout::Chain { len: 3 }
+        );
+    }
+
+    /// Packs a test grid: row `i` is `[1000 + i, transition]`, depth-major.
+    fn pack(transitions: &[f32]) -> Vec<f32> {
+        let mut packed = Vec::with_capacity(transitions.len() * 2);
+        for (index, &transition) in transitions.iter().enumerate() {
+            packed.push(1000.0 + index as f32);
+            packed.push(transition);
+        }
+        packed
+    }
+
+    fn grid(levels: usize, transitions: &[f32]) -> CandidateGrid {
+        CandidateGrid::new(levels, TREE_CANDIDATE_K, &pack(transitions)).unwrap()
+    }
+
+    /// The global grid indices behind a spec's tokens (row `i`'s token is
+    /// `1000 + i`, i.e. node `i + 1`).
+    fn selected_nodes(spec: &TreeSpec) -> Vec<usize> {
+        spec.tokens()
+            .iter()
+            .map(|&token| token as usize - 999)
+            .collect()
+    }
+
+    /// Depth-1 scores -1.0/-0.5, and one depth-3 node (-0.91) that beats the
+    /// remaining depth-1 sibling: the top five are {1, 2, 5, 6, 13}.
+    const SKEWED: [f32; 14] = [
+        -1.0, -0.5, -0.5, -0.5, -0.4, -0.4, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -0.01, -1.0,
+    ];
+
+    #[test]
+    fn candidate_rows_pack_ids_and_log_probabilities_breadth_first() {
+        use burn::backend::NdArray;
+        let device = Default::default();
+        // Two parents, four vocabulary entries each.
+        let scores = burn::tensor::Tensor::<NdArray, 2>::from_floats(
+            [[0.0, 2.0, 1.0, -1.0], [3.0, 0.0, 1.0, 2.0]],
+            &device,
+        );
+        let (rows, picks) = pack_candidate_rows(scores);
+        let rows = rows.into_data().convert::<f32>();
+        let rows = rows.as_slice::<f32>().unwrap();
+        let picks = picks.into_data().convert::<i32>();
+        let picks = picks.as_slice::<i32>().unwrap();
+        // Parent-major: parent 0's top two, then parent 1's top two.
+        assert_eq!(picks, [1, 2, 0, 3]);
+        let reference = [[0.0f32, 2.0, 1.0, -1.0], [3.0, 0.0, 1.0, 2.0]];
+        let logp = |values: &[f32], id: usize| {
+            let max = values
+                .iter()
+                .fold(f32::NEG_INFINITY, |best, &value| best.max(value));
+            let sum: f32 = values.iter().map(|&value| (value - max).exp()).sum();
+            values[id] - max - sum.ln()
+        };
+        for (index, &id) in picks.iter().enumerate() {
+            let expected = logp(&reference[index / TREE_CANDIDATE_K], id as usize);
+            assert_eq!(rows[index * 2], id as f32);
+            assert!(
+                (rows[index * 2 + 1] - expected).abs() < 1e-6,
+                "row {index}: {} != {expected}",
+                rows[index * 2 + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_grid_reconstructs_breadth_first_path_scores() {
+        let grid = grid(2, &[-0.05, -0.02, -0.01, -0.50, -0.30, -0.10]);
+        assert_eq!(grid.tokens, vec![0, 1000, 1001, 1002, 1003, 1004, 1005]);
+        let expected = [0.0, -0.05, -0.02, -0.06, -0.55, -0.32, -0.12];
+        for (node, want) in expected.iter().enumerate() {
+            assert!(
+                (grid.scores[node] - want).abs() < 1e-6,
+                "node {node}: {} != {want}",
+                grid.scores[node]
+            );
+        }
+        assert_eq!(grid.depth(1), 1);
+        assert_eq!(grid.depth(3), 2);
+        assert_eq!(grid.parent(4), 1);
+        assert_eq!(grid.parent(5), 2);
+        assert_eq!(grid.children(0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(grid.children(2).collect::<Vec<_>>(), vec![5, 6]);
+        assert!(grid.children(3).next().is_none());
+    }
+
+    #[test]
+    fn candidate_grid_never_scores_a_child_above_its_parent() {
+        // A positive transition (an impossible log-probability) clamps to
+        // zero: the selector's "children never exceed parents" contract.
+        let grid = grid(2, &[0.5, -0.25, 3.0, -0.1, -0.4, 0.2]);
+        for node in 1..grid.tokens.len() {
+            assert!(
+                grid.scores[node] <= grid.scores[grid.parent(node)],
+                "node {node} outranks its parent"
+            );
+        }
+        assert_eq!(grid.scores[1], 0.0);
+        assert_eq!(grid.scores[3], grid.scores[1]);
+    }
+
+    #[test]
+    fn candidate_grid_rejects_non_finite_scores() {
+        let packed = pack(&[-0.1, -0.2, f32::NAN, -0.3, -0.1, -0.1]);
+        assert!(CandidateGrid::new(2, TREE_CANDIDATE_K, &packed).is_err());
+        // A truncated readback is a failed propose, not a short grid.
+        let short = pack(&[-0.1, -0.2]);
+        assert!(CandidateGrid::new(2, TREE_CANDIDATE_K, &short).is_err());
+    }
+
+    #[test]
+    fn best_first_selects_an_optimal_ancestor_closed_set_for_every_n() {
+        // -0.05 (A), -0.02 (B) at depth 1; depth-2 paths are
+        // -0.06/-0.55 (under A) and -0.32/-0.12 (under B).
+        let grid = grid(2, &[-0.05, -0.02, -0.01, -0.50, -0.30, -0.10]);
+        let nodes = grid.tokens.len();
+        for n in 0..nodes - 1 {
+            let spec = select_best_first(&grid, n);
+            let picked = selected_nodes(&spec);
+            assert_eq!(picked.len(), n, "n={n}");
+            for &node in &picked {
+                let parent = grid.parent(node);
+                assert!(parent == 0 || picked.contains(&parent), "n={n}: {picked:?}");
+            }
+            let greedy: f32 = picked.iter().map(|&node| grid.scores[node]).sum();
+            let mut best = f32::NEG_INFINITY;
+            for mask in 0u32..1 << (nodes - 1) {
+                if mask.count_ones() as usize != n {
+                    continue;
+                }
+                let set: Vec<usize> = (1..nodes)
+                    .filter(|&node| mask & (1 << (node - 1)) != 0)
+                    .collect();
+                if set.iter().any(|&node| {
+                    let parent = grid.parent(node);
+                    parent != 0 && mask & (1 << (parent - 1)) == 0
+                }) {
+                    continue;
+                }
+                let total: f32 = set.iter().map(|&node| grid.scores[node]).sum();
+                best = best.max(total);
+            }
+            assert!(
+                (greedy - best).abs() < 1e-5,
+                "n={n}: greedy {greedy} is not optimal ({best})"
+            );
+        }
+    }
+
+    #[test]
+    fn best_first_selects_a_deeper_node_over_a_shallow_sibling() {
+        let grid = grid(3, &SKEWED);
+        let spec = select_best_first(&grid, 5);
+        let picked = selected_nodes(&spec);
+        assert_eq!(picked.len(), 5);
+        for &node in &picked {
+            let parent = grid.parent(node);
+            assert!(parent == 0 || picked.contains(&parent), "{picked:?}");
+        }
+        assert!(
+            picked.iter().any(|&node| grid.depth(node) == 3),
+            "no depth-3 node in {picked:?}"
+        );
+    }
+
+    #[test]
+    fn best_first_remaps_selected_nodes_breadth_first() {
+        let grid = grid(3, &SKEWED);
+        let spec = select_best_first(&grid, 5);
+        // Selected grid nodes {1, 2, 5, 6, 13} remap to positions 1..=5 in
+        // breadth-first order.
+        assert_eq!(spec.tokens(), &[1000, 1001, 1004, 1005, 1012]);
+        assert_eq!(spec.parent(), &[0, 0, 0, 2, 2, 4]);
+        assert_eq!(spec.depth(), &[0, 1, 1, 2, 2, 3]);
+        assert_eq!(
+            spec.children(),
+            &[
+                vec![1, 2],
+                Vec::new(),
+                vec![3, 4],
+                Vec::new(),
+                vec![5],
+                Vec::new()
+            ]
+        );
+        assert_eq!(spec.levels(), 3);
+        assert_eq!(spec.rows(), 6);
+
+        // The ancestor mask is exactly the remapped parent-chain closure.
+        let mask = spec.ancestor_mask();
+        let width = spec.rows();
+        let mut closure = vec![false; width * width];
+        for node in 0..width {
+            let mut current = node;
+            loop {
+                closure[node * width + current] = true;
+                if current == 0 {
+                    break;
+                }
+                current = spec.parent()[current];
+            }
+        }
+        for node in 0..width {
+            for other in 0..width {
+                assert_eq!(
+                    mask[node * width + other],
+                    !closure[node * width + other],
+                    "mask[{node}][{other}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn best_first_breaks_score_ties_breadth_first() {
+        let grid = grid(2, &[-1.0; 6]);
+        let spec = select_best_first(&grid, 3);
+        assert_eq!(selected_nodes(&spec), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn best_first_caps_live_rows_at_the_block_budget() {
+        let grid = grid(3, &[-0.01; 14]);
+        let all = select_best_first(&grid, MAX_TREE_LIVE + 4);
+        assert_eq!(all.tokens().len(), 14);
+        assert_eq!(all.rows(), 15);
+        assert!(all.rows() <= 16);
+        // #73's 2x4 per-sequence budget is live 3 (bonus + 3 rows).
+        let capped = select_best_first(&grid, 3);
+        assert_eq!(capped.tokens().len(), 3);
+        assert_eq!(capped.rows(), 4);
+    }
+
+    #[test]
+    fn tree_spec_binary_keeps_the_existing_layout() {
+        let tree = TreeSpec::binary(2, vec![10, 11, 12, 13, 14, 15]);
+        assert_eq!(tree.tokens, vec![10, 11, 12, 13, 14, 15]);
+        assert_eq!(tree.parent, vec![0, 0, 0, 1, 1, 2, 2]);
+        assert_eq!(tree.depth, vec![0, 1, 1, 2, 2, 2, 2]);
+        assert_eq!(
+            tree.children,
+            vec![
+                vec![1, 2],
+                vec![3, 4],
+                vec![5, 6],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new()
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tree parent after child")]
+    fn tree_spec_rejects_parents_after_children() {
+        TreeSpec::new(
+            vec![7, 8],
+            vec![0, 2, 0],
+            vec![0, 1, 1],
+            vec![vec![1, 2], Vec::new(), Vec::new()],
+            1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tree depth at")]
+    fn tree_spec_rejects_inconsistent_depths() {
+        TreeSpec::new(
+            vec![7, 8],
+            vec![0, 0, 0],
+            vec![0, 1, 2],
+            vec![vec![1, 2], Vec::new(), Vec::new()],
+            1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tree levels must be the deepest depth")]
+    fn tree_spec_rejects_wrong_levels() {
+        TreeSpec::new(
+            vec![7, 8],
+            vec![0, 0, 0],
+            vec![0, 1, 1],
+            vec![vec![1, 2], Vec::new(), Vec::new()],
+            2,
         );
     }
 }

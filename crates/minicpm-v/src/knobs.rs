@@ -13,6 +13,7 @@
 //! | `MINICPM_DSPARK_BLOCK` | adaptive | pin a fixed draft block, `1..=31` |
 //! | `MINICPM_DSPARK_LAYERS` | `[3,11,19,27,35]` | draft cross-attention layers, five ascending `0..40` |
 //! | `MINICPM_DSPARK_TREE` | off | markov-tree layout (adaptive runs only) |
+//! | `MINICPM_DSPARK_TREE_BEST` | off | best-first tree selection, implies tree mode |
 //! | `MINICPM_DSPARK_MARKOV_QUANT` | off | int8 markov scoring |
 //! | `MINICPM_DSPARK_LEDGER` | off | calibrated verify-size ledger (`=1`) |
 //! | `MINICPM_DSPARK_LEDGER_PATH` | `target/dspark-ledger/` | ledger JSON path override |
@@ -78,6 +79,23 @@ pub(crate) fn dspark_tree() -> bool {
     })
 }
 
+/// `MINICPM_DSPARK_TREE_BEST` — the best-first markov tree. Default off:
+/// best-first implies tree mode, so `=1` runs trees even without
+/// `MINICPM_DSPARK_TREE`; with both off the full-binary tree path is
+/// unchanged. The candidate grid is one draft forward with top-2 children
+/// per depth and log-softmax transition scores, read back once; the host
+/// selects the highest-scoring ancestor-closed node set and remaps it into
+/// the existing verify layout.
+pub(crate) fn dspark_tree_best() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        matches!(
+            std::env::var("MINICPM_DSPARK_TREE_BEST").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
 /// `MINICPM_DSPARK_MARKOV_QUANT`
 pub(crate) fn dspark_markov_quant() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -122,20 +140,25 @@ pub fn experiment_header() {
 
 fn header_line() -> String {
     let block = dspark_block().map_or_else(|| "adaptive".to_owned(), |size| size.to_string());
-    let allowed = dspark_block()
-        .map(|size| vec![size])
-        .unwrap_or_else(|| crate::ledger::ALLOWED_SIZES.to_vec());
+    let allowed = dspark_block().map(|size| vec![size]).unwrap_or_else(|| {
+        if dspark_tree_best() {
+            crate::ledger::TREE_ALLOWED_SIZES.to_vec()
+        } else {
+            crate::ledger::ALLOWED_SIZES.to_vec()
+        }
+    });
     let layers = dspark_layers()
         .iter()
         .map(|layer| layer.to_string())
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "dspark ab-header: trace={} block={} layers={} tree={} markov_quant={} ledger={} ledger_allowed={:?} ledger_basis={} glue={} draft_glue={} git={}",
+        "dspark ab-header: trace={} block={} layers={} tree={} tree_best={} markov_quant={} ledger={} ledger_allowed={:?} ledger_basis={} glue={} draft_glue={} git={}",
         dspark_trace(),
         block,
         layers,
         dspark_tree(),
+        dspark_tree_best(),
         dspark_markov_quant(),
         dspark_ledger(),
         allowed,
@@ -180,6 +203,7 @@ mod tests {
             "block=",
             "layers=",
             "tree=",
+            "tree_best=",
             "markov_quant=",
             "ledger=",
             "ledger_allowed=",

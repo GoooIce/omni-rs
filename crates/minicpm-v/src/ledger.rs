@@ -25,10 +25,17 @@
 //! execution time.
 //!
 //! Allowed sizes are the chain lengths `[3, 8, 16]`, the existing
-//! `BLOCK_LADDER`. The set is deliberately finite because each verify shape
-//! pays a one-time matmul/attention autotune that then replays from the
-//! persistent cache; an unbounded integer search would keep paying for new
-//! shapes. The ledger searches inside that set and never invents a shape.
+//! `BLOCK_LADDER`, or the best-first tree's live-row counts `[2, 6, 14]`
+//! ([`TREE_ALLOWED_SIZES`]) when `MINICPM_DSPARK_TREE_BEST` is on. The sets
+//! are deliberately finite because each verify shape pays a one-time
+//! matmul/attention autotune that then replays from the persistent cache; an
+//! unbounded integer search would keep paying for new shapes. The ledger
+//! searches inside the active set and never invents a shape. With BEST on,
+//! the candidate grid is always three levels deep, so the propose cost is
+//! constant across tree sizes and `cost[n]` compares verify work alone; the
+//! initial sweep measures every tree size before the argmax runs, so the
+//! chain-shaped depth prior in [`Ledger::expected`] is never used for a tree
+//! size.
 //!
 //! Exploration: every allowed size is sampled once in ascending order before
 //! the argmax runs, then the least recently sampled non-argmax size is forced
@@ -45,6 +52,16 @@ use std::path::{Path, PathBuf};
 /// The chain sizes the ledger may choose from: the adaptive ladder's finite
 /// autotune shape set (3/8/16 draft tokens).
 pub const ALLOWED_SIZES: [usize; 3] = crate::dspark::BLOCK_LADDER;
+
+/// The best-first tree's live-row set (`MINICPM_DSPARK_TREE_BEST` +
+/// `MINICPM_DSPARK_LEDGER`): the full-binary live-node counts of the
+/// 1/2/3-level depth mapping, i.e. verify blocks of 3/7/15 rows. These are
+/// exactly the shapes the existing tree path already pays autotune for, so
+/// the tree ledger searches a finite set instead of inventing a shape for
+/// every live count. The set respects the block cap (every live count is at
+/// most `MAX_TREE_LIVE`, every block at most `MAX_TREE_ROWS`); #73's 2x4
+/// budget is below the smallest member and passes its own capped live count.
+pub const TREE_ALLOWED_SIZES: [usize; 3] = [2, 6, 14];
 
 /// The cost basis label attached to every ledger decision (decision #65).
 pub const COST_BASIS: &str = "host-wall-clock";
@@ -469,7 +486,7 @@ fn ledger_path(key: &LedgerKey) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CycleObservation, EXPLORE_PERIOD, Ledger, LedgerKey};
+    use super::{CycleObservation, EXPLORE_PERIOD, Ledger, LedgerKey, TREE_ALLOWED_SIZES};
     use std::path::PathBuf;
 
     fn temp_path() -> PathBuf {
@@ -638,6 +655,26 @@ mod tests {
             "no exploration sample over {choices:?}"
         );
         assert_eq!(ledger.stats(3).unwrap().samples, 2);
+    }
+
+    #[test]
+    fn tree_allowed_sizes_are_the_full_binary_live_counts() {
+        // The best-first tree's live-row set: the full-binary live counts of
+        // the 1/2/3-level depth mapping (verify rows 3/7/15).
+        assert_eq!(TREE_ALLOWED_SIZES, [2, 6, 14]);
+        for (levels, live) in TREE_ALLOWED_SIZES.into_iter().enumerate() {
+            assert_eq!(live, 2 * (1 << (levels + 1)) - 2);
+        }
+        assert!(
+            TREE_ALLOWED_SIZES
+                .iter()
+                .all(|&live| live <= crate::dspark::MAX_TREE_LIVE)
+        );
+        assert!(
+            TREE_ALLOWED_SIZES
+                .iter()
+                .all(|&live| live + 1 <= crate::dspark::MAX_TREE_ROWS)
+        );
     }
 
     #[test]
