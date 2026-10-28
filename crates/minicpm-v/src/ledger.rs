@@ -149,7 +149,8 @@ impl LedgerKey {
 
     /// A short stable file stem for this key.
     pub fn fingerprint(&self) -> String {
-        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
         for part in [
             self.model.as_str(),
             self.drafter.as_str(),
@@ -157,10 +158,10 @@ impl LedgerKey {
             self.block.as_str(),
             self.chip.as_str(),
         ] {
-            sha2::Digest::update(&mut hasher, part.as_bytes());
-            sha2::Digest::update(&mut hasher, [0u8]);
+            hasher.update(part.as_bytes());
+            hasher.update([0u8]);
         }
-        let digest = sha2::Digest::finalize(hasher);
+        let digest = hasher.finalize();
         digest[..16]
             .iter()
             .map(|byte| format!("{byte:02x}"))
