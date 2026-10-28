@@ -27,7 +27,7 @@ use burn::tensor::backend::Backend;
 use std::time::Instant;
 
 use crate::dspark::{
-    AcceptedPath, BlockLayout, CycleOutcome, Draft, DraftState, SpecStats, TreeSpec, accept_path,
+    AcceptedPath, BlockLayout, CycleOutcome, DraftState, Drafter, SpecStats, TreeSpec, accept_path,
     assemble_block, greedy_argmax_block, select_captured, trim_to_room,
 };
 use crate::model::{DecodeState, TextModel, VerifyBlock};
@@ -69,9 +69,9 @@ pub struct BatchCycleMember<'a, B: Backend> {
 /// as [`crate::dspark::run_cycle`]'s tree path. Phase timings accumulate into
 /// `stats.trace` when enabled; per-member cycle counters stay with the caller
 /// so both paths account alike.
-pub fn run_cycle_batch<B: Backend>(
+pub fn run_cycle_batch<B: Backend, D: Drafter<B, State = DraftState<B>>>(
     model: &TextModel<B>,
-    draft: &Draft<B>,
+    draft: &D,
     eos_ids: &[u32],
     members: &mut [BatchCycleMember<'_, B>],
     stats: &mut SpecStats,

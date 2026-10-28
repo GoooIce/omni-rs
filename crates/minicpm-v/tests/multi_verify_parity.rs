@@ -37,6 +37,19 @@ fn argmax(row: &[f32]) -> usize {
         .expect("finite logit")
 }
 
+fn row<B: Backend>(tensor: &Tensor<B, 2>, index: usize) -> Vec<f32> {
+    let width = tensor.dims()[1];
+    values(tensor.clone().slice([index..index + 1, 0..width]))
+}
+
+fn max_abs(actual: &[f32], expected: &[f32]) -> f32 {
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max)
+}
+
 fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len(), "{label}: length");
     let worst = actual
@@ -194,6 +207,148 @@ fn multi_verify_matches_per_sequence_1b_cpu() {
     let last = config.text_config.num_hidden_layers - 1;
     let capture_at = [0usize, last / 2, last];
     assert_multi_matches("1b", &model, &states, &ids, &capture_at, 1e-3);
+}
+
+/// 1B checkpoint on CPU: two sequences, each verifying an irregular tree
+/// block in one multi forward. Every tree node's logits must match a
+/// sequential `forward` over that node's root path (the independent reference
+/// the tree-block multi path lacked), and a retained path must continue like
+/// the same token history forwarded sequentially.
+#[test]
+#[ignore = "needs models/MiniCPM-V-4.7-1B"]
+fn multi_verify_tree_blocks_match_sequential_paths_1b_cpu() {
+    use burn::backend::NdArray;
+    use omni_minicpm_v::config::ModelDirectory;
+    use omni_minicpm_v::dspark::TreeSpec;
+    use omni_r2t2::Precision;
+
+    type B = NdArray;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model_dir = root.join("models/MiniCPM-V-4.7-1B");
+    if !model_dir.join("config.json").is_file() {
+        eprintln!("skipping: 1B checkpoint not present");
+        return;
+    }
+    let device = burn::backend::ndarray::NdArrayDevice::default();
+    let config = ModelDirectory::new(&model_dir).config().unwrap();
+    let weights = omni_r2t2::weights::Weights::open(&model_dir).unwrap();
+    let model = TextModel::<B>::load(&weights, &config, Precision::F32, &device).unwrap();
+
+    let histories: [&[u32]; 2] = [&[1, 100, 200, 300], &[1, 42, 43, 44, 45]];
+    let bonuses = [11u32, 21u32];
+    let mut bases = [model.new_state(&device), model.new_state(&device)];
+    for (state, history) in bases.iter_mut().zip(histories) {
+        model.forward(history, None, None, state).unwrap();
+    }
+    // An irregular depth-3 tree and a full depth-2 tree: different shapes in
+    // one multi forward.
+    let trees = [
+        TreeSpec::new(
+            vec![101, 202, 303, 404, 505],
+            vec![0, 0, 0, 1, 2, 4],
+            vec![0, 1, 1, 2, 2, 3],
+            vec![
+                vec![1, 2],
+                vec![3],
+                vec![4],
+                Vec::new(),
+                vec![5],
+                Vec::new(),
+            ],
+            3,
+        ),
+        TreeSpec::new(
+            vec![61, 62, 63, 64, 65, 66],
+            vec![0, 0, 0, 1, 1, 2, 2],
+            vec![0, 1, 1, 2, 2, 2, 2],
+            vec![
+                vec![1, 2],
+                vec![3, 4],
+                vec![5, 6],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            2,
+        ),
+    ];
+    let ids: Vec<Vec<u32>> = trees
+        .iter()
+        .zip(bonuses)
+        .map(|(tree, bonus)| {
+            let mut block = vec![bonus];
+            block.extend_from_slice(tree.tokens());
+            block
+        })
+        .collect();
+    let before: Vec<usize> = bases.iter().map(|state| state.length).collect();
+
+    let mut states = bases.clone();
+    let capture: [usize; 0] = [];
+    let mut blocks: Vec<VerifyBlock<'_, B>> = states
+        .iter_mut()
+        .zip(ids.iter())
+        .zip(trees.iter())
+        .map(|((state, ids), tree)| VerifyBlock::with_tree(ids, state, &capture, tree))
+        .collect();
+    let outputs = model.forward_verifying_multi(&mut blocks).unwrap();
+    drop(blocks);
+    assert_eq!(outputs.len(), 2);
+
+    for (index, ((tree, output), block)) in
+        trees.iter().zip(outputs.iter()).zip(ids.iter()).enumerate()
+    {
+        assert_eq!(
+            states[index].length,
+            before[index] + block.len(),
+            "block {index}: state rows"
+        );
+        for node in 0..=tree.tokens().len() {
+            let mut path = vec![bonuses[index]];
+            let mut chain = Vec::new();
+            let mut cursor = node;
+            while cursor != 0 {
+                chain.push(cursor);
+                cursor = tree.parent()[cursor];
+            }
+            chain.reverse();
+            for &step in &chain {
+                path.push(tree.tokens()[step - 1]);
+            }
+            let mut sequential = bases[index].clone();
+            let expected = model.forward(&path, None, None, &mut sequential).unwrap();
+            let actual = row(&output.logits, node);
+            let expected = row(&expected, 0);
+            let delta = max_abs(&actual, &expected);
+            eprintln!("block {index} node {node} path {path:?}: max |delta| {delta:.6}");
+            assert!(delta <= 1e-3, "block {index} node {node} logits deviate");
+            assert_eq!(
+                argmax(&actual),
+                argmax(&expected),
+                "block {index} node {node}"
+            );
+        }
+    }
+
+    // Retain block 0's path bonus -> 202 -> 404 -> 505 and continue: the
+    // state must match forwarding that history sequentially.
+    let slots = [0usize, 2, 4, 5];
+    states[0].retain_path(before[0], &slots, &outputs[0].linear_after);
+    assert_eq!(states[0].length, before[0] + slots.len());
+    let mut sequential = bases[0].clone();
+    model
+        .forward(&[bonuses[0], 202, 404, 505], None, None, &mut sequential)
+        .unwrap();
+    let next = model.forward(&[777], None, None, &mut states[0]).unwrap();
+    let reference = model.forward(&[777], None, None, &mut sequential).unwrap();
+    let next = row(&next, 0);
+    let reference = row(&reference, 0);
+    assert!(
+        max_abs(&next, &reference) <= 1e-3,
+        "block 0 retained tree state"
+    );
+    assert_eq!(argmax(&next), argmax(&reference));
 }
 
 /// Same gate on the 35B int4 checkpoint in F16 on Metal: two sequences, two

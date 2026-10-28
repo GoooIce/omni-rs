@@ -16,7 +16,7 @@
 //! | `MINICPM_DSPARK_TREE_BEST` | off | best-first tree selection, implies tree mode |
 //! | `MINICPM_DSPARK_MARKOV_QUANT` | off | int8 markov scoring |
 //! | `MINICPM_DSPARK_LEDGER` | off | calibrated verify-size ledger (`=1`) |
-//! | `MINICPM_DSPARK_LEDGER_PATH` | `target/dspark-ledger/` | ledger JSON path override |
+//! | `MINICPM_DSPARK_LEDGER_PATH` | `target/dspark-ledger/<fingerprint>.json` | exact ledger JSON file path (written verbatim) |
 //! | `MINICPM_DSPARK_CHIP` | arch/OS | ledger chip fingerprint override |
 //! | `MINICPM_GLUE` | on | fused verify seams (`=0` disables) |
 //! | `MINICPM_DRAFT_GLUE` | on | fused draft seams (`=0` disables) |

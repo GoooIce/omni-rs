@@ -23,7 +23,9 @@ use std::sync::Once;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResinConfig {
     /// Verify all decode rows of a plan (`>= 2`) in one target forward
-    /// instead of one forward per row. Greedy DSpark only for now.
+    /// instead of one forward per row. Greedy decoding: the DSpark runner
+    /// (one speculative cycle per row) and the greedy text runner (one token
+    /// per row).
     pub multi_sequence_batch: bool,
     /// Store conversation checkpoints for requests tagged with a slot key and
     /// resume the deepest prefix-matching one (#74). No slot key means the

@@ -93,6 +93,13 @@ scripts/state-cache-cold-start.sh
 scripts/state-reuse-two-turn.sh
 scripts/state-reuse-quota-batch.sh --prefix 128 --suffix 16 --tokens 32
 
+# Greedy 1B co-batch (stream parity + printed batched/per-row ratio) and the
+# DSpark two-turn checkpoint gate (35B Metal, suffix prefill + parity).
+cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features \
+  --features cpu --test minicpm_greedy_batch -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal \
+  --test minicpm_dspark_conversation -- --ignored --nocapture
+
 # Two-arm A/B: chain co-batch vs solo best-first tree (35B arguments shown).
 MINICPM_DSPARK_TRACE=1 MINICPM_DSPARK_TREE_BEST=1 \
 cargo run --manifest-path crates/resin-metal/Cargo.toml --release --features metal \

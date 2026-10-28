@@ -10,7 +10,7 @@
 use burn::backend::wgpu::{Metal, WgpuDevice};
 use burn::tensor::backend::Backend as _;
 use omni_minicpm_v::{config::ModelDirectory, model::TextModel, tokenizer::MiniCpmTokenizer};
-use resin_core::engine::{EngineCore, RunnerConfig, SchedulerConfig, Submission};
+use resin_core::engine::{EngineCore, Runner, RunnerConfig, SchedulerConfig, Submission};
 use resin_metal::minicpm::MinicpmRunner;
 use resin_metal::session::DecodeRequest;
 use std::io::Write as _;
@@ -58,7 +58,7 @@ fn main() -> Result<(), String> {
     let mut input = Submission::new(
         ids,
         DecodeRequest {
-            max_new_tokens,
+            max_new_tokens: max_tokens,
             slot: None,
         },
     );
