@@ -32,6 +32,10 @@ required-features = ["metal"]
 name = "state_cache_cold"
 required-features = ["cpu"]
 
+[[example]]
+name = "state_reuse_ab"
+required-features = ["cpu"]
+
 [patch.crates-io]
 burn-cubecl = { path = "../../vendor/burn-cubecl" }
 cubecl-common = { path = "../../vendor/cubecl-common" }

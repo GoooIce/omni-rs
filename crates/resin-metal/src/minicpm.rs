@@ -150,6 +150,16 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         Ok(Some(((state, history), vec![token])))
     }
 
+    /// Resident target-state bytes of one slot (#76): KV pairs plus linear
+    /// conv/recurrence tensors.
+    fn slot_bytes(&self, slot: &Self::Slot) -> usize {
+        usize::try_from(crate::memory::state_bytes(&slot.0)).unwrap_or(usize::MAX)
+    }
+
+    fn checkpoint_bytes(&self, checkpoint: &Self::Checkpoint) -> usize {
+        usize::try_from(crate::memory::state_bytes(&checkpoint.state)).unwrap_or(usize::MAX)
+    }
+
     /// Greedy checkpoint as named tensors (#75): one `kv.<layer>.k/v` pair per
     /// full-attention layer and `linear.<layer>.conv/recurrent` per linear
     /// layer, in the state's own dtype.
@@ -267,6 +277,12 @@ impl<B: Backend> MinicpmRunner<B> {
         }
     }
 
+    /// Replace the experimental switches at runtime (same-process A/B arms,
+    /// #76 quota measurements).
+    pub fn set_config(&mut self, config: ResinConfig) {
+        self.session.set_config(config);
+    }
+
     /// The resolved engine switches (environment overrides folded in).
     pub fn config(&self) -> &ResinConfig {
         self.session.config()
@@ -280,6 +296,11 @@ impl<B: Backend> MinicpmRunner<B> {
     /// Disk cache counters, when a cache is attached (#75).
     pub fn state_cache_stats(&self) -> Option<crate::state_cache::StateCacheStats> {
         self.session.state_cache_stats()
+    }
+
+    /// Resident KV bytes, budget and release-order counters (#76).
+    pub fn memory_stats(&self) -> crate::memory::MemoryStats {
+        self.session.memory_stats()
     }
 
     /// Encode and write queued checkpoints now (#75).

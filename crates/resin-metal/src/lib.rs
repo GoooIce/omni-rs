@@ -16,6 +16,7 @@
 pub mod config;
 pub mod conversation;
 pub mod dspark_runner;
+pub mod memory;
 pub mod minicpm;
 pub mod session;
 pub mod state_cache;

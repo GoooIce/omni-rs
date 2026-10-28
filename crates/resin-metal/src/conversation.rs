@@ -48,6 +48,9 @@ struct StoredCheckpoint<C> {
     /// KV-aligned token history of the checkpoint (the pending bonus is not
     /// part of it; see the module note in `session.rs`).
     tokens: Vec<u32>,
+    /// Store-wide recency stamp (#76): saves and successful borrows bump it,
+    /// and the memory budget releases the smallest stamp first.
+    last_used: u64,
 }
 
 struct SlotCheckpoints<C> {
@@ -73,6 +76,7 @@ impl<C> SlotCheckpoints<C> {
 }
 
 /// Which stored checkpoint matched.
+#[derive(Clone, Copy)]
 enum Kind {
     Turn(usize),
     Prefix,
@@ -81,13 +85,24 @@ enum Kind {
 /// The per-session checkpoint store; `C` is the adapter's checkpoint type.
 pub(crate) struct ConversationStore<C> {
     slots: HashMap<u64, SlotCheckpoints<C>>,
+    /// Monotone recency clock; never reset, so a released checkpoint is always
+    /// older than one saved after it.
+    clock: u64,
 }
 
 impl<C> Default for ConversationStore<C> {
     fn default() -> Self {
         Self {
             slots: HashMap::new(),
+            clock: 0,
         }
+    }
+}
+
+impl<C> ConversationStore<C> {
+    fn stamp(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
     }
 }
 
@@ -95,9 +110,13 @@ impl<C: Clone> ConversationStore<C> {
     /// Save a turn-boundary snapshot; evicts the least recently used turn
     /// snapshot of that key when the cap is reached.
     pub fn save_turn(&mut self, key: u64, checkpoint: C, tokens: Vec<u32>) {
+        let last_used = self.stamp();
         let slot = self.slots.entry(key).or_default();
-        slot.turns
-            .push_back(StoredCheckpoint { checkpoint, tokens });
+        slot.turns.push_back(StoredCheckpoint {
+            checkpoint,
+            tokens,
+            last_used,
+        });
         while slot.turns.len() > MAX_TURN_CHECKPOINTS {
             slot.turns.pop_front();
         }
@@ -106,13 +125,18 @@ impl<C: Clone> ConversationStore<C> {
     /// Save the prefill-end prefix snapshot; an existing prefix is replaced
     /// only when the new token history is strictly longer (append-only).
     pub fn save_prefix(&mut self, key: u64, checkpoint: C, tokens: Vec<u32>) {
+        let last_used = self.stamp();
         let slot = self.slots.entry(key).or_default();
         let longer = slot
             .prefix
             .as_ref()
             .is_none_or(|stored| tokens.len() > stored.tokens.len());
         if longer {
-            slot.prefix = Some(StoredCheckpoint { checkpoint, tokens });
+            slot.prefix = Some(StoredCheckpoint {
+                checkpoint,
+                tokens,
+                last_used,
+            });
         }
     }
 
@@ -137,31 +161,112 @@ impl<C: Clone> ConversationStore<C> {
             }
         }
         let (key, tokens, kind) = best?;
+        let last_used = self.stamp();
         let slot = self
             .slots
             .get_mut(&key)
             .expect("matched slot remains stored");
         let checkpoint = match kind {
             Kind::Turn(index) => {
-                let stored = slot.turns.remove(index).expect("matched turn snapshot");
+                let mut stored = slot.turns.remove(index).expect("matched turn snapshot");
+                stored.last_used = last_used;
                 let checkpoint = stored.checkpoint.clone();
                 slot.turns.push_back(stored);
                 checkpoint
             }
-            Kind::Prefix => slot
-                .prefix
-                .as_ref()
-                .expect("matched prefix snapshot")
-                .checkpoint
-                .clone(),
+            Kind::Prefix => {
+                let stored = slot.prefix.as_mut().expect("matched prefix snapshot");
+                stored.last_used = last_used;
+                stored.checkpoint.clone()
+            }
         };
         Some((tokens, checkpoint))
+    }
+
+    /// Remove and return the least recently stored or borrowed checkpoint
+    /// (#76 tier 3), with the slot key it belonged to.
+    pub fn take_lru(&mut self) -> Option<(u64, Vec<u32>, C)> {
+        let mut best: Option<(u64, u64, Kind)> = None;
+        for (&key, slot) in &self.slots {
+            for (index, stored) in slot.turns.iter().enumerate() {
+                if older_than(stored.last_used, key, &best) {
+                    best = Some((stored.last_used, key, Kind::Turn(index)));
+                }
+            }
+            if let Some(stored) = &slot.prefix
+                && older_than(stored.last_used, key, &best)
+            {
+                best = Some((stored.last_used, key, Kind::Prefix));
+            }
+        }
+        let (_, key, kind) = best?;
+        let slot = self
+            .slots
+            .get_mut(&key)
+            .expect("chosen slot remains stored");
+        let (stored, remaining) = match kind {
+            Kind::Turn(index) => {
+                let stored = slot.turns.remove(index).expect("chosen turn snapshot");
+                (
+                    stored,
+                    slot.turns.len() + usize::from(slot.prefix.is_some()),
+                )
+            }
+            Kind::Prefix => (
+                slot.prefix.take().expect("chosen prefix snapshot"),
+                slot.turns.len(),
+            ),
+        };
+        if remaining == 0 {
+            self.slots.remove(&key);
+        }
+        Some((key, stored.tokens, stored.checkpoint))
+    }
+
+    /// Remove every checkpoint stored under `key` (#76 tier 1 self-drop).
+    pub fn take_key(&mut self, key: u64) -> Vec<(Vec<u32>, C)> {
+        let Some(slot) = self.slots.remove(&key) else {
+            return Vec::new();
+        };
+        let mut taken = Vec::with_capacity(slot.turns.len() + usize::from(slot.prefix.is_some()));
+        for stored in slot.turns {
+            taken.push((stored.tokens, stored.checkpoint));
+        }
+        if let Some(stored) = slot.prefix {
+            taken.push((stored.tokens, stored.checkpoint));
+        }
+        taken
+    }
+
+    /// Total bytes over every stored checkpoint, measured by `bytes` (#76).
+    pub fn sum_checkpoint_bytes<F: FnMut(&C) -> usize>(&self, mut bytes: F) -> usize {
+        let mut total = 0usize;
+        for slot in self.slots.values() {
+            for stored in &slot.turns {
+                total = total.saturating_add(bytes(&stored.checkpoint));
+            }
+            if let Some(stored) = &slot.prefix {
+                total = total.saturating_add(bytes(&stored.checkpoint));
+            }
+        }
+        total
     }
 
     /// Checkpoints currently stored under one key; used by tests.
     #[cfg(test)]
     pub fn stored_for(&self, key: u64) -> usize {
         self.slots.get(&key).map_or(0, SlotCheckpoints::len)
+    }
+}
+
+/// Whether `(last_used, key)` is a better LRU victim than the current best;
+/// ties go to the smaller key so the choice is deterministic.
+fn older_than(last_used: u64, key: u64, best: &Option<(u64, u64, Kind)>) -> bool {
+    match best {
+        None => true,
+        Some((best_used, best_key, _)) => {
+            last_used < *best_used || (last_used == *best_used && key < *best_key)
+        }
     }
 }
 

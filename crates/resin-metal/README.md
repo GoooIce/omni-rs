@@ -25,6 +25,27 @@ Resin 引擎栈的 Rust 侧:用 [resin](https://github.com/ekzhang/resin) 的 `E
 - 写盘时机:release 后或下一次 `forward` 前的引擎空闲边界,在 runner 线程同步 drain——编码要 `into_data()` 读回设备,故不是独立后台线程。进程退出前可调 `flush_state_cache()`(`release` 已自动 drain)。
 - 冷启动门(#66):`scripts/state-cache-cold-start.sh` 起两个进程(`cold-write` / `cold-read`),要求恢复请求 0 预填 token、TTFT ≤ 全量预填 0.5×、首 token 一致;无 1B 权重时打印 `gate=skip` 退出。
 
+## KV 内存额度与释放次序 (#76)
+
+`ResinConfig.kv_budget_mb: Option<usize>` 给 live slot KV + 内存检查点设上限,默认 `None`(无额度,行为与 #75 相同);实验覆盖 `RESIN_KV_BUDGET_MB=<MiB>`。额度只由 runner 侧的字节账驱动,不读设备分配器。
+
+- 字节口径:`DecodeAdapter::slot_bytes` / `checkpoint_bytes`,由适配器按张量形状 × dtype 宽度报告——贪心 runner 是目标 KV + 线性 conv/recurrent,DSpark 另加预分配的草稿 K/V 缓冲。默认实现返回 0,不 opt-in 的适配器不进入账本。
+- 释放次序(#65):
+  1. 本槽自弃:带 slot key 的整段 prompt 请求没有可用前缀检查点时,先释放该 key 的检查点(同时取消同内容的待写盘队列);
+  2. 图像 embedding 缓存:本仓 runner 不持有,跳过并在实验头注明;
+  3. 空闲槽 KV:跨 key 的 LRU 检查点;`state_cache` 开时先编码落盘再移出内存,否则直接丢弃;
+  4. 待预填 KV:单块 prefill 不跨请求保留,跳过;
+  5. ANE split:地图 Out of scope。
+- 强制点:检查点插入后、slot 创建后、`release` 后、`set_config` 后。live slot 不淘汰;live 单独超额度时请求照常跑完,`memory_stats()` 的 `over_budget_bytes` 记录差额。每次释放打印层级与字节数(`resin memory: tier=...`)。
+- 观测:`MinicpmRunner::memory_stats()` / `MinicpmDsparkRunner::memory_stats()` 返回 budget、live、checkpoint、spills、按层级的丢弃计数与 over-budget 差额。
+
+#66 测量脚本(引擎层,1B CPU,无权重时 `gate=skip`):
+
+- `scripts/state-cache-cold-start.sh`:#75 冷启动(两进程)。
+- `scripts/state-reuse-two-turn.sh`:第二轮 prompt = 渲染后的第一轮历史 + 新问题;要求只预填后缀+问题、输出与全量重预填逐 token 相同、TTFT ≤ 0.5×。
+- `scripts/state-reuse-quota-batch.sh [--budget-mb N] [--prefix N] [--suffix N]`:双请求合批在强制淘汰的额度下跑完、吞吐 ≥ 无额度 0.9×、被淘汰前缀可从 SSD 重取。
+- `tests/minicpm_quota.rs`(`#[ignore]`):1B CPU 额度门。
+
 ## 运行
 
 ```sh
