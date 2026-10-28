@@ -451,9 +451,12 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         let linear_layers = usize::try_from(meta.get("linear_layers")?.as_u64()?).ok()?;
         let draft_layers = usize::try_from(meta.get("draft_layers")?.as_u64()?).ok()?;
         let draft_length = usize::try_from(meta.get("draft_length")?.as_u64()?).ok()?;
-        if kv_layers == 0
-            || kv_layers != linear_layers
-            || kv_layers > 1024
+        // Hybrid towers have a different number of full-attention and linear
+        // layers (1B and 35B both do); only the total has to be non-empty and
+        // each count bounded.
+        if kv_layers > 1024
+            || linear_layers > 1024
+            || kv_layers + linear_layers == 0
             || draft_layers == 0
             || draft_layers > 1024
             || draft_length > length

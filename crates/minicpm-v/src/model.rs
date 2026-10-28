@@ -39,19 +39,16 @@ impl<B: Backend> DecodeState<B> {
         &self.linear
     }
 
-    /// Rebuild a state from restored parts (#75): one KV cache and one linear
-    /// state per layer, plus the KV-aligned length and rope offset.
+    /// Rebuild a state from restored parts (#75): the full-attention KV
+    /// caches, the linear-attention states, the KV-aligned length and the rope
+    /// offset. Hybrid towers keep one vector per layer type, so the two
+    /// lengths differ.
     pub fn from_parts(
         kv: Vec<KvCache<B>>,
         linear: Vec<LinearState<B>>,
         length: usize,
         rope_delta: i64,
     ) -> Self {
-        assert_eq!(
-            kv.len(),
-            linear.len(),
-            "one KV cache and one linear state per layer"
-        );
         Self {
             kv,
             linear,
@@ -1406,5 +1403,25 @@ mod checkpoint_seam_tests {
         assert_eq!(state.linear_states().len(), 2);
         assert_eq!(state.linear_states()[0].conv.dims(), [1, 2, 3]);
         assert_eq!(state.linear_states()[0].recurrent.dims(), [1, 2, 1, 4]);
+    }
+
+    #[test]
+    fn from_parts_accepts_a_hybrid_tower_with_unequal_layer_counts() {
+        // 1B and 35B mix full-attention and linear-attention layers, so the
+        // restored vectors differ in length. The forward walk indexes each
+        // vector independently; from_parts must not demand equality.
+        let device = Default::default();
+        let kv = KvCache::from_tensors(
+            Tensor::zeros([1, 1, 2, 2], &device),
+            Tensor::zeros([1, 1, 2, 2], &device),
+        );
+        let state = DecodeState::from_parts(
+            vec![kv],
+            vec![linear_state(), linear_state(), linear_state()],
+            2,
+            0,
+        );
+        assert_eq!(state.kv_caches().len(), 1);
+        assert_eq!(state.linear_states().len(), 3);
     }
 }

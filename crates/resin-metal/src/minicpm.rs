@@ -83,7 +83,13 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         _budget: usize,
     ) -> Result<Vec<u32>, Error> {
         let (state, history) = slot;
-        history.extend_from_slice(input);
+        // The engine feeds the previous row's sampled token back; it is
+        // already the last element of `history`. Appending it again would
+        // desynchronise the history from the KV state and move checkpoint
+        // tokens off the prompt prefix.
+        if input.len() != 1 || history.last() != input.first() {
+            history.extend_from_slice(input);
+        }
         let logits = self
             .model
             .forward(input, None, None, state)
@@ -199,7 +205,10 @@ impl<B: Backend> DecodeAdapter for GreedyAdapter<B> {
         let meta = meta?;
         let layers = usize::try_from(meta.get("kv_layers")?.as_u64()?).ok()?;
         let linear_layers = usize::try_from(meta.get("linear_layers")?.as_u64()?).ok()?;
-        if layers == 0 || layers != linear_layers || layers > 1024 {
+        // Hybrid towers have a different number of full-attention and linear
+        // layers (1B and 35B both do); only the total has to be non-empty and
+        // each count bounded.
+        if layers > 1024 || linear_layers > 1024 || layers + linear_layers == 0 {
             return None;
         }
         let mut kv = Vec::with_capacity(layers);
