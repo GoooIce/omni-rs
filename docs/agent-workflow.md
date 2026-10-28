@@ -58,6 +58,48 @@ Absolute wall times on this machine swing with GPU thermal state (plain decode h
 - Compare per-kernel durations only within one thermal window (consecutive runs); prefer a same-binary kill switch (env var) over cross-binary A/Bs — it eliminates binary, numerics and thermal-pairing noise at once.
 - After editing kernels, confirm the benchmark binary was actually relinked before trusting numbers (check its mtime against the source, or `strings` for the kernel name) — a cached `cargo build` finishing in <1s is a warning sign, not a success.
 
+### Kapitsa #57 switches and gates
+
+One mechanism, one switch; every new switch defaults off. Mechanism map, code seams, measured
+outcomes and limits: [kapitsa-57.md](kapitsa-57.md). `MINICPM_DSPARK_TRACE=1` or `OMNI_AB_HEADER=1`
+prints the model-side header; a session with an engine switch on prints the engine header once per
+process. The environment override wins over an explicit config `false`, so leave an arm's variable
+unset when the harness owns that arm.
+
+| Switch | Default | Mechanism |
+| --- | --- | --- |
+| `MINICPM_DSPARK_TREE` | off | full-binary markov tree (adaptive runs only) |
+| `MINICPM_DSPARK_TREE_BEST` | off | best-first tree with the confidence prefix; implies tree mode |
+| `MINICPM_DSPARK_LEDGER` | off | calibrated verify-size ledger (`MINICPM_DSPARK_LEDGER_PATH`, `MINICPM_DSPARK_CHIP`) |
+| `RESIN_MULTI_SEQUENCE_BATCH=1` | off | chain co-batch one plan's decode rows (`ResinConfig.multi_sequence_batch`) |
+| `RESIN_CONVERSATION_SLOTS=1` | off | conversation slot checkpoints (`ResinConfig.conversation_slots`) |
+| `RESIN_STATE_CACHE=1` | off | SSD checkpoint persistence (`ResinConfig.state_cache`) |
+| `RESIN_KV_BUDGET_MB=<MiB>` | none | KV budget and the #65 release order (`ResinConfig.kv_budget_mb`) |
+
+The composite `RESIN_TREE_BATCH` switch was removed by #67; do not look for it. The existing
+`MINICPM_DSPARK_BLOCK`, `MINICPM_DSPARK_LAYERS`, `MINICPM_DSPARK_MARKOV_QUANT` and
+`MINICPM_DSPARK_TRACE` switches are unchanged. Weight gates are `#[ignore]`d and skip when their
+checkpoint is absent; run them one at a time on an idle machine.
+
+```sh
+# Model-side parity gates (run from crates/minicpm-v; 1B CPU, then 35B Metal).
+cargo test --no-default-features --features native,cpu --test multi_verify_parity -- --ignored --nocapture
+cargo test --release --features metal --test multi_verify_parity -- --ignored --nocapture
+cargo test --no-default-features --features native,cpu --test tree_best_parity -- --ignored --nocapture
+cargo test --release --features metal --test tree_best_parity -- --ignored --nocapture
+
+# State protocols (#66); each prints gate=pass|fail|skip.
+scripts/state-cache-cold-start.sh
+scripts/state-reuse-two-turn.sh
+scripts/state-reuse-quota-batch.sh --prefix 128 --suffix 16 --tokens 32
+
+# Two-arm A/B: chain co-batch vs solo best-first tree (35B arguments shown).
+MINICPM_DSPARK_TRACE=1 MINICPM_DSPARK_TREE_BEST=1 \
+cargo run --manifest-path crates/resin-metal/Cargo.toml --release --features metal \
+  --example resin_batch_ab -- models/MiniCPM-V-4.7-35B-A3B-int4 \
+  models/MiniCPM-V-4.7-35B-A3B-DSpark 2 24 256 16 3
+```
+
 ## GPU reproduction and gates
 
 `./scripts/check metal` runs debug builds of every crate — unusable for iterating on the 35B checkpoint. Use these release commands from `crates/minicpm-v` (its manifest is not a root workspace member, so `-p omni-minicpm-v` from the repo root fails):

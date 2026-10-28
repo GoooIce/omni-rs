@@ -6,13 +6,37 @@ Resin 引擎栈的 Rust 侧:用 [resin](https://github.com/ekzhang/resin) 的 `E
 
 | 职责 | 归属 |
 | --- | --- |
-| 前向、采样、DSpark 提议/验证/接受 | `Runner` 实现(`src/minicpm.rs`),复用 `omni-minicpm-v` 的 `TextModel` 与 `generate::Sampler` |
-| 停止条件、解码循环、(未来)连续批处理与 overlap 调度 | vendored `EngineCore`(`submit` / `prepare_step` / `complete_step_with`) |
+| 前向、采样、DSpark 提议/验证/接受 | `Runner` 实现(`src/minicpm.rs` / `src/dspark_runner.rs`),复用 `omni-minicpm-v` 的 `TextModel`、`dspark::run_cycle` 与 `dspark_batch::run_cycle_batch` |
+| 停止条件、解码循环、连续批处理与 overlap 调度 | vendored `EngineCore`(`submit` / `prepare_step` / `complete_step_with`) |
+| 多序列链式 verify 合批 | `ResinConfig.multi_sequence_batch`(默认关)+ `DecodeSession::forward_batched_decode` + `DsparkAdapter::decode_batch`,一个 plan 的 decode 行走一次 `TextModel::forward_verifying_multi` |
+| 对话槽检查点 | `ResinConfig.conversation_slots`(默认关)+ `conversation.rs`(每槽 3 个检查点、跨槽前缀借用) |
+| SSD 状态缓存 | `ResinConfig.state_cache`(默认关)+ `state_cache.rs`(命名空间、内容链、原子写、额度 LRU) |
+| KV 额度与释放次序 | `ResinConfig.kv_budget_mb`(默认 `None`)+ `memory.rs` / `session.rs`(#65 次序) |
 | KV/状态 | runner 自持(按引擎 sequence id);引擎页式记账未启用(`cache_layout` 为空) |
+
+全部机制默认关。开关、代码接缝、测量结果与限制见 [docs/kapitsa-57.md](../../docs/kapitsa-57.md)。
 
 - **贪心 runner**:一个 `forward` 处理一个计划行——prefill 分块与单 token decode 走同一个 `TextModel::forward`,采样共用 `generate::Sampler`,因此引擎驱动的 token 流与直连 `generate` 循环按构造逐 token 一致(parity 门:`tests/minicpm_engine_parity.rs`,1B/NdArray,需本地权重)。
 - **overlap 接缝**:`prepare_step()` 冻结计划 → runner 在引擎外执行(真实 runner 可在此异步入队 GPU 工作)→ `complete_step_with()` 原子收割;收割前页不可复用。
-- **DSpark 块**(下一步):decode 行返回 k>1 token(speculative token rows),`cache_write_lookahead_tokens` 预留块写页——propose+verify+accept 恰为一个 `forward`。
+- **DSpark 块**:decode 行返回 k>1 token(speculative token rows),`cache_write_lookahead_tokens` 预留块写页——propose+verify+accept 恰为一个 `forward`;默认逐行执行,合批由 `multi_sequence_batch` 开启。
+
+## 多序列链式 verify 合批 (#72)
+
+同一 decode plan 的 ≥2 行共用一次目标前向:每个成员照常逐序列 propose,随后一次 `forward_verifying_multi` 验证全部块,再按 plan 顺序逐成员 accept/trim/retain。`DecodeSession` 在调用前把参与槽从 map 临时取出,成功或失败都放回,避免多槽可变借用;prefill 行始终走逐行路径。
+
+- 开关:`ResinConfig { multi_sequence_batch: true, .. }`;实验覆盖 `RESIN_MULTI_SEQUENCE_BATCH=1`。默认关。
+- 仅贪心 DSpark:非贪心请求退回逐行;`MinicpmRunner` 不覆写 `decode_batch`(贪心 runner 无合批路径)。
+- 行预算:一次多序列 verify 最多 8 行(`dspark_batch::MAX_PLAN_ROWS`)。两个 block 16 链是 34 行,超出契约,runner 自动退回逐行;block 3 的两成员(各 4 行)是已测形状。
+- 测量:35B int4 + DSpark、block 3、24 token,合批 43.99 ms/接受 token,同 block 直连 52.05(0.845×,未过 #63 的 0.8× 门),默认保持关。
+
+## 对话槽检查点 (#74)
+
+带 `DecodeRequest.slot` 的请求启用检查点(无 slot key 时行为与以前相同):release 时存轮次边界快照,prefill 结束存只增不覆的前缀快照;每槽最多 3 个(2 轮次 + 1 前缀),后来请求可取任意槽中最深的严格前缀检查点,恢复后只预填后缀。两个约束写进 `session.rs` 模块文档:
+
+- **单块 prefill**:只有整段 prompt 在一行(`context_lengths == 0 && prefill_lengths == 行长度`)才查检查点;续块与前缀缓存命中照旧全量预填。
+- **token 对齐**:引擎把最后采样 token 留在 KV 之外,检查点的 token 历史是 `history[..state.length]`,恢复时至少重放最后一个 prompt token(`tokens.len() <= prompt.len() - 1`)。
+
+测量:1B CPU 两轮门通过(第二轮只预填后缀+问题、输出与全量重预填逐 token 相同),但第二轮 TTFT 2275.8/2831.2 = 0.804,未过 0.5× 门,默认保持关。
 
 ## SSD 状态缓存 (#75)
 

@@ -22,6 +22,18 @@ One DSpark round: propose (draft block from the markov head), verify (one target
 **τ (acceptance length)**:
 Accepted draft tokens per verify cycle (`draft_tokens_accepted / cycles`). Content-dependent — ~2 on hard-to-predict prose, ~7.7 on repetitive code for the 35B int4 model — and the dominant lever for tokens per second once verify sits at its bandwidth floor.
 
+**Calibrated verify size**:
+The chain length or best-first live-row count chosen by the ledger's rule `E(n) − rate · cost[n]` from measured per-depth acceptance and verify-phase host wall clock. Bounded to `[3, 8, 16]` for chains and `[2, 6, 14]` for best-first trees so each verify shape stays autotuned; active only when `MINICPM_DSPARK_LEDGER=1`.
+
+**Conversation checkpoint**:
+A self-contained snapshot of one conversation slot's KV and linear state together with its KV-aligned token history, stored at a turn boundary and at prefill end. A later request restores the deepest checkpoint that is a strict prefix of its prompt and prefills only the suffix.
+
+**State cache namespace**:
+The hash that scopes persisted conversation checkpoints to the weights that produced them: model file names, sizes and modification times plus the config hash, the optional drafter directory, the state-layout version and the block row count. Entries from another namespace are ignored.
+
+**Confidence prefix**:
+The ancestor-closed set of candidate-tree nodes selected by best-first expansion, each scored by the summed log-softmax transition score along its root path. Choosing its size is choosing the verify prefix; there is no separate confidence threshold.
+
 **Transcription**:
 A complete speech-recognition run from incoming audio to committed text, including how input ends and the run's timing statistics.
 

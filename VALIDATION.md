@@ -3,6 +3,68 @@
 记录日期：2026-10-15（历史基线保留原日期）。设备：Apple M5 Max，40 核 GPU，128 GB RAM，macOS 27.0.1。
 工具链：rustc/cargo 1.99.0，Burn 0.21.0；依赖版本保存在 Cargo.lock。
 
+## 2026-10-28：#57 Kapitsa 开关、文档与测量记录
+
+#57 地图收口。落地机制：标定校验尺寸账本（`MINICPM_DSPARK_LEDGER`）、best-first 树与置信前缀（`MINICPM_DSPARK_TREE_BEST`）、多序列 verify API、resin 链式合批（`multi_sequence_batch`）、对话槽检查点（`conversation_slots`）、SSD 状态缓存（`state_cache`）、KV 额度与释放次序（`kv_budget_mb`）。树 + 合批叠加按 #67 终局门槛失败后移除（`e2ddbd4`），代码与文档中不再有 `RESIN_TREE_BATCH`。**所有新机制默认关**；机制、代码接缝与限制见 [docs/kapitsa-57.md](docs/kapitsa-57.md)，原始日志在 `artifacts/kapitsa-57/gates/`（本地、gitignored，不随 checkout 提供）。
+
+### 通过的门
+
+| 门（负载） | 结果 | 日志 |
+| --- | --- | --- |
+| 多序列 verify vs 逐序列（1B CPU；35B Metal，2 序列） | 通过；35B logits 最大绝对差 0，argmax 全等 | `multi_verify_1b.log`、`multi_verify_35b.log` |
+| best-first 树布局 vs 逐路径顺序（1B CPU） | 通过 | `tree_best_1b.log` |
+| 链 / 全二叉 / best-first vs 直连贪心（35B，24 token） | 通过；三者逐 token 相同；64 token 下 best-first vs 链也相同 | `tree_best_35b_fix.log` |
+| 两轮对话预填与输出（1B CPU） | 通过；prompt1=18 answer1=8 prompt2=45 checkpoint=25 suffix=20，输出逐 token 相同 | `conversation_1b_fix.log` |
+| 额度下轮次完成（1B CPU） | 通过；hits=1 disk_hits=1 second_prefill=5 prompt=53 | `quota_1b_fix2.log` |
+| 引擎贪心 parity（1B CPU） | 通过 | `engine_parity_1b.log` |
+| DSpark 引擎 vs 普通贪心（35B，24 token） | 通过；τ=1.917 | `dspark_engine_35b.log` |
+| 链式合批（35B，block 3，24 token） | 通过；τ=3.429，worker 线程无 panic | `dspark_batch_35b_fix.log` |
+| SSD 冷重启（1B CPU，272-token prompt） | 通过；全量 TTFT 7010.7 ms，恢复 3.6 ms（0.001×），跳过 272 token，首 token 相同 | `state_cold.log` |
+| 额度受限合批（1B CPU） | 通过；0.502 vs 0.501 tok/s（1.002×），3 次 spill，被淘汰前缀可复用 | `state_quota.log` |
+
+### 失败与未达门槛
+
+- **两轮状态复用**：后缀+问题预填与逐 token 相同均通过，但第二轮 TTFT 2275.8 / 2831.2 = **0.804 > 0.5 FAIL**（`state_two_turn.log`）。默认保持关。
+- **链式合批成本**：35B int4 + DSpark、block 3、24 token，43.99 vs 同 block 直连 52.05 ms/接受 token = **0.845×**，高于 #63 的 0.8× 门（`stacking_ab_24b.log`）。相对 #61 的 block-16 直连 136.0 ms 为 0.32×，但 block 不同，不作为过门依据。默认保持关。
+- **best-first 树**：64.8–67.9 vs 51.1 ms/token（24 token，τ 1.714 vs 2.0，prose 提示）——按接受 token 更慢（`tree_fast1.log`、`tree_fast2.log`）。默认保持关。
+- **标定账本**：48 token，warm 65.2 vs 56.0 ms/token（block 均值 4.0 vs 3.0）；首次开启 106.6 ms 含探索与新形状 autotune（`ledger_off.log`、`ledger_on2.log`）。默认保持关。
+- **树 + 合批叠加**：三臂交错 A/B、2 轮、block 3、24 token：chain_batch 43.993、solo_tree 147.716、stacked 72.256 ms/接受 token。stacked < chain_batch **FAIL（1.64×）**（`stacking_ab_24b.log`）；按 #67 删除叠加开关，只保留互斥。
+
+### 数值与行预算边界
+
+- **既有 close-argmax**：`VerifyNumerics::Batched` 下，既有链式 verify 在 64 token 运行的第 49 token 对普通贪心翻转一次 argmax（`tree_best_35b_64.log`），与树/合批无关。直连贪心 parity 门固定 24 token；长程检查只比较同一数值口径下的布局。
+- **8 行上限**：一次多序列 verify 最多 8 行（#59）。两个 block-16 链是 34 行，超出契约：该形状走 >32 行的 MoE 回退，cubek-matmul 在 worker 线程 panic 12 次（测试仍通过），因此 runner 在预算外退回逐行。已测合批/叠加形状为 block 3（两成员各 4 行）；block 16 无法合批。
+
+### 未运行
+
+- **1B 贪心合批门未运行**：合批路径只在 DSpark runner（`DsparkAdapter::decode_batch`）；贪心 `MinicpmRunner` 保留默认逐行 `decode_batch`，当前没有可执行的 1B 贪心合批代码路径，故不伪造该门。
+- ANE split 与图像 embedding 缓存层级按地图 Out of scope，未测、也未实现；`memory_stats()` 与实验头如实注明这些层级在本 runner 为空。
+- SSD 写盘按空闲边界在 runner 线程同步 drain（编码需 `into_data()` 读回设备），不是后台线程；未测独立后台写的吞吐。
+
+### 复现
+
+```sh
+# 模型侧（在 crates/minicpm-v 下执行；1B CPU，再 35B Metal；无权重时 skip）
+cargo test --no-default-features --features native,cpu --test multi_verify_parity -- --ignored --nocapture
+cargo test --release --features metal --test multi_verify_parity -- --ignored --nocapture
+cargo test --no-default-features --features native,cpu --test tree_best_parity -- --ignored --nocapture
+cargo test --release --features metal --test tree_best_parity -- --ignored --nocapture
+
+# 引擎侧
+cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu --test minicpm_conversation -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --no-default-features --features cpu --test minicpm_quota -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal --test minicpm_dspark_engine -- --ignored --nocapture
+cargo test --manifest-path crates/resin-metal/Cargo.toml --release --features metal --test minicpm_dspark_batch -- --ignored --nocapture
+
+# 状态协议与 A/B（无 1B 权重时 gate=skip）
+scripts/state-cache-cold-start.sh
+scripts/state-reuse-two-turn.sh
+scripts/state-reuse-quota-batch.sh --prefix 128 --suffix 16 --tokens 32
+MINICPM_DSPARK_TRACE=1 MINICPM_DSPARK_TREE_BEST=1 cargo run --manifest-path crates/resin-metal/Cargo.toml \
+  --release --features metal --example resin_batch_ab -- models/MiniCPM-V-4.7-35B-A3B-int4 \
+  models/MiniCPM-V-4.7-35B-A3B-DSpark 2 24 256 16 3
+```
+
 ## 2026-10-28：#76 KV 额度与释放次序 + #66 测量脚本
 
 `crates/resin-metal` 新增 `ResinConfig.kv_budget_mb`（默认 `None`，实验覆盖 `RESIN_KV_BUDGET_MB`）。额度按适配器报告的张量字节（目标 KV + 线性状态 + DSpark 草稿 K/V 缓冲）记账；超额度时按 #65 次序释放：本槽自弃 → 空闲检查点 LRU（`state_cache` 开时先落盘再丢弃）→ 其余层级本 runner 不持有，在实验头注明。live slot 不淘汰，差额记入 `memory_stats().over_budget_bytes`，请求照常完成。
