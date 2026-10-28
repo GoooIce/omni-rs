@@ -113,6 +113,7 @@ fn engine_dspark_cobatch_matches_direct_greedy() {
         eos.clone(),
         ResinConfig {
             multi_sequence_batch: true,
+            ..ResinConfig::default()
         },
     );
     assert!(runner.config().multi_sequence_batch);
@@ -132,6 +133,7 @@ fn engine_dspark_cobatch_matches_direct_greedy() {
             prompt,
             DecodeRequest {
                 max_new_tokens: MAX_NEW_TOKENS,
+                slot: None,
             },
         );
         input.max_output_tokens = Some(MAX_NEW_TOKENS);

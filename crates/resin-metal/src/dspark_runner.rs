@@ -9,6 +9,11 @@
 //! Engine-generic bookkeeping lives in [`crate::session::DecodeSession`];
 //! the model-side knowledge (draft, captured layers, capacity, numerics)
 //! stays here, next to the model types it names.
+//!
+//! Conversation checkpoints (#74) carry the target decode state, the draft
+//! context and the KV-aligned token history (`history[..state.length]`). The
+//! draft context grows to the new request's prompt plus budget on restore,
+//! because the checkpoint was sized for the request that produced it.
 
 use burn::tensor::backend::Backend;
 use omni_minicpm_v::dspark::{self, Draft, DraftState, SpecStats};
@@ -18,6 +23,7 @@ use omni_minicpm_v::model::{DecodeState, TextModel, VerifyNumerics};
 use resin_core::engine::{Error, Runner};
 
 use crate::config::ResinConfig;
+use crate::conversation::ConversationStats;
 use crate::session::{DecodeAdapter, DecodeRequest, DecodeRow, DecodeSession};
 
 struct DsparkAdapter<B: Backend> {
@@ -51,8 +57,18 @@ struct DsparkSlot<B: Backend> {
     history: Vec<u32>,
 }
 
+/// One DSpark slot's conversation checkpoint (#74).
+#[derive(Clone)]
+struct DsparkCheckpoint<B: Backend> {
+    state: DecodeState<B>,
+    draft_state: DraftState<B>,
+    /// `history[..state.length]`; the pending bonus is excluded.
+    tokens: Vec<u32>,
+}
+
 impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
     type Slot = DsparkSlot<B>;
+    type Checkpoint = DsparkCheckpoint<B>;
 
     fn prefill(&mut self, input: &[u32], budget: usize) -> Result<(Self::Slot, Vec<u32>), Error> {
         // Single-chunk prefill: prompt fits the default chunk size; the
@@ -195,6 +211,86 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         }
         Ok(outputs)
     }
+
+    fn checkpoint(&self, slot: &Self::Slot) -> Option<Self::Checkpoint> {
+        let aligned = slot.state.length.min(slot.history.len());
+        if aligned == 0 {
+            return None;
+        }
+        Some(DsparkCheckpoint {
+            state: slot.state.clone(),
+            draft_state: slot.draft_state.clone(),
+            tokens: slot.history[..aligned].to_vec(),
+        })
+    }
+
+    fn restore(&mut self, checkpoint: Self::Checkpoint) -> Result<Self::Slot, Error> {
+        Ok(DsparkSlot {
+            state: checkpoint.state,
+            draft_state: checkpoint.draft_state,
+            history: checkpoint.tokens,
+        })
+    }
+
+    fn checkpoint_tokens<'a>(&self, checkpoint: &'a Self::Checkpoint) -> &'a [u32] {
+        &checkpoint.tokens
+    }
+
+    /// Restore the target and draft state, extend both by the prompt suffix
+    /// and sample at prefill end. The draft buffers grow first when the new
+    /// request's prompt plus budget no longer fits the checkpoint's capacity.
+    fn prefill_resume(
+        &mut self,
+        checkpoint: Self::Checkpoint,
+        input: &[u32],
+        budget: usize,
+    ) -> Result<Option<(Self::Slot, Vec<u32>)>, Error> {
+        if input.is_empty() {
+            return Ok(None);
+        }
+        let DsparkCheckpoint {
+            mut state,
+            mut draft_state,
+            tokens,
+        } = checkpoint;
+        draft_state.ensure_capacity(tokens.len() + input.len() + budget + self.block_len + 1);
+        let (logits, _, captured) = self
+            .model
+            .forward_capturing(
+                input,
+                None,
+                None,
+                &mut state,
+                omni_minicpm_v::knobs::dspark_layers(),
+                false,
+            )
+            .map_err(|error| Error::execution(error.to_string()))?;
+        let mut history = tokens;
+        history.extend_from_slice(input);
+        let first = {
+            let mut sampler = Sampler::new(self.options.clone());
+            let values = logits
+                .into_data()
+                .convert::<f32>()
+                .as_slice::<f32>()
+                .map_err(|error| Error::execution(error.to_string()))?
+                .to_vec();
+            sampler.sample(values, &history).map_err(Error::execution)?
+        };
+        history.push(first);
+        self.draft
+            .extend(&mut draft_state, captured)
+            .map_err(|error| Error::execution(error.to_string()))?;
+        self.stats.cycles += 1;
+        Ok(Some((
+            DsparkSlot {
+                state,
+                draft_state,
+                history,
+            },
+            vec![first],
+        )))
+    }
 }
 
 pub struct MinicpmDsparkRunner<B: Backend> {
@@ -264,6 +360,11 @@ impl<B: Backend> MinicpmDsparkRunner<B> {
     /// Batched verify forwards run so far (0 when the switch is off).
     pub fn batch_cycles(&self) -> u64 {
         self.session.adapter().batched_cycles
+    }
+
+    /// Prefill tokens fed and checkpoint hit/miss counters (#74).
+    pub fn conversation_stats(&self) -> ConversationStats {
+        self.session.conversation_stats()
     }
 
     /// Aggregate cycle stats (τ via `acceptance_length`).

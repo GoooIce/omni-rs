@@ -311,10 +311,44 @@ impl TreeSpec {
 /// layer — appending is a `slice_assign`, and a propose writes its block rows
 /// past `length` and attends over the filled prefix, so no cycle copies the
 /// context. The stored K is already rotated at its absolute position.
+///
+/// `Clone` is the conversation-checkpoint snapshot seam (#74): the clone
+/// shares tensor storage until a later `extend` writes a new buffer.
+#[derive(Clone)]
 pub struct DraftState<B: Backend> {
     keys: Vec<Tensor<B, 4>>,
     values: Vec<Tensor<B, 4>>,
     length: usize,
+}
+
+impl<B: Backend> DraftState<B> {
+    /// Rows the preallocated K/V buffers can hold.
+    pub fn capacity(&self) -> usize {
+        self.keys.first().map_or(0, |keys| keys.dims()[2])
+    }
+
+    /// Grow the K/V buffers to `capacity`, preserving the filled prefix. A
+    /// restored conversation checkpoint was sized for the request that made
+    /// it; the next request's prompt plus budget can be longer (#74).
+    pub fn ensure_capacity(&mut self, capacity: usize) {
+        if self.capacity() >= capacity {
+            return;
+        }
+        let rows = self.length;
+        for buffers in [&mut self.keys, &mut self.values] {
+            for buffer in buffers.iter_mut() {
+                let [batch, heads, _, width] = buffer.dims();
+                let device = buffer.device();
+                let dtype = buffer.dtype();
+                let mut grown = Tensor::empty([batch, heads, capacity, width], (&device, dtype));
+                if rows > 0 {
+                    let filled = [0..batch, 0..heads, 0..rows, 0..width];
+                    grown = grown.slice_assign(filled.clone(), buffer.clone().slice(filled));
+                }
+                *buffer = grown;
+            }
+        }
+    }
 }
 
 pub struct Draft<B: Backend> {

@@ -76,6 +76,7 @@ fn engine_driven_greedy_matches_direct_generate() {
             ids,
             DecodeRequest {
                 max_new_tokens: MAX_NEW_TOKENS,
+                slot: None,
             },
         );
         input.max_output_tokens = Some(MAX_NEW_TOKENS);

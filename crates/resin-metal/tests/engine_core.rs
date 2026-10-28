@@ -241,6 +241,7 @@ mod session_tests {
 
     impl DecodeAdapter for ScriptedAdapter {
         type Slot = usize;
+        type Checkpoint = ();
 
         fn prefill(
             &mut self,
@@ -285,7 +286,13 @@ mod session_tests {
             false,
         )
         .unwrap();
-        let mut input = Submission::new(vec![0, 1, 2, 3], DecodeRequest { max_new_tokens: 5 });
+        let mut input = Submission::new(
+            vec![0, 1, 2, 3],
+            DecodeRequest {
+                max_new_tokens: 5,
+                slot: None,
+            },
+        );
         input.max_output_tokens = Some(5);
         let handle = engine.submit(input).unwrap();
         while engine.has_work() {
@@ -324,7 +331,10 @@ mod session_tests {
                     token_indptr: vec![0, 1],
                     sampling_mask: vec![true],
                     cache_groups: Vec::new(),
-                    payloads: vec![DecodeRequest { max_new_tokens: 5 }],
+                    payloads: vec![DecodeRequest {
+                        max_new_tokens: 5,
+                        slot: None
+                    }],
                 })
                 .is_err()
         );
@@ -362,6 +372,7 @@ mod batch_tests {
 
     impl DecodeAdapter for BatchScripted {
         type Slot = usize;
+        type Checkpoint = ();
 
         fn prefill(
             &mut self,
@@ -429,6 +440,7 @@ mod batch_tests {
             indptr.push(u32::try_from(token_ids.len()).unwrap());
             payloads.push(DecodeRequest {
                 max_new_tokens: budget,
+                slot: None,
             });
         }
         ExecutionPlan {
@@ -459,6 +471,7 @@ mod batch_tests {
     fn batched() -> ResinConfig {
         ResinConfig {
             multi_sequence_batch: true,
+            ..ResinConfig::default()
         }
     }
 

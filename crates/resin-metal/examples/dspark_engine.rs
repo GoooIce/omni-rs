@@ -64,6 +64,7 @@ fn main() -> Result<(), String> {
         ids,
         DecodeRequest {
             max_new_tokens: max_tokens,
+            slot: None,
         },
     );
     input.max_output_tokens = Some(max_tokens);
