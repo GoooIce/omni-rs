@@ -13,6 +13,7 @@
 //! The first real runner is MiniCPM-V-4.7 text decode on the shared burn
 //! model (`minicpm` module), the serving target of omni-rs issue #55 M0-R.
 
+pub mod config;
 pub mod dspark_runner;
 pub mod minicpm;
 pub mod session;
