@@ -636,12 +636,33 @@ fn select_best_first(grid: &CandidateGrid, live: usize) -> TreeSpec {
 /// breadth-first (parent-major). Token ids stay below 2^24 and are exact in
 /// f32, so ids and scores share one transfer. Returns the rows together with
 /// the `[parents, K]` picks the next level expands from.
+///
+/// Top-2 is two `argmax` passes plus a scatter, not `topk_with_indices`: the
+/// full-vocabulary sort in the latter cost 80–150 ms per cycle on the 35B
+/// vocab (248k), while an argmax scan is the 0.2 ms the chain path pays. K is
+/// fixed at 2 here; a wider grid would need a repeated-scatter loop or a
+/// dedicated kernel.
 fn pack_candidate_rows<B: Backend>(
     scores: Tensor<B, 2>,
 ) -> (Tensor<B, 2>, Tensor<B, 2, burn::tensor::Int>) {
+    debug_assert_eq!(TREE_CANDIDATE_K, 2, "the argmax top-2 path is K=2");
     let count = scores.dims()[0];
+    let device = scores.device();
     let logp = burn::tensor::activation::log_softmax(scores, 1);
-    let (values, picks) = logp.topk_with_indices(TREE_CANDIDATE_K, 1);
+    // `argmax(dim)` keeps the reduced axis as length 1, which is exactly the
+    // index shape `gather`/`scatter` want.
+    let first = logp.clone().argmax(1);
+    let first_values = logp.clone().gather(1, first.clone());
+    let masked = logp.clone().scatter(
+        1,
+        first.clone(),
+        Tensor::<B, 2>::full([count, 1], f32::NEG_INFINITY, &device),
+        burn::tensor::IndexingUpdateOp::Add,
+    );
+    let second = masked.argmax(1);
+    let second_values = logp.gather(1, second.clone());
+    let picks = Tensor::cat(vec![first, second], 1);
+    let values = Tensor::cat(vec![first_values, second_values], 1);
     let rows = Tensor::cat(
         vec![
             picks
