@@ -172,7 +172,13 @@ fn greedy_streams_match_across_layouts_35b_metal() {
     use std::sync::atomic::AtomicBool;
 
     const PROMPT: &str = "用几句话说明分页 KV 缓存是什么。";
+    /// Direct-greedy parity stays at the repository's pinned 24-token
+    /// horizon. At 64 tokens the pre-existing `Batched` verify itself flips a
+    /// close argmax against plain decode at token 49 (chain layout included;
+    /// recorded in VALIDATION.md), so the long-horizon check below compares
+    /// the layouts against the chain stream under the same numerics.
     const NEW_TOKENS: usize = 24;
+    const LONG_TOKENS: usize = 64;
     const MAX_BLOCK: usize = 16;
 
     type B = Metal;
@@ -213,7 +219,7 @@ fn greedy_streams_match_across_layouts_35b_metal() {
     .unwrap()
     .tokens;
 
-    let stream = |layout: BlockLayout| -> Vec<u32> {
+    let stream = |layout: BlockLayout, limit: usize| -> Vec<u32> {
         let device = WgpuDevice::default();
         let mut state = model.new_state(&device);
         state.rope_delta = prompt.rope_delta;
@@ -227,7 +233,7 @@ fn greedy_streams_match_across_layouts_35b_metal() {
                 false,
             )
             .unwrap();
-        let capacity = dspark::draft_capacity(prompt.ids.len(), options.max_new_tokens, MAX_BLOCK);
+        let capacity = dspark::draft_capacity(prompt.ids.len(), limit, MAX_BLOCK);
         let mut draft_state = draft.prepare(captured, capacity).unwrap();
         let mut sampler = Sampler::new(options.clone());
         let mut stats = SpecStats::default();
@@ -240,10 +246,10 @@ fn greedy_streams_match_across_layouts_35b_metal() {
         loop {
             tokens.push(bonus);
             history.push(bonus);
-            if tokens.len() >= options.max_new_tokens {
+            if tokens.len() >= limit {
                 break;
             }
-            let room = options.max_new_tokens - tokens.len();
+            let room = limit - tokens.len();
             let outcome = dspark::run_cycle(
                 &model,
                 &draft,
@@ -262,13 +268,13 @@ fn greedy_streams_match_across_layouts_35b_metal() {
             .unwrap();
             let finished = outcome.draft_eos;
             for token in outcome.tokens {
-                if tokens.len() == options.max_new_tokens {
+                if tokens.len() == limit {
                     break;
                 }
                 tokens.push(token);
                 history.push(token);
             }
-            if finished || tokens.len() >= options.max_new_tokens {
+            if finished || tokens.len() >= limit {
                 break;
             }
             match outcome.correction {
@@ -279,14 +285,25 @@ fn greedy_streams_match_across_layouts_35b_metal() {
         tokens
     };
 
-    let chain = stream(BlockLayout::Chain { len: 8 });
-    let tree = stream(BlockLayout::Tree { levels: 2 });
-    let best = stream(BlockLayout::BestTree { levels: 3, live: 6 });
+    let chain = stream(BlockLayout::Chain { len: 8 }, NEW_TOKENS);
+    let tree = stream(BlockLayout::Tree { levels: 2 }, NEW_TOKENS);
+    let best = stream(BlockLayout::BestTree { levels: 3, live: 6 }, NEW_TOKENS);
     assert_eq!(chain, reference, "chain stream");
     assert_eq!(tree, reference, "full-binary tree stream");
     assert_eq!(best, reference, "best-first tree stream");
+
+    // Long-horizon layout equivalence under the same Batched numerics. The
+    // chain stream is the control: a direct-greedy comparison here would
+    // measure the pre-existing close-argmax flip, not the tree layout.
+    let chain_long = stream(BlockLayout::Chain { len: 8 }, LONG_TOKENS);
+    let best_long = stream(BlockLayout::BestTree { levels: 3, live: 6 }, LONG_TOKENS);
+    assert_eq!(
+        best_long, chain_long,
+        "long-horizon best-first vs chain stream"
+    );
     eprintln!(
-        "35b greedy parity: {} tokens, all layouts identical",
-        reference.len()
+        "35b greedy parity: {} tokens direct, {} tokens best-first vs chain identical",
+        reference.len(),
+        LONG_TOKENS
     );
 }

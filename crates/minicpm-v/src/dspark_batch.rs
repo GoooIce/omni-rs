@@ -38,8 +38,18 @@ pub const STACKED_TREE_LIVE: usize = 3;
 pub const STACKED_TREE_ROWS: usize = STACKED_TREE_LIVE + 1;
 
 /// The total row budget for one stacked plan: two sequences of
-/// [`STACKED_TREE_ROWS`] rows.
+/// [`STACKED_TREE_ROWS`] rows. The same 8-row ceiling is the #59 contract for
+/// one multi-sequence verify, so a chain plan must fit it too.
 pub const STACKED_MAX_ROWS: usize = 2 * STACKED_TREE_ROWS;
+
+/// Whether one plan's members fit the multi-sequence verify row budget.
+/// The runner falls back to the per-row path when this is false; a block-16
+/// chain pair (34 rows) is outside the mechanism's contract.
+pub fn batch_fits(members: usize, rows_per_member: usize) -> bool {
+    members
+        .checked_mul(rows_per_member)
+        .is_some_and(|rows| rows <= STACKED_MAX_ROWS)
+}
 
 /// Draft rows one propose occupies past the draft context: the chain's block
 /// length, or at least the best-first candidate grid's depth (its draft
@@ -259,8 +269,8 @@ pub fn run_cycle_batch<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::{
-        STACKED_MAX_ROWS, STACKED_TREE_LIVE, co_batch_layouts, propose_rows, stacked_tree_layout,
-        validate_stacked_plan,
+        STACKED_MAX_ROWS, STACKED_TREE_LIVE, batch_fits, co_batch_layouts, propose_rows,
+        stacked_tree_layout, validate_stacked_plan,
     };
     use crate::dspark::{BlockLayout, TREE_GRID_LEVELS};
 
@@ -277,6 +287,14 @@ mod tests {
         assert_eq!(BlockLayout::Tree { levels: 1 }.rows(), 3);
         assert_eq!(BlockLayout::BestTree { levels: 3, live: 3 }.rows(), 4);
         assert_eq!(BlockLayout::BestTree { levels: 3, live: 6 }.rows(), 7);
+    }
+
+    #[test]
+    fn chain_pairs_outside_the_eight_row_contract_do_not_batch() {
+        assert!(batch_fits(2, 4), "two block-3 chains are eight rows");
+        assert!(!batch_fits(2, 17), "two block-16 chains are 34 rows");
+        assert!(!batch_fits(3, 4), "a third four-row member exceeds eight");
+        assert!(!batch_fits(usize::MAX, 2), "overflow is not a fit");
     }
 
     #[test]

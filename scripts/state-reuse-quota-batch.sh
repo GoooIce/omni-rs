@@ -22,7 +22,7 @@ if [[ ! -f "$model/config.json" ]]; then
     exit 0
 fi
 
-exec cargo run --quiet \
+exec cargo run --quiet --release \
     --manifest-path "$root/crates/resin-metal/Cargo.toml" \
     --no-default-features --features cpu \
     --example state_reuse_ab -- quota-batch --model "$model" "$@"

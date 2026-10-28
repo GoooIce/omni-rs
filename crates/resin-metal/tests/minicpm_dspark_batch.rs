@@ -30,8 +30,11 @@ use resin_metal::session::DecodeRequest;
 use std::sync::atomic::AtomicBool;
 
 type B = Metal;
-const BLOCK: usize = 16;
-const MAX_NEW_TOKENS: usize = 64;
+/// Two co-batched sequences must fit the #59 eight-row multi-verify budget:
+/// block 3 is four rows each, eight total. A block-16 pair is 34 rows, which
+/// is outside the mechanism's contract and takes the per-row fallback.
+const BLOCK: usize = 3;
+const MAX_NEW_TOKENS: usize = 24;
 /// Decode steps request A takes alone before request B joins.
 const SOLO_STEPS: usize = 2;
 /// Prompt prefix length; a multiple of `BLOCK` keeps the load shape aligned

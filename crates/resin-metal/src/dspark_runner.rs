@@ -210,6 +210,22 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
             }
             return Ok(outputs);
         }
+        // #59 caps one multi-sequence verify at 8 rows. A plan outside that
+        // contract (two block-16 chains are 34 rows) takes the per-row path:
+        // the >32-row MoE fallback is the wrong shape for this batch and the
+        // multi-row mechanism was never specified for it.
+        let per_member = if self.tree_batch {
+            dspark_batch::STACKED_TREE_ROWS
+        } else {
+            self.block_len + 1
+        };
+        if !dspark_batch::batch_fits(rows.len(), per_member) {
+            let mut outputs = Vec::with_capacity(rows.len());
+            for row in rows {
+                outputs.push(self.decode(&mut *row.slot, row.input, row.room, row.budget)?);
+            }
+            return Ok(outputs);
+        }
         let layouts = dspark_batch::co_batch_layouts(rows.len(), self.tree_batch, self.block_len)
             .map_err(Error::execution)?;
         let tree_members = layouts

@@ -28,7 +28,7 @@ export RESIN_STATE_CACHE_DIR="${RESIN_STATE_CACHE_DIR:-$root/target/resin-state-
 rm -rf "$RESIN_STATE_CACHE_DIR"
 
 run() {
-    cargo run --quiet \
+    cargo run --quiet --release \
         --manifest-path "$root/crates/resin-metal/Cargo.toml" \
         --no-default-features --features cpu \
         --example state_cache_cold -- "$@"
