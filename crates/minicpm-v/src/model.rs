@@ -1211,6 +1211,77 @@ mod multi_verify_tests {
         assert_close("tree continuation", &values(next), &values(next_reference));
     }
 
+    /// #73's stacked shape: bonus + three live nodes (four rows), with one
+    /// node at depth two so positions-by-depth and the ancestor mask differ
+    /// from a flat block.
+    fn stacked_tree() -> crate::dspark::TreeSpec {
+        crate::dspark::TreeSpec::new(
+            vec![11, 7, 21],
+            vec![0, 0, 0, 1],
+            vec![0, 1, 1, 2],
+            vec![vec![1, 2], vec![3], Vec::new(), Vec::new()],
+            2,
+        )
+    }
+
+    #[test]
+    fn multi_verify_stacked_tree_and_chain_blocks_match_single_forwards() {
+        let (model, device) = tiny_model();
+        let history = [4u32, 8, 2, 6];
+        let mut state = model.new_state(&device);
+        model.forward(&history, None, None, &mut state).unwrap();
+
+        let tree = stacked_tree();
+        assert_eq!(tree.rows(), 4, "stacked tree stays inside the #73 budget");
+        let tree_ids = [5u32, 11, 7, 21];
+        let chain_ids = [12u32, 13, 14];
+        let capture = [0usize, 1];
+
+        let mut single_tree = state.clone();
+        let single_tree_out = model
+            .forward_verifying_tree(&tree_ids, &tree, &mut single_tree, &capture)
+            .unwrap();
+        let mut single_chain = state.clone();
+        let single_chain_out = model
+            .forward_verifying_with(
+                &chain_ids,
+                &mut single_chain,
+                &capture,
+                VerifyNumerics::Batched,
+            )
+            .unwrap();
+
+        let mut multi_tree = state.clone();
+        let mut multi_chain = state.clone();
+        let mut blocks = [
+            VerifyBlock::with_tree(&tree_ids, &mut multi_tree, &capture, &tree),
+            VerifyBlock::new(&chain_ids, &mut multi_chain, &capture),
+        ];
+        let outputs = model.forward_verifying_multi(&mut blocks).unwrap();
+
+        assert_output("stacked tree", &outputs[0], &single_tree_out);
+        assert_output("stacked chain", &outputs[1], &single_chain_out);
+        assert_eq!(multi_tree.length, state.length + tree_ids.len());
+        assert_eq!(multi_chain.length, state.length + chain_ids.len());
+
+        // Retain the accepted root -> first child -> depth-2 child path: the
+        // shallow sibling (block slot 2) is rejected, so this is the
+        // non-prefix retention contract the batched cycle uses.
+        let before = state.length;
+        let slots = [0usize, 1, 3];
+        multi_tree.retain_path(before, &slots, &outputs[0].linear_after);
+        single_tree.retain_path(before, &slots, &single_tree_out.2);
+        assert_eq!(multi_tree.length, single_tree.length);
+        assert_eq!(multi_tree.length, before + slots.len());
+        let next = model.forward(&[19], None, None, &mut multi_tree).unwrap();
+        let next_reference = model.forward(&[19], None, None, &mut single_tree).unwrap();
+        assert_close(
+            "stacked tree continuation",
+            &values(next),
+            &values(next_reference),
+        );
+    }
+
     #[test]
     fn multi_verify_supports_more_than_two_blocks() {
         let (model, device) = tiny_model();

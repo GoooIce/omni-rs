@@ -32,7 +32,7 @@ pub fn dspark_trace() -> bool {
 }
 
 /// `MINICPM_DSPARK_BLOCK`
-pub(crate) fn dspark_block() -> Option<usize> {
+pub fn dspark_block() -> Option<usize> {
     static VALUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
         std::env::var("MINICPM_DSPARK_BLOCK")
@@ -86,7 +86,7 @@ pub(crate) fn dspark_tree() -> bool {
 /// per depth and log-softmax transition scores, read back once; the host
 /// selects the highest-scoring ancestor-closed node set and remaps it into
 /// the existing verify layout.
-pub(crate) fn dspark_tree_best() -> bool {
+pub fn dspark_tree_best() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
         matches!(
