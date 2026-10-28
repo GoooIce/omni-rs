@@ -90,6 +90,13 @@ impl<B: Backend> DecodeAdapter for DsparkAdapter<B> {
         room: usize,
         _budget: usize,
     ) -> Result<Vec<u32>, Error> {
+        // A terminal physical row can run once more after its request has
+        // already committed its last token. The engine ignores this row's
+        // output but still requires a non-empty row, so return the fed token
+        // without spending a speculative cycle.
+        if room == 0 {
+            return Ok(vec![input[0]]);
+        }
         // Decode rows carry exactly the last sampled token: the bonus the
         // cycle proposes from.
         let bonus = input[0];
@@ -129,6 +136,17 @@ pub struct MinicpmDsparkRunner<B: Backend> {
 }
 
 impl<B: Backend> MinicpmDsparkRunner<B> {
+    /// Shared model and draft references for in-process A/B harnesses (the
+    /// #61 baseline example) driving the direct dspark loop on the same
+    /// weights the engine runner holds.
+    pub fn model(&self) -> &TextModel<B> {
+        &self.session.adapter().model
+    }
+
+    pub fn draft(&self) -> &Draft<B> {
+        &self.session.adapter().draft
+    }
+
     /// Fixed chain length per cycle; the adaptive ladder stays CLI-side for
     /// now and can move into the adapter once overlap lands (M1-R).
     pub fn new(
