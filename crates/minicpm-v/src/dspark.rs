@@ -15,6 +15,7 @@
 //! think block is a prompt choice shared with plain decode.
 use crate::{
     generate::{FinishReason, GeneratedToken, Options, Outcome, Sampler, prompt_device},
+    ledger::{CycleObservation, Ledger, LedgerKey, RunIdentity},
     model::{TextModel, VerifyNumerics},
     multimodal::Prompt,
 };
@@ -40,7 +41,7 @@ const VOCAB: usize = 248144;
 /// replays from the persistent cache, instead of re-tuning on every step of
 /// a continuous walk. The bottom matches the hard-to-predict-prose optimum,
 /// and the top covers repetitive text.
-const BLOCK_LADDER: [usize; 3] = [3, 8, 16];
+pub(crate) const BLOCK_LADDER: [usize; 3] = [3, 8, 16];
 
 /// One speculative cycle's proposal layout, chosen by the [`Ladder`].
 #[derive(Debug, PartialEq, Eq)]
@@ -931,6 +932,11 @@ pub struct CycleOutcome {
     pub correction: Option<u32>,
     pub draft_eos: bool,
     pub trimmed: bool,
+    /// Host wall clock of the verify phase. Always measured: the ledger's
+    /// cost basis (decision #65) is the verify phase's host time.
+    pub verify_ms: f64,
+    /// Verify rows in the block, bonus included.
+    pub rows: usize,
 }
 
 /// Trim an accepted path to the emission room: tokens beyond `room` drop
@@ -1008,6 +1014,7 @@ pub fn run_cycle<B: Backend>(
     if stats.trace.enabled {
         stats.trace.propose_ms += phase.elapsed().as_secs_f64() * 1000.0;
     }
+    let rows = block.len();
     let length_before = state.length;
     let phase = Instant::now();
     let (position_logits, captured, linear_after) = match &tree {
@@ -1018,8 +1025,11 @@ pub fn run_cycle<B: Backend>(
             .forward_verifying_with(&block, state, crate::knobs::dspark_layers(), numerics)
             .map_err(|error| error.to_string())?,
     };
+    // The ledger always needs the verify phase's host time; the trace
+    // aggregates the same measurement across phases.
+    let verify_ms = phase.elapsed().as_secs_f64() * 1000.0;
     if stats.trace.enabled {
-        stats.trace.verify_ms += phase.elapsed().as_secs_f64() * 1000.0;
+        stats.trace.verify_ms += verify_ms;
     }
     let phase = Instant::now();
     let greedy_block: Vec<u32> = if options.temperature == 0.0
@@ -1064,9 +1074,15 @@ pub fn run_cycle<B: Backend>(
         correction: path.correction,
         draft_eos: path.draft_eos,
         trimmed,
+        verify_ms,
+        rows,
     })
 }
 
+/// Greedy speculative generation over a DSpark drafter.
+///
+/// `identity` names the checkpoint pair the ledger's persisted estimates are
+/// keyed under; it is only read when `MINICPM_DSPARK_LEDGER=1`.
 pub fn generate<B: Backend>(
     model: &TextModel<B>,
     draft: &Draft<B>,
@@ -1077,6 +1093,7 @@ pub fn generate<B: Backend>(
     cancel: &AtomicBool,
     mut emit: impl FnMut(GeneratedToken) -> std::result::Result<(), String>,
     decode: impl Fn(&[u32]) -> String,
+    identity: RunIdentity<'_>,
 ) -> std::result::Result<(Outcome, SpecStats), String> {
     let mut state = model.new_state(&prompt_device::<B>());
     state.rope_delta = prompt.rope_delta;
@@ -1107,6 +1124,23 @@ pub fn generate<B: Backend>(
     // budget, or (adaptive runs only; a pinned MINICPM_DSPARK_BLOCK stays
     // linear for experiments) a markov tree.
     let mut ladder = Ladder::new(crate::knobs::dspark_block(), crate::knobs::dspark_tree());
+    // `MINICPM_DSPARK_LEDGER=1` swaps the AIMD ladder for the calibrated
+    // size rule over chain lengths. Tree row sets arrive with the best-first
+    // builder (#70), so a tree run keeps the ladder; when the switch is off
+    // this is `None` and the loop below is the unchanged AIMD path.
+    let mut ledger = (crate::knobs::dspark_ledger() && !crate::knobs::dspark_tree()).then(|| {
+        let block = match crate::knobs::dspark_block() {
+            Some(size) => format!("fixed:{size}"),
+            None => "adaptive".to_owned(),
+        };
+        let allowed = crate::knobs::dspark_block()
+            .map(|size| vec![size])
+            .unwrap_or_else(|| crate::ledger::ALLOWED_SIZES.to_vec());
+        Ledger::load(
+            allowed,
+            LedgerKey::new(identity.model, identity.drafter, identity.precision, block),
+        )
+    });
     let mut block_sum = 0usize;
     let mut draft_state = draft
         .prepare(captured, capacity)
@@ -1141,8 +1175,17 @@ pub fn generate<B: Backend>(
         }
 
         stats.cycles += 1;
-        block_sum += ladder.block_len();
-        let layout = ladder.layout();
+        let layout = match ledger.as_mut() {
+            Some(ledger) => BlockLayout::Chain {
+                len: ledger.choose(),
+            },
+            None => ladder.layout(),
+        };
+        block_sum += if ledger.is_some() {
+            layout.policy_len()
+        } else {
+            ladder.block_len()
+        };
         // Propose: the layout owns the block's shape; both variants share
         // the masked draft forward and the markov correction.
         let phase = Instant::now();
@@ -1162,11 +1205,23 @@ pub fn generate<B: Backend>(
             room,
             &mut stats,
         )?;
+        let cycle_ms = phase.elapsed().as_secs_f64() * 1000.0;
         if outcome.draft_eos {
             finish = FinishReason::Stop;
         }
         stats.draft_tokens_accepted += outcome.tokens.len() as u64;
-        ladder.observe(outcome.tokens.len(), layout.policy_len(), outcome.trimmed);
+        if let Some(ledger) = ledger.as_mut() {
+            ledger.observe(CycleObservation {
+                size: layout.policy_len(),
+                rows: outcome.rows,
+                accepted: outcome.tokens.len(),
+                verify_ms: outcome.verify_ms,
+                cycle_ms,
+                trimmed: outcome.trimmed,
+            });
+        } else {
+            ladder.observe(outcome.tokens.len(), layout.policy_len(), outcome.trimmed);
+        }
 
         for token in outcome.tokens {
             if emission.committed() == options.max_new_tokens {
@@ -1197,6 +1252,11 @@ pub fn generate<B: Backend>(
             stats.trace.retain_ms / cycles,
             block_sum as f64 / cycles
         );
+    }
+    if let Some(ledger) = &ledger
+        && ledger.cycles() > 0
+    {
+        ledger.save();
     }
     Ok((outcome, stats))
 }
