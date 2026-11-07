@@ -553,6 +553,17 @@ pub struct MinicpmDsparkRunner<B: Backend> {
 }
 
 impl<B: Backend> MinicpmDsparkRunner<B> {
+    /// Shared model and draft references for in-process A/B harnesses (the
+    /// #61 baseline example) driving the direct dspark loop on the same
+    /// weights the engine runner holds.
+    pub fn model(&self) -> &TextModel<B> {
+        &self.session.adapter().model
+    }
+
+    pub fn draft(&self) -> &Draft<B> {
+        &self.session.adapter().draft
+    }
+
     /// Default engine config; `RESIN_MULTI_SEQUENCE_BATCH=1` still applies as
     /// the experimental same-binary override.
     pub fn new(

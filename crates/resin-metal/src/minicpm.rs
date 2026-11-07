@@ -311,6 +311,13 @@ pub struct MinicpmRunner<B: Backend> {
 }
 
 impl<B: Backend> MinicpmRunner<B> {
+    /// Shared model reference so in-process A/B harnesses (the #61 baseline
+    /// example) can drive the direct `generate` loop against the same weights
+    /// the engine runner holds.
+    pub fn model(&self) -> &TextModel<B> {
+        &self.session.adapter().model
+    }
+
     /// Default engine config; `RESIN_CONVERSATION_SLOTS=1` still applies as
     /// the experimental override.
     pub fn new(model: TextModel<B>, device: B::Device) -> Self {
