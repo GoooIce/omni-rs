@@ -192,7 +192,7 @@ impl Grid {
 /// Expand one image into marker-wrapped placeholder text, mirroring the official
 /// processor: the thumbnail first, then `rows` rows of `cols` slice crops joined
 /// by newlines. `divisor` is 16 in the default "16x" downsample mode.
-pub fn image_replacement(
+pub(crate) fn image_replacement(
     crops: &[Grid],
     rows: usize,
     cols: usize,
@@ -214,7 +214,7 @@ pub fn image_replacement(
 }
 
 /// Local image ids prefix each replacement, e.g. `<image_id>0</image_id>`.
-pub fn image_id_prefix(local_index: usize) -> String {
+pub(crate) fn image_id_prefix(local_index: usize) -> String {
     format!("{IMAGE_ID_START}{local_index}{IMAGE_ID_END}")
 }
 

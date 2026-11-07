@@ -176,7 +176,7 @@ fn vision_positions(
 }
 
 /// The `(3, seq)` canvas position table plus the generation-time delta.
-pub fn rope_index(
+pub(crate) fn rope_index(
     input_ids: &[u32],
     types: &[u8],
     target_sizes: &[Grid],

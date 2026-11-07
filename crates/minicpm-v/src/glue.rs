@@ -127,7 +127,7 @@ fn norm_launch<B: Backend>(
     eps: f64,
     plus_one: bool,
 ) -> Option<BurnTensor<B, 2>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !crate::metal_bridge::borrowable::<B, 2>() {
         return None;
     }
@@ -194,7 +194,7 @@ fn residual_launch<B: Backend>(
     x: BurnTensor<B, 2>,
     y: BurnTensor<B, 2>,
 ) -> Option<BurnTensor<B, 2>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !crate::metal_bridge::borrowable::<B, 2>() {
         return None;
     }
@@ -286,7 +286,7 @@ fn rope_launch<B: Backend>(
     cos: &BurnTensor<B, 4>,
     sin: &BurnTensor<B, 4>,
 ) -> Option<BurnTensor<B, 4>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !crate::metal_bridge::borrowable::<B, 4>() {
         return None;
     }
@@ -337,7 +337,8 @@ fn rope_launch<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::{gemma_norm_metal, plain_rms_norm_metal, residual_metal, rope_metal};
-    use burn::backend::wgpu::{Metal, WgpuDevice};
+    use crate::metal_bridge::RawMetal as Metal;
+    use burn::backend::wgpu::WgpuDevice;
     use burn::tensor::{FloatDType, Tensor, TensorData};
 
     /// The fused kernels against the burn chains they replace, on the 35B

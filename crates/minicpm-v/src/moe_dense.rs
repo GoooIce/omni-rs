@@ -283,7 +283,7 @@ pub(crate) fn try_dense_moe<B: Backend>(
     x: BurnTensor<B, 2>,
     dense: &crate::moe::DenseExperts<B>,
 ) -> Option<BurnTensor<B, 2>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !borrowable::<B, 2>() {
         return None;
     }
@@ -338,7 +338,7 @@ pub(crate) fn try_dense_experts<B: Backend>(
     weights: BurnTensor<B, 2>,
     shared_gate: BurnTensor<B, 2>,
 ) -> Option<BurnTensor<B, 2>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !borrowable::<B, 2>() {
         return None;
     }
@@ -460,7 +460,7 @@ pub(crate) fn try_dense_router<B: Backend>(
     gate_vec: BurnTensor<B, 2>,
     top_k: usize,
 ) -> Option<(BurnTensor<B, 2>, BurnTensor<B, 2>)> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !borrowable::<B, 2>() {
         return None;
     }
@@ -501,9 +501,10 @@ pub(crate) fn try_dense_router<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::{try_dense_experts, try_dense_router};
+    use crate::metal_bridge::RawMetal as Metal;
     use crate::moe::DenseExperts;
     use crate::quant;
-    use burn::backend::wgpu::{Metal, WgpuDevice};
+    use burn::backend::wgpu::WgpuDevice;
     use burn::tensor::{Int, Tensor, TensorData};
     use half::bf16;
     use omni_r2t2::weights::Weights;

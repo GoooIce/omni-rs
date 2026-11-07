@@ -22,11 +22,16 @@ use cubecl::wgpu::WgpuRuntime;
 use std::any::TypeId;
 use std::mem::{forget, size_of};
 
+/// The default raw Metal backend these kernels accept. Burn's `Metal` alias
+/// becomes a Fusion wrapper when features are unified; Fusion and raw u32
+/// backends use the normal Burn fallback instead.
+pub(crate) type RawMetal = burn_cubecl::CubeBackend<WgpuRuntime, f32, i32, u8>;
+
 /// Whether rank-`D` tensors on backend `B` may be borrowed into a cube
 /// kernel: the backend must be Metal and the burn handle layout must match
 /// (the generic-over-`B` call sites stay monomorphic through this check).
 pub(crate) fn borrowable<B: Backend, const D: usize>() -> bool {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     TypeId::of::<B>() == TypeId::of::<Metal>()
         && size_of::<BurnTensor<B, D>>() == size_of::<BurnTensor<Metal, D>>()
 }
@@ -48,7 +53,7 @@ pub(crate) unsafe fn take_as<T, U>(value: T) -> U {
 pub(crate) fn cube_float<B: Backend, const D: usize>(
     tensor: BurnTensor<B, D>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     let tensor: BurnTensor<Metal, D> = unsafe { take_as(tensor) };
     let primitive = tensor.into_primitive();
     let TensorPrimitive::Float(tensor) = primitive else {
@@ -62,7 +67,7 @@ pub(crate) fn cube_float<B: Backend, const D: usize>(
 pub(crate) fn cube_int<B: Backend, const D: usize>(
     tensor: BurnTensor<B, D, burn::tensor::Int>,
 ) -> CubeTensor<WgpuRuntime> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     let tensor: BurnTensor<Metal, D, burn::tensor::Int> = unsafe { take_as(tensor) };
     burn_cubecl::kernel::into_contiguous(tensor.into_primitive())
 }
@@ -81,4 +86,22 @@ pub(crate) fn alloc_f32<const N: usize>(
         client.empty(values * std::mem::size_of::<f32>()),
         burn::tensor::DType::F32,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_raw_default_metal_backend_can_cross_the_bridge() {
+        type RawMetal = burn_cubecl::CubeBackend<WgpuRuntime, f32, i32, u8>;
+        type OtherRaw = burn_cubecl::CubeBackend<WgpuRuntime, f32, i32, u32>;
+        type FusedMetal = burn_fusion::Fusion<RawMetal>;
+
+        assert!(borrowable::<RawMetal, 2>());
+        assert!(borrowable::<RawMetal, 4>());
+        assert!(!borrowable::<FusedMetal, 2>());
+        assert!(!borrowable::<OtherRaw, 2>());
+        assert!(!borrowable::<burn::backend::NdArray, 2>());
+    }
 }

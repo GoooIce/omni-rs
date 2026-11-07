@@ -158,7 +158,7 @@ pub(crate) fn try_scan<B: Backend>(
     state: BurnTensor<B, 4>,
     record: bool,
 ) -> Option<(BurnTensor<B, 4>, BurnTensor<B, 4>, Vec<BurnTensor<B, 4>>)> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !crate::metal_bridge::borrowable::<B, 4>() {
         return None;
     }
@@ -180,17 +180,17 @@ pub(crate) fn try_scan<B: Backend>(
 }
 
 fn scan_metal(
-    q: BurnTensor<burn::backend::wgpu::Metal, 4>,
-    k: BurnTensor<burn::backend::wgpu::Metal, 4>,
-    v: BurnTensor<burn::backend::wgpu::Metal, 4>,
-    g: BurnTensor<burn::backend::wgpu::Metal, 3>,
-    beta: BurnTensor<burn::backend::wgpu::Metal, 3>,
-    state: BurnTensor<burn::backend::wgpu::Metal, 4>,
+    q: BurnTensor<crate::metal_bridge::RawMetal, 4>,
+    k: BurnTensor<crate::metal_bridge::RawMetal, 4>,
+    v: BurnTensor<crate::metal_bridge::RawMetal, 4>,
+    g: BurnTensor<crate::metal_bridge::RawMetal, 3>,
+    beta: BurnTensor<crate::metal_bridge::RawMetal, 3>,
+    state: BurnTensor<crate::metal_bridge::RawMetal, 4>,
     record: bool,
 ) -> Option<(
-    BurnTensor<burn::backend::wgpu::Metal, 4>,
-    BurnTensor<burn::backend::wgpu::Metal, 4>,
-    Vec<BurnTensor<burn::backend::wgpu::Metal, 4>>,
+    BurnTensor<crate::metal_bridge::RawMetal, 4>,
+    BurnTensor<crate::metal_bridge::RawMetal, 4>,
+    Vec<BurnTensor<crate::metal_bridge::RawMetal, 4>>,
 )> {
     let [qb, t_len, heads, k_dim] = q.dims();
     let [kb, kt, kh, kk] = k.dims();
@@ -306,7 +306,8 @@ fn scan_metal(
 #[cfg(test)]
 mod tests {
     use super::scan_metal;
-    use burn::backend::wgpu::{Metal, WgpuDevice};
+    use crate::metal_bridge::RawMetal as Metal;
+    use burn::backend::wgpu::WgpuDevice;
     use burn::tensor::{Tensor, TensorData};
 
     fn tensor4(values: Vec<f32>, shape: [usize; 4]) -> Tensor<Metal, 4> {
@@ -409,7 +410,7 @@ mod tests {
 fn wrap4(
     tensor: CubeTensor<WgpuRuntime>,
     shape: [usize; 4],
-) -> BurnTensor<burn::backend::wgpu::Metal, 4> {
+) -> BurnTensor<crate::metal_bridge::RawMetal, 4> {
     let _ = shape;
     BurnTensor::from_primitive(TensorPrimitive::Float(tensor))
 }

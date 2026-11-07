@@ -24,6 +24,7 @@ pub mod moe;
 pub(crate) mod moe_dense;
 pub mod multimodal;
 pub mod positions;
+pub mod prompt;
 pub mod quant;
 pub mod text;
 pub mod tokenizer;

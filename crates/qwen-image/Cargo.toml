@@ -64,6 +64,8 @@ burn = { version = "=0.21.0", default-features = false, features = ["std", "ndar
 half = "=2.7.1"
 
 [patch.crates-io]
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
 cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
 burn-fusion = { path = "../../vendor/burn-fusion" }
 cubecl-runtime = { path = "../../vendor/cubecl-runtime" }

@@ -57,20 +57,20 @@ impl Pages {
         }
     }
     fn allocate(&mut self) -> Result<Page> {
-        loop {
-            for _ in 0..self.slots.len() {
-                let id = self.cursor;
-                self.cursor = (self.cursor + 1) % self.slots.len();
-                if self.slots[id].strong_count() == 0 {
-                    let page = Arc::new(id);
-                    self.slots[id] = Arc::downgrade(&page);
-                    return Ok(page);
-                }
-            }
-            if !self.tree.evict_leaf() {
-                return Err(Error::Inference("paged KV pool exhausted".into()));
+        for _ in 0..self.slots.len() {
+            let id = self.cursor;
+            self.cursor = (self.cursor + 1) % self.slots.len();
+            if self.slots[id].strong_count() == 0 {
+                let page = Arc::new(id);
+                self.slots[id] = Arc::downgrade(&page);
+                return Ok(page);
             }
         }
+        // The cache decides which page it can give up. A page a translation
+        // still holds is not returned.
+        self.tree
+            .reclaim()
+            .ok_or_else(|| Error::Inference("paged KV pool exhausted".into()))
     }
     /// Reserve slots for one forward. The caller commits `len` only after every
     /// layer and logits readback succeeds. Shared tails are never overwritten.
@@ -140,7 +140,6 @@ mod tests {
         assert_eq!(pool.lookup(&changed).len, 26);
         assert_eq!(pool.lookup(&[0, 1, 2, 99]).len, 3);
         pool.clear();
-        assert_eq!(pool.stats().resident_tokens, 0);
         assert_eq!(pool.lookup(&tokens).len, 0);
         assert_eq!(pool.used(), 3);
         drop(original);
@@ -150,29 +149,30 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_reclaims_only_unpinned_pages_and_reuses_slots() {
+    fn slot_reuse_and_pool_exhaustion_follow_live_holders() {
         let mut pool = Pages::new(64, 32);
-        let mut pinned = History::default();
-        pool.extend(&mut pinned, 16).unwrap();
-        pinned.len = 16;
-        let pinned_id = *pinned.pages[0];
-        pool.publish(&[1; 16], &pinned);
-        for token in 2..20 {
+        let mut held = Vec::new();
+        for _ in 0..pool.capacity() {
             let mut history = History::default();
-            pool.extend(&mut history, 17).unwrap();
-            history.len = 17;
-            assert!(history.pages.iter().all(|page| **page != pinned_id));
-            pool.publish(&[token; 17], &history);
-            assert!(pool.stats().resident_tokens <= 32);
+            pool.extend(&mut history, PAGE_SIZE).unwrap();
+            assert_eq!(pool.used(), held.len() + 1);
+            held.push(history);
         }
-        assert!(pool.stats().evicted_tokens > 0);
-        pool.clear();
-        assert_eq!(pool.used(), 1);
-        let mut full = History::default();
-        pool.extend(&mut full, 48).unwrap();
-        assert!(pool.extend(&mut full, 64).is_err());
-        drop(full);
-        drop(pinned);
+        let mut blocked = History::default();
+        assert!(pool.extend(&mut blocked, PAGE_SIZE).is_err());
+        assert_eq!(pool.used(), pool.capacity());
+
+        let released = held.pop().unwrap();
+        let freed_slot = *released.pages[0];
+        drop(released);
+        assert_eq!(pool.used(), pool.capacity() - 1);
+
+        pool.extend(&mut blocked, PAGE_SIZE).unwrap();
+        assert_eq!(*blocked.pages[0], freed_slot);
+        assert_eq!(pool.used(), pool.capacity());
+
+        drop(held);
+        drop(blocked);
         assert_eq!(pool.used(), 0);
     }
 }

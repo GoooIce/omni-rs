@@ -118,7 +118,7 @@ pub(crate) fn try_scores<B: Backend>(
     w1: BurnTensor<B, 2>,                     // [vocab, rank]
     quant: &MarkovQuant<B>,
 ) -> Option<BurnTensor<B, 2>> {
-    use burn::backend::wgpu::Metal;
+    use crate::metal_bridge::RawMetal as Metal;
     if !crate::metal_bridge::borrowable::<B, 2>() {
         return None;
     }
@@ -169,7 +169,8 @@ pub(crate) fn try_scores<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::{MarkovQuant, quantize_w2, try_scores};
-    use burn::backend::wgpu::{Metal, WgpuDevice};
+    use crate::metal_bridge::RawMetal as Metal;
+    use burn::backend::wgpu::WgpuDevice;
     use burn::tensor::{DType, Int, Tensor, TensorData};
 
     /// The kernel's scores against a CPU mirror of the same quantized

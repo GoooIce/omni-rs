@@ -33,6 +33,8 @@ hound = "3.5"
 tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
 cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
 burn-fusion = { path = "../../vendor/burn-fusion" }
 cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
