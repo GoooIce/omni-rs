@@ -29,6 +29,30 @@ impl View {
 struct Job {
     cancel: Arc<AtomicBool>,
     view: Mutex<View>,
+    events: Mutex<EventLog>,
+}
+const MAX_EVENTS: usize = 16_384;
+const MAX_EVENT_BYTES: usize = 64 * 1024 * 1024;
+#[derive(Default)]
+struct EventLog {
+    values: Vec<Value>,
+    bytes: usize,
+}
+impl EventLog {
+    fn push(&mut self, value: Value) -> bool {
+        self.push_bounded(value, MAX_EVENTS, MAX_EVENT_BYTES)
+    }
+    fn push_bounded(&mut self, value: Value, max_events: usize, max_bytes: usize) -> bool {
+        let Ok(size) = serde_json::to_vec(&value).map(|bytes| bytes.len()) else {
+            return false;
+        };
+        if self.values.len() >= max_events || size > max_bytes.saturating_sub(self.bytes) {
+            return false;
+        }
+        self.bytes += size;
+        self.values.push(value);
+        true
+    }
 }
 /// Execution adapters can report progress but cannot publish terminal states.
 #[derive(Clone)]
@@ -45,6 +69,9 @@ impl Context {
     }
     pub fn progress(&self, value: Value) {
         self.job.view.lock().unwrap().progress = value;
+    }
+    pub fn event(&self, value: Value) -> bool {
+        self.job.events.lock().unwrap().push(value)
     }
     pub fn file(
         &self,
@@ -330,6 +357,7 @@ impl<C: Send + 'static> Jobs<C> {
         let job = Arc::new(Job {
             cancel: Arc::new(AtomicBool::new(false)),
             view: Mutex::new(view.clone()),
+            events: Mutex::new(EventLog::default()),
         });
         sender
             .try_send(Queued {
@@ -372,6 +400,11 @@ impl<C: Send + 'static> Jobs<C> {
     pub fn get(&self, id: &str) -> Option<View> {
         Some(self.find(id)?.view.lock().unwrap().clone())
     }
+    pub fn events(&self, id: &str, after: usize) -> Option<Vec<Value>> {
+        let job = self.find(id)?;
+        let events = job.events.lock().unwrap();
+        Some(events.values.get(after..).unwrap_or(&[]).to_vec())
+    }
     pub fn cancel(&self, id: &str) -> bool {
         let Some(job) = self.find(id) else {
             return false;
@@ -400,6 +433,17 @@ mod tests {
         sync::mpsc::{Receiver, Sender},
         time::{Duration, Instant},
     };
+    #[test]
+    fn event_buffer_rejects_overflow_without_losing_delivered_events() {
+        let mut events = EventLog::default();
+        assert!(events.push_bounded(json!({"n":1}), 2, 100));
+        assert!(events.push_bounded(json!({"n":2}), 2, 100));
+        assert!(!events.push_bounded(json!({"n":3}), 2, 100));
+        assert_eq!(events.values, vec![json!({"n":1}), json!({"n":2})]);
+        let mut bytes = EventLog::default();
+        assert!(!bytes.push_bounded(json!({"too":"large"}), 10, 2));
+        assert!(bytes.values.is_empty());
+    }
     enum Action {
         Done,
         Fail,

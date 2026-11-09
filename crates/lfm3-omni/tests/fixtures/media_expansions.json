@@ -1,0 +1,37 @@
+[
+  {
+    "name": "mixed",
+    "prompt": "A<|vision_start|><|image|><|vision_end|>B<|vision_start|><|audio|><|vision_end|>C",
+    "media": [
+      {
+        "type": "image",
+        "tokens": 2
+      },
+      {
+        "type": "audio",
+        "tokens": 13
+      }
+    ],
+    "expected": "A<|vision_start|><|image|><|image|><|vision_end|>B<|vision_start|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|vision_end|>C"
+  },
+  {
+    "name": "video_soundtrack",
+    "prompt": "X<|vision_start|><|video|><|vision_end|>Y",
+    "media": [
+      {
+        "type": "video",
+        "tokens_per_frame": 2,
+        "frame_indices": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "fps": 2.0,
+        "temporal_patch_size": 2,
+        "audio_tokens": 17
+      }
+    ],
+    "expected": "X<|vision_start|><0.2 seconds><|vision_start|><|video|><|video|><|vision_end|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><|audio|><1.2 seconds><|vision_start|><|video|><|video|><|vision_end|><|audio|><|audio|><|audio|><|audio|><|audio|><|vision_end|>Y"
+  }
+]

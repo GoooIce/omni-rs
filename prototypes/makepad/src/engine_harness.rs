@@ -134,6 +134,17 @@ impl<U> Clone for Publisher<U> {
 }
 
 impl<U: Event> Publisher<U> {
+    /// Consume optional capture meters when an adapter only needs PCM.
+    pub fn discarding(stop: Arc<AtomicBool>) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<U>(128);
+        std::thread::spawn(move || while receiver.recv().is_ok() {});
+        Self {
+            sender,
+            notify: Arc::new(|| {}),
+            stop,
+            name: "capture",
+        }
+    }
     fn trace(&self, update: &U) {
         static TRACE: OnceLock<bool> = OnceLock::new();
         if *TRACE.get_or_init(|| std::env::var_os("R2T2_TRACE_EVENTS").is_some()) {

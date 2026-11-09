@@ -1,6 +1,6 @@
 //! The sole execution seam: production engines and scripted tests both return
 //! owned events. Job ownership and result publication stay in Models / Jobs.
-use super::{Backend, Command, Failure, Kind, ModelPaths};
+use super::{Backend, Command, Failure, Kind, ModelPaths, OmniBackend};
 use std::{
     io::Cursor,
     path::Path,
@@ -74,6 +74,28 @@ pub(crate) struct Step {
 }
 pub(crate) trait Driver: 'static {
     type Loaded;
+    fn recover(&mut self) {}
+    fn forget_omni(&mut self, _id: &str) -> bool {
+        false
+    }
+    fn run_omni_live(
+        &mut self,
+        _job: super::omni::LiveJob,
+        _context: &crate::jobs::Context,
+    ) -> Result<crate::jobs::Output, Failure> {
+        Err(Failure::Error(
+            "live Omni transcription is unavailable in this driver".into(),
+        ))
+    }
+    fn run_omni(
+        &mut self,
+        _job: super::omni::Job,
+        _context: &crate::jobs::Context,
+    ) -> Result<crate::jobs::Output, Failure> {
+        Err(Failure::Error(
+            "Omni inference is unavailable in this driver".into(),
+        ))
+    }
     fn load(
         &mut self,
         kind: Kind,
@@ -91,6 +113,8 @@ pub(crate) trait Driver: 'static {
 }
 pub(crate) struct NativeDriver {
     paths: ModelPaths,
+    omni: Option<Box<omni_lfm3::model::OmniModel<OmniBackend>>>,
+    omni_sessions: std::collections::HashMap<String, omni_lfm3::model::Conversation<OmniBackend>>,
 }
 pub(crate) enum NativeLoaded {
     Music(Box<super::music::Music>),
@@ -101,11 +125,47 @@ pub(crate) enum NativeLoaded {
 }
 impl NativeDriver {
     pub fn new(paths: ModelPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            omni: None,
+            omni_sessions: Default::default(),
+        }
     }
 }
 impl Driver for NativeDriver {
     type Loaded = NativeLoaded;
+    fn recover(&mut self) {
+        self.omni_sessions.clear();
+        self.omni = None;
+    }
+    fn forget_omni(&mut self, id: &str) -> bool {
+        self.omni_sessions.remove(id).is_some()
+    }
+    fn run_omni_live(
+        &mut self,
+        job: super::omni::LiveJob,
+        context: &crate::jobs::Context,
+    ) -> Result<crate::jobs::Output, Failure> {
+        if self.omni.is_none() {
+            self.omni = Some(Box::new(super::omni::load(&self.paths, context)?));
+        }
+        super::omni::run_live(self.omni.as_ref().expect("loaded Omni model"), job, context)
+    }
+    fn run_omni(
+        &mut self,
+        job: super::omni::Job,
+        context: &crate::jobs::Context,
+    ) -> Result<crate::jobs::Output, Failure> {
+        if self.omni.is_none() {
+            self.omni = Some(Box::new(super::omni::load(&self.paths, context)?));
+        }
+        super::omni::run(
+            self.omni.as_ref().expect("loaded Omni model"),
+            job,
+            context,
+            &mut self.omni_sessions,
+        )
+    }
     fn load(
         &mut self,
         kind: Kind,
@@ -115,6 +175,7 @@ impl Driver for NativeDriver {
         let paths = &self.paths;
         let device = Default::default();
         Ok(match kind {
+            Kind::Omni => return Err(Failure::Error("Omni requests use direct execution".into())),
             Kind::Music => NativeLoaded::Music(Box::new(super::music::Music::new(paths.clone()))),
             Kind::Translation => {
                 let model = omni_hy_mt::Model::from_directory(

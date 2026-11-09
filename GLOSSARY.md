@@ -16,6 +16,10 @@ Attention keys and values retained for already processed positions in one decodi
 **Session**:
 One stream of speech recognition with its own audio history and decoding state. Sessions share a model but never share their evolving transcript.
 
+**Omni conversation**:
+An ordered exchange in which a user turn can combine text, images, video and audio, and an assistant turn contains text, speech, or interleaved text and speech. Video frames and their soundtrack retain their relative timing.
+_Avoid_: transcription session
+
 **Speculative cycle**:
 One DSpark round: propose (draft block from the markov head), verify (one target forward over the block), accept (longest prefix matching the target's greedy argmax, plus one correction token), retain (KV rollback to the accepted prefix). The draft block length adapts over the ladder 3/8/16 by measured acceptance.
 

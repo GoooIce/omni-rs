@@ -173,6 +173,26 @@ impl MelFrontend {
         self.stable_log_mel.clear();
     }
 
+    /// Compute one uncentered 400-sample Slaney log-mel frame. The caller
+    /// supplies any desired padding and the floor in base-10 log units.
+    pub fn log_mel_frame(
+        &self,
+        samples: &[f32],
+        log_floor: f64,
+    ) -> Result<[f32; MEL_BINS], &'static str> {
+        if samples.len() != FFT_SIZE || !log_floor.is_finite() {
+            return Err("invalid log-mel frame size or floor");
+        }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err("PCM contains NaN or infinity");
+        }
+        let mut input = [0.0; FFT_SIZE];
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample = samples[i] as f64 * self.window[i];
+        }
+        Ok(self.log_mel_from_windowed(&input, 10.0_f64.powf(log_floor)))
+    }
+
     fn frame(&self, frame: usize, padded_len: usize) -> [f32; MEL_BINS] {
         let mut input = [0.0; FFT_SIZE];
         for (i, sample) in input.iter_mut().enumerate() {
@@ -182,8 +202,12 @@ impl MelFrontend {
             );
             *sample = self.pcm.get(source).copied().unwrap_or(0.0) as f64 * self.window[i];
         }
+        self.log_mel_from_windowed(&input, 1e-10)
+    }
+
+    fn log_mel_from_windowed(&self, input: &[f64; FFT_SIZE], min_energy: f64) -> [f32; MEL_BINS] {
         let mut spectrum = [Complex::default(); FFT_SIZE];
-        self.fft.transform(&input, 0, 1, &mut spectrum);
+        self.fft.transform(input, 0, 1, &mut spectrum);
         let power: Vec<f64> = spectrum[..=FFT_SIZE / 2]
             .iter()
             .map(|c| c.re * c.re + c.im * c.im)
@@ -191,7 +215,7 @@ impl MelFrontend {
         let mut result = [0.0; MEL_BINS];
         for (m, filter) in self.filters.iter().enumerate() {
             let energy: f64 = filter.iter().map(|&(k, weight)| power[k] * weight).sum();
-            result[m] = energy.max(1e-10).log10() as f32;
+            result[m] = energy.max(min_energy).log10() as f32;
         }
         result
     }

@@ -26,6 +26,18 @@
       "metal": true
     },
     {
+      "path": "crates/lfm3-omni/Cargo.toml",
+      "cpu_features": "native,cpu",
+      "target": "target/minicpm-v-cpu",
+      "metal": true
+    },
+    {
+      "path": "crates/omni-rsi/Cargo.toml",
+      "cpu_features": "native,cpu",
+      "target": "target/minicpm-v-cpu",
+      "metal": true
+    },
+    {
       "path": "crates/qwen-image/Cargo.toml",
       "cpu_features": "cpu",
       "target": "target/qwen-image-test",

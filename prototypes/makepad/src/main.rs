@@ -34,6 +34,10 @@ mod music_engine;
 #[cfg(not(target_arch = "wasm32"))]
 mod music_ui;
 #[cfg(not(target_arch = "wasm32"))]
+mod omni_engine;
+#[cfg(not(target_arch = "wasm32"))]
+mod omni_ui;
+#[cfg(not(target_arch = "wasm32"))]
 mod playback;
 #[cfg(not(target_arch = "wasm32"))]
 mod playback_buffer;
@@ -232,6 +236,57 @@ script_mod! {
                                     width: Fill height: Fit flow: Right spacing: 0
                             language_page := View{
                                 width: Fill height: Fit flow: Down spacing: 12
+                                omni_panel := WorkspacePanel{
+                                    visible: false
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                        SectionLabel{width: Fill text: "全能对话"}
+                                        omni_back := QuietButton{text: "返回语音" height: 30}
+                                        omni_new := QuietButton{text: "新对话" height: 30}
+                                    }
+                                    MutedLabel{text: "文字、图片、音频与视频可按顺序放入同一轮对话。"}
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        omni_model := SpeechInput{width: Fill height: 34 empty_text: "LFM3-Omni-2B 模型目录"}
+                                        omni_choose_model := QuietButton{text: "选择…" height: 34}
+                                        omni_load := SpeechButton{text: "载入" height: 34}
+                                    }
+                                    omni_status := MutedLabel{text: "请选择并载入 LFM3-Omni-2B" draw_text.color: #d7b56a}
+                                    omni_live := MutedLabel{text: ""}
+                                    omni_transcript := SpeechInput{
+                                        width: Fill height: 160 is_multiline: true is_read_only: true
+                                        empty_text: "对话会显示在这里"
+                                    }
+                                    omni_draft := SpeechInput{
+                                        width: Fill height: 68 is_multiline: true
+                                        empty_text: "输入文字。可加入文字和媒体以安排顺序。"
+                                    }
+                                    omni_parts := MutedLabel{text: "当前轮次尚未加入内容"}
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        omni_add_text := QuietButton{text: "加入文字" height: 34}
+                                        omni_add_media := QuietButton{text: "加入媒体…" height: 34}
+                                        omni_microphone := QuietButton{text: "中文听写" height: 34}
+                                        omni_listen_route := QuietButton{text: "听写：预览校正" height: 34}
+                                        omni_clear_parts := QuietButton{text: "清空待发" height: 34}
+                                        omni_mode := QuietButton{text: "输出：自动" height: 34}
+                                    }
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                        SpeechLabel{text: "语音温度"}
+                                        omni_temperature := SpeechInput{width: 100 height: 34 empty_text: "模型默认"}
+                                        SpeechLabel{text: "top-k"}
+                                        omni_top_k := SpeechInput{width: 100 height: 34 empty_text: "模型默认"}
+                                        MutedLabel{width: Fill text: "留空使用模型默认；温度 0 为贪心"}
+                                    }
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        omni_send := PrimaryButton{text: "发送" height: 38}
+                                        omni_stop := QuietButton{text: "停止" height: 38}
+                                        omni_play := QuietButton{text: "播放语音" height: 38}
+                                        omni_save := QuietButton{text: "保存语音…" height: 38}
+                                    }
+                                }
                                 language_columns := View{
                                     width: Fill height: Fit flow: Right spacing: 14
                                     asr_page := WorkspacePanel{
@@ -240,6 +295,7 @@ script_mod! {
                                         View{
                                             width: Fill height: Fit flow: Right align: Align{y: 0.5}
                                             SectionLabel{width: Fill text: "听见，变成文字"}
+                                            omni_toggle := QuietButton{text: "全能对话 →" height: 30}
                                             asr_details_toggle := QuietButton{text: "识别设置" height: 30}
                                         }
                                         status := MutedLabel{text: "正在准备转写模型…" draw_text.color: #b7dfc7}
@@ -811,6 +867,9 @@ pub struct App {
     music: Option<music_ui::State>,
     #[cfg(not(target_arch = "wasm32"))]
     #[rust]
+    omni: Option<omni_ui::State>,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[rust]
     translation: Option<translation_ui::State>,
 }
 
@@ -831,7 +890,8 @@ impl App {
                 .map(|stopped| ("translation", stopped))
         });
         let playing = self.tts.as_ref().is_some_and(|t| t.playing())
-            || self.music.as_ref().is_some_and(|m| m.playing());
+            || self.music.as_ref().is_some_and(|m| m.playing())
+            || self.omni.as_ref().is_some_and(|o| o.playing());
         self.ui
             .view(cx, ids!(running_bar))
             .set_visible(cx, active.is_some() || playing);
@@ -852,6 +912,7 @@ impl App {
                     "qwen-image" => "图像生成",
                     "translation" => "翻译",
                     "music" => "音乐创作",
+                    "lfm3-omni" => "全能对话",
                     name => name,
                 };
                 format!(
@@ -872,7 +933,11 @@ impl App {
         // Sharing a workspace never starts the neighboring tool's model.
         // ASR keeps its existing startup/recovery continuation; TTS and image
         // load only from their explicit controls, music from a submitted action.
-        if self.inference_busy() || self.runtime.dialog_busy() || !self.workspace.language() {
+        if self.inference_busy()
+            || self.runtime.dialog_busy()
+            || !self.workspace.language()
+            || self.omni.as_ref().is_some_and(|state| state.visible())
+        {
             return;
         }
         self.resume_transcription_model(cx);
@@ -892,6 +957,7 @@ impl MatchEvent for App {
                 .button(cx, ids!(asr_details_toggle))
                 .set_visible(cx, false);
             self.ui.button(cx, ids!(asr_to_tts)).set_visible(cx, false);
+            self.ui.button(cx, ids!(omni_toggle)).set_visible(cx, false);
             self.ui
                 .label(cx, ids!(app_subtitle))
                 .set_text(cx, "浏览器内语音转写");
@@ -902,6 +968,7 @@ impl MatchEvent for App {
             self.tts = Some(tts_ui::State::new(&root, self.runtime.clone()));
             self.image = Some(image_ui::State::new(&root, self.runtime.clone()));
             self.initialize_music(cx, &root);
+            self.initialize_omni(cx, &root);
             self.refresh_workspace_layout(cx, 1000.0);
             self.translation = Some(translation_ui::State::new(&root, self.runtime.clone()));
             self.ui
@@ -936,12 +1003,16 @@ impl MatchEvent for App {
                 if let Some(m) = &mut self.music {
                     m.stop_playback();
                 }
+                if let Some(o) = &mut self.omni {
+                    o.stop_playback();
+                }
             }
             self.handle_workspace_actions(cx, actions);
             self.handle_translation_actions(cx, actions);
             self.handle_image_actions(cx, actions);
             self.handle_tts_actions(cx, actions);
             self.handle_music_actions(cx, actions);
+            self.handle_omni_actions(cx, actions);
         }
         self.handle_transcription_actions(cx, actions);
     }
@@ -981,6 +1052,7 @@ impl AppMain for App {
             self.poll_image(cx);
             self.poll_translation(cx);
             self.poll_music(cx);
+            self.poll_omni(cx);
         }
         self.poll_transcription(cx, event);
         self.match_event(cx, event);
@@ -1000,6 +1072,8 @@ impl AppMain for App {
         self.refresh_translation_controls(cx);
         #[cfg(not(target_arch = "wasm32"))]
         self.refresh_music_controls(cx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.refresh_omni_controls(cx);
         self.ui.handle_event(cx, event, &mut Scope::empty());
     }
 }

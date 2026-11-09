@@ -1,0 +1,49 @@
+[package]
+name = "omni-rsi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Verified, idle-time chart reader adaptation for LFM3 Omni"
+
+[workspace]
+
+[features]
+default = ["native", "metal"]
+native = ["dep:clap", "dep:ctrlc"]
+metal = ["omni-lfm3/metal", "burn/metal", "burn/fusion"]
+cpu = ["omni-lfm3/cpu", "burn/ndarray"]
+
+[dependencies]
+omni-lfm3 = { path = "../lfm3-omni", default-features = false }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.9"
+tempfile = "3"
+libc = "0.2"
+clap = { version = "4.5", features = ["derive"], optional = true }
+ctrlc = { version = "3.4", optional = true }
+
+[[bin]]
+name = "omni-rsi"
+path = "src/main.rs"
+required-features = ["native"]
+
+[patch.crates-io]
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
+burn = { path = "../../vendor/burn" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

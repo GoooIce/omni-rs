@@ -16,6 +16,7 @@
 | 翻译 | [Hy-MT2-7B](https://huggingface.co/tencent/Hy-MT2-7B) | CLI · Makepad · API | RadixAttention 前缀缓存 + 连续批处理 |
 | 语音合成 | Breeze-TTS-2 | Makepad | 流式边生成边播放，音色设计与声音克隆 |
 | 图像理解 | [MiniCPM-V-4.7-1B](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B) | CLI · Makepad | ≈26 ms/token（Metal FP16，贪心对齐官方） |
+| 多模态对话 | [LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B) | Rust · CLI · Makepad · API | 文字、图像、音频、视频输入；文字与语音输出 |
 | 文生图 · 图像编辑 | Qwen-Image-2.1-Turbo | CLI · Makepad | 8 步生成，1024² ≈51 s，默认 2K |
 | 音乐理解 · 歌曲生成 | MERT2 → SheetSage2 → YuE2 | Makepad · Web | 48 kHz 双声道 WAV |
 
@@ -98,6 +99,19 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
   --model models/MiniCPM-V-4.7-1B --image photo.jpg --prompt '描述这张图' --greedy
 ```
 
+### 多模态对话 · LFM3-Omni-2B
+
+使用本地官方模型目录（包含 `audio_tokenizer/`），按顺序组合文字、图片、音频和视频。语音输出为 24 kHz 单声道；视频和非 WAV 音频解码需要本地 `ffmpeg`。格式、会话与验证范围见 [LFM3-Omni 接入说明](docs/lfm3-omni.md)。
+
+```sh
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
+  --model models/LFM3-Omni-2B --part 'text:描述这张图' --part image:photo.jpg --mode text
+```
+
+### 闲时图表读图演化 · 实验
+
+[闲时 RSI 实验](docs/idle-rsi.md)用可核验的合成图表训练独立读图头，并以开发集控制实验入口的候选切换。另有[中文语音自训练试验](docs/chinese-speech-rsi.md)，使用经语音识别核验的数据训练独立 LoRA，并检查实际生成音频。两者保留原模型；图像生成器尚未训练，语音候选尚未接入产品推理。[查看交互式流程图](docs/rsi-overview.html)。
+
 ### 文生图与图像编辑 · Qwen-Image-2.1-Turbo
 
 视觉编码器、文本编码器、扩散主干和 RGBA VAE 都在 `crates/qwen-image` 里。支持 8 步文生图、1–4 张参考图编辑和透明 PNG。完整权重约 32.5 GB，Qwen Research License。默认 2048×2048、seed 42；七组官方比例的最长边是 2752，自定义宽高须在 256–2752 且总像素不超过 4,300,800。
@@ -121,7 +135,7 @@ cargo run --release --manifest-path crates/omni-api/Cargo.toml -- --port 8848
 
 ## 本地 Web API
 
-服务默认只听 `127.0.0.1:8848`，模型按需载入。同一模型的请求可以合批（翻译、ASR、TTS 默认各最多 4 个，图像 1–4），不同模型按 FIFO 等待。取消在当前 GPU 步结束后生效。成品要等编码完成并原子发布才进入终态，文件在 `artifacts/api-output/published`。HTTP 目前是 WAV 转写、无参考音频的 TTS 和文生图；麦克风、声音克隆和参考图编辑留在原生界面。
+服务默认只听 `127.0.0.1:8848`，模型按需载入。同一模型的请求可以合批（翻译、ASR、TTS 默认各最多 4 个，图像 1–4），不同模型按 FIFO 等待。取消在当前 GPU 步结束后生效。成品要等编码完成并原子发布才进入终态，文件在 `artifacts/api-output/published`。Omni 请求上传媒体字节；麦克风、声音克隆和参考图编辑留在原生界面。
 
 ```sh
 cargo run --release --manifest-path crates/omni-api/Cargo.toml -- --port 8848
@@ -134,6 +148,9 @@ curl -s http://127.0.0.1:8848/v1/translations \
 
 | 请求 | 输入 |
 | --- | --- |
+| `POST /v1/omni/generations` | JSON 消息与 base64 媒体；可选会话、工具和输出模式 |
+| `GET /v1/jobs/{id}/events` | 按顺序读取 Omni 文本、语音码和音频块 |
+| `DELETE /v1/omni/sessions/{id}` | 排队释放 Omni 会话缓存 |
 | `POST /v1/translations` | JSON：`text`、`target_language`，可选 `options` |
 | `POST /v1/audio/transcriptions` | WAV 字节；可选查询参数 `language`、`context` |
 | `POST /v1/audio/speech` | JSON：`text`，可选 `instruction`、`seed`、`max_frames`、`guidance_scale` |
@@ -145,7 +162,7 @@ curl -s http://127.0.0.1:8848/v1/translations \
 | `GET /v1/files/{name}` | 下载已发布的 WAV、PNG、JSON、ABC 或 MIDI |
 | `GET /v1/models` · `GET /health` | 模型列表与服务状态 |
 
-等待通道长度为 4，满了返回 503。目录可用 `--asr-model`、`--tts-model`、`--translation-model`、`--image-model`、`--music-models` 指定。
+等待通道长度为 4，满了返回 503。目录可用 `--lfm3-model`、`--asr-model`、`--tts-model`、`--translation-model`、`--image-model`、`--music-models` 指定。
 
 ## 运行后端
 

@@ -11,8 +11,14 @@ type Backend = burn::backend::wgpu::WebGpu;
 #[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
 type Backend = burn::backend::NdArray;
 
+#[cfg(any(feature = "metal", feature = "webgpu"))]
+type OmniBackend = omni_lfm3::NativeGpu;
+#[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
+type OmniBackend = burn::backend::NdArray;
+
 #[derive(Clone)]
 pub struct ModelPaths {
+    pub lfm3: PathBuf,
     pub asr: PathBuf,
     pub tts: PathBuf,
     pub translation: PathBuf,
@@ -29,6 +35,9 @@ pub struct ModelPaths {
     pub tts_paged_attention: bool,
 }
 pub enum Command {
+    Omni(omni::Job),
+    OmniLive(omni::LiveJob),
+    OmniForget(String),
     Translate(omni_hy_mt::Request),
     Transcribe {
         audio: Vec<u8>,
@@ -136,6 +145,7 @@ impl From<std::io::Error> for Failure {
 
 mod driver;
 mod music;
+pub(crate) mod omni;
 use driver::{Driver, NativeDriver, Step, Update};
 
 impl driver::Progress {
@@ -162,6 +172,7 @@ impl driver::Progress {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Kind {
+    Omni,
     Translation,
     Transcription,
     Speech,
@@ -171,6 +182,7 @@ pub(super) enum Kind {
 impl Command {
     fn kind(&self) -> Kind {
         match self {
+            Self::Omni(_) | Self::OmniLive(_) | Self::OmniForget(_) => Kind::Omni,
             Self::Translate(_) => Kind::Translation,
             Self::Transcribe { .. } => Kind::Transcription,
             Self::Speech(_) => Kind::Speech,
@@ -273,8 +285,15 @@ impl<D: Driver> Executor for Models<D> {
     type Command = Command;
     fn recover(&mut self) {
         self.unload();
+        self.driver.recover();
     }
     fn batchable(&self, command: &Command) -> bool {
+        if matches!(
+            command,
+            Command::Omni(_) | Command::OmniLive(_) | Command::OmniForget(_)
+        ) {
+            return false;
+        }
         self.active
             .as_ref()
             .is_none_or(|active| active.kind == command.kind())
@@ -341,8 +360,16 @@ impl<D: Driver> Executor for Models<D> {
         let step = self.driver.step(engine);
         self.apply(step)
     }
-    fn run(&mut self, _command: Command, _context: &Context) -> Result<Output, Failure> {
-        Err(Failure::Error("request requires batch admission".into()))
+    fn run(&mut self, command: Command, context: &Context) -> Result<Output, Failure> {
+        match command {
+            Command::Omni(job) => self.driver.run_omni(job, context),
+            Command::OmniLive(job) => self.driver.run_omni_live(job, context),
+            Command::OmniForget(id) => Ok(Output::new(
+                json!({"removed":self.driver.forget_omni(&id)}),
+                false,
+            )),
+            _ => Err(Failure::Error("request requires batch admission".into())),
+        }
     }
 }
 

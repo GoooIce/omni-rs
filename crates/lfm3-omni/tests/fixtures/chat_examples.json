@@ -1,0 +1,384 @@
+[
+  {
+    "name": "text_multi_turn",
+    "messages": [
+      {
+        "role": "system",
+        "content": "回答要简洁。"
+      },
+      {
+        "role": "user",
+        "content": "你好"
+      },
+      {
+        "role": "assistant",
+        "content": "你好！"
+      },
+      {
+        "role": "user",
+        "content": "继续"
+      }
+    ],
+    "expected": "<|startoftext|><|im_start|>system\n回答要简洁。<|im_end|>\n<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think></think>你好！<|im_end|>\n<|im_start|>user\n继续<|im_end|>\n<|im_start|>assistant\n<think></think>",
+    "tokens": [
+      124894,
+      124899,
+      23630,
+      207,
+      49809,
+      3023,
+      23988,
+      52547,
+      646,
+      124900,
+      207,
+      124899,
+      5922,
+      207,
+      11253,
+      5899,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      124902,
+      11253,
+      5899,
+      8167,
+      124900,
+      207,
+      124899,
+      5922,
+      207,
+      39730,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      124902
+    ]
+  },
+  {
+    "name": "mixed_media_order",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "描述："
+          },
+          {
+            "type": "image"
+          },
+          {
+            "type": "text",
+            "text": " 然后 "
+          },
+          {
+            "type": "audio"
+          },
+          {
+            "type": "video"
+          }
+        ]
+      }
+    ],
+    "expected": "<|startoftext|><|im_start|>user\n描述：<|vision_start|><|image|><|vision_end|> 然后 <|vision_start|><|audio|><|vision_end|><|vision_start|><|video|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think></think>",
+    "tokens": [
+      124894,
+      124899,
+      5922,
+      207,
+      89785,
+      4947,
+      125009,
+      125030,
+      125010,
+      117312,
+      229,
+      125009,
+      125031,
+      125010,
+      125009,
+      125029,
+      125010,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      124902
+    ]
+  },
+  {
+    "name": "tool_call_and_result",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "description": "查询天气",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "today": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "成都天气？"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "function": {
+              "name": "weather",
+              "arguments": {
+                "city": "成都",
+                "today": true
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "a",
+        "content": "晴"
+      }
+    ],
+    "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"weather\", \"description\": \"查询天气\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"today\": {\"type\": \"boolean\"}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\n成都天气？<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=weather>\n<parameter=city>\n成都\n</parameter>\n<parameter=today>\ntrue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n晴\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>",
+    "tokens": [
+      124894,
+      124899,
+      23630,
+      207,
+      125017,
+      207,
+      38184,
+      2554,
+      6380,
+      496,
+      51492,
+      1377,
+      496,
+      19021,
+      6380,
+      496,
+      65061,
+      6364,
+      11228,
+      1377,
+      496,
+      29701,
+      6380,
+      36579,
+      5882,
+      6380,
+      496,
+      7022,
+      1377,
+      496,
+      38805,
+      6380,
+      36579,
+      47749,
+      6380,
+      36579,
+      5882,
+      6380,
+      496,
+      3987,
+      65916,
+      496,
+      99677,
+      6380,
+      36579,
+      5882,
+      6380,
+      496,
+      27626,
+      87961,
+      496,
+      34503,
+      6380,
+      34564,
+      47749,
+      13328,
+      10703,
+      125018,
+      124900,
+      207,
+      124899,
+      5922,
+      207,
+      3194,
+      6289,
+      6364,
+      11228,
+      9890,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      124902,
+      125019,
+      207,
+      125021,
+      51492,
+      703,
+      125023,
+      47749,
+      703,
+      3194,
+      6289,
+      207,
+      125024,
+      207,
+      125023,
+      99677,
+      703,
+      10066,
+      207,
+      125024,
+      207,
+      125022,
+      207,
+      125020,
+      124900,
+      207,
+      124899,
+      46765,
+      207,
+      125025,
+      207,
+      42882,
+      207,
+      125026,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      124902
+    ]
+  },
+  {
+    "name": "tool_results_merge",
+    "messages": [
+      {
+        "role": "user",
+        "content": "run"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call1",
+        "content": "first"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call1",
+        "content": "second"
+      }
+    ],
+    "expected": "<|startoftext|><|im_start|>user\nrun<|im_end|>\n<|im_start|>tool\n<tool_response>\nfirst\nsecond\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>",
+    "tokens": [
+      124894,
+      124899,
+      5922,
+      207,
+      10943,
+      124900,
+      207,
+      124899,
+      46765,
+      207,
+      125025,
+      207,
+      15557,
+      207,
+      16707,
+      207,
+      125026,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      124902
+    ]
+  },
+  {
+    "name": "thinking_kept",
+    "preserve_thinking": true,
+    "enable_thinking": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "thinking": "reason",
+        "content": "hello"
+      },
+      {
+        "role": "user",
+        "content": "again"
+      }
+    ],
+    "expected": "<|startoftext|><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>reason</think>hello<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n<think>",
+    "tokens": [
+      124894,
+      124899,
+      5922,
+      207,
+      6427,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901,
+      92608,
+      124902,
+      52071,
+      124900,
+      207,
+      124899,
+      5922,
+      207,
+      42915,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901
+    ]
+  }
+]

@@ -1,0 +1,48 @@
+# 闲时图表读图演化实验
+
+`crates/omni-rsi` 是受 [Recursive Self-Improvement in Unified Multimodal Models](https://arxiv.org/abs/2610.03002) 启发的本地实验。它只训练一个作用于冻结 LFM3 图像问答状态的二分类读图头，范围是固定样式的双柱图；它不改 LFM3 权重，不训练图像生成器，也不会替换 Makepad、API 或普通 LFM3 对话的模型。论文训练统一模型的生成和理解两侧；目前仓库没有对应的 Qwen-Image 训练／导出链路，因此这不是论文的完整复现。论文分析和后续条件见 [调研记录](research/rsi-2610-03002.md)。
+
+## 运行
+
+需要本地 LFM3-Omni-2B 官方权重、Apple Silicon 和 Metal；也可编译 CPU 版本用于无设备测试。以下命令从仓库根目录运行。`--model` 可省略，依次使用 `LFM3_MODEL_DIR`、`models/LFM3-Omni-2B` 或 `~/models/LiquidAI/LFM3-Omni-2B`。
+
+```sh
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo build --manifest-path crates/omni-rsi/Cargo.toml
+
+# 显式启动后等待闲时；完成四轮后退出，Ctrl-C 停止，不会自动重启。
+target/minicpm-v-cpu/debug/omni-rsi watch
+
+# 从另一个终端查看调度状态和当前候选。
+target/minicpm-v-cpu/debug/omni-rsi status
+
+# 停止调度器后恢复上一个已校验的候选。
+target/minicpm-v-cpu/debug/omni-rsi rollback
+
+# 单轮立即运行，适合有人看管的试验。
+target/minicpm-v-cpu/debug/omni-rsi once
+
+# 在实验性的双柱图问答入口使用已晋级的读图头。
+target/minicpm-v-cpu/debug/omni-rsi read --image chart.png --question taller
+target/minicpm-v-cpu/debug/omni-rsi read --image chart.png --question twice
+```
+
+`read` 输出 Yes/No、Yes 概率和 `adapted`：仅有本模型指纹匹配且通过开发集门槛的候选时才为 `true`，否则使用原模型的 Yes/No logits。该头只针对 192×192、白底、左红右蓝的合成双柱图及两个英文问题训练；不要把结果当作通用读图能力或校准概率。
+
+默认状态在被 Git 忽略的 `artifacts/rsi/`；可用全局 `--state` 改目录。`progress.json`、候选和每轮报告可以审计；`active.json` 指向晋级候选，`previous.json` 保留前一个指针。候选文件和训练恢复数据经过哈希校验，写入使用临时文件与原子替换。中途让出时丢弃当前未完成的轮次，下一次从最后一个完整轮次继续。更换模型文件后旧状态不会被当作新模型的训练结果或读图头。
+
+每轮报告的 `promotion_finalized` 为 `false` 表示进程在晋级决定的记录完成前退出；此时需要结合 `active.json` 查看当前状态。恢复训练不会自动重新晋级旧候选，因此显式回滚不会被恢复逻辑撤销。
+
+## 实际循环
+
+1. 按数值对的无序家族划分训练、开发和测试集，镜像图不跨集合。根据此前已核验样本上的读图错误抽取训练家族，保留 20% 探索预算并限制权重。
+2. 冻结 LFM3 根据请求输出严格 JSON 图表描述。可信渲染器绘制双柱图，独立像素检查器验证描述和图片；不执行模型产生的任意代码。每个通过的样本再构造左右交换的反事实，标签由实际柱高计算。
+3. 从冻结 LFM3 提取图片与问题对应的隐藏状态和 Yes/No logits，使用有界回放集进行完整批次的逻辑回归梯度更新。每次新轮从现用头或上一候选继续，验证模型文件在轮次期间没有改变。
+4. 开发集必须相对原模型及当前头提高至少 5% 的样本数，两个问题各自不能退步，才能在**本实验读图入口**晋级。测试集单独记录，不参与门槛或采样。当前开发集仅 24 个问题，门槛只能阻止明显退步，不能证明统计显著或分布外泛化；训练发生也不代表能力已经提升。
+
+每轮默认选 6 个训练家族、训练 100 次、最多保存 256 条回放样本。失败描述不会成为训练数据；候选读图头即使未晋级仍可供后续轮次继续训练。
+
+## 闲时边界
+
+在 macOS 上，`watch` 等待连续 5 分钟没有键鼠事件、连接交流电、低电量模式关闭、热状态正常、内存压力正常、可用磁盘至少 5 GiB，且没有检测到本项目常见模型进程；任一信号不可得时不准入。运行期间每 500 ms 重新检查，条件变化后在模型和训练的可取消边界让出；`read` 使用同状态目录中的前台租约发出让出请求。`DDUST_RUN_REGISTRY` 所在目录的 `mps.lock`（或默认 ddust 锁）若存在也会参与协作锁定。
+
+这些锁只约束实现了相同协议的进程。现有 Makepad、API 和其它应用没有共同的设备租约，进程名扫描也不能识别所有 GPU 工作；用户返回后的释放时间和对前台延迟的影响尚未完成压力验证。模块不会安装登录启动项；其它系统上的自动闲时准入因信号未知而保持等待。

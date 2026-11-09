@@ -29,6 +29,10 @@ static NSURL *selection(NSSavePanel *panel, SEL selector) {
     return selected;
 }
 
+static NSArray<NSURL *> *selections(NSOpenPanel *panel, SEL selector) {
+    return selected ? @[selected] : @[];
+}
+
 __attribute__((constructor)) static void install(void) {
     if (!getenv("R2T2_PICKER_TEST_PLAN")) return;
     for (Class cls in @[NSSavePanel.class, NSOpenPanel.class]) {
@@ -37,4 +41,6 @@ __attribute__((constructor)) static void install(void) {
         class_replaceMethod(cls, @selector(URL), (IMP)selection,
                             method_getTypeEncoding(class_getInstanceMethod(cls, @selector(URL))));
     }
+    class_replaceMethod(NSOpenPanel.class, @selector(URLs), (IMP)selections,
+                        method_getTypeEncoding(class_getInstanceMethod(NSOpenPanel.class, @selector(URLs))));
 }

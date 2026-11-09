@@ -8,6 +8,9 @@ struct Args {
     port: u16,
     #[arg(long, default_value = "models/Confucius4-R2T2")]
     asr_model: PathBuf,
+    /// Directory containing the LFM3 Omni checkpoint and audio tokenizer.
+    #[arg(long, default_value = "models/LFM3-Omni-2B")]
+    lfm3_model: PathBuf,
     #[arg(long, default_value = "models/Breeze-TTS-2")]
     tts_model: PathBuf,
     #[arg(long, default_value = "models/Hy-MT2-7B")]
@@ -64,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     std::fs::create_dir_all(&args.output)?;
     let paths = ModelPaths {
+        lfm3: args.lfm3_model,
         asr: args.asr_model,
         tts: args.tts_model,
         translation: args.translation_model,

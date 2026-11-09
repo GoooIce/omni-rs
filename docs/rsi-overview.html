@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RSI 流程总览 · omni-rs</title>
+  <style>
+    :root {
+      --ink: #1d302f;
+      --muted: #647572;
+      --paper: #f4f6f2;
+      --surface: #fff;
+      --line: #dce4de;
+      --green: #236b5b;
+      --green-soft: #e7f2eb;
+      --orange: #a8502e;
+      --orange-soft: #fbede5;
+      --gold: #8e691d;
+      --gold-soft: #f7f0dd;
+      --shadow: 0 12px 36px rgba(39, 68, 56, .055);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-size: 14px; line-height: 1.6; }
+    button, code { font: inherit; }
+    button { color: inherit; }
+    a { color: inherit; text-decoration-color: #a6b6ad; text-underline-offset: 3px; }
+    a:hover { color: var(--green); }
+    button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px solid #81bba5; outline-offset: 3px; }
+    .topbar { border-bottom: 1px solid var(--line); background: rgba(255, 255, 255, .84); }
+    .topbar-inner, main, footer { width: min(1500px, calc(100% - 72px)); margin: auto; }
+    .topbar-inner { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 760; letter-spacing: -.03em; font-size: 16px; }
+    .brand-mark { width: 27px; height: 27px; display: grid; place-items: center; background: var(--ink); color: #e8f4e7; border-radius: 8px; font: 700 13px/1 ui-monospace, SFMono-Regular, monospace; }
+    .brand small { color: #99a6a0; font-size: 13px; font-weight: 500; letter-spacing: 0; }
+    .top-links { display: flex; gap: 24px; color: #667873; font-size: 12px; }
+    .top-links a { text-decoration: none; }
+    main { padding: 31px 0 52px; }
+    .intro { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .eyebrow { display: flex; align-items: center; gap: 9px; color: var(--green); font-size: 11px; font-weight: 750; letter-spacing: .11em; text-transform: uppercase; }
+    .eyebrow:before { content: ""; width: 17px; height: 2px; background: #6aab8b; }
+    h1 { margin: 7px 0 3px; font-size: clamp(27px, 3vw, 36px); line-height: 1.22; letter-spacing: -.055em; }
+    .intro p { margin: 0; color: var(--muted); font-size: 13px; }
+    .snapshot { flex: none; color: #7b8b84; font-size: 12px; text-align: right; }
+    .snapshot strong { display: block; color: #52655d; font-weight: 650; }
+    .summary { display: grid; grid-template-columns: 1fr 1fr 1fr; margin-bottom: 19px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+    .summary-item { display: flex; align-items: center; gap: 13px; min-width: 0; padding: 13px 18px; }
+    .summary-item + .summary-item { border-left: 1px solid #edf0ed; }
+    .summary-symbol { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 9px; font-size: 15px; font-weight: 700; flex: none; }
+    .summary-symbol.chart { background: var(--green-soft); color: var(--green); }
+    .summary-symbol.speech { background: var(--orange-soft); color: var(--orange); }
+    .summary-symbol.idle { background: #edf1ef; color: #697d75; }
+    .summary-label { color: #788982; font-size: 11px; line-height: 1.3; }
+    .summary-value { margin-top: 2px; font-weight: 690; font-size: 13px; line-height: 1.35; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 312px; gap: 16px; align-items: start; }
+    .board, .inspector { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+    .board { min-width: 0; overflow: hidden; }
+    .board-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 17px 21px; border-bottom: 1px solid #edf1ed; }
+    .section-title { display: flex; align-items: center; gap: 9px; margin: 0; font-size: 14px; font-weight: 750; letter-spacing: -.015em; }
+    .section-title:before { content: ""; width: 6px; height: 6px; background: var(--green); border-radius: 50%; }
+    .board-hint { color: #85938d; font-size: 11px; white-space: nowrap; }
+    .board-body { padding: 16px 20px 19px; }
+    .scheduler { width: 100%; display: flex; gap: 13px; align-items: center; text-align: left; padding: 13px 15px; cursor: pointer; background: #f2f7f2; border: 1px solid #dbe9de; border-radius: 10px; transition: border-color .15s, background .15s; }
+    .scheduler:hover, .scheduler[aria-pressed="true"] { border-color: #8cbaa1; background: #eaf4eb; }
+    .scheduler-icon { display: grid; place-items: center; width: 34px; height: 34px; color: var(--green); background: #dceee0; border-radius: 9px; flex: none; }
+    .scheduler-copy { flex: 1; min-width: 0; }
+    .scheduler-copy strong { display: block; font-size: 13px; line-height: 1.4; }
+    .scheduler-copy span { display: block; margin-top: 2px; font-size: 11px; color: #687d70; }
+    .scheduler-tag { flex: none; color: #547d65; font-size: 10px; font-weight: 700; border: 1px solid #c5dfca; padding: 3px 8px; border-radius: 5px; }
+    .fork { height: 19px; margin-left: 30px; border-left: 1px dashed #bdcfc2; }
+    .lane { position: relative; padding: 13px 14px 9px; border: 1px solid #e6ede7; border-radius: 10px; background: #fbfcfa; }
+    .lane + .lane { margin-top: 12px; }
+    .lane-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 11px; }
+    .lane-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .lane-name h3 { margin: 0; font-size: 13px; line-height: 1.3; }
+    .lane-name p { margin: 0; color: #889790; font-size: 10px; }
+    .lane-marker { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 7px; background: var(--green-soft); color: var(--green); font-size: 12px; font-weight: 800; flex: none; }
+    .speech-lane .lane-marker { color: var(--orange); background: var(--orange-soft); }
+    .lane-badge { border-radius: 5px; color: #8c6d2e; background: #f6f0de; padding: 3px 7px; font-size: 10px; white-space: nowrap; }
+    .steps { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 11px; }
+    .step { min-height: 91px; min-width: 0; position: relative; padding: 10px 8px; border: 1px solid #e2e9e2; border-radius: 8px; background: white; text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s; }
+    .step:not(:last-child):after { position: absolute; content: "→"; z-index: 2; right: -10px; top: 32px; width: 9px; color: #aebeb3; font-size: 12px; line-height: 18px; text-align: center; pointer-events: none; }
+    .step:hover { border-color: #9fc9b1; transform: translateY(-2px); }
+    .step[aria-pressed="true"] { border-color: #72ae8e; box-shadow: 0 0 0 2px #e4f2e7; }
+    .speech-lane .step:hover, .speech-lane .step[aria-pressed="true"] { border-color: #d99974; }
+    .speech-lane .step[aria-pressed="true"] { box-shadow: 0 0 0 2px #faede5; }
+    .step-index { display: block; margin-bottom: 5px; color: #88a18f; font: 700 10px/1.3 ui-monospace, SFMono-Regular, monospace; }
+    .speech-lane .step-index { color: #bf8b6d; }
+    .step strong { display: block; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+    .step span:last-child { display: block; margin-top: 4px; color: #83938a; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+    .feedback { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: #7f9086; font-size: 10px; }
+    .feedback:before { content: "↶"; font-size: 16px; line-height: 1; color: #7ba68c; }
+    .feedback:after { content: ""; flex: 1; border-top: 1px dashed #d8e3da; }
+    .speech-lane .feedback:before { color: #c58a69; }
+    .inspector { position: sticky; top: 16px; overflow: hidden; }
+    .inspector-head { display: flex; align-items: center; justify-content: space-between; padding: 17px 18px; border-bottom: 1px solid #edf1ed; }
+    .inspector-head span { color: #9aa8a0; font-size: 10px; }
+    .back-link { display: none; color: #688879; font-size: 11px; text-decoration: none; }
+    .inspector-content { padding: 19px; }
+    .detail-kicker { margin: 0 0 6px; color: var(--green); font: 700 10px/1.4 ui-monospace, SFMono-Regular, monospace; letter-spacing: .08em; }
+    .detail-title { margin: 0 0 8px; font-size: 20px; line-height: 1.3; letter-spacing: -.04em; }
+    .detail-lead { margin: 0; color: #5f7167; font-size: 12px; line-height: 1.75; }
+    .detail-rule { margin: 17px 0; border: 0; border-top: 1px solid #edf1ed; }
+    .detail-list { display: grid; gap: 14px; margin: 0; }
+    .detail-list dt { color: #91a098; font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+    .detail-list dd { margin: 4px 0 0; color: #40544a; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+    .detail-note { margin: 18px 0 0; padding: 10px 11px; color: #786236; background: #faf5e8; border-left: 2px solid #d9b768; border-radius: 0 6px 6px 0; font-size: 11px; line-height: 1.65; }
+    .lower { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; margin-top: 16px; }
+    .lower-panel { border: 1px solid var(--line); border-radius: 12px; background: white; padding: 19px 20px; }
+    .lower-panel > p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+    .comparison { display: grid; grid-template-columns: 1fr 1fr; margin-top: 15px; gap: 13px; }
+    .comparison-block { border-top: 2px solid #91bca1; padding-top: 9px; }
+    .comparison-block.missing { border-color: #d6c8ac; }
+    .comparison-block strong { display: block; font-size: 12px; }
+    .comparison-block p { margin: 5px 0 0; color: #72827a; font-size: 11px; line-height: 1.65; }
+    .evidence { list-style: none; margin: 11px 0 0; padding: 0; }
+    .evidence li { padding: 7px 0; color: #6a7b72; font-size: 11px; }
+    .evidence li + li { border-top: 1px solid #f0f3ef; }
+    .evidence strong { color: #344b3f; }
+    details.commands { margin-top: 16px; border: 1px solid var(--line); border-radius: 10px; background: #fdfefd; }
+    details.commands summary { padding: 12px 16px; cursor: pointer; color: #52675b; font-size: 12px; font-weight: 700; }
+    .command-body { padding: 0 16px 15px; }
+    .command-body p { margin: 0 0 8px; color: #7c8a82; font-size: 11px; }
+    pre { max-width: 100%; overflow: auto; margin: 0; padding: 12px; border-radius: 7px; background: #23362f; color: #e5f1e8; font: 11px/1.65 ui-monospace, SFMono-Regular, monospace; }
+    footer { display: flex; justify-content: space-between; gap: 15px; padding: 0 0 28px; color: #91a097; font-size: 11px; }
+    footer nav { display: flex; gap: 18px; flex-wrap: wrap; }
+    @media (max-width: 1150px) {
+      .workspace { grid-template-columns: minmax(0, 1fr) 270px; }
+      .board-body { padding-inline: 14px; }
+      .lane { padding-inline: 10px; }
+      .steps { gap: 8px; }
+      .step { padding-inline: 6px; }
+      .step:not(:last-child):after { right: -8px; width: 7px; }
+    }
+    @media (max-width: 960px) {
+      .workspace { grid-template-columns: 1fr; }
+      .inspector { position: static; }
+      .inspector-head > span { display: none; }
+      .back-link { display: inline; }
+      .detail-list { grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    }
+    @media (max-width: 640px) {
+      .topbar-inner, main, footer { width: calc(100% - 32px); }
+      .topbar-inner { min-height: 54px; }
+      .top-links { gap: 14px; font-size: 11px; }
+      .brand small { display: none; }
+      main { padding-top: 24px; }
+      .intro { align-items: start; flex-direction: column; gap: 10px; }
+      .snapshot { text-align: left; font-size: 11px; }
+      .snapshot strong { display: inline; margin-right: 5px; }
+      .summary { grid-template-columns: 1fr; }
+      .summary-item { padding: 10px 13px; }
+      .summary-item + .summary-item { border-left: 0; border-top: 1px solid #edf0ed; }
+      .board-head { align-items: start; flex-direction: column; gap: 3px; }
+      .board-hint { white-space: normal; }
+      .scheduler { align-items: start; }
+      .scheduler-tag { display: none; }
+      .lane-head { align-items: start; }
+      .lane-name { align-items: start; }
+      .lane-name p { display: none; }
+      .steps { grid-template-columns: 1fr; gap: 10px; }
+      .step { display: grid; grid-template-columns: 74px minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 6px; min-height: 61px; padding: 8px 9px; }
+      .step-index, .step span:last-child { margin: 0; }
+      .step:not(:last-child):after { content: "↓"; top: auto; right: calc(50% - 7px); bottom: -14px; width: 14px; }
+      .detail-list { grid-template-columns: 1fr; gap: 13px; }
+      .lower { grid-template-columns: 1fr; }
+      footer { flex-direction: column; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *:before, *:after { transition: none !important; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">o</span> omni-rs <small>/ 实验工作台</small></div>
+      <nav class="top-links" aria-label="页面导航"><a href="#flow">流程总览</a><a href="#boundaries">实现边界</a><a href="#evidence">验证记录</a></nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="intro">
+      <div><div class="eyebrow">Recursive self-improvement</div><h1>闲时 RSI 流程总览</h1><p>两条受控实验路径，训练和评估使用闲时调度；点击节点查看输入、处理和边界。</p></div>
+      <div class="snapshot"><strong>本机验证快照 · 2026.11.09 18:44</strong>静态页面，状态不自动刷新</div>
+    </div>
+
+    <section class="summary" aria-label="最近的验证结果">
+      <div class="summary-item"><span class="summary-symbol chart" aria-hidden="true">▥</span><div><div class="summary-label">图表读图实验</div><div class="summary-value">开发集 20 / 24，候选未晋级</div></div></div>
+      <div class="summary-item"><span class="summary-symbol speech" aria-hidden="true">∿</span><div><div class="summary-label">中文语音实验</div><div class="summary-value">27 次更新，四次验收未通过</div></div></div>
+      <div class="summary-item"><span class="summary-symbol idle" aria-hidden="true">◷</span><div><div class="summary-label">闲时调度</div><div class="summary-value">需要手动启动，不自动常驻</div></div></div>
+    </section>
+
+    <div class="workspace" id="flow">
+      <section class="board" aria-labelledby="flow-title">
+        <div class="board-head"><h2 class="section-title" id="flow-title">当前实现</h2><span class="board-hint">点击节点，查看步骤详情</span></div>
+        <div class="board-body">
+          <button class="scheduler" type="button" data-node="scheduler" aria-pressed="true" aria-controls="detail-content">
+            <span class="scheduler-icon" aria-hidden="true"><svg width="19" height="19" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.7"/><path d="M12 7.5V12l3 2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+            <span class="scheduler-copy"><strong>闲时准入与让出</strong><span>连续空闲 5 分钟 · 电源、温度、内存、磁盘与设备检查</span></span><span class="scheduler-tag">手动启动</span>
+          </button>
+          <div class="fork" aria-hidden="true"></div>
+
+          <section class="lane chart-lane" aria-labelledby="chart-title">
+            <div class="lane-head"><div class="lane-name"><span class="lane-marker" aria-hidden="true">Ⅰ</span><div><h3 id="chart-title">图表读图</h3><p>固定样式双柱图 · 受控样本循环</p></div></div><span class="lane-badge">候选未晋级</span></div>
+            <div class="steps">
+              <button class="step" type="button" data-node="chart-plan" aria-pressed="false" aria-controls="detail-content"><span class="step-index">01 / PLAN</span><strong>弱项采样</strong><span>根据读图错误<br>选择样本家族</span></button>
+              <button class="step" type="button" data-node="chart-write" aria-pressed="false" aria-controls="detail-content"><span class="step-index">02 / WRITE</span><strong>图表描述</strong><span>冻结 LFM3<br>输出受限 JSON</span></button>
+              <button class="step" type="button" data-node="chart-verify" aria-pressed="false" aria-controls="detail-content"><span class="step-index">03 / VERIFY</span><strong>渲染与核验</strong><span>可信绘图<br>检查像素及标签</span></button>
+              <button class="step" type="button" data-node="chart-train" aria-pressed="false" aria-controls="detail-content"><span class="step-index">04 / TRAIN</span><strong>训练读图头</strong><span>冻结模型特征<br>更新独立小头</span></button>
+              <button class="step" type="button" data-node="chart-gate" aria-pressed="false" aria-controls="detail-content"><span class="step-index">05 / GATE</span><strong>开发集门槛</strong><span>比较基线与现用头<br>按题型防退步</span></button>
+              <button class="step" type="button" data-node="chart-use" aria-pressed="false" aria-controls="detail-content"><span class="step-index">06 / USE</span><strong>实验入口</strong><span>通过才可用于<br>专用读图命令</span></button>
+            </div>
+            <div class="feedback">读图错误反馈给下一轮采样；未晋级的候选仍可继续训练</div>
+          </section>
+
+          <section class="lane speech-lane" aria-labelledby="speech-title">
+            <div class="lane-head"><div class="lane-name"><span class="lane-marker" aria-hidden="true">Ⅱ</span><div><h3 id="speech-title">中文语音</h3><p>种子单独准备 · 闲时训练和验收</p></div></div><span class="lane-badge">尚无已验收候选</span></div>
+            <div class="steps">
+              <button class="step" type="button" data-node="speech-seeds" aria-pressed="false" aria-controls="detail-content"><span class="step-index">01 / SEED</span><strong>种子题目</strong><span>预先划分<br>训练、开发、测试</span></button>
+              <button class="step" type="button" data-node="speech-generate" aria-pressed="false" aria-controls="detail-content"><span class="step-index">02 / GENERATE</span><strong>中文文字与语音</strong><span>冻结 LFM3 回答<br>Breeze 中文 TTS</span></button>
+              <button class="step" type="button" data-node="speech-verify" aria-pressed="false" aria-controls="detail-content"><span class="step-index">03 / VERIFY</span><strong>独立核验</strong><span>编解码对齐<br>R2T2 识别中文</span></button>
+              <button class="step" type="button" data-node="speech-train" aria-pressed="false" aria-controls="detail-content"><span class="step-index">04 / TRAIN</span><strong>训练语音 LoRA</strong><span>冻结底座<br>学习语音码</span></button>
+              <button class="step" type="button" data-node="speech-gate" aria-pressed="false" aria-controls="detail-content"><span class="step-index">05 / GATE</span><strong>生成音频验收</strong><span>开发集实际发声<br>独立识别与比较</span></button>
+              <button class="step" type="button" data-node="speech-use" aria-pressed="false" aria-controls="detail-content"><span class="step-index">06 / STAGE</span><strong>保存候选</strong><span>通过才保存<br>待后续验证</span></button>
+            </div>
+            <div class="feedback">未通过则不发布候选；保留完整检查点，后续可续训</div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="inspector" aria-label="步骤详情">
+        <div class="inspector-head"><h2 class="section-title">步骤详情</h2><span>点击流程节点切换</span><a class="back-link" href="#flow">返回流程 ↑</a></div>
+        <div class="inspector-content" id="detail-content" aria-live="polite" aria-atomic="true">
+          <p class="detail-kicker">SHARED / SCHEDULER</p>
+          <h3 class="detail-title">闲时准入与让出</h3>
+          <p class="detail-lead">两个实验分别使用 watch 命令。调度器等待安全的本机闲时条件，再开始实验工作。</p>
+          <hr class="detail-rule">
+          <dl class="detail-list"><div><dt>准入条件</dt><dd>连续 5 分钟无键鼠输入；连接交流电、低电量模式关闭、温度和内存正常、磁盘至少 5 GiB，且未检测到已知冲突进程。</dd></div><div><dt>运行与恢复</dt><dd>约每 500 ms 检查一次；用户返回或协作前台任务请求设备时让出。图表以完整轮次恢复，语音从完整更新检查点续训。</dd></div><div><dt>启动方式</dt><dd>手动执行 watch 或 speech-watch；Ctrl-C 后不会自动重启。中文语音的种子准备与核验是独立步骤。</dd></div></dl>
+          <p class="detail-note">进程扫描和锁不能覆盖所有 GPU 应用，当前没有全系统前台延迟保证。</p>
+        </div>
+      </aside>
+    </div>
+
+    <div class="lower">
+      <section class="lower-panel" id="boundaries"><h2 class="section-title">与完整 RSI 的距离</h2><p>现在是两个局部实验闭环，尚未复现论文中的联合能力演化。</p><div class="comparison"><div class="comparison-block"><strong>已经实现</strong><p>可信样本核验、真实参数更新、独立开发集门槛、检查点与受控恢复。</p></div><div class="comparison-block missing"><strong>仍然缺少</strong><p>图像生成器训练与导出、通用读写底座训练、语音 LoRA 的原生加载，以及足够规模的跨模态回归。</p></div></div></section>
+      <section class="lower-panel" id="evidence"><h2 class="section-title">本机验证记录</h2><ul class="evidence"><li><strong>图表：</strong>三轮候选和原模型均为 20 / 24，暂无晋级或读图提升证据。</li><li><strong>语音：</strong>6 条训练、2 条开发、3 条测试样本通过核验；累计 27 次更新，四次生成验收均未通过。</li><li><strong>已知现象：</strong>官方中文 TTS 可说中文，普通语音对话的中文语音仍需改善。</li></ul></section>
+    </div>
+
+    <details class="commands"><summary>查看本机命令</summary><div class="command-body"><p>在项目根目录执行。下面的 status 只查询状态；启动训练及依赖准备见对应文档。</p><pre><code>target/minicpm-v-cpu/debug/omni-rsi --state artifacts/chinese-speech/idle-r2t2 status</code></pre></div></details>
+  </main>
+
+  <footer><span>omni-rs · 实验流程与验证记录</span><nav aria-label="资料来源"><a href="idle-rsi.md">图表实验文档 ↗</a><a href="chinese-speech-rsi.md">中文语音文档 ↗</a><a href="../VALIDATION.md">验证记录 ↗</a><a href="research/rsi-2610-03002.md">论文调研 ↗</a><a href="https://arxiv.org/abs/2610.03002">论文原文 ↗</a></nav></footer>
+
+  <script>
+    const nodes = {
+      scheduler: {
+        kicker: 'SHARED / SCHEDULER', title: '闲时准入与让出',
+        lead: '两个实验分别使用 watch 命令。调度器等待安全的本机闲时条件，再开始实验工作。',
+        fields: [['准入条件', '连续 5 分钟无键鼠输入；连接交流电、低电量模式关闭、温度和内存正常、磁盘至少 5 GiB，且未检测到已知冲突进程。'], ['运行与恢复', '约每 500 ms 检查一次；用户返回或协作前台任务请求设备时让出。图表以完整轮次恢复，语音从完整更新检查点续训。'], ['启动方式', '手动执行 watch 或 speech-watch；Ctrl-C 后不会自动重启。中文语音的种子准备与核验是独立步骤。']],
+        note: '进程扫描和锁不能覆盖所有 GPU 应用，当前没有全系统前台延迟保证。'
+      },
+      'chart-plan': {
+        kicker: 'CHART / 01', title: '弱项采样', lead: '依据已经核验样本上的读图错误，选择下一轮需要练习的数据。',
+        fields: [['输入', '固定样式的双柱图题目，训练、开发、测试按数值对家族预先划分。'], ['策略', '大部分预算偏向读错的家族，同时保留 20% 探索；单家族权重有上限。'], ['输出', '下一轮受限图表规格，不把测试集用于采样。']],
+        note: '反馈来自读图错误；图像生成器的失败诊断目前尚未接入。'
+      },
+      'chart-write': {
+        kicker: 'CHART / 02', title: '生成图表描述', lead: '冻结的 LFM3 将样本请求写成受限的图表描述。',
+        fields: [['输入', '采样得到的双柱图规格。'], ['处理', '模型输出严格 JSON；执行侧只接受有限字段和允许的取值。'], ['输出', '可交给可信渲染器的描述。格式错误或不符合约束的描述会被拒绝。']],
+        note: '这里不执行模型生成的任意代码，也不训练写者底座。'
+      },
+      'chart-verify': {
+        kicker: 'CHART / 03', title: '渲染与独立核验', lead: '只有实际图像与描述匹配的样本才能进入训练。',
+        fields: [['处理', '可信渲染器绘制白底、左红右蓝的 192 × 192 双柱图；像素检查器核对图像与规格。'], ['标签', '构造左右交换的反事实图，答案由实际柱高计算，覆盖“左边是否更高”和“是否至少两倍高”。'], ['输出', '通过校验的图像、问题及标签；失败样本不会成为训练数据。']],
+        note: '核验针对固定图表领域，不能外推为通用图像理解。'
+      },
+      'chart-train': {
+        kicker: 'CHART / 04', title: '训练独立读图头', lead: '冻结 LFM3 提取图像与问题的特征，只更新轻量残差读图头。',
+        fields: [['输入', '经过核验的新样本及有界历史回放。'], ['训练', '基于 2048 维隐藏状态及原模型 Yes/No logits，进行逻辑回归梯度更新。'], ['保存', '记录模型指纹、回放摘要及不可变候选；中断时从上一个完整轮次继续。']],
+        note: '模型底座保持冻结，实际更新的是该实验专用的小头。'
+      },
+      'chart-gate': {
+        kicker: 'CHART / 05', title: '开发集晋级门槛', lead: '对照原模型和当前现用头，检查候选是否真的改善。',
+        fields: [['验收', '候选相对原模型及当前头都需提升至少 5% 的样本数，两个问题类型各自不能退步。'], ['隔离', '测试集单独记录，不参与采样或晋级决定。'], ['已测结果', '三轮候选及原模型均为 20 / 24，未达到晋级条件。']],
+        note: '开发集只有 24 个问题，不足以证明统计显著或跨领域泛化。'
+      },
+      'chart-use': {
+        kicker: 'CHART / 06', title: '仅限实验入口', lead: '通过门槛的读图头可在专用命令中使用，并可回滚。',
+        fields: [['通过时', '实验状态中的现用指针切换到候选；omni-rsi read 在模型指纹匹配时使用该头。'], ['未通过时', '保留原有现用头；候选可供后续轮次继续训练。'], ['范围', '只适用于此固定双柱图和两个问题，不会接入普通对话、Makepad 或 API。']],
+        note: '当前没有经过门槛晋级的候选。'
+      },
+      'speech-seeds': {
+        kicker: 'SPEECH / 01', title: '预先划分种子题目', lead: '先固定问题集合及其用途，再生成中文回答和语音。',
+        fields: [['本机快照', '新教师数据中 6 条训练、2 条开发和 3 条测试样本通过了核验。'], ['划分原则', '训练题用于梯度更新，开发题用于比较候选；测试题不用于训练或选择模型。'], ['执行时机', '种子准备是独立的数据准备步骤，不由 speech-watch 自动生成。']],
+        note: '种子集规模很小，内置题目不会自动扩展。'
+      },
+      'speech-generate': {
+        kicker: 'SPEECH / 02', title: '生成中文回答与语音', lead: '用冻结的 LFM3 制作种子问题对应的文字与语音数据。',
+        fields: [['文字', '冻结的 LFM3 先生成简短中文回答。'], ['语音', '项目内的 Breeze-TTS-2 用普通话朗读，再通过 LFM3 的 LiquidCodec 编码并重解码为训练目标。'], ['产物', '保留 Breeze 源波形、LFM3 语音码和重解码波形，记录教师与模型指纹。']],
+        note: 'LFM3 官方中文 TTS 也可说中文；普通交错语音对话仍有输出不一致的问题。'
+      },
+      'speech-verify': {
+        kicker: 'SPEECH / 03', title: '独立核验样本', lead: '不把模型自己生成的音频直接当作正确答案。',
+        fields: [['波形核验', '将 Breeze 源音频重编码并与保存的语音码对齐，再解码与目标波形逐样本核对。'], ['内容核验', '项目内 R2T2 转写目标音频；要求至少两个汉字、汉字占转写字母数字的 80% 及以上，内容相似度至少 0.75。'], ['输出', '仅将通过核验的样本送入对应数据分组；记录 ASR 模型与执行文件指纹。']],
+        note: 'R2T2 不提供可用的语言置信度；这里不虚构概率。自动转写仍可能误判。'
+      },
+      'speech-train': {
+        kicker: 'SPEECH / 04', title: '训练语音 LoRA', lead: '训练只改独立的少量参数，原始权重保持不变。',
+        fields: [['训练目标', '在官方 PyTorch 模型上计算语音码内容损失；冻结底座，只训练最后一层秩 4 LoRA。'], ['检查点', '每个完整更新保存 LoRA、优化器和数据游标，校验模型、数据、ASR 与训练代码指纹。'], ['本机实测', '累计完成 27 次更新；四个训练 epoch 已评估，下一 epoch 已完成 3 条训练样本。']],
+        note: '参数得到更新或损失下降，并不代表生成语音已经改善。'
+      },
+      'speech-gate': {
+        kicker: 'SPEECH / 05', title: '实际生成音频验收', lead: '每个完整 epoch 都让原模型与候选回答开发问题，并独立识别实际声音。',
+        fields: [['通过条件', '候选必须正常结束、音频足够长、R2T2 转写符合中文比例与内容门槛；至少在一个基线未通过的问题上通过。'], ['隔离', '测试集不用于训练或开发集选取。'], ['本机实测', '四次验收均未通过：第四次一个候选正常结束但未识别出中文，另一个候选未正常结束。']],
+        note: '小开发集和自动识别只能用于保守筛选，还需要更多独立测试。'
+      },
+      'speech-use': {
+        kicker: 'SPEECH / 06', title: '保存待验证候选', lead: '候选通过开发门槛后才保存为独立文件，供后续测试。',
+        fields: [['通过时', '保存 candidate-<epoch>.pt，不覆盖底座，也不自动部署。'], ['未通过时', '不发布候选；保留已完成的训练检查点，之后可续训。'], ['后续工作', '需要未接触测试集、英文和多模态回归，以及将 LoRA 导出并加载到 Rust 的验证。']],
+        note: '当前候选未通过生成门槛，尚未接入 Makepad、API 或原生 LFM3。'
+      }
+    };
+
+    const detail = document.getElementById('detail-content');
+    const buttons = [...document.querySelectorAll('[data-node]')];
+    function appendText(parent, tag, className, value) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      element.textContent = value;
+      parent.appendChild(element);
+      return element;
+    }
+    function showNode(id) {
+      const node = nodes[id];
+      if (!node) return;
+      buttons.forEach(button => button.setAttribute('aria-pressed', String(button.dataset.node === id)));
+      detail.replaceChildren();
+      appendText(detail, 'p', 'detail-kicker', node.kicker);
+      appendText(detail, 'h3', 'detail-title', node.title);
+      appendText(detail, 'p', 'detail-lead', node.lead);
+      appendText(detail, 'hr', 'detail-rule', '');
+      const list = appendText(detail, 'dl', 'detail-list', '');
+      node.fields.forEach(([label, value]) => {
+        const item = document.createElement('div');
+        appendText(item, 'dt', '', label);
+        appendText(item, 'dd', '', value);
+        list.appendChild(item);
+      });
+      appendText(detail, 'p', 'detail-note', node.note);
+    }
+    buttons.forEach(button => button.addEventListener('click', () => {
+      showNode(button.dataset.node);
+      if (window.matchMedia('(max-width: 960px)').matches) {
+        document.querySelector('.inspector').scrollIntoView({ block: 'start', behavior: 'instant' });
+      }
+    }));
+  </script>
+</body>
+</html>

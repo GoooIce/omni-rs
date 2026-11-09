@@ -1,0 +1,4 @@
+[
+  {"role": "system", "content": "Perform TTS in Chinese using a female voice."},
+  {"role": "user", "content": "你好，我是一名人工智能助手，很高兴认识你。"}
+]

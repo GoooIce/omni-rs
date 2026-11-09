@@ -1,0 +1,81 @@
+{
+  "audio_encoder_config": {
+    "transformers_version": "5.21.0",
+    "architectures": null,
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": null,
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "problem_type": null,
+    "text_config": {
+      "architectures": null,
+      "output_hidden_states": false,
+      "return_dict": true,
+      "dtype": null,
+      "chunk_size_feed_forward": 0,
+      "is_encoder_decoder": false,
+      "id2label": {
+        "0": "LABEL_0",
+        "1": "LABEL_1"
+      },
+      "label2id": {
+        "LABEL_0": 0,
+        "LABEL_1": 1
+      },
+      "problem_type": null,
+      "vocab_size": 2,
+      "hidden_size": 16,
+      "intermediate_size": 32,
+      "num_hidden_layers": 3,
+      "num_attention_heads": 4,
+      "num_key_value_heads": 2,
+      "max_position_embeddings": 128000,
+      "initializer_range": 0.02,
+      "norm_eps": 1e-05,
+      "use_cache": true,
+      "pad_token_id": 0,
+      "bos_token_id": 1,
+      "eos_token_id": null,
+      "tie_word_embeddings": true,
+      "rope_parameters": {
+        "rope_type": "default",
+        "rope_theta": 1000000.0
+      },
+      "conv_bias": false,
+      "conv_L_cache": 3,
+      "block_multiple_of": 256,
+      "block_ffn_dim_multiplier": 1.0,
+      "block_auto_adjust_ff_dim": false,
+      "full_attn_idxs": null,
+      "layer_types": [
+        "conv",
+        "full_attention",
+        "conv"
+      ],
+      "_name_or_path": "",
+      "sliding_window": 3,
+      "model_type": "lfm2",
+      "output_attentions": false
+    },
+    "num_mel_bins": 128,
+    "conv_channels": 4,
+    "hidden_size": 16,
+    "sliding_window": 3,
+    "initializer_range": 0.02,
+    "_name_or_path": "",
+    "model_type": "lfm3_omni_encoder",
+    "output_attentions": false
+  },
+  "text_config": {
+    "hidden_size": 24
+  }
+}
