@@ -22,6 +22,9 @@ burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+libc = "0.2"
+unicode-normalization = "0.1"
 minijinja = { version = "3.1", features = ["json", "preserve_order", "serde"] }
 minijinja-contrib = { version = "3.1", features = ["pycompat"] }
 clap = { version = "4.5", features = ["derive"], optional = true }

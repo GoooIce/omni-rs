@@ -1,7 +1,7 @@
 //! LFM3 hybrid convolution/attention language backbone.
 use crate::config::{Config, TextConfig};
 use burn::tensor::{
-    FloatDType, Tensor,
+    FloatDType, Tensor, TensorData,
     activation::{sigmoid, silu},
     backend::Backend,
     module,
@@ -57,6 +57,12 @@ pub(crate) struct ShortConv<B: Backend> {
     bias: Option<Tensor<B, 1>>,
     width: usize,
     kernel: usize,
+    lora: Option<ConvLoRA<B>>,
+}
+
+struct ConvLoRA<B: Backend> {
+    a: Linear<B>,
+    b: Linear<B>,
 }
 impl<B: Backend> ShortConv<B> {
     fn load(
@@ -104,6 +110,7 @@ impl<B: Backend> ShortConv<B> {
             },
             width,
             kernel,
+            lora: None,
         })
     }
     pub(crate) fn forward(
@@ -135,7 +142,15 @@ impl<B: Backend> ShortConv<B> {
             self.bias.clone(),
             ConvOptions::new([1], [0], [1], h),
         );
-        self.output.forward(c * convolved.swap_dims(1, 2))
+        let input = c * convolved.swap_dims(1, 2);
+        let base = self.output.forward(input.clone());
+        if let Some(lora) = &self.lora {
+            let dtype = tensor::dtype(&base);
+            let delta = lora.b.forward(lora.a.forward(input.cast(FloatDType::F32)));
+            base + delta.cast(dtype)
+        } else {
+            base
+        }
     }
 }
 
@@ -444,11 +459,70 @@ impl<B: Backend> TextModel<B> {
             layers,
         }
     }
+    /// Install explicitly supplied low-rank weights at a conversation boundary.
+    /// Callers must verify provenance and their candidate gate before invoking this method.
+    pub fn install_conv_lora(
+        &mut self,
+        layer: usize,
+        rank: usize,
+        a: &[f32],
+        b: &[f32],
+    ) -> Result<()> {
+        let width = self.config.hidden_size;
+        if rank == 0
+            || rank > 64
+            || rank > width
+            || width.checked_mul(rank) != Some(a.len())
+            || a.len() != b.len()
+            || a.iter().chain(b).any(|value| !value.is_finite())
+        {
+            return Err(Error::Config(
+                "invalid convolution LoRA dimensions or values".into(),
+            ));
+        }
+        let Some(Layer {
+            operator: Operator::Conv(conv),
+            ..
+        }) = self.layers.get_mut(layer)
+        else {
+            return Err(Error::Config(
+                "LoRA target must be a convolution layer".into(),
+            ));
+        };
+        let device = conv.weight.device();
+        let left = Tensor::<B, 2>::from_data(TensorData::new(a.to_vec(), [rank, width]), &device);
+        let right = Tensor::<B, 2>::from_data(TensorData::new(b.to_vec(), [width, rank]), &device);
+        conv.lora = Some(ConvLoRA {
+            a: Linear::from_parts(left, None),
+            b: Linear::from_parts(right, None),
+        });
+        self.id = NEXT_MODEL.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Restore the base layer and invalidate caches from the previous weights.
+    pub fn clear_conv_lora(&mut self, layer: usize) -> Result<()> {
+        let Some(Layer {
+            operator: Operator::Conv(conv),
+            ..
+        }) = self.layers.get_mut(layer)
+        else {
+            return Err(Error::Config(
+                "LoRA target must be a convolution layer".into(),
+            ));
+        };
+        if conv.lora.take().is_some() {
+            self.id = NEXT_MODEL.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
     pub fn embed_tokens(&self, ids: &[u32]) -> Result<Tensor<B, 3>> {
         self.embeddings.forward(ids)
     }
     pub fn vocab_size(&self) -> usize {
         self.config.vocab_size
+    }
+    pub fn hidden_size(&self) -> usize {
+        self.config.hidden_size
     }
     pub fn forward(&self, ids: &[u32], cache: &mut TextCache<B>) -> Result<Tensor<B, 3>> {
         self.forward_embeddings(self.embed_tokens(ids)?, cache)

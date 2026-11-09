@@ -79,9 +79,14 @@ enum Command {
         epochs: usize,
         #[arg(long, default_value_t = 5)]
         updates_per_round: usize,
+        /// Process explicitly queued speech and include verified samples at epoch boundaries.
+        #[arg(long)]
+        online: bool,
     },
     /// Read the latest scheduler state and active candidate identifier.
     Status,
+    /// Ask the active scheduler to yield and stop.
+    Stop,
     /// Restore the previous verified candidate after stopping the scheduler.
     Rollback,
     /// Classify a two-bar image with the current verified reader head.
@@ -191,6 +196,33 @@ fn foreground_clear(root: &Path) -> bool {
     )
 }
 
+fn stopping(root: &Path, shutdown: &AtomicBool) -> bool {
+    shutdown.load(Ordering::Acquire) || root.join("stop.request").exists()
+}
+
+fn speech_directory_count(root: &Path, name: &str) -> Result<usize, String> {
+    let entries = match std::fs::read_dir(root.join(name)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| {
+            name.len() == 64
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        }) && entry.file_type().map_err(|e| e.to_string())?.is_dir()
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn wait_for_device(root: &Path, stop: &AtomicBool) -> Result<Lease, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -246,6 +278,53 @@ struct SpeechWorker<'a> {
     python: &'a Path,
     epochs: usize,
     updates: usize,
+    online: bool,
+}
+
+fn run_online_ingest(
+    worker: &SpeechWorker<'_>,
+    state: &Path,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    let result_path = state.join("online-ingest.json");
+    let output = std::fs::File::create(&result_path).map_err(|e| e.to_string())?;
+    let log_path = state.join("worker.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| e.to_string())?;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("training/online_speech.py");
+    let mut command = ProcessCommand::new("uv");
+    command
+        .args(["run", "--offline", "--no-project", "--python"])
+        .arg(worker.python)
+        .args(["--with", "opencc-python-reimplemented", "python"])
+        .arg(script)
+        .arg("--state")
+        .arg(worker.root)
+        .arg("--data")
+        .arg(worker.data)
+        .arg("--model")
+        .arg(worker.model)
+        .arg("--asr")
+        .arg(worker.asr)
+        .arg("--asr-binary")
+        .arg(worker.asr_binary)
+        .env("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(log));
+    let status = child::run(command, stop, Duration::from_secs(10))?;
+    if !status.success() {
+        return Err(format!(
+            "online speech ingestion exited {status}; see {}",
+            log_path.display()
+        ));
+    }
+    let bytes = std::fs::read(result_path).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid online speech result: {e}"))
 }
 
 fn run_speech_worker(
@@ -261,9 +340,27 @@ fn run_speech_worker(
         python,
         epochs,
         updates,
+        online,
     } = *worker;
     let state = root.join("speech");
     std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
+    let ingestion = if online {
+        let directory = root.join("online-data");
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let queued =
+            speech_directory_count(root, "inbox")? + speech_directory_count(root, "processing")?;
+        let result = if queued == 0 {
+            json!({"state":"empty"})
+        } else {
+            run_online_ingest(worker, &state, stop)?
+        };
+        if speech_directory_count(root, "online-data")? == 0 {
+            return Ok(json!({"pending":true,"online":result}));
+        }
+        Some(result)
+    } else {
+        None
+    };
     let log_path = state.join("worker.log");
     let log = OpenOptions::new()
         .create(true)
@@ -296,6 +393,9 @@ fn run_speech_worker(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log));
+    if online {
+        command.arg("--online").arg(root.join("online-data"));
+    }
     let status = child::run(command, stop, Duration::from_secs(10))?;
     if !status.success() {
         return Err(format!(
@@ -309,19 +409,21 @@ fn run_speech_worker(
         .get("epoch")
         .and_then(serde_json::Value::as_u64)
         .is_some_and(|epoch| epoch >= epochs as u64);
-    Ok(json!({"complete":complete,"speech":progress}))
+    Ok(json!({"complete":complete,"speech":progress,"online":ingestion}))
 }
 
-fn watch<F>(
+fn watch<F, P>(
     root: &Path,
     rounds: usize,
     policy: IdlePolicy,
     shutdown: Arc<AtomicBool>,
     description: &str,
+    mut waiting_for_work: P,
     mut run_round: F,
 ) -> Result<(), String>
 where
     F: FnMut(&AtomicBool) -> Result<serde_json::Value, String>,
+    P: FnMut() -> Result<Option<&'static str>, String>,
 {
     if rounds == 0 || rounds > 1_000 {
         return Err("round count must be between 1 and 1000".into());
@@ -330,7 +432,21 @@ where
         .ok_or("an RSI scheduler is already running")?;
     let mut completed = 0;
     let mut last_detail = String::new();
-    while completed < rounds && !shutdown.load(Ordering::Acquire) {
+    while completed < rounds && !stopping(root, &shutdown) {
+        if let Some(detail) = waiting_for_work()? {
+            if detail != last_detail {
+                state_status(root, "waiting", detail, completed)?;
+                eprintln!("omni-rsi: waiting: {detail}");
+                last_detail = detail.into();
+            }
+            for _ in 0..5 {
+                if stopping(root, &shutdown) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            continue;
+        }
         let state = platform::snapshot(root);
         let blocker = policy
             .blocker(&state)
@@ -343,7 +459,7 @@ where
                 last_detail = blocker;
             }
             for _ in 0..10 {
-                if shutdown.load(Ordering::Acquire) {
+                if stopping(root, &shutdown) {
                     break;
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -369,7 +485,7 @@ where
         let check_policy = policy.clone();
         let check_shutdown = shutdown.clone();
         let watchdog = Watchdog::start(cancel.clone(), Duration::from_millis(500), move || {
-            !check_shutdown.load(Ordering::Acquire)
+            !stopping(&check_root, &check_shutdown)
                 && check_policy
                     .blocker(&platform::snapshot(&check_root))
                     .is_none()
@@ -388,6 +504,21 @@ where
         }
         match result {
             Ok(report) => {
+                if report.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+                    state_status(
+                        root,
+                        "waiting",
+                        "waiting for verified online speech",
+                        completed,
+                    )?;
+                    for _ in 0..5 {
+                        if stopping(root, &shutdown) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    continue;
+                }
                 completed += 1;
                 let complete =
                     report.get("complete").and_then(serde_json::Value::as_bool) == Some(true);
@@ -403,16 +534,18 @@ where
             }
         }
     }
-    state_status(
+    let stopped = stopping(root, &shutdown);
+    let result = state_status(
         root,
-        if shutdown.load(Ordering::Acquire) {
-            "stopped"
-        } else {
-            "complete"
-        },
+        if stopped { "stopped" } else { "complete" },
         "",
         completed,
-    )
+    );
+    let request = root.join("stop.request");
+    if request.exists() {
+        std::fs::remove_file(request).map_err(|e| e.to_string())?;
+    }
+    result
 }
 
 fn execute() -> Result<(), String> {
@@ -444,6 +577,7 @@ fn execute() -> Result<(), String> {
                 policy,
                 shutdown,
                 "verified chart reader round",
+                || Ok(None),
                 |stop| {
                     let report = run_one(&model, &store, &options, stop)?;
                     serde_json::to_value(report).map_err(|e| e.to_string())
@@ -459,6 +593,7 @@ fn execute() -> Result<(), String> {
             python,
             epochs,
             updates_per_round,
+            online,
         } => {
             if !model.is_dir()
                 || !data.is_dir()
@@ -486,6 +621,7 @@ fn execute() -> Result<(), String> {
                 python: &python,
                 epochs,
                 updates: updates_per_round,
+                online,
             };
             watch(
                 &args.state,
@@ -493,6 +629,17 @@ fn execute() -> Result<(), String> {
                 policy,
                 shutdown,
                 "Chinese speech adapter training",
+                || {
+                    if online
+                        && speech_directory_count(&args.state, "inbox")? == 0
+                        && speech_directory_count(&args.state, "processing")? == 0
+                        && speech_directory_count(&args.state, "online-data")? == 0
+                    {
+                        Ok(Some("waiting for verified online speech"))
+                    } else {
+                        Ok(None)
+                    }
+                },
                 |stop| run_speech_worker(&worker, stop),
             )
         }
@@ -522,6 +669,14 @@ fn execute() -> Result<(), String> {
                 "{}",
                 serde_json::to_string(&report).map_err(|e| e.to_string())?
             );
+            Ok(())
+        }
+        Command::Stop => {
+            let running = Lease::try_acquire(&args.state.join("runner.lock"))?.is_none();
+            if running {
+                atomic_write(&args.state.join("stop.request"), b"stop\n")?;
+            }
+            println!("{}", json!({"stop_requested":running}));
             Ok(())
         }
         Command::Status => {
@@ -572,6 +727,17 @@ fn execute() -> Result<(), String> {
                         .map_err(|e| e.to_string())?;
                 fields.insert("speech_progress".into(), progress);
             }
+            let last_ingestion = std::fs::read(args.state.join("speech/online-ingest.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            fields.insert("online_speech".into(), json!({
+                "queued":speech_directory_count(&args.state, "inbox")?,
+                "processing":speech_directory_count(&args.state, "processing")?,
+                "verified":speech_directory_count(&args.state, "online-data")?,
+                "rejected":speech_directory_count(&args.state, "rejected")?,
+                "candidate_packages":speech_directory_count(&args.state.join("speech"), "candidates")?,
+                "last_ingestion":last_ingestion,
+            }));
             println!("{}", value);
             Ok(())
         }

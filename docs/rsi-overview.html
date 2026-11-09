@@ -183,12 +183,12 @@
   <main>
     <div class="intro">
       <div><div class="eyebrow">Recursive self-improvement</div><h1>闲时 RSI 流程总览</h1><p>两条受控实验路径，训练和评估使用闲时调度；点击节点查看输入、处理和边界。</p></div>
-      <div class="snapshot"><strong>本机验证快照 · 2026.11.09 18:44</strong>静态页面，状态不自动刷新</div>
+      <div class="snapshot"><strong>本机验证快照 · 2026.11.10</strong>静态页面，状态不自动刷新</div>
     </div>
 
     <section class="summary" aria-label="最近的验证结果">
       <div class="summary-item"><span class="summary-symbol chart" aria-hidden="true">▥</span><div><div class="summary-label">图表读图实验</div><div class="summary-value">开发集 20 / 24，候选未晋级</div></div></div>
-      <div class="summary-item"><span class="summary-symbol speech" aria-hidden="true">∿</span><div><div class="summary-label">中文语音实验</div><div class="summary-value">27 次更新，四次验收未通过</div></div></div>
+      <div class="summary-item"><span class="summary-symbol speech" aria-hidden="true">∿</span><div><div class="summary-label">中文语音实验</div><div class="summary-value">真人语音候选 CER 43.6%，未通过</div></div></div>
       <div class="summary-item"><span class="summary-symbol idle" aria-hidden="true">◷</span><div><div class="summary-label">闲时调度</div><div class="summary-value">需要手动启动，不自动常驻</div></div></div>
     </section>
 
@@ -216,14 +216,14 @@
           </section>
 
           <section class="lane speech-lane" aria-labelledby="speech-title">
-            <div class="lane-head"><div class="lane-name"><span class="lane-marker" aria-hidden="true">Ⅱ</span><div><h3 id="speech-title">中文语音</h3><p>种子单独准备 · 闲时训练和验收</p></div></div><span class="lane-badge">尚无已验收候选</span></div>
+            <div class="lane-head"><div class="lane-name"><span class="lane-marker" aria-hidden="true">Ⅱ</span><div><h3 id="speech-title">中文语音</h3><p>种子与主动输入 · 闲时训练和验收</p></div></div><span class="lane-badge">尚无已验收候选</span></div>
             <div class="steps">
-              <button class="step" type="button" data-node="speech-seeds" aria-pressed="false" aria-controls="detail-content"><span class="step-index">01 / SEED</span><strong>种子题目</strong><span>预先划分<br>训练、开发、测试</span></button>
+              <button class="step" type="button" data-node="speech-seeds" aria-pressed="false" aria-controls="detail-content"><span class="step-index">01 / INPUT</span><strong>种子与输入</strong><span>预先划分数据<br>主动开启采样</span></button>
               <button class="step" type="button" data-node="speech-generate" aria-pressed="false" aria-controls="detail-content"><span class="step-index">02 / GENERATE</span><strong>中文文字与语音</strong><span>冻结 LFM3 回答<br>Breeze 中文 TTS</span></button>
-              <button class="step" type="button" data-node="speech-verify" aria-pressed="false" aria-controls="detail-content"><span class="step-index">03 / VERIFY</span><strong>独立核验</strong><span>编解码对齐<br>R2T2 识别中文</span></button>
+              <button class="step" type="button" data-node="speech-verify" aria-pressed="false" aria-controls="detail-content"><span class="step-index">03 / VERIFY</span><strong>核验样本</strong><span>编解码对齐<br>R2T2 识别中文</span></button>
               <button class="step" type="button" data-node="speech-train" aria-pressed="false" aria-controls="detail-content"><span class="step-index">04 / TRAIN</span><strong>训练语音 LoRA</strong><span>冻结底座<br>学习语音码</span></button>
               <button class="step" type="button" data-node="speech-gate" aria-pressed="false" aria-controls="detail-content"><span class="step-index">05 / GATE</span><strong>生成音频验收</strong><span>开发集实际发声<br>独立识别与比较</span></button>
-              <button class="step" type="button" data-node="speech-use" aria-pressed="false" aria-controls="detail-content"><span class="step-index">06 / STAGE</span><strong>保存候选</strong><span>通过才保存<br>待后续验证</span></button>
+              <button class="step" type="button" data-node="speech-use" aria-pressed="false" aria-controls="detail-content"><span class="step-index">06 / STAGE</span><strong>选择候选</strong><span>通过才保存<br>新会话显式加载</span></button>
             </div>
             <div class="feedback">未通过则不发布候选；保留完整检查点，后续可续训</div>
           </section>
@@ -244,8 +244,8 @@
     </div>
 
     <div class="lower">
-      <section class="lower-panel" id="boundaries"><h2 class="section-title">与完整 RSI 的距离</h2><p>现在是两个局部实验闭环，尚未复现论文中的联合能力演化。</p><div class="comparison"><div class="comparison-block"><strong>已经实现</strong><p>可信样本核验、真实参数更新、独立开发集门槛、检查点与受控恢复。</p></div><div class="comparison-block missing"><strong>仍然缺少</strong><p>图像生成器训练与导出、通用读写底座训练、语音 LoRA 的原生加载，以及足够规模的跨模态回归。</p></div></div></section>
-      <section class="lower-panel" id="evidence"><h2 class="section-title">本机验证记录</h2><ul class="evidence"><li><strong>图表：</strong>三轮候选和原模型均为 20 / 24，暂无晋级或读图提升证据。</li><li><strong>语音：</strong>6 条训练、2 条开发、3 条测试样本通过核验；累计 27 次更新，四次生成验收均未通过。</li><li><strong>已知现象：</strong>官方中文 TTS 可说中文，普通语音对话的中文语音仍需改善。</li></ul></section>
+      <section class="lower-panel" id="boundaries"><h2 class="section-title">与完整 RSI 的距离</h2><p>现在是两个局部实验闭环，尚未复现论文中的联合能力演化。</p><div class="comparison"><div class="comparison-block"><strong>已经实现</strong><p>样本核验、真实参数更新、固定开发集门槛、检查点和显式的语音 LoRA 加载。</p></div><div class="comparison-block missing"><strong>仍然缺少</strong><p>图像生成器训练与导出、通用读写底座训练、真实语音候选通过验收，以及充分的跨模态回归。</p></div></div></section>
+      <section class="lower-panel" id="evidence"><h2 class="section-title">本机验证记录</h2><ul class="evidence"><li><strong>图表：</strong>三轮候选和原模型均为 20 / 24，暂无晋级或读图提升证据。</li><li><strong>语音：</strong>真人录音与回放训练 7 次后，底座 CER 为 33.3%、候选为 43.6%，候选未通过。</li><li><strong>已知现象：</strong>官方中文 TTS 可说中文，普通语音对话的中文语音仍需改善。</li></ul></section>
     </div>
 
     <details class="commands"><summary>查看本机命令</summary><div class="command-body"><p>在项目根目录执行。下面的 status 只查询状态；启动训练及依赖准备见对应文档。</p><pre><code>target/minicpm-v-cpu/debug/omni-rsi --state artifacts/chinese-speech/idle-r2t2 status</code></pre></div></details>
@@ -292,34 +292,34 @@
         note: '当前没有经过门槛晋级的候选。'
       },
       'speech-seeds': {
-        kicker: 'SPEECH / 01', title: '预先划分种子题目', lead: '先固定问题集合及其用途，再生成中文回答和语音。',
-        fields: [['本机快照', '新教师数据中 6 条训练、2 条开发和 3 条测试样本通过了核验。'], ['划分原则', '训练题用于梯度更新，开发题用于比较候选；测试题不用于训练或选择模型。'], ['执行时机', '种子准备是独立的数据准备步骤，不由 speech-watch 自动生成。']],
-        note: '种子集规模很小，内置题目不会自动扩展。'
+        kicker: 'SPEECH / 01', title: '种子与主动输入', lead: '先划分固定评估题；用户显式开启后，已完成的语音可进入本地队列。',
+        fields: [['种子集', '已有 Breeze 教师语音作为训练回放，训练与评估题保持隔离。'], ['主动输入', '只采集正常结束的 0.4–15 秒语音，取消、损坏和重复录音不产生新样本。'], ['隐私', '录音和训练数据只保存在本机；不自动打开麦克风。']],
+        note: '在线样本只用于训练，测试题不参与候选选择。'
       },
       'speech-generate': {
         kicker: 'SPEECH / 02', title: '生成中文回答与语音', lead: '用冻结的 LFM3 制作种子问题对应的文字与语音数据。',
-        fields: [['文字', '冻结的 LFM3 先生成简短中文回答。'], ['语音', '项目内的 Breeze-TTS-2 用普通话朗读，再通过 LFM3 的 LiquidCodec 编码并重解码为训练目标。'], ['产物', '保留 Breeze 源波形、LFM3 语音码和重解码波形，记录教师与模型指纹。']],
+        fields: [['种子', '冻结 LFM3 生成简短回答，项目内 Breeze-TTS-2 朗读。'], ['用户语音', 'R2T2 识别原声并产生伪标签；样本只学习朗读自身转写。'], ['产物', 'LiquidCodec 编码和重解码语音，记录来源、语音码及模型指纹。']],
         note: 'LFM3 官方中文 TTS 也可说中文；普通交错语音对话仍有输出不一致的问题。'
       },
       'speech-verify': {
-        kicker: 'SPEECH / 03', title: '独立核验样本', lead: '不把模型自己生成的音频直接当作正确答案。',
-        fields: [['波形核验', '将 Breeze 源音频重编码并与保存的语音码对齐，再解码与目标波形逐样本核对。'], ['内容核验', '项目内 R2T2 转写目标音频；要求至少两个汉字、汉字占转写字母数字的 80% 及以上，内容相似度至少 0.75。'], ['输出', '仅将通过核验的样本送入对应数据分组；记录 ASR 模型与执行文件指纹。']],
-        note: 'R2T2 不提供可用的语言置信度；这里不虚构概率。自动转写仍可能误判。'
+        kicker: 'SPEECH / 03', title: '核验样本', lead: '检查音频、语音码与转写是否一致，再决定是否进入训练。',
+        fields: [['波形核验', '源音频重编码与语音码对齐，重解码波形须与保存的目标一致。'], ['内容核验', '项目内 R2T2 检查汉字比例和转写相似度。用户原声与重解码音频各转写一次。'], ['输出', '只接收通过检查的样本，记录来源和模型指纹；保留拒绝与中断记录。']],
+        note: '用户语音的两次转写使用同一 ASR，一致不等于独立真值，也不虚构置信度。'
       },
       'speech-train': {
         kicker: 'SPEECH / 04', title: '训练语音 LoRA', lead: '训练只改独立的少量参数，原始权重保持不变。',
-        fields: [['训练目标', '在官方 PyTorch 模型上计算语音码内容损失；冻结底座，只训练最后一层秩 4 LoRA。'], ['检查点', '每个完整更新保存 LoRA、优化器和数据游标，校验模型、数据、ASR 与训练代码指纹。'], ['本机实测', '累计完成 27 次更新；四个训练 epoch 已评估，下一 epoch 已完成 3 条训练样本。']],
+        fields: [['训练目标', '冻结底座，只训练最后一层秩 4 LoRA；内容与结束帧损失采用实验权重。'], ['检查点', '保存 LoRA、优化器和数据游标，核对模型、数据、ASR 与训练代码指纹；新语音在下一轮加入。'], ['本机实测', '合成语音模拟主动输入，已完成真实梯度更新和检查点恢复；历史 27 次更新仍独立保留。']],
         note: '参数得到更新或损失下降，并不代表生成语音已经改善。'
       },
       'speech-gate': {
         kicker: 'SPEECH / 05', title: '实际生成音频验收', lead: '每个完整 epoch 都让原模型与候选回答开发问题，并独立识别实际声音。',
-        fields: [['通过条件', '候选必须正常结束、音频足够长、R2T2 转写符合中文比例与内容门槛；至少在一个基线未通过的问题上通过。'], ['隔离', '测试集不用于训练或开发集选取。'], ['本机实测', '四次验收均未通过：第四次一个候选正常结束但未识别出中文，另一个候选未正常结束。']],
+        fields: [['通过条件', '至少五条朗读和五条对话；候选须正常结束且有声音，整体字错误率相对下降至少 10%，两个分组均不退步。'], ['隔离', '另有 45 条固定测试题，其中 15 条绑定已有真人录音，不用于训练或开发集选取。'], ['本机实测', '真人录音版训练 7 次后，底座 CER 33.3%、候选 43.6%，正常结束分别为 8 / 10 与 9 / 10；候选未通过。']],
         note: '小开发集和自动识别只能用于保守筛选，还需要更多独立测试。'
       },
       'speech-use': {
-        kicker: 'SPEECH / 06', title: '保存待验证候选', lead: '候选通过开发门槛后才保存为独立文件，供后续测试。',
-        fields: [['通过时', '保存 candidate-<epoch>.pt，不覆盖底座，也不自动部署。'], ['未通过时', '不发布候选；保留已完成的训练检查点，之后可续训。'], ['后续工作', '需要未接触测试集、英文和多模态回归，以及将 LoRA 导出并加载到 Rust 的验证。']],
-        note: '当前候选未通过生成门槛，尚未接入 Makepad、API 或原生 LFM3。'
+        kicker: 'SPEECH / 06', title: '保存并选择候选', lead: '开发门槛通过后导出独立文件，在新 CLI 会话中显式选择。',
+        fields: [['通过时', '原生加载器再次核对模型指纹、权重和开发集证据；不覆盖底座，也不自动启用。'], ['未通过时', '继续使用底座；保留完整检查点。去掉适配器参数即可在新会话回退。'], ['后续工作', '仍需真实候选的独立测试、英文及多模态回归；Makepad 和 API 尚未接入。']],
+        note: '当前没有通过新门槛的真实候选，不能声称中文语音已经改善。'
       }
     };
 

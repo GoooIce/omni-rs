@@ -14,6 +14,8 @@ pub mod media_io;
 pub mod model;
 pub mod prepared;
 pub mod sampling;
+pub mod speech_adapter;
+pub mod speech_inbox;
 pub mod stable;
 pub mod text;
 pub mod video;

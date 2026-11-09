@@ -3944,6 +3944,7 @@ dependencies = [
  "cubecl",
  "hound",
  "image",
+ "libc",
  "minijinja",
  "minijinja-contrib",
  "omni-r2t2",
@@ -3951,8 +3952,10 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -72,6 +72,9 @@ struct Args {
     /// Save generated speech as a new 24 kHz WAV file.
     #[arg(long)]
     audio_output: Option<PathBuf>,
+    /// Select a speech adapter that passed the frozen development gate.
+    #[arg(long)]
+    speech_adapter: Option<PathBuf>,
     #[arg(long, value_enum)]
     backend: Option<BackendChoice>,
     #[arg(long, default_value = "f32")]
@@ -82,6 +85,9 @@ struct Args {
     /// Transcribe a stream of little-endian f32 mono PCM at 16 kHz from stdin.
     #[arg(long)]
     live_pcm: bool,
+    /// Explicitly queue normally completed live speech for local learning.
+    #[arg(long, requires = "live_pcm")]
+    learn_state: Option<PathBuf>,
     /// Live transcription route: preview with optional final correction, or stable committed text.
     #[arg(long, value_enum, requires = "live_pcm")]
     live_route: Option<LiveRoute>,
@@ -117,6 +123,17 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;
+    let _foreground = args
+        .learn_state
+        .as_deref()
+        .map(|state| {
+            omni_lfm3::speech_inbox::ForegroundLease::acquire(
+                state,
+                &stop,
+                std::time::Duration::from_secs(30),
+            )
+        })
+        .transpose()?;
     let backend = args.backend.unwrap_or(if cfg!(feature = "metal") {
         BackendChoice::Metal
     } else {
@@ -269,7 +286,27 @@ fn run<B: Backend>(
             Ok(serde_json::from_slice(&std::fs::read(path)?)?)
         })
         .transpose()?;
-    let model = OmniModel::<B>::load(&args.model, precision, device)?;
+    let mut model = OmniModel::<B>::load(&args.model, precision, device)?;
+    if let Some(directory) = &args.speech_adapter {
+        let apply = || -> omni_lfm3::Result<_> {
+            let fingerprint = omni_lfm3::speech_adapter::source_fingerprint(&args.model)?;
+            omni_lfm3::speech_adapter::VerifiedAdapter::load(
+                directory,
+                &fingerprint,
+                model.text.hidden_size(),
+            )
+        };
+        match apply().and_then(|adapter| {
+            model
+                .text
+                .install_conv_lora(adapter.layer, adapter.rank, &adapter.a, &adapter.b)
+        }) {
+            Ok(()) => eprintln!("speech adapter enabled for this session"),
+            Err(error) => {
+                eprintln!("speech adapter rejected; continuing with frozen base: {error}")
+            }
+        }
+    }
     if args.live_pcm {
         return run_live(&model, args, stop);
     }
@@ -421,6 +458,10 @@ fn run_live<B: Backend>(
         return run_stable_live(model, args, stop);
     }
     let mut live = LiveTranscription::new(model, &model.live_transcription_prompt()?)?;
+    let mut learning = args
+        .learn_state
+        .as_ref()
+        .map(|_| omni_lfm3::speech_inbox::SpeechCapture::new());
     let options = LiveOptions {
         max_new_tokens: args.live_block_tokens,
         ..Default::default()
@@ -442,7 +483,12 @@ fn run_live<B: Backend>(
             }
         };
         let (samples, is_final) = match chunk {
-            PcmInput::Samples(samples) => (samples, false),
+            PcmInput::Samples(samples) => {
+                if let Some(capture) = &mut learning {
+                    capture.push(&samples);
+                }
+                (samples, false)
+            }
             PcmInput::End => (Vec::new(), true),
             PcmInput::Error(error) => return Err(error.into()),
         };
@@ -509,13 +555,16 @@ fn run_live<B: Backend>(
     } else if !args.json {
         println!();
     }
+    let learning = finish_learning(learning, args.learn_state.as_deref(), reason, stop);
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"text":text,"preview_text":preview,"tokens":tokens,"reason":reason})
-            )?
-        );
+        let mut result =
+            json!({"text":text,"preview_text":preview,"tokens":tokens,"reason":reason});
+        if let Some(learning) = learning {
+            result["learning"] = learning;
+        }
+        println!("{}", serde_json::to_string(&result)?);
+    } else if let Some(learning) = learning {
+        eprintln!("learning: {learning}");
     }
     Ok(())
 }
@@ -528,6 +577,10 @@ fn run_stable_live<B: Backend>(
     use omni_lfm3::stable::StableTranscription;
     let language = args.live_language.as_deref().unwrap_or("Chinese");
     let mut live = StableTranscription::new(model, language, args.max_slots)?;
+    let mut learning = args
+        .learn_state
+        .as_ref()
+        .map(|_| omni_lfm3::speech_inbox::SpeechCapture::new());
     let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     std::thread::spawn(move || read_pcm(std::io::stdin().lock(), sender));
     let mut output_error = None;
@@ -544,7 +597,12 @@ fn run_stable_live<B: Backend>(
             }
         };
         let (samples, is_final) = match input {
-            PcmInput::Samples(samples) => (samples, false),
+            PcmInput::Samples(samples) => {
+                if let Some(capture) = &mut learning {
+                    capture.push(&samples);
+                }
+                (samples, false)
+            }
             PcmInput::End => (Vec::new(), true),
             PcmInput::Error(error) => return Err(error.into()),
         };
@@ -572,13 +630,14 @@ fn run_stable_live<B: Backend>(
             };
         }
     };
+    let learning = finish_learning(learning, args.learn_state.as_deref(), reason, stop);
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"text":live.text(),"route":"stable","reason":reason,"conflict":conflict})
-            )?
-        );
+        let mut result =
+            json!({"text":live.text(),"route":"stable","reason":reason,"conflict":conflict});
+        if let Some(learning) = learning {
+            result["learning"] = learning;
+        }
+        println!("{}", serde_json::to_string(&result)?);
     } else {
         println!();
         if conflict {
@@ -587,8 +646,40 @@ fn run_stable_live<B: Backend>(
         if reason != "stop" {
             eprintln!("Finished: {reason}");
         }
+        if let Some(learning) = learning {
+            eprintln!("learning: {learning}");
+        }
     }
     Ok(())
+}
+
+fn finish_learning(
+    capture: Option<omni_lfm3::speech_inbox::SpeechCapture>,
+    state: Option<&Path>,
+    reason: &str,
+    stop: &AtomicBool,
+) -> Option<Value> {
+    use omni_lfm3::speech_inbox::{Completion, SpeechInbox};
+    let (capture, state) = (capture?, state?.to_owned());
+    if reason == "limit" {
+        return Some(json!({"state":"rejected", "reason":"transcription reached its token limit"}));
+    }
+    let completion = if reason == "stop" && !stop.load(Ordering::Acquire) {
+        Completion::Normal
+    } else {
+        Completion::Cancelled
+    };
+    let result = std::thread::spawn(move || {
+        let inbox = SpeechInbox::open(state)?;
+        capture.finish(&inbox, completion)
+    })
+    .join();
+    Some(match result {
+        Ok(Ok(receipt)) => serde_json::to_value(receipt)
+            .unwrap_or_else(|error| json!({"state":"error", "reason":error.to_string()})),
+        Ok(Err(error)) => json!({"state":"error", "reason":error.to_string()}),
+        Err(_) => json!({"state":"error", "reason":"speech inbox worker panicked"}),
+    })
 }
 
 #[cfg(test)]
