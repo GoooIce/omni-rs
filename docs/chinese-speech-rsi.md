@@ -22,6 +22,27 @@
 
 种子数据合同仍要求至少 3 条训练、2 条损失监测及 1 条保留样本；另有上述固定生成验收题。当前尚无真实候选通过完整开发门槛，最终测试、英语及其他 Omni 回归尚未形成候选报告，因此不能声称效果改善。小规模伪标签和同一 ASR 的复核也不能保证真人语音标签正确。Breeze 权重及其输出遵循其[研究／非商业许可](breeze-tts.md)。
 
+## 分开验证调度和语音质量
+
+闲时调度使用 mock 验证：模拟空闲信号和工作负载，检查用户返回、前台设备请求、让出后恢复、无任务等待以及停止；不加载模型，也不根据训练效果判定调度通过。运行：
+
+```sh
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo test --manifest-path crates/omni-rsi/Cargo.toml \
+  --no-default-features --features native,cpu --bin omni-rsi mock_
+```
+
+语音质量使用真实模型单独验证。`speech-once` 是前台、限量的训练入口，不依赖闲时信号；它使用同目录的前台和设备锁，训练完整 epoch 后对固定开发题分别生成基线和候选，保存 R2T2 转写、字符错误率与结束情况。可在独立状态目录执行：
+
+```sh
+SPEECH_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B"
+QUALITY_STATE=artifacts/chinese-speech/quality-native-v1
+target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$QUALITY_STATE" \
+  speech-once --data artifacts/chinese-speech/synthetic-breeze-r2t2-v1 \
+  --epochs 1 --updates-per-round 6
+```
+
+本机种子训练集当前有 6 条，完整 epoch 的报告位于 `$QUALITY_STATE/speech-native/epoch-1.json`。这是开发集比较，不是最终保留集结果；前台执行会占用计算资源，任务中断后可用相同命令和状态目录续跑。历史 PyTorch 对照的候选未通过开发门槛；当前 Rust/Burn 训练尚无完整生成对照，mock 调度通过不能证明语音质量提高。
+
 ## 在线语音：启用、状态与停止
 
 以下命令使用独立状态目录，保留历史 `idle-r2t2` 检查点。先启动闲时调度器，再将用户主动提供的 16 kHz 单声道 little-endian `f32` PCM 流送入 CLI；项目不会自行启动麦克风。两个命令必须使用同一个状态目录，前台会持有协作锁并等待后台让出设备。

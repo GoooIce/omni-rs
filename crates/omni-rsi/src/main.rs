@@ -5,7 +5,7 @@ use omni_rsi::{
     child,
     evolution::{RoundOptions, RoundReport, run_round},
     fingerprint::model_fingerprint,
-    idle::IdlePolicy,
+    idle::{IdlePolicy, IdleSnapshot},
     lease::Lease,
     model::FrozenReader,
     platform,
@@ -70,6 +70,11 @@ enum Command {
         rounds: usize,
         #[arg(long, default_value_t = 300)]
         idle_seconds: u64,
+        #[command(flatten)]
+        job: SpeechJob,
+    },
+    /// Run a bounded speech training round as a supervised foreground job.
+    SpeechOnce {
         #[command(flatten)]
         job: SpeechJob,
     },
@@ -448,12 +453,44 @@ fn run_speech_worker(
     serde_json::from_slice(&bytes).map_err(|error| format!("invalid native speech result: {error}"))
 }
 
-fn watch<F, P>(
-    root: &Path,
+type IdleProbe = Arc<dyn Fn(&Path) -> IdleSnapshot + Send + Sync>;
+
+struct WatchConfig<'a> {
+    root: &'a Path,
     rounds: usize,
     policy: IdlePolicy,
     shutdown: Arc<AtomicBool>,
-    description: &str,
+    description: &'a str,
+    probe: IdleProbe,
+    ddust_lease: fn() -> Result<Option<Lease>, String>,
+    wait_unit: Duration,
+    watchdog_interval: Duration,
+}
+
+impl<'a> WatchConfig<'a> {
+    fn new(
+        root: &'a Path,
+        rounds: usize,
+        policy: IdlePolicy,
+        shutdown: Arc<AtomicBool>,
+        description: &'a str,
+    ) -> Self {
+        Self {
+            root,
+            rounds,
+            policy,
+            shutdown,
+            description,
+            probe: Arc::new(platform::snapshot),
+            ddust_lease,
+            wait_unit: Duration::from_secs(1),
+            watchdog_interval: Duration::from_millis(500),
+        }
+    }
+}
+
+fn watch<F, P>(
+    config: WatchConfig<'_>,
     mut waiting_for_work: P,
     mut run_round: F,
 ) -> Result<(), String>
@@ -461,6 +498,17 @@ where
     F: FnMut(&AtomicBool) -> Result<serde_json::Value, String>,
     P: FnMut() -> Result<Option<&'static str>, String>,
 {
+    let WatchConfig {
+        root,
+        rounds,
+        policy,
+        shutdown,
+        description,
+        probe,
+        ddust_lease,
+        wait_unit,
+        watchdog_interval,
+    } = config;
     if rounds == 0 || rounds > 1_000 {
         return Err("round count must be between 1 and 1000".into());
     }
@@ -479,11 +527,11 @@ where
                 if stopping(root, &shutdown) {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(wait_unit);
             }
             continue;
         }
-        let state = platform::snapshot(root);
+        let state = probe(root);
         let blocker = policy
             .blocker(&state)
             .map(str::to_owned)
@@ -498,13 +546,13 @@ where
                 if stopping(root, &shutdown) {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(wait_unit);
             }
             continue;
         }
         let Some(device_lease) = Lease::try_acquire(&root.join("device.lock"))? else {
             state_status(root, "waiting", "RSI device lease occupied", completed)?;
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(wait_unit);
             continue;
         };
         let ddust = match ddust_lease() {
@@ -512,7 +560,7 @@ where
             Err(message) => {
                 drop(device_lease);
                 state_status(root, "waiting", &message, completed)?;
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(wait_unit * 2);
                 continue;
             }
         };
@@ -520,11 +568,10 @@ where
         let check_root = root.to_owned();
         let check_policy = policy.clone();
         let check_shutdown = shutdown.clone();
-        let watchdog = Watchdog::start(cancel.clone(), Duration::from_millis(500), move || {
+        let check_probe = probe.clone();
+        let watchdog = Watchdog::start(cancel.clone(), watchdog_interval, move || {
             !stopping(&check_root, &check_shutdown)
-                && check_policy
-                    .blocker(&platform::snapshot(&check_root))
-                    .is_none()
+                && check_policy.blocker(&check_probe(&check_root)).is_none()
                 && foreground_clear(&check_root)
         });
         state_status(root, "running", description, completed)?;
@@ -551,7 +598,7 @@ where
                         if stopping(root, &shutdown) {
                             break;
                         }
-                        std::thread::sleep(Duration::from_secs(1));
+                        std::thread::sleep(wait_unit);
                     }
                     continue;
                 }
@@ -608,11 +655,13 @@ fn execute() -> Result<(), String> {
             let options = options.into();
             let store = Store::new(&args.state);
             watch(
-                &args.state,
-                rounds,
-                policy,
-                shutdown,
-                "verified chart reader round",
+                WatchConfig::new(
+                    &args.state,
+                    rounds,
+                    policy,
+                    shutdown,
+                    "verified chart reader round",
+                ),
                 || Ok(None),
                 |stop| {
                     let report = run_one(&model, &store, &options, stop)?;
@@ -643,11 +692,13 @@ fn execute() -> Result<(), String> {
             };
             let online = job.online;
             watch(
-                &args.state,
-                rounds,
-                policy,
-                shutdown,
-                "Chinese speech adapter training",
+                WatchConfig::new(
+                    &args.state,
+                    rounds,
+                    policy,
+                    shutdown,
+                    "Chinese speech adapter training",
+                ),
                 || {
                     if online
                         && speech_directory_count(&args.state, "inbox")? == 0
@@ -661,6 +712,15 @@ fn execute() -> Result<(), String> {
                 },
                 |stop| run_speech_worker(&model, &args.state, &job, stop),
             )
+        }
+        Command::SpeechOnce { job } => {
+            let _foreground = Lease::try_acquire(&args.state.join("foreground.lock"))?
+                .ok_or("another RSI foreground request is active")?;
+            let _device = wait_for_device(&args.state, &shutdown)?;
+            let _ddust = ddust_lease()?;
+            let result = native_speech_job(&model, &args.state, &job, &shutdown)?;
+            println!("{result}");
+            Ok(())
         }
         Command::SpeechWork { job } => {
             let result = native_speech_job(&model, &args.state, &job, &shutdown)?;
@@ -875,3 +935,7 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+#[path = "watch_tests.rs"]
+mod watch_tests;

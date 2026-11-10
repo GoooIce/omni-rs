@@ -14,6 +14,47 @@ fn speech_watch_exposes_explicit_online_opt_in() {
 }
 
 #[test]
+fn supervised_speech_training_is_independent_of_idle_scheduling() {
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi"))
+        .args(["speech-once", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--data") && help.contains("--updates-per-round"));
+    assert!(!help.contains("--idle-seconds") && !help.contains("--python"));
+}
+
+#[cfg(unix)]
+#[test]
+fn supervised_speech_training_respects_the_foreground_lease() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let foreground = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.path().join("foreground.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(foreground.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi"))
+        .args([
+            "--model",
+            root.path().to_str().unwrap(),
+            "--state",
+            root.path().to_str().unwrap(),
+            "speech-once",
+            "--online",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("another RSI foreground request"));
+}
+
+#[test]
 fn heldout_speech_evaluation_is_a_native_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi"))
         .args(["speech-evaluate", "--help"])
