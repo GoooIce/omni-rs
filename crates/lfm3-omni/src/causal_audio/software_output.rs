@@ -407,6 +407,22 @@ impl<'a, B: Backend> StopBarrier<'a, B> {
         }))
     }
 
+    fn enter_stopping(
+        session: &mut AudioSession<'a, B>,
+        active: &mut Active<B>,
+        pending: &mut VecDeque<f32>,
+        at: Duration,
+        reason: StopReason,
+    ) -> Result<(), Error> {
+        session
+            .apply_turn(at, &active.turn, TurnEvent::Stop { reason })
+            .map_err(Error::Session)?;
+        active.stopping = true;
+        active.producer.cancelled.store(true, Ordering::Release);
+        pending.clear();
+        Ok(())
+    }
+
     /// Stop admissions and request cooperative cancellation immediately.
     pub fn stop(
         &mut self,
@@ -419,12 +435,7 @@ impl<'a, B: Backend> StopBarrier<'a, B> {
         if !Arc::ptr_eq(&active.producer, &producer.identity) {
             return Err(Error::WrongProducer);
         }
-        self.session
-            .apply_turn(at, &active.turn, TurnEvent::Stop { reason })
-            .map_err(Error::Session)?;
-        active.stopping = true;
-        active.producer.cancelled.store(true, Ordering::Release);
-        self.pending.clear();
+        Self::enter_stopping(&mut self.session, active, &mut self.pending, at, reason)?;
         self.last_at = at;
         Ok(())
     }
@@ -443,18 +454,13 @@ impl<'a, B: Backend> StopBarrier<'a, B> {
             return Err(Error::WrongLoan);
         }
         if !active.stopping {
-            self.session
-                .apply_turn(
-                    at,
-                    &active.turn,
-                    TurnEvent::Stop {
-                        reason: StopReason::PlaybackFailed,
-                    },
-                )
-                .map_err(Error::Session)?;
-            active.stopping = true;
-            active.producer.cancelled.store(true, Ordering::Release);
-            self.pending.clear();
+            Self::enter_stopping(
+                &mut self.session,
+                active,
+                &mut self.pending,
+                at,
+                StopReason::PlaybackFailed,
+            )?;
         }
         self.last_at = at;
         Ok(())

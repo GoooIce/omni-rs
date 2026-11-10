@@ -242,6 +242,52 @@ fn invalid_callback_and_repeated_stop_do_not_allow_an_early_session_change() {
 }
 
 #[test]
+fn repeated_playback_failure_during_stop_preserves_reason_loan_and_observed_time() {
+    let encoder = encoder();
+    let session = AudioSession::new(SessionId(16), &encoder, &Default::default(), at(0)).unwrap();
+    let mut owner = StopBarrier::new(session, 4).unwrap();
+    owner.push(at(1), &vec![0.1; 3200], 16_000, false).unwrap();
+    let snapshot = owner.snapshot().unwrap().unwrap();
+    let producer = owner.start(at(2), snapshot, 24_000).unwrap();
+    owner.generated(at(3), &producer, 4).unwrap();
+    owner.enqueue(at(4), &producer, &[1., 2., 3., 4.]).unwrap();
+    let loan = owner.lend(at(5), 2).unwrap().unwrap();
+    owner.stop(at(6), &producer, StopReason::Cancelled).unwrap();
+    let stopping_timeline = owner.conversation().timeline().to_vec();
+
+    owner.playback_failed(at(7), &loan).unwrap();
+    owner.playback_failed(at(8), &loan).unwrap();
+    assert_eq!(owner.conversation().timeline(), stopping_timeline);
+    assert!(matches!(
+        owner.producer_quiesced(at(7), &producer),
+        Err(Error::TimeWentBackwards)
+    ));
+    owner.producer_quiesced(at(8), &producer).unwrap();
+    assert!(matches!(
+        owner.finish_stop(at(9), &producer),
+        Err(Error::BarrierPending)
+    ));
+    owner.return_playback(at(10), loan, 1).unwrap();
+    owner.finish_stop(at(11), &producer).unwrap();
+    assert!(owner.conversation().timeline().iter().any(|entry| matches!(
+        entry.event,
+        TimelineEvent::PlaybackStopped {
+            played_end: 1,
+            queued_end: 4,
+            generated_end: 4,
+            ..
+        }
+    )));
+    assert!(owner.conversation().timeline().iter().any(|entry| matches!(
+        entry.event,
+        TimelineEvent::StopRequested {
+            reason: StopReason::Cancelled,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn a_lost_loan_keeps_stop_and_session_change_fail_closed() {
     let encoder = encoder();
     let session = AudioSession::new(SessionId(8), &encoder, &Default::default(), at(0)).unwrap();
