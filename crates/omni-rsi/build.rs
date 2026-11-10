@@ -1,0 +1,319 @@
+//! Compile-time identities for this repository's supported local Cargo patches.
+pub mod build_backend;
+
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+fn field(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn config_identity(hash: &mut Sha256, cwd: &Path, manifest: &Path) -> Result<(), String> {
+    let mut dirs = BTreeSet::new();
+    for root in [cwd, manifest] {
+        for parent in root.ancestors() {
+            dirs.insert(parent.join(".cargo"));
+        }
+    }
+    if let Some(home) = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".cargo")))
+    {
+        dirs.insert(home);
+    }
+    for dir in dirs {
+        // Watching Cargo home itself would rebuild on unrelated registry/cache changes.
+        // Watch existing config files, and an existing repository-local .cargo directory.
+        if dir.starts_with(
+            manifest
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("missing repo")?,
+        ) && dir.is_dir()
+        {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+        for name in ["config", "config.toml"] {
+            let path = dir.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+                        return Err(format!("invalid Cargo configuration: {}", path.display()));
+                    }
+                    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+                    let config = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+                    build_backend::validate_config(config)?;
+                    field(hash, name.as_bytes());
+                    field(hash, &bytes);
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+    for name in [
+        "TARGET",
+        "HOST",
+        "PROFILE",
+        "OPT_LEVEL",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CC",
+        "CXX",
+        "AR",
+        "CFLAGS",
+        "CXXFLAGS",
+        "SDKROOT",
+        "MACOSX_DEPLOYMENT_TARGET",
+    ] {
+        field(hash, name.as_bytes());
+        field(hash, env::var(name).unwrap_or_default().as_bytes());
+        if !matches!(
+            name,
+            "TARGET" | "HOST" | "PROFILE" | "OPT_LEVEL" | "CARGO_ENCODED_RUSTFLAGS"
+        ) {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
+    }
+    for name in ["CARGO_FEATURE_CPU", "CARGO_FEATURE_METAL"] {
+        field(hash, name.as_bytes());
+        field(hash, env::var(name).unwrap_or_default().as_bytes());
+    }
+    Ok(())
+}
+
+// Follow local dependency/build-dependency paths even if optional. This is
+// deliberately conservative; nested [patch] tables are ignored by Cargo.
+pub fn local_dependencies(manifest: &str) -> Result<Vec<String>, String> {
+    let mut dependencies = false;
+    let mut result = Vec::new();
+    for original in manifest.lines() {
+        let line = build_backend::uncomment(original)?.trim();
+        if line.starts_with('[') {
+            let section = if line.starts_with("[[") {
+                line.strip_prefix("[[")
+                    .and_then(|s| s.strip_suffix("]]"))
+                    .ok_or("invalid Cargo table")?
+            } else {
+                line.strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .ok_or("invalid Cargo table")?
+            };
+            let section = build_backend::keys(section)?;
+            dependencies = section.first().is_none_or(|s| s != "patch")
+                && section.iter().any(|s| {
+                    s == "dependencies" || s == "build-dependencies" || s == "dev-dependencies"
+                });
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok((lhs, _)) = build_backend::assignment(line) {
+            let key = build_backend::keys(lhs)?;
+            if dependencies
+                || key.first().is_some_and(|k| {
+                    k == "dependencies" || k == "build-dependencies" || k == "dev-dependencies"
+                })
+            {
+                build_backend::dependency_assignment(line, &mut result)?;
+            }
+        } else if dependencies && (line.contains('{') || line.contains('=')) {
+            return Err("unsupported dependency syntax".into());
+        }
+    }
+    Ok(result)
+}
+
+pub fn graph_identity(
+    repo: &Path,
+    initial: Vec<PathBuf>,
+    common: &[u8],
+    label: &str,
+) -> Result<String, String> {
+    let mut pending = initial;
+    let mut visited = BTreeSet::new();
+    let mut entries = Vec::new();
+    while let Some(path) = pending.pop() {
+        let mut checked = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    if !checked.pop() {
+                        return Err("invalid backend source path".into());
+                    }
+                }
+                std::path::Component::CurDir => (),
+                _ => {
+                    checked.push(component.as_os_str());
+                    if checked.starts_with(repo) {
+                        let meta = fs::symlink_metadata(&checked)
+                            .map_err(|e| format!("{}: {e}", checked.display()))?;
+                        if meta.file_type().is_symlink() {
+                            return Err(format!(
+                                "backend source contains symlink: {}",
+                                checked.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !checked.starts_with(repo) {
+            return Err("local backend path outside repository is unsupported".into());
+        }
+        let path = fs::canonicalize(&checked).map_err(|e| format!("{}: {e}", checked.display()))?;
+        if !path.starts_with(repo) {
+            return Err("local backend path outside repository is unsupported".into());
+        }
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let (digest, watches) = build_backend::source_tree_digest(&path)?;
+        for watched in &watches {
+            println!("cargo:rerun-if-changed={}", watched.display());
+            if watched.file_name().is_some_and(|name| name == "Cargo.toml") {
+                let contents = fs::read_to_string(watched).map_err(|e| e.to_string())?;
+                for dependency in local_dependencies(&contents)? {
+                    pending.push(
+                        watched
+                            .parent()
+                            .ok_or("invalid dependency manifest")?
+                            .join(dependency),
+                    );
+                }
+            }
+        }
+        let relative = path
+            .strip_prefix(repo)
+            .map_err(|e| e.to_string())?
+            .to_str()
+            .ok_or("invalid source path")?;
+        entries.push((relative.to_owned(), digest));
+    }
+    entries.sort();
+    let mut hash = Sha256::new();
+    field(&mut hash, b"omni-local-backend-graph-v1");
+    field(&mut hash, label.as_bytes());
+    field(&mut hash, common);
+    for (path, digest) in entries {
+        field(&mut hash, path.as_bytes());
+        field(&mut hash, digest.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+// These files describe the CPU dependency graph whose local packages were
+// inspected. Any graph change falls back to including every local patch.
+fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
+    let inputs = [
+        (
+            "Cargo.toml",
+            "abae3e721ce3b59e511dbb30e3e7e491646193c50dd64cf7bd9b878085a01418",
+        ),
+        (
+            "Cargo.lock",
+            "88851b9ed39e38c47483ee8c0bb1f9d51ca65beaa44e73fe8bf25334f958bc3e",
+        ),
+        (
+            "crates/lfm3-omni/Cargo.toml",
+            "cbb8099b360eff538b8d76585c1cd7691e0d47d6a85b7ca2dcc016b90c1d8de0",
+        ),
+        (
+            "crates/lfm3-omni/Cargo.lock",
+            "2e9f1267311142fe5a0dd4b6b9fa5513f44b1992e58f2c54d270fa2685781b8d",
+        ),
+        (
+            "crates/omni-rsi/Cargo.toml",
+            "1f19d2ed09a4704028cada1ee7ae3a510ac728a5f43ed67d74b5a5864cd864fc",
+        ),
+        (
+            "crates/omni-rsi/Cargo.lock",
+            "9699cd05ba24998f463e8e50b8b8980c09bea0932849df38a03622b1ff1a21a0",
+        ),
+        (
+            "vendor/burn/Cargo.toml",
+            "ae43f28673449477f9e34cde9e9f3289ce55b4a352ea059aa357649d9b872701",
+        ),
+        (
+            "vendor/cubecl-common/Cargo.toml",
+            "68c03a500f4eafe809cf3b1beb5a6d348d510bb082bc8ab1c7c6fc316b688150",
+        ),
+        (
+            "crates/burn-ane/Cargo.toml",
+            "0ff1aaa0f6ac6257257fd8af012675042938f348da068ebc24e36f3cde301dc5",
+        ),
+    ];
+    let mut known = true;
+    for (name, expected) in inputs {
+        let path = repo.join(name);
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        known &= format!("{:x}", Sha256::digest(bytes)) == expected;
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    Ok(known)
+}
+
+fn run() -> Result<(), String> {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest")?);
+    let repo = fs::canonicalize(
+        manifest
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("missing repo")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let cwd = env::var_os("PWD")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| repo.clone());
+    let manifest_file = manifest.join("Cargo.toml");
+    let patches = build_backend::patch_paths(
+        &fs::read_to_string(&manifest_file).map_err(|e| e.to_string())?,
+    )?;
+    let known_cpu_graph = known_cpu_graph(&repo)?;
+    let gpu_only = [
+        "burn-cubecl",
+        "burn-fusion",
+        "burn-router",
+        "cubecl-cpp",
+        "cubecl-runtime",
+        "cubecl-wgpu",
+    ];
+    let mut cpu = Vec::new();
+    let mut gpu = vec![repo.join("crates/omni-kernel")];
+    for (name, path) in patches {
+        let path = manifest.join(path);
+        if !known_cpu_graph || !gpu_only.contains(&name.as_str()) {
+            cpu.push(path.clone());
+        }
+        gpu.push(path);
+    }
+    let mut common = Sha256::new();
+    field(&mut common, b"omni-backend-build-config-v1");
+    config_identity(&mut common, &cwd, &manifest)?;
+    let common = common.finalize();
+    println!("cargo:rerun-if-changed={}", manifest_file.display());
+    println!("cargo:rerun-if-changed=build_backend.rs");
+    println!(
+        "cargo:rustc-env=OMNI_RSI_BACKEND_CPU={}",
+        graph_identity(&repo, cpu, &common, "cpu")?
+    );
+    println!(
+        "cargo:rustc-env=OMNI_RSI_BACKEND_GPU={}",
+        graph_identity(&repo, gpu, &common, "gpu")?
+    );
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        panic!("cannot fingerprint local numerical backend: {error}");
+    }
+}

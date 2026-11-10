@@ -151,23 +151,41 @@ struct Transcribe {
     #[arg(long, default_value_t = 0)]
     final_padding_ms: usize,
     /// Emit one JSON event per decoding step instead of plain transcript deltas.
-    #[arg(long)]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false", require_equals = true)]
     json: bool,
     /// Pace WAV packets against a monotonic clock for a real-time playback simulation.
-    #[arg(long)]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false", require_equals = true)]
     realtime: bool,
     /// Run the WAV once silently to compile/tune kernels before measuring it.
-    #[arg(long, requires = "audio")]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false", require_equals = true)]
     warmup: bool,
     /// Recompute the model prefix for cache parity debugging.
-    #[arg(long)]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false", require_equals = true)]
     no_cache: bool,
 }
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+fn parse_args<I, T>(arguments: I) -> Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let args = Args::try_parse_from(arguments)?;
+    if let Command::Transcribe(options) = &args.command
+        && options.warmup
+        && options.audio.is_none()
+    {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--warmup=true requires --audio",
+        ));
+    }
+    Ok(args)
+}
+
 fn main() -> AnyResult<()> {
-    let args = Args::parse();
+    let args = parse_args(std::env::args_os()).unwrap_or_else(|error| error.exit());
     if let Command::Inspect { model } = &args.command {
         let config = ModelConfig::from_json(&std::fs::read(model.join("config.json"))?)?;
         println!("{}", serde_json::to_string_pretty(&config)?);
@@ -486,4 +504,44 @@ fn emit_event(event: TranscriptionEvent, json: bool) -> omni_r2t2::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn transcription_boolean_options_accept_explicit_values_and_legacy_flags() {
+        let parse = |flags: &[&str]| {
+            let mut args = vec!["r2t2", "transcribe", "--model", "model", "--audio", "x.wav"];
+            args.extend_from_slice(flags);
+            match parse_args(args).unwrap().command {
+                Command::Transcribe(options) => options,
+                _ => unreachable!(),
+            }
+        };
+        let explicit = parse(&[
+            "--json=true",
+            "--realtime=false",
+            "--warmup=false",
+            "--no-cache=false",
+        ]);
+        assert!(explicit.json);
+        assert!(!explicit.realtime && !explicit.warmup && !explicit.no_cache);
+        let legacy = parse(&["--json", "--realtime", "--warmup", "--no-cache"]);
+        assert!(legacy.json && legacy.realtime && legacy.warmup && legacy.no_cache);
+    }
+
+    #[test]
+    fn warmup_requires_audio_only_when_true() {
+        let base = ["r2t2", "transcribe", "--model", "model", "--stdin-pcm"];
+        assert!(parse_args(base).is_ok());
+        assert!(parse_args(base.into_iter().chain(["--warmup=false"])).is_ok());
+        assert!(parse_args(base.into_iter().chain(["--warmup=true"])).is_err());
+        assert!(parse_args(base.into_iter().chain(["--warmup"])).is_err());
+        let mic = ["r2t2", "transcribe", "--model", "model", "--microphone"];
+        assert!(parse_args(mic).is_ok());
+        assert!(parse_args(mic.into_iter().chain(["--warmup=false"])).is_ok());
+        assert!(parse_args(mic.into_iter().chain(["--warmup=true"])).is_err());
+    }
 }

@@ -66,10 +66,7 @@ pub fn transcribe_v3_r2t2(
     mode: V3AsrMode,
     stop: &AtomicBool,
 ) -> Result<AsrEvent, String> {
-    match mode {
-        V3AsrMode::MetalF16 => crate::speech_asr::transcribe(audio, model, binary, stop),
-        V3AsrMode::CpuF32 => voice::transcribe_cpu(audio, model, binary, stop),
-    }
+    voice::transcribe(audio, model, binary, mode, stop)
 }
 
 pub struct V3Options<'a> {
@@ -574,7 +571,7 @@ pub fn evaluate_v3_voice_with<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
     mode: V3AsrMode,
-    infer: impl FnMut(&str, &str, &[f32]) -> Result<(DecodedText, DecodedSpeech), String>,
+    mut infer: impl FnMut(&str, &str, &[f32]) -> Result<(DecodedText, DecodedSpeech), String>,
     transcribe: impl FnMut(&Path) -> Result<AsrEvent, String>,
 ) -> Result<serde_json::Value, String> {
     if options.r2t2.is_none() {
@@ -586,7 +583,7 @@ pub fn evaluate_v3_voice_with<B: AutodiffBackend>(
             prepared,
             voice_dir,
             stop,
-            infer,
+            |arm, instruction, samples, _remaining| infer(arm, instruction, samples),
             transcribe,
             "injected_unverified",
         )
@@ -598,7 +595,7 @@ fn compare_voice(
     prepared: &Prepared,
     voice_dir: &Path,
     stop: &AtomicBool,
-    mut infer: impl FnMut(&str, &str, &[f32]) -> Result<(DecodedText, DecodedSpeech), String>,
+    mut infer: impl FnMut(&str, &str, &[f32], usize) -> Result<(DecodedText, DecodedSpeech), String>,
     mut transcribe: impl FnMut(&Path) -> Result<AsrEvent, String>,
     source: &'static str,
 ) -> Result<serde_json::Value, String> {
@@ -615,7 +612,7 @@ fn compare_voice(
     let mut writer = voice::VoiceWriter::new(voice_dir, format)?;
     let mut speech = Vec::new();
     let mut report = compare_registered_with(registered, stop, |arm, instruction, samples| {
-        let (text, audio) = infer(arm, instruction, samples)?;
+        let (text, audio) = infer(arm, instruction, samples, writer.remaining_samples())?;
         speech.push(writer.observe(audio, stop, &mut transcribe, source)?);
         Ok(text)
     })?;
@@ -826,7 +823,7 @@ pub fn evaluate_v3_voice<B: AutodiffBackend>(
             prepared,
             voice_dir,
             stop,
-            |arm, instruction, samples| {
+            |arm, instruction, samples, remaining| {
                 interrupted(stop)?;
                 if arm == "baseline" {
                     model.text.clear_conv_lora(23).map_err(|e| e.to_string())?;
@@ -857,8 +854,7 @@ pub fn evaluate_v3_voice<B: AutodiffBackend>(
                     .tokenizer
                     .decode(&text_result.tokens, true)
                     .map_err(|e| e.to_string())?;
-                let mut streamed_samples = 0_usize;
-                let mut invalid_stream = false;
+                let mut stream_budget = voice::StreamPcmBudget::new(remaining);
                 let audio = model
                     .generate_omni(
                         &messages,
@@ -873,23 +869,13 @@ pub fn evaluate_v3_voice<B: AutodiffBackend>(
                                 sample_rate,
                             } = event
                             {
-                                match streamed_samples.checked_add(samples.len()) {
-                                    Some(next)
-                                        if *sample_rate == 24_000 && next <= voice::MAX_SAMPLES =>
-                                    {
-                                        streamed_samples = next;
-                                    }
-                                    _ => {
-                                        invalid_stream = true;
-                                        return false;
-                                    }
-                                }
+                                return stream_budget.accept(samples.len(), *sample_rate);
                             }
                             true
                         },
                     )
                     .map_err(|e| e.to_string())?;
-                if invalid_stream {
+                if stream_budget.invalid() {
                     return Err(
                         "speech stream exceeds the registered PCM format or sample limit".into(),
                     );

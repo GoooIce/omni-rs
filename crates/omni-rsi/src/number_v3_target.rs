@@ -76,11 +76,33 @@ fn verify_target<B: Backend>(
     budget: &mut MediaBudget,
     stop: &AtomicBool,
 ) -> Result<(), String> {
+    let samples = target_samples(root, partition, target, budget, stop)?;
+    compare_frames(encoder, &samples, target.frames(), format.0, format.1, stop)
+}
+
+fn target_samples(
+    root: &Path,
+    partition: &str,
+    target: &SpeechTarget,
+    budget: &mut MediaBudget,
+    stop: &AtomicBool,
+) -> Result<Vec<f32>, String> {
     check_encoding_claim(target)?;
     let bytes = read_target_snapshot(root, partition, target, budget, stop)?;
     budget.reserve_target_decode(&bytes)?;
-    let samples = target_pcm(&bytes)?;
-    compare_frames(encoder, &samples, target.frames(), format.0, format.1, stop)
+    target_pcm(&bytes)
+}
+
+#[cfg(all(test, unix, feature = "cpu"))]
+thread_local! {
+    static TEST_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static TEST_REENCODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix, feature = "cpu"))]
+pub(crate) fn test_mock_reencoding_budget(remaining: Option<usize>) -> usize {
+    TEST_BUDGET.with(|value| value.set(remaining));
+    TEST_REENCODED.with(|count| count.replace(0))
 }
 
 /// Only real local encoding can return the codec snapshot used by training.
@@ -130,6 +152,10 @@ pub(crate) fn verify<B: AutodiffBackend>(
     let format = TargetCodeFormat::from_bytes(&model_bytes, &config_bytes)?;
     let config = CodecConfig::from_bytes(&config_bytes).map_err(|e| e.to_string())?;
     let mut media_budget = development.media_budget();
+    #[cfg(all(test, unix, feature = "cpu"))]
+    if let Some(remaining) = TEST_BUDGET.with(|value| value.get()) {
+        media_budget.test_remaining_bytes(remaining);
+    }
 
     // Check identities and resource limits before constructing the encoder.
     for (partition, target) in targets() {
@@ -153,6 +179,20 @@ pub(crate) fn verify<B: AutodiffBackend>(
         {
             return Err("target codec frame count or STFT workload exceeds limit".into());
         }
+    }
+
+    // This test-only codec exercises the real snapshot/decode budget path and
+    // can never return a VerifiedCodec or authorize training.
+    #[cfg(all(test, unix, feature = "cpu"))]
+    if TEST_BUDGET.with(|value| value.get()).is_some() {
+        for (partition, target) in targets() {
+            let samples = target_samples(root, partition, target, &mut media_budget, stop)?;
+            if samples.is_empty() {
+                return Err("empty mock target".into());
+            }
+            TEST_REENCODED.with(|count| count.set(count.get() + 1));
+        }
+        return Err("test mock cannot authorize training".into());
     }
 
     cancelled(stop)?;
@@ -201,6 +241,74 @@ mod tests {
     struct Case {
         samples: Vec<f32>,
         frames: Vec<Vec<u32>>,
+    }
+
+    #[test]
+    fn reencoding_budget_failure_preserves_new_and_resumed_checkpoint_state() {
+        use crate::{
+            number_v3_fixture::repeated_target_budget_fixture,
+            speech_audio_round::{AudioRoundOptions, train_v3_audio_round},
+        };
+        use burn::backend::{Autodiff, NdArray};
+        type Cpu = Autodiff<NdArray<f32>>;
+        let root = repeated_target_budget_fixture(113, None, 2);
+        let model = root.path().join("model");
+        let wav_size = fs::metadata(root.path().join("train-target-media/answer.wav"))
+            .unwrap()
+            .len() as usize;
+        for resume in [false, true] {
+            let state = root
+                .path()
+                .join(if resume { "resume-state" } else { "new-state" });
+            let directory = state.join("number-audio-v3/audio-conditioned-v1");
+            let pointer = directory.join("latest.json");
+            if resume {
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(&pointer, b"existing checkpoint pointer").unwrap();
+            }
+            let options = AudioRoundOptions {
+                model: &model,
+                data: root.path(),
+                state: &state,
+                epochs: 1,
+                max_updates: 1,
+                resume,
+            };
+            test_mock_reencoding_budget(Some(wav_size * 3));
+            let error =
+                train_v3_audio_round::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                    .err()
+                    .unwrap();
+            let encoded = test_mock_reencoding_budget(None);
+            assert!(error.contains("media byte limit"), "{error}");
+            assert_eq!(
+                encoded, 1,
+                "preflight and first reencoding must complete before exhaustion"
+            );
+            if resume {
+                assert_eq!(fs::read(&pointer).unwrap(), b"existing checkpoint pointer");
+                assert!(!directory.join("checkpoints").exists());
+            } else {
+                assert!(!directory.exists());
+            }
+        }
+        let state = root.path().join("mock-success-state");
+        let options = AudioRoundOptions {
+            model: &model,
+            data: root.path(),
+            state: &state,
+            epochs: 1,
+            max_updates: 1,
+            resume: false,
+        };
+        test_mock_reencoding_budget(Some(wav_size * 4));
+        let error =
+            train_v3_audio_round::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                .err()
+                .unwrap();
+        assert_eq!(test_mock_reencoding_budget(None), 2);
+        assert!(error.contains("mock cannot authorize"), "{error}");
+        assert!(!state.join("number-audio-v3/audio-conditioned-v1").exists());
     }
 
     #[test]

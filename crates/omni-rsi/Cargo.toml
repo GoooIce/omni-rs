@@ -31,6 +31,10 @@ libc = "0.2"
 clap = { version = "4.5", features = ["derive"], optional = true }
 ctrlc = { version = "3.4", optional = true }
 
+[build-dependencies]
+sha2 = "0.10"
+libc = "0.2"
+
 [[bin]]
 name = "omni-rsi"
 path = "src/main.rs"

@@ -1,7 +1,7 @@
 //! Checkpoints for audio-conditioned training, isolated from self-reading.
 use crate::{
     fingerprint::{codec_fingerprint, target_codec_hash},
-    number_audio_v3::v3_audio_implementation_hash,
+    number_audio_v3::v3_audio_implementation_hash_for_backend,
     speech_audio_data::AudioDataset,
     speech_checkpoint::{atomic_json, implementation_hash},
     speech_training::{SpeechOptimizer, SpeechOptimizerSnapshot},
@@ -53,8 +53,8 @@ fn hex_id(value: &str) -> bool {
 
 fn validate(protocol: &AudioProtocol, progress: &AudioProgress) -> Result<(), String> {
     let expected_implementation = match protocol.version {
-        1 => audio_implementation_hash(),
-        2 => v3_audio_implementation_hash(),
+        1 => audio_implementation_hash_for_backend(&protocol.backend),
+        2 => v3_audio_implementation_hash_for_backend(&protocol.backend),
         _ => return Err("invalid audio training protocol or progress".into()),
     };
     if protocol.implementation_hash != expected_implementation {
@@ -98,6 +98,10 @@ fn audio_shared_sources() -> Vec<(&'static str, &'static [u8])> {
         source!("fingerprint.rs", "fingerprint.rs"),
         source!("audio_main.rs", "audio_main.rs"),
         source!("Cargo.toml", "../Cargo.toml"),
+        source!("build.rs", "../build.rs"),
+        source!("build_backend.rs", "../build_backend.rs"),
+        source!("root/Cargo.toml", "../../../Cargo.toml"),
+        source!("lfm3/Cargo.toml", "../../lfm3-omni/Cargo.toml"),
         source!("lfm3/media_io.rs", "../../lfm3-omni/src/media_io.rs"),
         source!("src/input.rs", "../../../src/input.rs"),
         source!("src/config.rs", "../../../src/config.rs"),
@@ -142,11 +146,24 @@ pub(crate) fn hash_audio_sources(domain: &[u8], parent: &str, sources: &[(&str, 
 
 /// Bind legacy audio training only to its actual shared execution sources.
 pub fn audio_implementation_hash() -> String {
-    hash_audio_sources(
-        b"omni-audio-legacy-v2\0",
-        &implementation_hash(),
-        &audio_shared_sources(),
-    )
+    #[cfg(feature = "cpu")]
+    let backend = "autodiff<ndarray>";
+    #[cfg(not(feature = "cpu"))]
+    let backend = "autodiff<cubecl<metal>>";
+    audio_implementation_hash_for_backend(backend)
+}
+
+/// Include the source identity appropriate to the recorded numerical backend.
+pub fn audio_implementation_hash_for_backend(backend: &str) -> String {
+    let backend_hash = if backend == "autodiff<ndarray>" || backend == "ndarray" {
+        env!("OMNI_RSI_BACKEND_CPU")
+    } else {
+        // Unknown backends get the conservative graph, not a CPU-only digest.
+        env!("OMNI_RSI_BACKEND_GPU")
+    };
+    let mut sources = audio_shared_sources();
+    sources.push(("patched-numerical-backend", backend_hash.as_bytes()));
+    hash_audio_sources(b"omni-audio-legacy-v2\0", &implementation_hash(), &sources)
 }
 
 impl AudioProtocol {
@@ -200,7 +217,7 @@ impl AudioProtocol {
             base_hash,
             codec_hash,
             dataset_hash: dataset.digest().into(),
-            implementation_hash: audio_implementation_hash(),
+            implementation_hash: audio_implementation_hash_for_backend(&backend),
             backend,
             width,
             train_records: dataset.len(),
@@ -368,13 +385,20 @@ mod tests {
 
     #[test]
     fn v3_only_sources_do_not_change_the_legacy_training_identity() {
-        let shared = audio_shared_sources();
+        let mut shared = audio_shared_sources();
+        shared.push((
+            "patched-numerical-backend",
+            env!("OMNI_RSI_BACKEND_CPU").as_bytes(),
+        ));
         let v3 = crate::number_audio_v3::v3_audio_sources();
         let native = implementation_hash();
         let legacy = hash_audio_sources(b"omni-audio-legacy-v2\0", &native, &shared);
         let v3_hash = hash_audio_sources(b"omni-audio-v3-v2\0", &legacy, &v3);
         assert_eq!(legacy, audio_implementation_hash());
-        assert_eq!(v3_hash, v3_audio_implementation_hash());
+        assert_eq!(
+            v3_hash,
+            v3_audio_implementation_hash_for_backend("autodiff<ndarray>")
+        );
 
         for name in [
             "number_v3_target.rs",
@@ -439,7 +463,7 @@ mod tests {
         assert!(AudioCheckpoint::new(value.clone(), AudioProgress::default(), &optimizer).is_ok());
         value.version = 2;
         assert!(AudioCheckpoint::new(value.clone(), AudioProgress::default(), &optimizer).is_err());
-        value.implementation_hash = v3_audio_implementation_hash();
+        value.implementation_hash = v3_audio_implementation_hash_for_backend(&value.backend);
         assert!(AudioCheckpoint::new(value.clone(), AudioProgress::default(), &optimizer).is_ok());
         value.version = 1;
         assert!(AudioCheckpoint::new(value, AudioProgress::default(), &optimizer).is_err());

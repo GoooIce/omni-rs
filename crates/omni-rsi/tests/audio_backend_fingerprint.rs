@@ -1,0 +1,37 @@
+#![cfg(feature = "cpu")]
+
+use burn::{
+    backend::{Autodiff, NdArray},
+    tensor::backend::Backend,
+};
+use omni_rsi::{
+    speech_audio_checkpoint::{
+        AudioCheckpoint, AudioProgress, AudioProtocol, audio_implementation_hash,
+    },
+    speech_training::SpeechOptimizer,
+};
+
+#[test]
+fn prior_audio_checkpoints_without_patched_backend_identity_are_rejected() {
+    type Cpu = Autodiff<NdArray<f32>>;
+    // Captured from the unchanged 856b313 source identity before this test.
+    const OLD: &str = "bcf40480cfd095d8534a49e161c029cccbab3241c21d7498bb6e7de1c6f55eb4";
+    assert_ne!(audio_implementation_hash(), OLD);
+    let device = Default::default();
+    let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
+    let protocol = AudioProtocol {
+        version: 1,
+        base_hash: "1".repeat(64),
+        codec_hash: "2".repeat(64),
+        dataset_hash: "3".repeat(64),
+        implementation_hash: OLD.into(),
+        backend: Cpu::name(&device),
+        width: 16,
+        train_records: 1,
+        mask_seed: 159,
+    };
+    let error = AudioCheckpoint::new(protocol, AudioProgress::default(), &optimizer)
+        .err()
+        .unwrap();
+    assert!(error.contains("implementation changed"), "{error}");
+}

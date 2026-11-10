@@ -1,4 +1,11 @@
 //! Idle, verified chart-reader adaptation for the local LFM3 model.
+#[cfg(all(test, unix, feature = "cpu"))]
+extern crate self as omni_rsi;
+
+#[cfg(all(test, unix, feature = "cpu"))]
+#[path = "../tests/support/number_v3_fixture.rs"]
+mod number_v3_fixture;
+
 pub mod chart;
 pub mod child;
 pub mod evolution;
