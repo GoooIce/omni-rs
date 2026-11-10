@@ -3,14 +3,19 @@
 //! The caller supplies authorization and verifies the answer separately. This
 //! module does not infer a transcript, meaning, or training eligibility.
 
-use crate::{fingerprint::codec_fingerprint, speech_data::file_hash};
+use crate::fingerprint::{
+    CodecSnapshot, codec_fingerprint, read_regular_bounded, target_codec_hash,
+};
 use burn::tensor::backend::Backend;
-use omni_lfm3::{Precision, codec::CodecEncoder};
+use omni_lfm3::{
+    Precision,
+    codec::{CodecConfig, CodecEncoder},
+};
+use omni_r2t2::weights::Weights;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
-    io::{Cursor, Read},
+    io::Cursor,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -19,6 +24,8 @@ const SAMPLE_RATE: u32 = 24_000;
 const MAX_WAV_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SAMPLES: usize = SAMPLE_RATE as usize * 20;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_CODEBOOKS: usize = 128;
+const MAX_TARGET_CODES: usize = 200 * MAX_CODEBOOKS;
 
 #[derive(Deserialize)]
 struct ModelCodeFormat {
@@ -34,8 +41,9 @@ struct CodecCodeFormat {
     sampling_rate: u32,
 }
 
-/// JSON fields may be copied into a rule-data plan record. Provenance and
-/// frames are read-only so an injected result cannot be relabelled as native.
+/// JSON fields may be copied into a rule-data plan record. The Rust fields are
+/// read-only after construction; serialized fields are editable declarations,
+/// not authenticated evidence of execution or of a WAV-to-frames relation.
 ///
 /// ```compile_fail
 /// fn relabel(target: &mut omni_rsi::speech_audio_target::EncodedTarget) {
@@ -99,18 +107,10 @@ fn interrupted(stop: &AtomicBool) -> Result<(), String> {
     }
 }
 
-fn bounded_read(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+fn bounded_read(path: &Path, limit: u64, stop: &AtomicBool) -> Result<Vec<u8>, String> {
+    let bytes = read_regular_bounded(path, limit, stop)?;
+    if bytes.is_empty() {
         return Err(format!("invalid or oversized file: {}", path.display()));
-    }
-    let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > limit {
-        return Err(format!("file changed while reading: {}", path.display()));
     }
     Ok(bytes)
 }
@@ -119,60 +119,71 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn preparation_fingerprint() -> String {
+fn preparation_sources() -> Vec<(&'static str, &'static [u8])> {
+    macro_rules! source {
+        ($name:literal, $path:literal) => {
+            ($name, include_bytes!($path).as_slice())
+        };
+    }
+    vec![
+        source!("speech_audio_target.rs", "speech_audio_target.rs"),
+        source!("fingerprint.rs", "fingerprint.rs"),
+        source!("speech_pcm.rs", "speech_pcm.rs"),
+        source!("lfm3/codec.rs", "../../lfm3-omni/src/codec.rs"),
+        source!("lfm3/config.rs", "../../lfm3-omni/src/config.rs"),
+        source!("lfm3/text.rs", "../../lfm3-omni/src/text.rs"),
+        source!("lfm3/lib.rs", "../../lfm3-omni/src/lib.rs"),
+        source!("src/lib.rs", "../../../src/lib.rs"),
+        source!("src/weights.rs", "../../../src/weights.rs"),
+        source!("src/weights/layout.rs", "../../../src/weights/layout.rs"),
+        source!("src/tensor/mod.rs", "../../../src/tensor/mod.rs"),
+        source!("src/tensor/norm.rs", "../../../src/tensor/norm.rs"),
+        source!("src/tensor/cache.rs", "../../../src/tensor/cache.rs"),
+        source!(
+            "src/tensor/embedding.rs",
+            "../../../src/tensor/embedding.rs"
+        ),
+        source!("vendor/burn/lib.rs", "../../../vendor/burn/src/lib.rs"),
+        source!(
+            "vendor/burn/backend.rs",
+            "../../../vendor/burn/src/backend.rs"
+        ),
+        source!("vendor/burn/Cargo.toml", "../../../vendor/burn/Cargo.toml"),
+        source!("Cargo.toml", "../Cargo.toml"),
+        source!("lfm3/Cargo.toml", "../../lfm3-omni/Cargo.toml"),
+        source!("root/Cargo.toml", "../../../Cargo.toml"),
+        source!("Cargo.lock", "../Cargo.lock"),
+    ]
+}
+
+fn hash_preparation_sources(sources: &[(&str, &[u8])]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"omni-rsi-target-preparation-v1\0");
-    for bytes in [
-        include_bytes!("speech_audio_target.rs").as_slice(),
-        include_bytes!("fingerprint.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/codec.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/config.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/text.rs").as_slice(),
-        include_bytes!("../../../src/weights.rs").as_slice(),
-        include_bytes!("../Cargo.lock").as_slice(),
-    ] {
+    hash.update(b"omni-rsi-target-preparation-v2\0");
+    for (name, bytes) in sources {
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     }
     format!("{:x}", hash.finalize())
 }
 
+fn preparation_fingerprint() -> String {
+    hash_preparation_sources(&preparation_sources())
+}
+
 fn target_pcm(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    let mut wav = hound::WavReader::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
-    let spec = wav.spec();
-    if spec.channels != 1
-        || spec.sample_rate != SAMPLE_RATE
-        || wav.duration() as usize > MAX_SAMPLES
-    {
-        return Err("target WAV must be bounded mono 24 kHz PCM".into());
-    }
-    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Int, 16) => wav
-            .samples::<i16>()
-            .map(|sample| {
-                sample
-                    .map(|value| f32::from(value) / 32768.0)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Float, 32) => wav
-            .samples::<f32>()
-            .map(|sample| sample.map_err(|error| error.to_string()))
-            .collect::<Result<_, _>>()?,
-        _ => return Err("target WAV must be PCM16 or float32".into()),
-    };
+    let samples = crate::speech_pcm::decode_mono_pcm(Cursor::new(bytes), SAMPLE_RATE)?;
     if samples.is_empty()
         || samples.len() > MAX_SAMPLES
-        || samples
-            .iter()
-            .any(|sample| !sample.is_finite() || sample.abs() > 1.0)
+        || samples.iter().any(|sample| sample.abs() > 1.0)
     {
         return Err("invalid target WAV samples".into());
     }
     Ok(samples)
 }
 
-/// Pipeline seam for an injected encoder. Its output is explicitly marked as
+/// Pipeline seam for an injected encoder. Its initial output is marked as
 /// injected and must not be treated as evidence that the local codec ran.
 pub fn encode_target_with(
     model: &Path,
@@ -180,21 +191,32 @@ pub fn encode_target_with(
     stop: &AtomicBool,
     mut encode: impl FnMut(&Path, &[f32]) -> Result<Vec<Vec<u32>>, String>,
 ) -> Result<EncodedTarget, String> {
+    encode_target_impl(model, wav, stop, |codec, samples, _, _, _| {
+        encode(codec, samples)
+    })
+}
+
+fn encode_target_impl(
+    model: &Path,
+    wav: &Path,
+    stop: &AtomicBool,
+    mut encode: impl FnMut(&Path, &[f32], &str, &str, &[u8]) -> Result<Vec<Vec<u32>>, String>,
+) -> Result<EncodedTarget, String> {
     interrupted(stop)?;
     let model_config = model.join("config.json");
     let codec = model.join("audio_tokenizer");
-    let wav_bytes = bounded_read(wav, MAX_WAV_BYTES)?;
+    let wav_bytes = bounded_read(wav, MAX_WAV_BYTES, stop)?;
     let wav_before = sha256(&wav_bytes);
-    if sha256(&bounded_read(wav, MAX_WAV_BYTES)?) != wav_before {
+    if sha256(&bounded_read(wav, MAX_WAV_BYTES, stop)?) != wav_before {
         return Err("target WAV changed while reading".into());
     }
     let samples = target_pcm(&wav_bytes)?;
-    let model_bytes = bounded_read(&model_config, MAX_CONFIG_BYTES)?;
+    let model_bytes = bounded_read(&model_config, MAX_CONFIG_BYTES, stop)?;
     let model_hash = sha256(&model_bytes);
     let model_format: ModelCodeFormat =
         serde_json::from_slice(&model_bytes).map_err(|error| error.to_string())?;
     let codec_hash = codec_fingerprint(&codec, stop)?;
-    let codec_bytes = bounded_read(&codec.join("config.json"), MAX_CONFIG_BYTES)?;
+    let codec_bytes = bounded_read(&codec.join("config.json"), MAX_CONFIG_BYTES, stop)?;
     let codec_format: CodecCodeFormat =
         serde_json::from_slice(&codec_bytes).map_err(|error| error.to_string())?;
     let code_count = codec_format
@@ -206,22 +228,30 @@ pub fn encode_target_with(
         .ok_or("invalid codec levels")?;
     if codec_format.fsq_levels.is_empty()
         || codec_format.sampling_rate != SAMPLE_RATE
-        || codec_format.n_q == 0
+        || !(1..=MAX_CODEBOOKS).contains(&codec_format.n_q)
         || codec_format.n_q != model_format.num_codebooks
         || model_format.audio_eos_code < code_count
         || model_format.audio_eos_code as usize >= model_format.codebook_size
     {
         return Err("model and codec codebook formats do not match".into());
     }
-    let target_codec_sha256 = if codec.join("model.safetensors.index.json").is_file() {
-        codec_hash.clone()
-    } else {
-        file_hash(&codec.join("model.safetensors"))?
-    };
+    let target_codec_sha256 = target_codec_hash(&codec, stop)?;
     interrupted(stop)?;
-    let mut frames = encode(&codec, &samples)?;
+    let mut frames = encode(
+        &codec,
+        &samples,
+        &codec_hash,
+        &target_codec_sha256,
+        &codec_bytes,
+    )?;
     interrupted(stop)?;
     if !(4..200).contains(&frames.len())
+        || frames
+            .iter()
+            .try_fold(codec_format.n_q, |total, frame| {
+                total.checked_add(frame.len())
+            })
+            .is_none_or(|total| total > MAX_TARGET_CODES)
         || frames.iter().any(|frame| {
             frame.len() != model_format.num_codebooks
                 || frame.iter().any(|code| *code >= code_count)
@@ -229,7 +259,14 @@ pub fn encode_target_with(
     {
         return Err("invalid encoded target frames".into());
     }
-    if encode(&codec, &samples)? != frames {
+    if encode(
+        &codec,
+        &samples,
+        &codec_hash,
+        &target_codec_sha256,
+        &codec_bytes,
+    )? != frames
+    {
         return Err("unstable codec output for the same target WAV".into());
     }
     interrupted(stop)?;
@@ -237,8 +274,8 @@ pub fn encode_target_with(
         model_format.audio_eos_code;
         model_format.num_codebooks
     ]);
-    if sha256(&bounded_read(wav, MAX_WAV_BYTES)?) != wav_before
-        || sha256(&bounded_read(&model_config, MAX_CONFIG_BYTES)?) != model_hash
+    if sha256(&bounded_read(wav, MAX_WAV_BYTES, stop)?) != wav_before
+        || sha256(&bounded_read(&model_config, MAX_CONFIG_BYTES, stop)?) != model_hash
         || codec_fingerprint(&codec, stop)? != codec_hash
     {
         return Err("target WAV or codec changed during encoding".into());
@@ -266,20 +303,62 @@ pub fn encode_target<B: Backend>(
     stop: &AtomicBool,
 ) -> Result<EncodedTarget, String> {
     let mut encoder: Option<CodecEncoder<B>> = None;
-    let mut result = encode_target_with(model, wav, stop, |codec, samples| {
-        if encoder.is_none() {
-            encoder = Some(
-                CodecEncoder::<B>::load(codec, Precision::F32, device)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        let encoder = encoder.as_ref().ok_or("missing codec encoder")?;
-        if encoder.sample_rate() != SAMPLE_RATE {
-            return Err("codec sample rate does not match target WAV".into());
-        }
-        encoder.encode(samples).map_err(|error| error.to_string())
-    })?;
+    let mut result = encode_target_impl(
+        model,
+        wav,
+        stop,
+        |codec, samples, fingerprint, target_hash, config_bytes| {
+            if encoder.is_none() {
+                let snapshot = CodecSnapshot::capture(codec, stop)?;
+                if snapshot.fingerprint() != fingerprint
+                    || snapshot.target_codec_hash() != target_hash
+                {
+                    return Err("codec changed while capturing encoder".into());
+                }
+                let (captured_config, shards) = snapshot.into_parts();
+                if captured_config != config_bytes {
+                    return Err("codec configuration changed while capturing encoder".into());
+                }
+                let config =
+                    CodecConfig::from_bytes(&captured_config).map_err(|error| error.to_string())?;
+                let weights = Weights::from_bytes(shards).map_err(|error| error.to_string())?;
+                encoder = Some(
+                    CodecEncoder::<B>::from_weights(&weights, config, Precision::F32, device)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let encoder = encoder.as_ref().ok_or("missing codec encoder")?;
+            if encoder.sample_rate() != SAMPLE_RATE {
+                return Err("codec sample rate does not match target WAV".into());
+            }
+            encoder.encode(samples).map_err(|error| error.to_string())
+        },
+    )?;
     result.encoding = "local_liquidcodec_f32";
     result.runtime_backend = B::name(device);
     Ok(result)
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::{hash_preparation_sources, preparation_fingerprint, preparation_sources};
+
+    #[test]
+    fn preparation_identity_changes_with_shared_numerical_and_pcm_sources() {
+        let original = preparation_fingerprint();
+        for name in [
+            "src/tensor/norm.rs",
+            "src/tensor/mod.rs",
+            "src/tensor/cache.rs",
+            "speech_pcm.rs",
+        ] {
+            let mut sources = preparation_sources();
+            let entry = sources
+                .iter_mut()
+                .find(|(path, _)| *path == name)
+                .expect("preparation source must be bound");
+            entry.1 = b"independently changed source";
+            assert_ne!(original, hash_preparation_sources(&sources), "{name}");
+        }
+    }
 }
