@@ -1,7 +1,7 @@
 //! Checkpoints for audio-conditioned training, isolated from self-reading.
 use crate::{
     fingerprint::{codec_fingerprint, target_codec_hash},
-    number_audio_v3::NumberAudioV3,
+    number_audio_v3::v3_audio_implementation_hash,
     speech_audio_data::AudioDataset,
     speech_checkpoint::{atomic_json, implementation_hash},
     speech_training::{SpeechOptimizer, SpeechOptimizerSnapshot},
@@ -52,18 +52,22 @@ fn hex_id(value: &str) -> bool {
 }
 
 fn validate(protocol: &AudioProtocol, progress: &AudioProgress) -> Result<(), String> {
-    if protocol.implementation_hash != audio_implementation_hash() {
+    let expected_implementation = match protocol.version {
+        1 => audio_implementation_hash(),
+        2 => v3_audio_implementation_hash(),
+        _ => return Err("invalid audio training protocol or progress".into()),
+    };
+    if protocol.implementation_hash != expected_implementation {
         return Err("audio checkpoint implementation changed; existing state is untouched; use its original binary".into());
     }
-    if protocol.version != 1
-        || [
-            &protocol.base_hash,
-            &protocol.codec_hash,
-            &protocol.dataset_hash,
-            &protocol.implementation_hash,
-        ]
-        .iter()
-        .any(|value| !hex_id(value))
+    if [
+        &protocol.base_hash,
+        &protocol.codec_hash,
+        &protocol.dataset_hash,
+        &protocol.implementation_hash,
+    ]
+    .iter()
+    .any(|value| !hex_id(value))
         || protocol.backend.is_empty()
         || protocol.backend.len() > 256
         || !(4..=65_536).contains(&protocol.width)
@@ -80,103 +84,72 @@ fn validate(protocol: &AudioProtocol, progress: &AudioProgress) -> Result<(), St
     Ok(())
 }
 
-/// Hash every part of the native audio-conditioned objective and prompt path.
-pub fn audio_implementation_hash() -> String {
+fn audio_shared_sources() -> Vec<(&'static str, &'static [u8])> {
+    macro_rules! source {
+        ($name:literal, $path:literal) => {
+            ($name, include_bytes!($path).as_slice())
+        };
+    }
+    vec![
+        source!("speech_audio.rs", "speech_audio.rs"),
+        source!("speech_audio_checkpoint.rs", "speech_audio_checkpoint.rs"),
+        source!("speech_audio_data.rs", "speech_audio_data.rs"),
+        source!("speech_audio_round.rs", "speech_audio_round.rs"),
+        source!("fingerprint.rs", "fingerprint.rs"),
+        source!("audio_main.rs", "audio_main.rs"),
+        source!("Cargo.toml", "../Cargo.toml"),
+        source!("lfm3/media_io.rs", "../../lfm3-omni/src/media_io.rs"),
+        source!("src/input.rs", "../../../src/input.rs"),
+        source!("src/config.rs", "../../../src/config.rs"),
+        source!("src/weights.rs", "../../../src/weights.rs"),
+        source!("src/weights/layout.rs", "../../../src/weights/layout.rs"),
+        source!("src/tensor/mod.rs", "../../../src/tensor/mod.rs"),
+        source!("src/tensor/norm.rs", "../../../src/tensor/norm.rs"),
+        source!(
+            "src/tensor/embedding.rs",
+            "../../../src/tensor/embedding.rs"
+        ),
+        source!("src/tensor/cache.rs", "../../../src/tensor/cache.rs"),
+        source!(
+            "src/tensor/decode_cache.rs",
+            "../../../src/tensor/decode_cache.rs"
+        ),
+        source!("lfm3/config.rs", "../../lfm3-omni/src/config.rs"),
+        source!("lfm3/audio.rs", "../../lfm3-omni/src/audio.rs"),
+        source!(
+            "lfm3/audio_encoder.rs",
+            "../../lfm3-omni/src/audio_encoder.rs"
+        ),
+        source!("lfm3/chat.rs", "../../lfm3-omni/src/chat.rs"),
+        source!("lfm3/media.rs", "../../lfm3-omni/src/media.rs"),
+        source!("lfm3/prepared.rs", "../../lfm3-omni/src/prepared.rs"),
+    ]
+}
+
+pub(crate) fn hash_audio_sources(domain: &[u8], parent: &str, sources: &[(&str, &[u8])]) -> String {
     let mut hash = Sha256::new();
-    for bytes in [
-        implementation_hash().as_bytes(),
-        include_bytes!("speech_audio.rs").as_slice(),
-        include_bytes!("speech_audio_checkpoint.rs").as_slice(),
-        include_bytes!("speech_audio_data.rs").as_slice(),
-        include_bytes!("speech_audio_round.rs").as_slice(),
-        include_bytes!("number_v3_target.rs").as_slice(),
-        include_bytes!("number_audio_v3.rs").as_slice(),
-        include_bytes!("number_development.rs").as_slice(),
-        include_bytes!("speech_audio_target.rs").as_slice(),
-        include_bytes!("fingerprint.rs").as_slice(),
-        include_bytes!("audio_main.rs").as_slice(),
-        include_bytes!("../Cargo.toml").as_slice(),
-        include_bytes!("../../lfm3-omni/src/media_io.rs").as_slice(),
-        include_bytes!("../../../src/input.rs").as_slice(),
-        include_bytes!("../../../src/weights.rs").as_slice(),
-        include_bytes!("../../../src/weights/layout.rs").as_slice(),
-        include_bytes!("../../../src/tensor/mod.rs").as_slice(),
-        include_bytes!("../../../src/tensor/norm.rs").as_slice(),
-        include_bytes!("../../../src/tensor/embedding.rs").as_slice(),
-        include_bytes!("../../../src/tensor/cache.rs").as_slice(),
-        include_bytes!("../../../src/tensor/decode_cache.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/config.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/audio.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/audio_encoder.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/chat.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/media.rs").as_slice(),
-        include_bytes!("../../lfm3-omni/src/prepared.rs").as_slice(),
-    ] {
+    hash.update(domain);
+    hash.update((parent.len() as u64).to_le_bytes());
+    hash.update(parent.as_bytes());
+    for (name, bytes) in sources {
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     }
     format!("{:x}", hash.finalize())
 }
 
-impl AudioProtocol {
-    /// Build a checkpoint protocol for the isolated v3 training snapshot.
-    pub fn for_v3(
-        model: &Path,
-        dataset: &NumberAudioV3,
-        backend: String,
-        stop: &AtomicBool,
-    ) -> Result<Self, String> {
-        if stop.load(Ordering::Acquire) {
-            return Err("interrupted".into());
-        }
-        crate::number_development::check_artifact_tree(model, stop)?;
-        let base_hash =
-            omni_lfm3::speech_adapter::source_fingerprint(model).map_err(|e| e.to_string())?;
-        let full_codec_hash = codec_fingerprint(&model.join("audio_tokenizer"), stop)?;
-        let codec_hash = audio_codec_hash(model, stop)?;
-        if dataset
-            .development()
-            .target_model_fingerprints()
-            .is_some_and(|(base, codec)| base != base_hash || codec != full_codec_hash)
-        {
-            return Err("v3 target model or codec changed after data loading".into());
-        }
-        for record in dataset
-            .development()
-            .train()
-            .iter()
-            .chain(dataset.development().dev())
-        {
-            if record
-                .speech_target()
-                .is_some_and(|target| target.target_codec_sha256() != codec_hash)
-            {
-                return Err("v3 target codec does not match the current model".into());
-            }
-        }
-        let config: serde_json::Value = serde_json::from_slice(
-            &fs::read(model.join("config.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let width = config
-            .pointer("/text_config/hidden_size")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|width| usize::try_from(width).ok())
-            .filter(|width| (4..=65_536).contains(width))
-            .ok_or("invalid audio model width")?;
-        Ok(Self {
-            version: 1,
-            base_hash,
-            codec_hash,
-            dataset_hash: dataset.digest().into(),
-            implementation_hash: audio_implementation_hash(),
-            backend,
-            width,
-            train_records: dataset.len(),
-            mask_seed: 159,
-        })
-    }
+/// Bind legacy audio training only to its actual shared execution sources.
+pub fn audio_implementation_hash() -> String {
+    hash_audio_sources(
+        b"omni-audio-legacy-v2\0",
+        &implementation_hash(),
+        &audio_shared_sources(),
+    )
+}
 
+impl AudioProtocol {
     /// Build the identical model/data binding for training and evaluation.
     pub fn for_dataset(
         model: &Path,
@@ -255,7 +228,7 @@ impl AudioProtocol {
 }
 
 // Preserve the established target and checkpoint digest for unsharded codecs.
-fn audio_codec_hash(model: &Path, stop: &AtomicBool) -> Result<String, String> {
+pub(crate) fn audio_codec_hash(model: &Path, stop: &AtomicBool) -> Result<String, String> {
     target_codec_hash(&model.join("audio_tokenizer"), stop)
 }
 
@@ -391,6 +364,85 @@ mod tests {
             train_records: 2,
             mask_seed: 159,
         }
+    }
+
+    #[test]
+    fn v3_only_sources_do_not_change_the_legacy_training_identity() {
+        let shared = audio_shared_sources();
+        let v3 = crate::number_audio_v3::v3_audio_sources();
+        let native = implementation_hash();
+        let legacy = hash_audio_sources(b"omni-audio-legacy-v2\0", &native, &shared);
+        let v3_hash = hash_audio_sources(b"omni-audio-v3-v2\0", &legacy, &v3);
+        assert_eq!(legacy, audio_implementation_hash());
+        assert_eq!(v3_hash, v3_audio_implementation_hash());
+
+        for name in [
+            "number_v3_target.rs",
+            "number_audio_v3.rs",
+            "number_development.rs",
+            "speech_target_format.rs",
+        ] {
+            let mut changed_v3 = v3.clone();
+            changed_v3
+                .iter_mut()
+                .find(|(path, _)| *path == name)
+                .unwrap()
+                .1 = b"changed v3 source";
+            assert_ne!(
+                hash_audio_sources(b"omni-audio-v3-v2\0", &legacy, &changed_v3),
+                v3_hash,
+                "{name}"
+            );
+            assert_eq!(
+                hash_audio_sources(b"omni-audio-legacy-v2\0", &native, &shared),
+                legacy
+            );
+        }
+
+        for name in [
+            "src/config.rs",
+            "src/weights.rs",
+            "src/weights/layout.rs",
+            "src/tensor/norm.rs",
+            "speech_audio.rs",
+        ] {
+            let mut changed_shared = shared.clone();
+            changed_shared
+                .iter_mut()
+                .find(|(path, _)| *path == name)
+                .unwrap()
+                .1 = b"changed shared implementation";
+            let new_legacy =
+                hash_audio_sources(b"omni-audio-legacy-v2\0", &native, &changed_shared);
+            assert_ne!(new_legacy, legacy, "{name}");
+            assert_ne!(
+                hash_audio_sources(b"omni-audio-v3-v2\0", &new_legacy, &v3),
+                v3_hash,
+                "{name}"
+            );
+        }
+
+        let new_native = "0".repeat(64);
+        let new_legacy = hash_audio_sources(b"omni-audio-legacy-v2\0", &new_native, &shared);
+        assert_ne!(new_legacy, legacy);
+        assert_ne!(
+            hash_audio_sources(b"omni-audio-v3-v2\0", &new_legacy, &v3),
+            v3_hash
+        );
+    }
+
+    #[test]
+    fn checkpoint_version_cannot_use_the_other_paths_implementation_identity() {
+        let device = Default::default();
+        let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 1, &device).unwrap();
+        let mut value = protocol();
+        assert!(AudioCheckpoint::new(value.clone(), AudioProgress::default(), &optimizer).is_ok());
+        value.version = 2;
+        assert!(AudioCheckpoint::new(value.clone(), AudioProgress::default(), &optimizer).is_err());
+        value.implementation_hash = v3_audio_implementation_hash();
+        assert!(AudioCheckpoint::new(value.clone(), AudioProgress::default(), &optimizer).is_ok());
+        value.version = 1;
+        assert!(AudioCheckpoint::new(value, AudioProgress::default(), &optimizer).is_err());
     }
 
     fn update(optimizer: &mut SpeechOptimizer<Cpu>) {

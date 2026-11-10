@@ -2,14 +2,116 @@
 //! This is data admission, not evidence of quality or verified authorization.
 
 use crate::{
+    fingerprint::codec_fingerprint,
     number_development::{DevelopmentData, DevelopmentRecord},
     speech_audio::AudioAnswer,
+    speech_audio_checkpoint::{
+        AudioProtocol, audio_codec_hash, audio_implementation_hash, hash_audio_sources,
+    },
 };
+
+pub(crate) fn v3_audio_sources() -> Vec<(&'static str, &'static [u8])> {
+    vec![
+        (
+            "number_v3_target.rs",
+            include_bytes!("number_v3_target.rs").as_slice(),
+        ),
+        (
+            "number_audio_v3.rs",
+            include_bytes!("number_audio_v3.rs").as_slice(),
+        ),
+        (
+            "number_development.rs",
+            include_bytes!("number_development.rs").as_slice(),
+        ),
+        (
+            "number_blind_holdout.rs",
+            include_bytes!("number_blind_holdout.rs").as_slice(),
+        ),
+        (
+            "speech_audio_target.rs",
+            include_bytes!("speech_audio_target.rs").as_slice(),
+        ),
+        (
+            "speech_target_format.rs",
+            include_bytes!("speech_target_format.rs").as_slice(),
+        ),
+    ]
+}
+
+pub(crate) fn v3_audio_implementation_hash() -> String {
+    hash_audio_sources(
+        b"omni-audio-v3-v2\0",
+        &audio_implementation_hash(),
+        &v3_audio_sources(),
+    )
+}
 use sha2::{Digest, Sha256};
 use std::{
+    fs,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+impl AudioProtocol {
+    /// Build a checkpoint protocol for the isolated v3 training snapshot.
+    pub fn for_v3(
+        model: &Path,
+        dataset: &NumberAudioV3,
+        backend: String,
+        stop: &AtomicBool,
+    ) -> Result<Self, String> {
+        if stop.load(Ordering::Acquire) {
+            return Err("interrupted".into());
+        }
+        crate::number_development::check_artifact_tree(model, stop)?;
+        let base_hash =
+            omni_lfm3::speech_adapter::source_fingerprint(model).map_err(|e| e.to_string())?;
+        let full_codec_hash = codec_fingerprint(&model.join("audio_tokenizer"), stop)?;
+        let codec_hash = audio_codec_hash(model, stop)?;
+        if dataset
+            .development()
+            .target_model_fingerprints()
+            .is_some_and(|(base, codec)| base != base_hash || codec != full_codec_hash)
+        {
+            return Err("v3 target model or codec changed after data loading".into());
+        }
+        for record in dataset
+            .development()
+            .train()
+            .iter()
+            .chain(dataset.development().dev())
+        {
+            if record
+                .speech_target()
+                .is_some_and(|target| target.target_codec_sha256() != codec_hash)
+            {
+                return Err("v3 target codec does not match the current model".into());
+            }
+        }
+        let config: serde_json::Value = serde_json::from_slice(
+            &fs::read(model.join("config.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let width = config
+            .pointer("/text_config/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|width| usize::try_from(width).ok())
+            .filter(|width| (4..=65_536).contains(width))
+            .ok_or("invalid audio model width")?;
+        Ok(Self {
+            version: 2,
+            base_hash,
+            codec_hash,
+            dataset_hash: dataset.digest().into(),
+            implementation_hash: v3_audio_implementation_hash(),
+            backend,
+            width,
+            train_records: dataset.len(),
+            mask_seed: 159,
+        })
+    }
+}
 
 const INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
 
@@ -115,6 +217,7 @@ fn data_identity(data: &DevelopmentData, stop: &AtomicBool) -> Result<String, St
         include_bytes!("number_development.rs").as_slice(),
         include_bytes!("number_blind_holdout.rs").as_slice(),
         include_bytes!("speech_audio_target.rs").as_slice(),
+        include_bytes!("speech_target_format.rs").as_slice(),
         include_bytes!("fingerprint.rs").as_slice(),
     ] {
         feed(&mut hash, bytes);
