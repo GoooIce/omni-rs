@@ -619,6 +619,330 @@ fn losing_the_media_turn_keeps_explicit_stop_and_barrier_control() {
 }
 
 #[test]
+fn cancelled_start_observation_prevents_an_earlier_session_change() {
+    use omni_lfm3::causal_audio::Error;
+
+    let encoder = synthetic_encoder();
+    let mut session = AudioSession::new(
+        SessionId(135),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let snapshot = session.snapshot().unwrap().unwrap();
+    session.cancellation().cancel();
+    let failure = session
+        .start_generation(Duration::from_millis(10), snapshot, 24_000)
+        .err()
+        .expect("cancelled input cannot start generation");
+    assert!(matches!(failure.error(), Error::StreamUnavailable));
+    assert!(
+        session
+            .change_session(Duration::from_millis(3), SessionId(136))
+            .is_err()
+    );
+    session
+        .change_session(Duration::from_millis(10), SessionId(136))
+        .unwrap();
+}
+
+#[test]
+fn foreign_and_backwards_starts_do_not_record_a_cancellation_observation() {
+    use omni_lfm3::causal_audio::Error;
+
+    let encoder = synthetic_encoder();
+    let device = Default::default();
+    let mut first = AudioSession::new(SessionId(137), &encoder, &device, Duration::ZERO).unwrap();
+    let mut second = AudioSession::new(SessionId(137), &encoder, &device, Duration::ZERO).unwrap();
+    for session in [&mut first, &mut second] {
+        session
+            .push(
+                Duration::from_millis(2),
+                &synthetic_pcm(3200),
+                16_000,
+                false,
+            )
+            .unwrap();
+    }
+    let snapshot = first.snapshot().unwrap().unwrap();
+    let foreign = second.snapshot().unwrap().unwrap();
+    first.cancellation().cancel();
+    let before = first.conversation().timeline().len();
+    let failure = first
+        .start_generation(Duration::from_millis(50), foreign, 24_000)
+        .err()
+        .unwrap();
+    assert!(matches!(failure.error(), Error::WrongStream));
+    assert_eq!(first.conversation().timeline().len(), before);
+    let failure = first
+        .start_generation(Duration::from_millis(1), snapshot, 24_000)
+        .err()
+        .unwrap();
+    assert!(matches!(failure.error(), Error::StreamUnavailable));
+    assert_eq!(first.conversation().timeline().len(), before);
+    first
+        .change_session(Duration::from_millis(3), SessionId(138))
+        .unwrap();
+}
+
+#[test]
+fn foreign_and_stale_turns_do_not_record_cancellation_for_the_current_turn() {
+    use omni_lfm3::causal_audio::{ControlEvent, Error};
+    use omni_lfm3::interruptible::Error as ProtocolError;
+
+    let encoder = synthetic_encoder();
+    let device = Default::default();
+    let mut first = AudioSession::new(SessionId(140), &encoder, &device, Duration::ZERO).unwrap();
+    let mut second = AudioSession::new(SessionId(140), &encoder, &device, Duration::ZERO).unwrap();
+    for session in [&mut first, &mut second] {
+        session
+            .push(
+                Duration::from_millis(1),
+                &synthetic_pcm(3200),
+                16_000,
+                false,
+            )
+            .unwrap();
+    }
+    let next_snapshot = first.snapshot().unwrap().unwrap();
+    let old = first
+        .start_generation(
+            Duration::from_millis(2),
+            first.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    first
+        .apply_turn(
+            Duration::from_millis(3),
+            &old,
+            TurnEvent::GenerationFinished,
+        )
+        .unwrap();
+    let current = first
+        .start_generation(Duration::from_millis(4), next_snapshot, 24_000)
+        .unwrap();
+    let other = second
+        .start_generation(
+            Duration::from_millis(2),
+            second.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let control = first.current_control().unwrap();
+    first.cancellation().cancel();
+    let before = first.conversation().timeline().len();
+    assert!(matches!(
+        first.apply_turn(
+            Duration::from_millis(50),
+            &other,
+            TurnEvent::Queued { end: 1 }
+        ),
+        Err(Error::WrongStream)
+    ));
+    assert!(matches!(
+        first.apply_turn(
+            Duration::from_millis(50),
+            &old,
+            TurnEvent::Queued { end: 1 }
+        ),
+        Err(Error::Protocol(ProtocolError::StaleTurn))
+    ));
+    assert_eq!(first.conversation().timeline().len(), before);
+    assert!(matches!(
+        first.apply_turn(
+            Duration::from_millis(10),
+            &current,
+            TurnEvent::Queued { end: 1 }
+        ),
+        Err(Error::StreamUnavailable)
+    ));
+    assert!(
+        first
+            .apply_control(
+                Duration::from_millis(9),
+                &control,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled
+                }
+            )
+            .is_err()
+    );
+    first
+        .apply_control(
+            Duration::from_millis(10),
+            &control,
+            ControlEvent::Stop {
+                reason: StopReason::Cancelled,
+            },
+        )
+        .unwrap();
+    first
+        .apply_control(
+            Duration::from_millis(11),
+            &control,
+            ControlEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+}
+
+#[test]
+fn all_generation_events_observing_cancellation_preserve_the_stop_barrier() {
+    use omni_lfm3::causal_audio::{ControlEvent, Error};
+
+    let encoder = synthetic_encoder();
+    for event in [TurnEvent::Queued { end: 1 }, TurnEvent::GenerationFinished] {
+        let mut session = AudioSession::new(
+            SessionId(139),
+            &encoder,
+            &Default::default(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        session
+            .push(
+                Duration::from_millis(1),
+                &synthetic_pcm(3200),
+                16_000,
+                false,
+            )
+            .unwrap();
+        let turn = session
+            .start_generation(
+                Duration::from_millis(2),
+                session.snapshot().unwrap().unwrap(),
+                24_000,
+            )
+            .unwrap();
+        let control = session.current_control().unwrap();
+        session.cancellation().cancel();
+        let before = session.conversation().timeline().len();
+        assert!(matches!(
+            session.apply_turn(Duration::from_millis(1), &turn, event),
+            Err(Error::StreamUnavailable)
+        ));
+        assert_eq!(session.conversation().timeline().len(), before);
+        assert!(matches!(
+            session.apply_turn(Duration::from_millis(10), &turn, event),
+            Err(Error::StreamUnavailable)
+        ));
+        assert!(
+            session
+                .apply_control(
+                    Duration::from_millis(9),
+                    &control,
+                    ControlEvent::Stop {
+                        reason: StopReason::Cancelled
+                    }
+                )
+                .is_err()
+        );
+        session
+            .apply_control(
+                Duration::from_millis(10),
+                &control,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled,
+                },
+            )
+            .unwrap();
+        session
+            .apply_control(
+                Duration::from_millis(11),
+                &control,
+                ControlEvent::Stopped { played_end: 0 },
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn generation_event_observing_cancellation_prevents_an_earlier_stop() {
+    use omni_lfm3::causal_audio::{ControlEvent, Error};
+
+    let encoder = synthetic_encoder();
+    let mut session = AudioSession::new(
+        SessionId(134),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let turn = session
+        .start_generation(
+            Duration::from_millis(2),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let control = session.current_control().unwrap();
+    session.cancellation().cancel();
+    let before = session.conversation().timeline().len();
+    assert!(
+        session
+            .apply_control(
+                Duration::from_millis(20),
+                &control,
+                ControlEvent::Played { end: 1 }
+            )
+            .is_err()
+    );
+    assert_eq!(session.conversation().timeline().len(), before);
+    assert!(matches!(
+        session.apply_turn(
+            Duration::from_millis(10),
+            &turn,
+            TurnEvent::Generated { end: 1 }
+        ),
+        Err(Error::StreamUnavailable)
+    ));
+    assert!(
+        session
+            .apply_control(
+                Duration::from_millis(3),
+                &control,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled
+                },
+            )
+            .is_err()
+    );
+    session
+        .apply_control(
+            Duration::from_millis(10),
+            &control,
+            ControlEvent::Stop {
+                reason: StopReason::Cancelled,
+            },
+        )
+        .unwrap();
+    session
+        .apply_control(
+            Duration::from_millis(11),
+            &control,
+            ControlEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+}
+
+#[test]
 fn observed_async_cancellation_prevents_backdated_stop() {
     use omni_lfm3::causal_audio::{ControlEvent, Error};
     use omni_lfm3::interruptible::State;

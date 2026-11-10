@@ -382,14 +382,12 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         {
             return Err(Error::Protocol(crate::interruptible::Error::StaleTurn));
         }
-        if !self.scope.available()
-            && matches!(
-                event,
-                TurnEvent::Generated { .. }
-                    | TurnEvent::Queued { .. }
-                    | TurnEvent::GenerationFinished
-            )
+        if matches!(
+            event,
+            TurnEvent::Generated { .. } | TurnEvent::Queued { .. } | TurnEvent::GenerationFinished
+        ) && !self.scope.available()
         {
+            self.observe_unavailable_at(at);
             return Err(Error::StreamUnavailable);
         }
         let reducer_event = match event {
@@ -475,19 +473,7 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         is_final: bool,
     ) -> Result<usize, Error> {
         if !self.scope.available() {
-            // An asynchronous cancellation has no timestamp of its own. A
-            // valid timed call does establish when it was observed, so later
-            // events cannot be backdated before that observation.
-            if self.conversation.check_time(at).is_ok() {
-                self.conversation
-                    .apply(
-                        at,
-                        Event::InputFailed {
-                            session: self.session,
-                        },
-                    )
-                    .expect("preflighted unavailable input must fit the timeline");
-            }
+            self.observe_unavailable_at(at);
             return Err(Error::StreamUnavailable);
         }
         self.conversation.check_time(at).map_err(Error::Protocol)?;
@@ -570,6 +556,21 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         }
     }
 
+    fn observe_unavailable_at(&mut self, at: Duration) {
+        // Cancellation itself has no timestamp; only a valid timed call that
+        // observes the unavailable stream establishes a lower bound.
+        if self.conversation.check_time(at).is_ok() {
+            self.conversation
+                .apply(
+                    at,
+                    Event::InputFailed {
+                        session: self.session,
+                    },
+                )
+                .expect("preflighted unavailable input must fit the timeline");
+        }
+    }
+
     /// Capture the completed encoding at the current ingested prefix, without
     /// flushing the tail. `None` means that no complete token is available.
     pub fn snapshot(&self) -> Result<Option<AudioSnapshot<B>>, Error> {
@@ -637,6 +638,7 @@ impl<'a, B: Backend> AudioSession<'a, B> {
             });
         }
         if !self.scope.available() {
+            self.observe_unavailable_at(at);
             return Err(StartError {
                 error: Error::StreamUnavailable,
                 snapshot: Box::new(snapshot),

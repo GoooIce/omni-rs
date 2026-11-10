@@ -24,7 +24,13 @@ jobs:
       - name: Run all CPU checks
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
-        run: python scripts/check.py cpu
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME:?HOME or CARGO_HOME is required}/.cargo}"
+          if [ ! -d "$CARGO_HOME" ]; then
+            echo "Cargo home does not exist: install the toolchain before CPU checks" >&2
+            exit 1
+          fi
+          python scripts/check.py cpu
       - name: Show check reports
         if: always()
         run: python scripts/check.py status

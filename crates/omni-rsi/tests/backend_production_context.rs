@@ -277,19 +277,91 @@ fn cargo_rejects_configuration_that_sets_cargo_home() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn rustup_injected_cargo_home_keeps_valid_identity_and_detects_override() {
-    let original_home = PathBuf::from(std::env::var_os("HOME").unwrap());
-    let original_cargo_home = std::env::var_os("CARGO_HOME")
+fn rustup_locations() -> Option<(PathBuf, PathBuf)> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let cargo_home = std::env::var_os("CARGO_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| original_home.join(".cargo"));
-    let proxy = original_cargo_home.join("bin/cargo");
+        .or_else(|| home.as_ref().map(|home| home.join(".cargo")));
     let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| original_home.join(".rustup"));
+        .or_else(|| home.as_ref().map(|home| home.join(".rustup")));
+    Some((cargo_home?, rustup_home?))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn report_unverified_rustup(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "{reason}; rustup-only probe not verified; direct Cargo tests still run"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn missing_rustup_locations_are_reported_even_with_test_output_capture() {
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rustup_injected_cargo_home_keeps_valid_identity_and_detects_override",
+        ])
+        .env_remove("HOME")
+        .env_remove("CARGO_HOME")
+        .env_remove("RUSTUP_HOME")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("rustup locations unavailable"),
+        "an unavailable rustup-only probe must be visible under normal test capture"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn rustup_probe_accepts_missing_home_when_locations_are_explicit() {
+    let Some((cargo_home, rustup_home)) = rustup_locations() else {
+        report_unverified_rustup("rustup locations unavailable");
+        return;
+    };
+    if !cargo_home.join("bin/cargo").is_file() || !rustup_home.is_dir() {
+        report_unverified_rustup("rustup proxy unavailable");
+        return;
+    }
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rustup_injected_cargo_home_keeps_valid_identity_and_detects_override",
+            "--nocapture",
+        ])
+        .env_remove("HOME")
+        .env("CARGO_HOME", cargo_home)
+        .env("RUSTUP_HOME", rustup_home)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("rustup-before="));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn rustup_injected_cargo_home_keeps_valid_identity_and_detects_override() {
+    let Some((cargo_home, rustup_home)) = rustup_locations() else {
+        report_unverified_rustup("rustup locations unavailable");
+        return;
+    };
+    let proxy = cargo_home.join("bin/cargo");
     if !proxy.is_file() || !rustup_home.is_dir() {
-        eprintln!("rustup proxy unavailable; no rustup claim for this environment");
+        report_unverified_rustup("rustup proxy unavailable");
         return;
     }
     let fixture = Fixture::new();

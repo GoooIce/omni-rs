@@ -43,7 +43,7 @@ def write_report(path, report):
 def environment():
     value = {"python": sys.version, "executable": sys.executable, "platform": platform.platform(),
              "build_env": {key: os.environ.get(key) for key in (
-                 "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET",
+                 "RUSTUP_TOOLCHAIN", "CARGO_HOME", "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET",
                  "CARGO_ENCODED_RUSTFLAGS", "CC", "CXX", "SDKROOT")}}
     for tool in ("cargo", "rustc"):
         executable = shutil.which(tool)
@@ -79,6 +79,13 @@ def plan(root, profile, output):
             add("fmt-" + name, ["cargo", "fmt", "--manifest-path", manifest, "--", "--check"], 120)
         if profile == "quick":
             return steps
+        audio = next(row for row in config["manifests"] if row["path"] == "crates/omni-rsi/Cargo.toml")
+        add("verify-audio-cpu-context", [
+            "cargo", "test", "--locked", "--manifest-path", audio["path"],
+            "--no-default-features", "--features", audio["cpu_features"],
+            "--target-dir", cargo_target(audio["target"]), "--test", "audio_backend_fingerprint",
+            "prior_audio_checkpoints_without_patched_backend_identity_are_rejected", "--", "--exact",
+        ])
         for row in config["manifests"]:
             if "cpu_features" not in row:
                 continue
@@ -159,7 +166,8 @@ def run_steps(root, steps, output, profile, resume=None):
     try:
         for step in steps:
             row = dict(step, status="running", log=str(output / (step["id"] + ".log")))
-            old = reusable.get(step["id"])
+            # Cargo's actual parent and home must be revalidated on every run.
+            old = None if step["id"] == "verify-audio-cpu-context" else reusable.get(step["id"])
             if old and old["command"] == step["command"] and Path(old["log"]).is_file() and \
                     old.get("stdout") == step.get("stdout") and \
                     (not old.get("stdout") or Path(old["stdout"]).is_file()):

@@ -247,27 +247,8 @@ fn scanner_manifest_keeps_the_real_cpu_roots_without_scanning_gpu_only_paths() {
     let current = fs::read_to_string(manifest.join("Cargo.toml")).unwrap();
     let original_hash = "1f19d2ed09a4704028cada1ee7ae3a510ac728a5f43ed67d74b5a5864cd864fc";
     let scanner_hash = "f1502a1d91d591305f1675d2f382b902aa80e6bc05e07031716129205d1c22e2";
-    let addition = "[[bin]]\nname = \"alimeeting-screen\"\npath = \"src/bin/alimeeting-screen.rs\"\nrequired-features = [\"native\"]\n\n";
-    let versions = |current: &str| {
-        let current_hash = format!("{:x}", Sha256::digest(current.as_bytes()));
-        if current_hash == original_hash {
-            (
-                current.to_owned(),
-                current.replacen(
-                    "[patch.crates-io]",
-                    &format!("{addition}[patch.crates-io]"),
-                    1,
-                ),
-            )
-        } else if current_hash == scanner_hash {
-            assert_eq!(current.matches(addition).count(), 1);
-            (current.replacen(addition, "", 1), current.to_owned())
-        } else {
-            panic!("unrecognised source manifest: {current_hash}");
-        }
-    };
-    let (original, scanner) = versions(&current);
-    assert_eq!(versions(&scanner), (original.clone(), scanner.clone()));
+    let original = include_str!("fixtures/backend-cpu-original.toml");
+    let scanner = include_str!("fixtures/backend-cpu-scanner.toml");
     assert_eq!(
         format!("{:x}", Sha256::digest(original.as_bytes())),
         original_hash
@@ -276,30 +257,93 @@ fn scanner_manifest_keeps_the_real_cpu_roots_without_scanning_gpu_only_paths() {
         format!("{:x}", Sha256::digest(scanner.as_bytes())),
         scanner_hash
     );
+    let other_anchors = [
+        (
+            "Cargo.toml",
+            "abae3e721ce3b59e511dbb30e3e7e491646193c50dd64cf7bd9b878085a01418",
+        ),
+        (
+            "Cargo.lock",
+            "88851b9ed39e38c47483ee8c0bb1f9d51ca65beaa44e73fe8bf25334f958bc3e",
+        ),
+        (
+            "crates/lfm3-omni/Cargo.toml",
+            "cbb8099b360eff538b8d76585c1cd7691e0d47d6a85b7ca2dcc016b90c1d8de0",
+        ),
+        (
+            "crates/lfm3-omni/Cargo.lock",
+            "2e9f1267311142fe5a0dd4b6b9fa5513f44b1992e58f2c54d270fa2685781b8d",
+        ),
+        (
+            "crates/omni-rsi/Cargo.lock",
+            "9699cd05ba24998f463e8e50b8b8980c09bea0932849df38a03622b1ff1a21a0",
+        ),
+        (
+            "vendor/burn/Cargo.toml",
+            "ae43f28673449477f9e34cde9e9f3289ce55b4a352ea059aa357649d9b872701",
+        ),
+        (
+            "vendor/cubecl-common/Cargo.toml",
+            "68c03a500f4eafe809cf3b1beb5a6d348d510bb082bc8ab1c7c6fc316b688150",
+        ),
+        (
+            "crates/burn-ane/Cargo.toml",
+            "0ff1aaa0f6ac6257257fd8af012675042938f348da068ebc24e36f3cde301dc5",
+        ),
+    ];
+    let other_anchors_match = other_anchors.iter().all(|(path, expected)| {
+        format!("{:x}", Sha256::digest(fs::read(repo.join(path)).unwrap())) == *expected
+    });
+    let mut known_cpu_hash = None;
+    for frozen in [original, scanner] {
+        fs::write(manifest.join("Cargo.toml"), frozen).unwrap();
+        assert_eq!(
+            build_script::known_cpu_graph(&repo).unwrap(),
+            other_anchors_match
+        );
+        let (cpu, gpu) = build_script::backend_roots(&repo, &manifest).unwrap();
+        if other_anchors_match {
+            let identity = build_script::graph_identity(&repo, cpu, b"fixture", "cpu").unwrap();
+            if let Some(previous) = &known_cpu_hash {
+                assert_eq!(&identity, previous);
+            } else {
+                known_cpu_hash = Some(identity);
+            }
+        } else {
+            assert!(build_script::graph_identity(&repo, cpu, b"fixture", "cpu").is_err());
+        }
+        assert!(build_script::graph_identity(&repo, gpu, b"fixture", "gpu").is_err());
+    }
 
-    fs::write(manifest.join("Cargo.toml"), &original).unwrap();
-    assert!(build_script::known_cpu_graph(&repo).unwrap());
-    let (before, _) = build_script::backend_roots(&repo, &manifest).unwrap();
-    let before_hash = build_script::graph_identity(&repo, before, b"fixture", "cpu").unwrap();
-    fs::write(manifest.join("Cargo.toml"), &scanner).unwrap();
-    assert!(build_script::known_cpu_graph(&repo).unwrap());
-    let (cpu, gpu) = build_script::backend_roots(&repo, &manifest).unwrap();
-    assert_eq!(
-        build_script::graph_identity(&repo, cpu, b"fixture", "cpu").unwrap(),
-        before_hash
-    );
-    assert!(build_script::graph_identity(&repo, gpu, b"fixture", "gpu").is_err());
-
-    fs::write(manifest.join("Cargo.toml"), &current).unwrap();
-    assert!(build_script::known_cpu_graph(&repo).unwrap());
-    fs::write(
-        manifest.join("Cargo.toml"),
-        format!("{scanner}\n# unrecognised change\n"),
-    )
-    .unwrap();
-    assert!(!build_script::known_cpu_graph(&repo).unwrap());
-    let (conservative_cpu, _) = build_script::backend_roots(&repo, &manifest).unwrap();
-    assert!(build_script::graph_identity(&repo, conservative_cpu, b"fixture", "cpu").is_err());
+    let third = format!("{original}\n# another legal manifest\n");
+    for candidate in [&current, &third] {
+        fs::write(manifest.join("Cargo.toml"), candidate).unwrap();
+        let hash = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+        let known = other_anchors_match && (hash == original_hash || hash == scanner_hash);
+        assert_eq!(build_script::known_cpu_graph(&repo).unwrap(), known);
+        let (cpu, _) = build_script::backend_roots(&repo, &manifest).unwrap();
+        if known {
+            assert_eq!(
+                build_script::graph_identity(&repo, cpu, b"fixture", "cpu").unwrap(),
+                *known_cpu_hash.as_ref().unwrap()
+            );
+        } else {
+            let expected: std::collections::BTreeSet<_> = build_backend::patch_paths(candidate)
+                .unwrap()
+                .into_iter()
+                .map(|(_, path)| manifest.join(path))
+                .collect();
+            assert_eq!(
+                cpu.iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
+            if candidate == &third {
+                assert!(build_script::graph_identity(&repo, cpu, b"fixture", "cpu").is_err());
+            }
+        }
+    }
 }
 
 #[test]
