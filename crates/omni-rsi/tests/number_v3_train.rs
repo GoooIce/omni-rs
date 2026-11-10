@@ -189,6 +189,51 @@ fn v3_training_protocol_binds_model_and_refuses_stale_target_codec() {
 
 #[cfg(unix)]
 #[test]
+fn v3_training_uses_a_distinct_version_and_implementation_identity() {
+    use omni_rsi::speech_audio_checkpoint::{AudioProtocol, audio_implementation_hash};
+    let root = fixture();
+    let model = root.path().join("model");
+    let stop = AtomicBool::new(false);
+    let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
+    let protocol = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop).unwrap();
+    assert_eq!(protocol.version, 2);
+    assert_ne!(protocol.implementation_hash, audio_implementation_hash());
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn checkpoints_from_4735758_are_not_assumed_compatible() {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::{
+        speech_audio_checkpoint::{AudioCheckpoint, AudioProgress, AudioProtocol},
+        speech_training::SpeechOptimizer,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let device = Default::default();
+    let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
+    let protocol = AudioProtocol {
+        version: 1,
+        base_hash: "1".repeat(64),
+        codec_hash: "2".repeat(64),
+        dataset_hash: "3".repeat(64),
+        implementation_hash: "72e33fa08dff04970ff83c1212f1d34d72390fd7ff49247e90dc9814d8072ebe"
+            .into(),
+        backend: Cpu::name(&device),
+        width: 16,
+        train_records: 1,
+        mask_seed: 159,
+    };
+    let error = AudioCheckpoint::new(protocol, AudioProgress::default(), &optimizer)
+        .err()
+        .unwrap();
+    assert!(error.contains("implementation changed"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
 fn v3_training_digest_binds_train_dev_frames_sources_and_public_commitment() {
     let root = fixture();
     let path = root.path();
@@ -569,6 +614,162 @@ fn v3_rejects_unverified_speech_targets_before_creating_a_checkpoint() {
         assert!(error.contains("unverified"), "{error}");
         assert!(!state.join("number-audio-v3/audio-conditioned-v1").exists());
     }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn repeated_target_budget_fixture(
+    samples: usize,
+    padded_bytes: Option<u64>,
+    copies: usize,
+) -> tempfile::TempDir {
+    let root = fixture();
+    let model = root.path().join("model");
+    let codec = model.join("audio_tokenizer");
+    let reference =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../lfm3-omni/tests/fixtures/codec/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(reference).unwrap()).unwrap();
+    let (hop, stack) = if samples > 1_000 {
+        (400_usize, 8_usize)
+    } else {
+        (8, 2)
+    };
+    if samples > 1_000 {
+        config["stft_n_fft"] = 1024.into();
+        config["stft_win_length"] = 1024.into();
+        config["stft_hop_length"] = hop.into();
+        config["stft_frame_stack"] = stack.into();
+    }
+    write_json(&codec.join("config.json"), &config);
+    write_json(
+        &model.join("config.json"),
+        &json!({"num_codebooks":3,"codebook_size":13,"audio_eos_code":12,"text_config":{"hidden_size":16}}),
+    );
+
+    let wav = root.path().join("train-target-media/answer.wav");
+    let mut writer = hound::WavWriter::create(
+        &wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for i in 0..samples {
+        writer
+            .write_sample(if i % 2 == 0 { 4096_i16 } else { -4096_i16 })
+            .unwrap();
+    }
+    writer.finalize().unwrap();
+    if let Some(size) = padded_bytes {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&wav)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+    let frame_count = samples.div_ceil(hop * stack);
+    let encoded = omni_rsi::speech_audio_target::encode_target_with(
+        &model,
+        &wav,
+        &AtomicBool::new(false),
+        |_, _| Ok(vec![vec![1, 2, 3]; frame_count]),
+    )
+    .unwrap();
+    let mut target = serde_json::to_value(encoded).unwrap();
+    target["audio_file"] = "answer.wav".into();
+    target["source"] =
+        json!({"kind":"licensed-synthetic","source":"budget fixture","license":"CC0-1.0"});
+    target["source_group"] = source('d', 'e', '0', 'f');
+    target["encoding"] = "local_liquidcodec_f32".into();
+    target["runtime_backend"] = "untrusted-fixture".into();
+
+    let manifest_path = root.path().join("train.v3.json");
+    let groups_path = root.path().join("train.groups.v3.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let mut groups: Value = serde_json::from_slice(&fs::read(&groups_path).unwrap()).unwrap();
+    let base = manifest["records"][0].clone();
+    let mut records = Vec::new();
+    let mut identities = Vec::new();
+    for i in 0..copies {
+        let mut row = base.clone();
+        let name = format!("budget-{i}.wav");
+        fs::hard_link(
+            root.path().join("train-media/train-a.wav"),
+            root.path().join("train-media").join(&name),
+        )
+        .unwrap();
+        row["id"] = format!("budget-{i}").into();
+        row["audio_file"] = name.into();
+        row["speech_target"] = target.clone();
+        identities.push(
+            json!({"id":row["id"],"source":row["source"],"target_source":target["source_group"]}),
+        );
+        records.push(row);
+    }
+    manifest["records"] = records.into();
+    groups["records"] = identities.into();
+    write_json(&manifest_path, &manifest);
+    write_json(&groups_path, &groups);
+    root
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn assert_training_budget_fails_before_checkpoint(root: &Path, expected: &str) {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::speech_audio_round::{AudioRoundOptions, train_v3_audio_round};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let model = root.join("model");
+    let state = root.join("state");
+    let stop = AtomicBool::new(false);
+    NumberAudioV3::load(root, &model, &stop).expect("initial load is within budget");
+    let options = AudioRoundOptions {
+        model: &model,
+        data: root,
+        state: &state,
+        epochs: 1,
+        max_updates: 1,
+        resume: false,
+    };
+    let error = train_v3_audio_round::<Cpu>(&options, &Default::default(), &stop)
+        .err()
+        .unwrap();
+    assert!(error.contains(expected), "{error}");
+    assert!(!state.join("number-audio-v3/audio-conditioned-v1").exists());
+    let resume = root.join("resume-state");
+    let directory = resume.join("number-audio-v3/audio-conditioned-v1");
+    fs::create_dir_all(&directory).unwrap();
+    let pointer = directory.join("latest.json");
+    fs::write(&pointer, b"existing pointer must stay untouched").unwrap();
+    let options = AudioRoundOptions {
+        state: &resume,
+        resume: true,
+        ..options
+    };
+    let error = train_v3_audio_round::<Cpu>(&options, &Default::default(), &stop)
+        .err()
+        .unwrap();
+    assert!(error.contains(expected), "{error}");
+    assert_eq!(
+        fs::read(pointer).unwrap(),
+        b"existing pointer must stay untouched"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_target_rereads_share_the_initial_media_byte_budget() {
+    let root = repeated_target_budget_fixture(113, Some(24 * 1024 * 1024), 3);
+    assert_training_budget_fails_before_checkpoint(root.path(), "media byte limit");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_target_redecoding_shares_the_initial_duration_budget() {
+    let root = repeated_target_budget_fixture(24_000 * 20, None, 31);
+    assert_training_budget_fails_before_checkpoint(root.path(), "sample limit");
 }
 
 #[cfg(unix)]

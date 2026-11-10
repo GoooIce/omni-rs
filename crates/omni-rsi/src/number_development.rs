@@ -1,6 +1,9 @@
 //! Isolated train/development inputs and pre-registration; no holdout reader.
 
-use crate::number_blind_holdout::{BlindSource, PublicMetadata};
+use crate::{
+    number_blind_holdout::{BlindSource, PublicMetadata},
+    speech_target_format::{TARGET_SAMPLE_RATE, TargetCodeFormat},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -18,8 +21,6 @@ const MAX_MEDIA: usize = 32 * 1024 * 1024;
 const MAX_TOTAL_MEDIA: usize = 128 * 1024 * 1024;
 const MAX_SAMPLES: usize = 16_000 * 20;
 const MAX_TOTAL_SAMPLES: usize = 16_000 * 1_200;
-// Bound v3 target output to 128 codebooks and 200 total frames.
-const MAX_TARGET_CODEBOOKS: usize = 128;
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -154,6 +155,36 @@ pub struct DevelopmentData {
     dev_groups_sha256: String,
     blind: PublicMetadata,
     target_binding: Option<TargetBinding>,
+    media_budget: MediaBudget,
+}
+
+/// Usage accumulated from the same admitted train/dev media snapshot.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MediaBudget {
+    bytes: usize,
+    samples: usize,
+}
+
+impl MediaBudget {
+    /// Charge a further target decode before allocating its samples.
+    pub(crate) fn reserve_target_decode(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let wav = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+        let spec = wav.spec();
+        if spec.channels != 1
+            || spec.sample_rate != TARGET_SAMPLE_RATE
+            || wav.duration() == 0
+            || wav.duration() > TARGET_SAMPLE_RATE * 20
+            || !matches!(
+                (spec.sample_format, spec.bits_per_sample),
+                (hound::SampleFormat::Int, 16) | (hound::SampleFormat::Float, 32)
+            )
+        {
+            return Err("target WAV must be bounded mono 24 kHz PCM".into());
+        }
+        let predicted = normalized_samples(wav.duration(), spec.sample_rate)?;
+        self.samples = check_sample_budget(self.samples, predicted)?;
+        Ok(())
+    }
 }
 
 struct TargetBinding {
@@ -306,6 +337,10 @@ impl DevelopmentData {
             dev_groups_sha256: format!("{:x}", Sha256::digest(&dev_group_bytes)),
             blind,
             target_binding,
+            media_budget: MediaBudget {
+                bytes: total_bytes,
+                samples: total_samples,
+            },
         })
     }
 
@@ -339,6 +374,10 @@ impl DevelopmentData {
                 binding.codec_sha256.as_str(),
             )
         })
+    }
+
+    pub(crate) fn media_budget(&self) -> MediaBudget {
+        self.media_budget
     }
 }
 
@@ -542,7 +581,7 @@ fn valid_target_metadata(target: &SpeechTarget) -> bool {
         ]
         .iter()
         .all(|value| valid_hash(value))
-        && target.sample_rate == 24_000
+        && target.sample_rate == TARGET_SAMPLE_RATE
         && matches!(
             target.encoding.as_str(),
             "caller_supplied_unverified" | "local_liquidcodec_f32"
@@ -661,11 +700,12 @@ fn load_media(
         let samples = omni_lfm3::media_io::decode_wav(&bytes, stop).map_err(|e| e.to_string())?;
         if samples.is_empty()
             || samples.len() > MAX_SAMPLES
+            || samples.len() > predicted
             || samples.iter().any(|v| !v.is_finite() || v.abs() > 1.0)
         {
             return Err("invalid v3 audio samples".into());
         }
-        *total_samples = check_sample_budget(*total_samples, samples.len())?;
+        *total_samples = check_sample_budget(*total_samples, predicted)?;
         let pcm_sha256 = pcm_sha256(&samples);
         let label = (record.spoken_number, record.answer);
         if labels
@@ -736,9 +776,9 @@ fn validate_target_wav(
     let mut wav = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let spec = wav.spec();
     if spec.channels != 1
-        || spec.sample_rate != 24_000
+        || spec.sample_rate != TARGET_SAMPLE_RATE
         || wav.duration() == 0
-        || wav.duration() > 24_000 * 20
+        || wav.duration() > TARGET_SAMPLE_RATE * 20
     {
         return Err("target WAV must be bounded mono 24 kHz PCM".into());
     }
@@ -863,6 +903,7 @@ pub(crate) fn read_target_snapshot(
     root: &Path,
     partition: &str,
     target: &SpeechTarget,
+    budget: &mut MediaBudget,
     stop: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let directory = match partition {
@@ -872,7 +913,7 @@ pub(crate) fn read_target_snapshot(
     };
     let root = open_root(root)?;
     let directory = open_child(&root, directory, true)?;
-    let bytes = read_child(&directory, &target.audio_file, MAX_MEDIA, stop)?;
+    let bytes = read_media(&directory, &target.audio_file, &mut budget.bytes, stop)?;
     if format!("{:x}", Sha256::digest(&bytes)) != target.target_audio_sha256 {
         return Err("target WAV changed after data loading".into());
     }
@@ -881,6 +922,59 @@ pub(crate) fn read_target_snapshot(
 
 pub(crate) fn read_model_config(path: &Path, stop: &AtomicBool) -> Result<Vec<u8>, String> {
     read_child(&open_root(path)?, "config.json", MAX_MANIFEST, stop)
+}
+
+#[cfg(all(test, unix))]
+mod media_budget_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_reads_and_decodes_accept_the_exact_remaining_budget() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("sample.wav"), b"12345").unwrap();
+        let directory = open_root(root.path()).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut bytes = MAX_TOTAL_MEDIA - 5;
+        assert_eq!(
+            read_media(&directory, "sample.wav", &mut bytes, &stop).unwrap(),
+            b"12345"
+        );
+        assert_eq!(bytes, MAX_TOTAL_MEDIA);
+        assert!(
+            read_media(&directory, "sample.wav", &mut bytes, &stop)
+                .unwrap_err()
+                .contains("media byte limit")
+        );
+
+        let wav_path = root.path().join("target.wav");
+        let mut writer = hound::WavWriter::create(
+            &wav_path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 24_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in [0_i16, 4, -4] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        let wav = std::fs::read(wav_path).unwrap();
+        let mut budget = MediaBudget {
+            bytes: 0,
+            samples: MAX_TOTAL_SAMPLES - 2,
+        };
+        budget.reserve_target_decode(&wav).unwrap();
+        assert_eq!(budget.samples, MAX_TOTAL_SAMPLES);
+        assert!(
+            budget
+                .reserve_target_decode(&wav)
+                .unwrap_err()
+                .contains("sample limit")
+        );
+    }
 }
 
 fn read_open_file(mut file: File, limit: usize, stop: &AtomicBool) -> Result<Vec<u8>, String> {
@@ -892,7 +986,13 @@ fn read_open_file(mut file: File, limit: usize, stop: &AtomicBool) -> Result<Vec
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         check_stop(stop)?;
-        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        let available = limit.saturating_sub(bytes.len()).min(buffer.len());
+        if available == 0 {
+            break;
+        }
+        let count = file
+            .read(&mut buffer[..available])
+            .map_err(|e| e.to_string())?;
         if count == 0 {
             break;
         }
@@ -1523,43 +1623,11 @@ fn validate_target_model(
     path: &Path,
     stop: &AtomicBool,
 ) -> Result<TargetBinding, String> {
-    #[derive(Deserialize)]
-    struct ModelFormat {
-        num_codebooks: usize,
-        codebook_size: usize,
-        audio_eos_code: u32,
-    }
-    #[derive(Deserialize)]
-    struct CodecFormat {
-        n_q: usize,
-        fsq_levels: Vec<u32>,
-        sampling_rate: u32,
-    }
-
     let model = open_root(path)?;
     let codec = open_child(&model, "audio_tokenizer", true)?;
     let model_bytes = read_child(&model, "config.json", MAX_MANIFEST, stop)?;
     let codec_bytes = read_child(&codec, "config.json", MAX_MANIFEST, stop)?;
-    let model_format: ModelFormat =
-        serde_json::from_slice(&model_bytes).map_err(|e| e.to_string())?;
-    let codec_format: CodecFormat =
-        serde_json::from_slice(&codec_bytes).map_err(|e| e.to_string())?;
-    let code_count = codec_format
-        .fsq_levels
-        .iter()
-        .try_fold(1_u32, |product, level| {
-            (*level >= 2).then(|| product.checked_mul(*level)).flatten()
-        })
-        .ok_or("invalid codec levels")?;
-    if codec_format.fsq_levels.is_empty()
-        || codec_format.sampling_rate != 24_000
-        || !(1..=MAX_TARGET_CODEBOOKS).contains(&codec_format.n_q)
-        || codec_format.n_q != model_format.num_codebooks
-        || model_format.audio_eos_code < code_count
-        || model_format.audio_eos_code as usize >= model_format.codebook_size
-    {
-        return Err("model and codec codebook formats do not match".into());
-    }
+    let format = TargetCodeFormat::from_bytes(&model_bytes, &codec_bytes)?;
     let (base_model_sha256, codec_sha256) = model_and_codec_fingerprints(path, stop)?;
     let target_codec_sha256 = match open_child_io(&codec, "model.safetensors.index.json", false) {
         Ok(_) => codec_sha256.clone(),
@@ -1591,16 +1659,15 @@ fn validate_target_model(
         if target
             .frames
             .iter()
-            .any(|frame| frame.len() != model_format.num_codebooks)
-            || target.frames.last().is_none_or(|frame| {
-                frame
-                    .iter()
-                    .any(|code| *code != model_format.audio_eos_code)
-            })
+            .any(|frame| frame.len() != format.num_codebooks)
+            || target
+                .frames
+                .last()
+                .is_none_or(|frame| frame.iter().any(|code| *code != format.eos_code))
             || target.frames[..target.frames.len() - 1]
                 .iter()
                 .flatten()
-                .any(|code| *code >= code_count)
+                .any(|code| *code >= format.code_count)
         {
             return Err("invalid speech target frames or EOS".into());
         }

@@ -2,9 +2,10 @@
 use crate::{
     fingerprint::CodecSnapshot,
     number_audio_v3::NumberAudioV3,
-    number_development::{SpeechTarget, read_model_config, read_target_snapshot},
+    number_development::{MediaBudget, SpeechTarget, read_model_config, read_target_snapshot},
     speech_audio_checkpoint::AudioProtocol,
     speech_audio_target::target_pcm,
+    speech_target_format::{TARGET_SAMPLE_RATE, TargetCodeFormat},
 };
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use omni_lfm3::{
@@ -12,7 +13,6 @@ use omni_lfm3::{
     codec::{CodecConfig, CodecEncoder},
 };
 use omni_r2t2::weights::Weights;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     path::Path,
@@ -21,20 +21,6 @@ use std::{
 
 // Limit the one-target STFT working array to 64 MiB of FP32 features.
 const MAX_STFT_FEATURES: usize = 16 * 1024 * 1024;
-
-#[derive(Deserialize)]
-struct ModelFormat {
-    num_codebooks: usize,
-    codebook_size: usize,
-    audio_eos_code: u32,
-}
-
-#[derive(Deserialize)]
-struct CodecFormat {
-    n_q: usize,
-    fsq_levels: Vec<u32>,
-    sampling_rate: u32,
-}
 
 pub(crate) struct VerifiedCodec {
     pub(crate) config: CodecConfig,
@@ -86,14 +72,15 @@ fn verify_target<B: Backend>(
     partition: &str,
     target: &SpeechTarget,
     encoder: &CodecEncoder<B>,
-    eos: u32,
-    books: usize,
+    format: (u32, usize),
+    budget: &mut MediaBudget,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     check_encoding_claim(target)?;
-    let bytes = read_target_snapshot(root, partition, target, stop)?;
+    let bytes = read_target_snapshot(root, partition, target, budget, stop)?;
+    budget.reserve_target_decode(&bytes)?;
     let samples = target_pcm(&bytes)?;
-    compare_frames(encoder, &samples, target.frames(), eos, books, stop)
+    compare_frames(encoder, &samples, target.frames(), format.0, format.1, stop)
 }
 
 /// Only real local encoding can return the codec snapshot used by training.
@@ -140,27 +127,9 @@ pub(crate) fn verify<B: AutodiffBackend>(
     let (config_bytes, shards) = snapshot.into_parts();
     let model_bytes = read_model_config(model, stop)?;
     let model_hash = format!("{:x}", Sha256::digest(&model_bytes));
-    let model_format: ModelFormat =
-        serde_json::from_slice(&model_bytes).map_err(|e| e.to_string())?;
-    let codec_format: CodecFormat =
-        serde_json::from_slice(&config_bytes).map_err(|e| e.to_string())?;
-    let code_count = codec_format
-        .fsq_levels
-        .iter()
-        .try_fold(1_u32, |count, &level| {
-            (level >= 2).then(|| count.checked_mul(level)).flatten()
-        })
-        .ok_or("invalid codec levels")?;
-    if codec_format.fsq_levels.is_empty()
-        || codec_format.sampling_rate != 24_000
-        || !(1..=128).contains(&codec_format.n_q)
-        || codec_format.n_q != model_format.num_codebooks
-        || model_format.audio_eos_code < code_count
-        || model_format.audio_eos_code as usize >= model_format.codebook_size
-    {
-        return Err("model and captured codec formats do not match".into());
-    }
+    let format = TargetCodeFormat::from_bytes(&model_bytes, &config_bytes)?;
     let config = CodecConfig::from_bytes(&config_bytes).map_err(|e| e.to_string())?;
+    let mut media_budget = development.media_budget();
 
     // Check identities and resource limits before constructing the encoder.
     for (partition, target) in targets() {
@@ -171,7 +140,8 @@ pub(crate) fn verify<B: AutodiffBackend>(
         {
             return Err("target does not match the captured model or codec".into());
         }
-        let bytes = read_target_snapshot(root, partition, target, stop)?;
+        let bytes = read_target_snapshot(root, partition, target, &mut media_budget, stop)?;
+        media_budget.reserve_target_decode(&bytes)?;
         let samples = target_pcm(&bytes)?;
         cancelled(stop)?;
         let (frames, features) = config
@@ -194,7 +164,7 @@ pub(crate) fn verify<B: AutodiffBackend>(
         device,
     )
     .map_err(|e| e.to_string())?;
-    if encoder.sample_rate() != 24_000 {
+    if encoder.sample_rate() != TARGET_SAMPLE_RATE {
         return Err("invalid codec sample rate".into());
     }
     for (partition, target) in targets() {
@@ -204,8 +174,8 @@ pub(crate) fn verify<B: AutodiffBackend>(
             partition,
             target,
             &encoder,
-            model_format.audio_eos_code,
-            codec_format.n_q,
+            (format.eos_code, format.num_codebooks),
+            &mut media_budget,
             stop,
         )?;
     }
@@ -219,6 +189,7 @@ mod tests {
     use super::*;
     use burn::backend::NdArray;
     use omni_lfm3::config::TextConfig;
+    use serde::Deserialize;
     use serde_json::{Value, json};
     use std::{fs, os::unix::fs::symlink};
 
@@ -287,6 +258,7 @@ mod tests {
             "source_group":{"speaker_sha256":"1".repeat(64),"session_sha256":"2".repeat(64),"recording_sha256":"3".repeat(64),"family_sha256":"4".repeat(64)}});
         let target = |v: &Value| serde_json::from_value::<SpeechTarget>(v.clone()).unwrap();
         let stop = AtomicBool::new(false);
+        let mut budget = MediaBudget::default();
         assert_eq!(
             config.encoder_workload(case.samples.len()).unwrap().0,
             case.frames.len()
@@ -296,8 +268,8 @@ mod tests {
             "train",
             &target(&value),
             &encoder,
-            12,
-            3,
+            (12, 3),
+            &mut budget,
             &stop,
         )
         .unwrap();
@@ -309,8 +281,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .unwrap_err()
@@ -324,8 +296,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .unwrap_err()
@@ -340,8 +312,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .unwrap_err()
@@ -356,8 +328,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .unwrap_err()
@@ -370,8 +342,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .unwrap_err()
@@ -387,8 +359,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .is_err()
@@ -400,8 +372,8 @@ mod tests {
                 "train",
                 &target(&value),
                 &encoder,
-                12,
-                3,
+                (12, 3),
+                &mut budget,
                 &stop
             )
             .unwrap_err(),

@@ -7,13 +7,14 @@ use crate::fingerprint::{
     CodecSnapshot, codec_fingerprint_for_encoding, read_regular_bounded,
     target_codec_hash_for_encoding,
 };
+use crate::speech_target_format::{MAX_TARGET_CODEBOOKS, TARGET_SAMPLE_RATE, TargetCodeFormat};
 use burn::tensor::backend::Backend;
 use omni_lfm3::{
     Precision,
     codec::{CodecConfig, CodecEncoder},
 };
 use omni_r2t2::weights::Weights;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     io::Cursor,
@@ -21,26 +22,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-const SAMPLE_RATE: u32 = 24_000;
+const SAMPLE_RATE: u32 = TARGET_SAMPLE_RATE;
 const MAX_WAV_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SAMPLES: usize = SAMPLE_RATE as usize * 20;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MAX_CODEBOOKS: usize = 128;
-const MAX_TARGET_CODES: usize = 200 * MAX_CODEBOOKS;
-
-#[derive(Deserialize)]
-struct ModelCodeFormat {
-    num_codebooks: usize,
-    codebook_size: usize,
-    audio_eos_code: u32,
-}
-
-#[derive(Deserialize)]
-struct CodecCodeFormat {
-    n_q: usize,
-    fsq_levels: Vec<u32>,
-    sampling_rate: u32,
-}
+const MAX_TARGET_CODES: usize = 200 * MAX_TARGET_CODEBOOKS;
 
 /// JSON fields may be copied into a rule-data plan record. The Rust fields are
 /// read-only after construction; serialized fields are editable declarations,
@@ -128,6 +114,7 @@ fn preparation_sources() -> Vec<(&'static str, &'static [u8])> {
     }
     vec![
         source!("speech_audio_target.rs", "speech_audio_target.rs"),
+        source!("speech_target_format.rs", "speech_target_format.rs"),
         source!("fingerprint.rs", "fingerprint.rs"),
         source!("speech_pcm.rs", "speech_pcm.rs"),
         source!("lfm3/codec.rs", "../../lfm3-omni/src/codec.rs"),
@@ -135,6 +122,7 @@ fn preparation_sources() -> Vec<(&'static str, &'static [u8])> {
         source!("lfm3/text.rs", "../../lfm3-omni/src/text.rs"),
         source!("lfm3/lib.rs", "../../lfm3-omni/src/lib.rs"),
         source!("src/lib.rs", "../../../src/lib.rs"),
+        source!("src/config.rs", "../../../src/config.rs"),
         source!("src/weights.rs", "../../../src/weights.rs"),
         source!("src/weights/layout.rs", "../../../src/weights/layout.rs"),
         source!("src/tensor/mod.rs", "../../../src/tensor/mod.rs"),
@@ -214,28 +202,9 @@ fn encode_target_impl(
     let samples = target_pcm(&wav_bytes)?;
     let model_bytes = bounded_read(&model_config, MAX_CONFIG_BYTES, stop)?;
     let model_hash = sha256(&model_bytes);
-    let model_format: ModelCodeFormat =
-        serde_json::from_slice(&model_bytes).map_err(|error| error.to_string())?;
-    let codec_hash = codec_fingerprint_for_encoding(&codec, stop)?;
     let codec_bytes = bounded_read(&codec.join("config.json"), MAX_CONFIG_BYTES, stop)?;
-    let codec_format: CodecCodeFormat =
-        serde_json::from_slice(&codec_bytes).map_err(|error| error.to_string())?;
-    let code_count = codec_format
-        .fsq_levels
-        .iter()
-        .try_fold(1_u32, |product, level| {
-            (*level >= 2).then(|| product.checked_mul(*level)).flatten()
-        })
-        .ok_or("invalid codec levels")?;
-    if codec_format.fsq_levels.is_empty()
-        || codec_format.sampling_rate != SAMPLE_RATE
-        || !(1..=MAX_CODEBOOKS).contains(&codec_format.n_q)
-        || codec_format.n_q != model_format.num_codebooks
-        || model_format.audio_eos_code < code_count
-        || model_format.audio_eos_code as usize >= model_format.codebook_size
-    {
-        return Err("model and codec codebook formats do not match".into());
-    }
+    let format = TargetCodeFormat::from_bytes(&model_bytes, &codec_bytes)?;
+    let codec_hash = codec_fingerprint_for_encoding(&codec, stop)?;
     let target_codec_sha256 = target_codec_hash_for_encoding(&codec, stop)?;
     interrupted(stop)?;
     let mut frames = encode(
@@ -249,13 +218,13 @@ fn encode_target_impl(
     if !(4..200).contains(&frames.len())
         || frames
             .iter()
-            .try_fold(codec_format.n_q, |total, frame| {
+            .try_fold(format.num_codebooks, |total, frame| {
                 total.checked_add(frame.len())
             })
             .is_none_or(|total| total > MAX_TARGET_CODES)
         || frames.iter().any(|frame| {
-            frame.len() != model_format.num_codebooks
-                || frame.iter().any(|code| *code >= code_count)
+            frame.len() != format.num_codebooks
+                || frame.iter().any(|code| *code >= format.code_count)
         })
     {
         return Err("invalid encoded target frames".into());
@@ -271,10 +240,7 @@ fn encode_target_impl(
         return Err("unstable codec output for the same target WAV".into());
     }
     interrupted(stop)?;
-    frames.push(vec![
-        model_format.audio_eos_code;
-        model_format.num_codebooks
-    ]);
+    frames.push(vec![format.eos_code; format.num_codebooks]);
     if sha256(&bounded_read(wav, MAX_WAV_BYTES, stop)?) != wav_before
         || sha256(&bounded_read(&model_config, MAX_CONFIG_BYTES, stop)?) != model_hash
         || codec_fingerprint_for_encoding(&codec, stop)? != codec_hash
