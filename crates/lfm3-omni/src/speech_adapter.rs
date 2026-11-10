@@ -3,7 +3,7 @@ use omni_r2t2::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -232,10 +232,39 @@ fn codec_files(root: &Path, directory: &Path, names: &mut Vec<String>) -> Result
     Ok(())
 }
 
+// Match Weights::open: an index takes precedence over a single-file checkpoint.
+fn weight_files(directory: &Path) -> Result<BTreeSet<String>> {
+    let index = directory.join("model.safetensors.index.json");
+    if !index.is_file() {
+        return Ok(BTreeSet::from(["model.safetensors".into()]));
+    }
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: HashMap<String, String>,
+    }
+    let index: Index = serde_json::from_slice(&fs::read(index)?)?;
+    if index.weight_map.is_empty() {
+        return Err(invalid("empty checkpoint weight map"));
+    }
+    let mut names = BTreeSet::from(["model.safetensors.index.json".to_owned()]);
+    for name in index.weight_map.into_values() {
+        let path = Path::new(&name);
+        if name.is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(invalid("invalid checkpoint shard path"));
+        }
+        names.insert(name);
+    }
+    Ok(names)
+}
+
 /// Match the training protocol's SHA-256 over base weights, configuration and codec.
 pub fn source_fingerprint(root: &Path) -> Result<String> {
     let mut names: Vec<String> = [
-        "model.safetensors",
         "config.json",
         "processor_config.json",
         "tokenizer.json",
@@ -246,6 +275,7 @@ pub fn source_fingerprint(root: &Path) -> Result<String> {
     .into_iter()
     .map(str::to_owned)
     .collect();
+    names.extend(weight_files(root)?);
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|v| v == "py") {
@@ -257,8 +287,22 @@ pub fn source_fingerprint(root: &Path) -> Result<String> {
             );
         }
     }
-    codec_files(root, &root.join("audio_tokenizer"), &mut names)?;
+    let codec = root.join("audio_tokenizer");
+    let mut codec_names = Vec::new();
+    codec_files(root, &codec, &mut codec_names)?;
+    // CodecConfig::load follows symlinks just as Weights::open does.
+    codec_names.push("audio_tokenizer/config.json".into());
+    if codec.join("model.safetensors.index.json").is_file() {
+        codec_names.retain(|name| !name.ends_with(".safetensors"));
+    }
+    codec_names.extend(
+        weight_files(&codec)?
+            .into_iter()
+            .map(|name| format!("audio_tokenizer/{name}")),
+    );
+    names.extend(codec_names);
     names.sort();
+    names.dedup();
     let mut digest = Sha256::new();
     digest.update(b"omni-rsi-chinese-speech-v1\0");
     let mut buffer = vec![0u8; 1024 * 1024];

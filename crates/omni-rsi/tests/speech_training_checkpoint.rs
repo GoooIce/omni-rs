@@ -7,6 +7,7 @@ use burn::{
 use omni_lfm3::{Precision, model::OmniModel};
 use omni_rsi::{
     speech_audio::{AudioAnswer, train_step},
+    speech_audio_data::AudioDataset,
     speech_training::{SpeechOptimizer, speech_loss_with_media, text_loss_with_media},
 };
 use serde::Deserialize;
@@ -34,7 +35,8 @@ struct AudioReference {
     answer: String,
     target_ids: Vec<u32>,
     frames: Vec<Vec<u32>>,
-    masks: Vec<Vec<bool>>,
+    seed: u64,
+    pcm16: Vec<i16>,
     prefix_ids: Vec<u32>,
     a: Vec<f32>,
     b: Vec<f32>,
@@ -43,10 +45,55 @@ struct AudioReference {
     end: f32,
     gradient_a: Vec<f32>,
     gradient_b: Vec<f32>,
+    gradient_norm: f64,
+}
+
+fn audio_reference_dataset(reference: &AudioReference) -> (tempfile::TempDir, AudioDataset) {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let mut records = Vec::new();
+    for (name, samples) in [
+        ("decoy.wav", vec![0_i16; reference.pcm16.len()]),
+        ("target.wav", reference.pcm16.clone()),
+    ] {
+        let path = root.path().join(name);
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in samples {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        records.push(serde_json::json!({
+            "id":name, "split":"train", "input_audio":name,
+            "input_sha256":format!("{:x}", Sha256::digest(std::fs::read(path).unwrap())),
+            "authorization":{"kind":"licensed-synthetic","source":"official-reference waveform","license":"CC0-1.0"},
+            "instruction":"把听到的数字加一，用中文回答。", "answer":reference.answer,
+            "frames":reference.frames, "target_codec_sha256":"1".repeat(64)
+        }));
+    }
+    std::fs::write(
+        root.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"version":1,"records":records})).unwrap(),
+    )
+    .unwrap();
+    let data = AudioDataset::load(root.path(), &AtomicBool::new(false)).unwrap();
+    (root, data)
 }
 
 fn close(actual: Vec<f32>, expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
+    assert!(
+        actual.iter().chain(expected).all(|value| value.is_finite()),
+        "non-finite numerical comparison"
+    );
     let error = actual
         .iter()
         .zip(expected)
@@ -60,6 +107,17 @@ fn close(actual: Vec<f32>, expected: &[f32]) {
         error < 1e-5_f32.max(scale * 0.03),
         "max error {error}, reference scale {scale}"
     );
+}
+
+#[test]
+fn numerical_comparison_rejects_nonfinite_values() {
+    for (actual, expected) in [
+        (f32::NAN, 0.0),
+        (0.0, f32::NAN),
+        (f32::INFINITY, f32::INFINITY),
+    ] {
+        assert!(std::panic::catch_unwind(|| close(vec![actual], &[expected])).is_err());
+    }
 }
 
 #[test]
@@ -156,9 +214,9 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
     )
     .unwrap();
     optimizer.adapter().install(&mut model.text, 23).unwrap();
-    let samples: Vec<f32> = (0..6400)
-        .map(|i| ((i * 37) % 127 - 63) as f32 / 8192.0)
-        .collect();
+    let (_dataset_root, dataset) = audio_reference_dataset(&reference);
+    let samples = dataset.record(1).unwrap().samples();
+    assert_ne!(dataset.record(0).unwrap().samples(), samples);
     let base_embeddings = model
         .text
         .embed_tokens(&[1, 2, 3])
@@ -169,7 +227,7 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
     let mut actual_targets = model.tokenizer.encode(&reference.answer).unwrap();
     actual_targets.extend(model.tokenizer.encode("<|im_end|>").unwrap());
     assert_eq!(actual_targets, reference.target_ids);
-    let media = [model.prepare_audio(&samples, 16_000).unwrap()];
+    let media = [model.prepare_audio(samples, 16_000).unwrap()];
     assert_eq!(
         model
             .prepare_prompt(&reference.messages, None, &media)
@@ -184,7 +242,8 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
     );
     let text =
         text_loss_with_media(&model, &reference.messages, &media, &reference.target_ids).unwrap();
-    assert!((text.clone().into_scalar() - reference.text).abs() < 0.02);
+    let text_value = text.clone().into_scalar();
+    assert!((text_value - reference.text).abs() < 0.02);
     let silence = [model
         .prepare_audio(&vec![0.0; samples.len()], 16_000)
         .unwrap()];
@@ -193,41 +252,16 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
             .unwrap()
             .into_scalar();
     assert!((text.clone().into_scalar() - silent_loss).abs() > 1e-5);
-    let states = model
-        .teacher_forced_speech_states_with_media(&reference.messages, &media, &reference.frames)
-        .unwrap();
-    let width = states.dims()[2];
-    let mut content: Option<Tensor<CpuTraining, 1>> = None;
-    let mut count = 0;
-    for (index, mask) in reference.masks.iter().enumerate() {
-        let hidden = states
-            .clone()
-            .slice([0..1, index..index + 1, 0..width])
-            .reshape([1, width]);
-        let (loss, masked) = model
-            .depth
-            .masked_loss(hidden, &reference.frames[index], mask)
-            .unwrap();
-        content = Some(match content {
-            Some(previous) => previous + loss,
-            None => loss,
-        });
-        count += masked;
-    }
-    let content = content.unwrap() / count as f32;
-    let last = reference.frames.len() - 1;
-    let hidden = states
-        .slice([0..1, last..last + 1, 0..width])
-        .reshape([1, width]);
-    let (end, masked) = model
-        .depth
-        .masked_loss(
-            hidden,
-            &reference.frames[last],
-            &vec![true; reference.frames[last].len()],
-        )
-        .unwrap();
-    let end = end / masked as f32;
+    let speech = speech_loss_with_media(
+        &model,
+        &reference.messages,
+        &media,
+        &reference.frames,
+        reference.seed,
+    )
+    .unwrap();
+    let content = speech.content;
+    let end = speech.end;
     assert!((content.clone().into_scalar() - reference.speech).abs() < 0.02);
     assert!((end.clone().into_scalar() - reference.end).abs() < 0.02);
     let gradients = (text + content + end * 0.01).backward();
@@ -255,7 +289,7 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
         .adapter()
         .install(&mut model.text, 23)
         .unwrap();
-    let text_media = [model.prepare_audio(&samples, 16_000).unwrap()];
+    let text_media = [model.prepare_audio(samples, 16_000).unwrap()];
     let text_gradients = text_loss_with_media(
         &model,
         &reference.messages,
@@ -289,13 +323,13 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
         .adapter()
         .install(&mut model.text, 23)
         .unwrap();
-    let speech_media = [model.prepare_audio(&samples, 16_000).unwrap()];
+    let speech_media = [model.prepare_audio(samples, 16_000).unwrap()];
     let speech = speech_loss_with_media(
         &model,
         &reference.messages,
         &speech_media,
         &reference.frames,
-        159,
+        reference.seed,
     )
     .unwrap();
     let speech_gradients = (speech.content + speech.end * 0.01).backward();
@@ -320,27 +354,27 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
             .into_scalar();
     optimizer.adapter().install(&mut model.text, 23).unwrap();
 
-    let example = AudioAnswer::new(
-        &samples,
-        16_000,
-        "把听到的数字加一，用中文回答。",
-        &reference.answer,
-        &reference.frames,
-    )
-    .unwrap();
+    let example = AudioAnswer::from_dataset(&dataset, 1).unwrap();
     let before = optimizer.export().unwrap();
     let stop = AtomicBool::new(true);
-    assert!(train_step(&mut model, &mut optimizer, &example, 159, &stop).is_err());
+    assert!(train_step(&mut model, &mut optimizer, &example, reference.seed, &stop).is_err());
     assert_eq!(before, optimizer.export().unwrap());
     let result = train_step(
         &mut model,
         &mut optimizer,
         &example,
-        159,
+        reference.seed,
         &AtomicBool::new(false),
     )
     .unwrap();
     assert!(result.gradient_norm.is_finite() && result.gradient_norm > 0.0);
+    assert!((result.text_loss - f64::from(text_value)).abs() < 1e-6);
+    assert!((result.speech_loss - f64::from(reference.speech)).abs() < 0.02);
+    assert!((result.speech_end_loss - f64::from(reference.end)).abs() < 0.02);
+    assert!(
+        (result.gradient_norm - reference.gradient_norm).abs()
+            < 1e-5_f64.max(reference.gradient_norm * 0.03)
+    );
     assert_ne!(before, optimizer.export().unwrap());
     model.text.clear_conv_lora(23).unwrap();
     let base_loss_after =

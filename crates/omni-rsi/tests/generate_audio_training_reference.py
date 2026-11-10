@@ -8,15 +8,22 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 from transformers import AutoModelForMultimodalLM, AutoProcessor
+from audio_training_sampling_reference import selection_and_masks
 
 source, speech_reference, output = map(Path, sys.argv[1:])
-torch.set_num_threads(4)
-frames = json.loads(speech_reference.read_text())["frames"]
+torch.set_num_threads(2)
+source_frames = json.loads(speech_reference.read_text())["frames"]
+# Eleven content frames exercise selection as well as masking; repeating valid
+# teacher codes avoids inventing codebook IDs or requiring generated speech.
+frames = [source_frames[i % (len(source_frames) - 1)] for i in range(11)] + [source_frames[-1]]
+seed = 159
+selected, masks = selection_and_masks(len(frames), len(frames[0]), seed)
 messages = [{"role": "user", "content": [
     {"type": "text", "text": "把听到的数字加一，用中文回答。"}, {"type": "audio"}
 ]}]
 answer = "十三"
-samples = np.array([((i * 37) % 127 - 63) / 8192.0 for i in range(6400)], dtype=np.float32)
+pcm16 = np.array([((i * 37) % 127 - 63) * 4 for i in range(6400)], dtype=np.int16)
+samples = pcm16.astype(np.float32) / 32768.0
 processor = AutoProcessor.from_pretrained(source, trust_remote_code=True, local_files_only=True)
 model = AutoModelForMultimodalLM.from_pretrained(
     source, trust_remote_code=True, local_files_only=True,
@@ -54,10 +61,9 @@ ids = torch.cat([prefix, torch.tensor([[model.config.audio_start_token_id] +
                                      [model.config.audio_out_token_id] * len(frames)])], dim=1)
 codes = torch.tensor(frames, dtype=torch.long)
 hidden = model.model(input_ids=ids, audio_out_codes=codes, **audio_inputs, use_cache=False).last_hidden_state
-parts, count, masks = [], 0, []
-for index, row in enumerate(frames[:-1]):
-    masked = torch.tensor([[(book + index) % 2 == 0 for book in range(len(row))]])
-    masks.append(masked[0].tolist())
+parts, count = [], 0
+for index, row_mask in zip(selected, masks):
+    masked = torch.tensor([row_mask])
     logits = model.model.depth_decoder(hidden[:, prefix.shape[1] + index], codes[index:index + 1], masked)
     loss = functional.cross_entropy(logits.transpose(1, 2), codes[index:index + 1], reduction="none")
     parts.append((loss * masked).sum())
@@ -67,12 +73,18 @@ mask = torch.ones(1, len(frames[-1]), dtype=torch.bool)
 logits = model.model.depth_decoder(hidden[:, prefix.shape[1] + len(frames) - 1], codes[-1:], mask)
 end = functional.cross_entropy(logits.transpose(1, 2), codes[-1:], reduction="mean")
 (text + speech + 0.01 * end).backward()
+gradient_norm = torch.sqrt(layer.out_proj.a.grad.double().square().sum() +
+                           layer.out_proj.b.grad.double().square().sum()).item()
 output.parent.mkdir(parents=True, exist_ok=True)
-output.write_text(json.dumps({
+reference = {
     "messages": messages, "answer": answer, "target_ids": targets, "frames": frames,
-    "masks": masks, "prefix_ids": prefix[0].tolist(), "a": a.flatten().tolist(), "b": b.flatten().tolist(),
+    "seed": seed, "selected": selected, "masks": masks, "pcm16": pcm16.tolist(),
+    "prefix_ids": prefix[0].tolist(), "a": a.flatten().tolist(), "b": b.flatten().tolist(),
     "text": text.item(), "speech": speech.item(), "end": end.item(),
+    "gradient_norm": gradient_norm,
     "gradient_a": layer.out_proj.a.grad.flatten().tolist(),
     "gradient_b": layer.out_proj.b.grad.flatten().tolist(),
-}, ensure_ascii=False))
+}
+with output.open("x", encoding="utf-8") as target:
+    json.dump(reference, target, ensure_ascii=False, allow_nan=False)
 print(f"text={text.item():.7g} speech={speech.item():.7g} end={end.item():.7g} prompt={prefix.numel()}")

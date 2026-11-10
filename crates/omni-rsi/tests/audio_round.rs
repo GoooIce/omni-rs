@@ -64,6 +64,7 @@ fn resume_rejects_changed_data_before_loading_or_replacing_state() {
     )
     .unwrap();
     fs::write(codec.join("model.safetensors"), b"codec fixture").unwrap();
+    fs::write(codec.join("config.json"), b"{}").unwrap();
     let wav = data.join("input.wav");
     let mut writer = hound::WavWriter::create(
         &wav,
@@ -99,6 +100,10 @@ fn resume_rejects_changed_data_before_loading_or_replacing_state() {
         train_records: 1,
         mask_seed: 159,
     };
+    assert_eq!(
+        AudioProtocol::for_dataset(&model, &dataset, Cpu::name(&device), &stop).unwrap(),
+        protocol
+    );
     let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
     AudioCheckpoint::new(protocol, AudioProgress::default(), &optimizer)
         .unwrap()
@@ -155,6 +160,131 @@ fn audio_checkpoints_leave_legacy_speech_state_untouched() {
         fs::read(legacy).unwrap(),
         b"legacy speech checkpoint pointer"
     );
+}
+
+#[test]
+fn indexed_codec_is_accepted_and_its_shards_bind_the_checkpoint_and_targets() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("model");
+    let codec = model.join("audio_tokenizer");
+    let data = root.path().join("data");
+    let state = root.path().join("state");
+    fs::create_dir_all(&codec).unwrap();
+    fs::create_dir(&data).unwrap();
+    for name in [
+        "model.safetensors",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ] {
+        fs::write(model.join(name), b"fixture").unwrap();
+    }
+    fs::write(
+        model.join("config.json"),
+        br#"{"text_config":{"hidden_size":16}}"#,
+    )
+    .unwrap();
+    fs::write(codec.join("config.json"), b"{}").unwrap();
+    fs::write(codec.join("part.safetensors"), b"codec shard").unwrap();
+    fs::write(
+        codec.join("model.safetensors.index.json"),
+        br#"{"weight_map":{"a":"part.safetensors"}}"#,
+    )
+    .unwrap();
+    let stop = AtomicBool::new(false);
+    let codec_hash = omni_rsi::fingerprint::codec_fingerprint(&codec, &stop).unwrap();
+    let wav = data.join("input.wav");
+    let mut writer = hound::WavWriter::create(
+        &wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    writer.write_sample(4096_i16).unwrap();
+    writer.finalize().unwrap();
+    let manifest = serde_json::json!({"version":1,"records":[{
+        "id":"fixture","split":"train","input_audio":"input.wav",
+        "input_sha256":format!("{:x}", Sha256::digest(fs::read(&wav).unwrap())),
+        "authorization":{"kind":"licensed-synthetic","source":"fixture","license":"CC0-1.0"},
+        "instruction":"加一回答","answer":"十三",
+        "frames":vec![vec![1;12];5],"target_codec_sha256":codec_hash
+    }]});
+    fs::write(
+        data.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let dataset = AudioDataset::load(&data, &stop).unwrap();
+    let device = Default::default();
+    let protocol = AudioProtocol {
+        version: 1,
+        base_hash: omni_lfm3::speech_adapter::source_fingerprint(&model).unwrap(),
+        codec_hash,
+        dataset_hash: dataset.digest().into(),
+        implementation_hash: audio_implementation_hash(),
+        backend: Cpu::name(&device),
+        width: 16,
+        train_records: 1,
+        mask_seed: 159,
+    };
+    let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
+    AudioCheckpoint::new(protocol, AudioProgress::default(), &optimizer)
+        .unwrap()
+        .save(&state)
+        .unwrap();
+    let pointer = state.join("audio-conditioned-v1/latest.json");
+    let before = fs::read(&pointer).unwrap();
+    let options = AudioRoundOptions {
+        model: &model,
+        data: &data,
+        state: &state,
+        epochs: 1,
+        max_updates: 1,
+        resume: true,
+    };
+    let error = train_audio_round::<Cpu>(&options, &device, &stop)
+        .err()
+        .unwrap();
+    assert!(
+        !error.contains("No such file"),
+        "indexed codec was not admitted: {error}"
+    );
+    assert!(
+        !error.contains("does not match"),
+        "indexed codec protocol disagreed: {error}"
+    );
+    assert!(
+        error.contains("missing field"),
+        "did not reach model loading: {error}"
+    );
+    fs::write(codec.join("part.safetensors"), b"changed codec shard").unwrap();
+    let error = train_audio_round::<Cpu>(&options, &device, &stop)
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("codec") || error.contains("does not match"),
+        "{error}"
+    );
+    fs::write(codec.join("part.safetensors"), b"codec shard").unwrap();
+    fs::write(
+        codec.join("model.safetensors.index.json"),
+        br#"{ "weight_map":{"a":"part.safetensors"}}"#,
+    )
+    .unwrap();
+    let error = train_audio_round::<Cpu>(&options, &device, &stop)
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("codec") || error.contains("does not match"),
+        "{error}"
+    );
+    assert_eq!(fs::read(pointer).unwrap(), before);
 }
 
 #[test]

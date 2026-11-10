@@ -44,6 +44,53 @@ fn admitted_audio_is_bound_to_the_manifest_and_media_bytes() {
 }
 
 #[test]
+fn assembled_answer_uses_the_selected_wav_record() {
+    use omni_rsi::speech_audio::AudioAnswer;
+    let root = tempfile::tempdir().unwrap();
+    let mut records = Vec::new();
+    for (name, pcm) in [
+        ("decoy.wav", [0_i16, 8192, 0, -8192]),
+        ("target.wav", [0_i16, 16384, -8192, 4096]),
+    ] {
+        let path = root.path().join(name);
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in pcm {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        records.push(serde_json::json!({
+            "id":name,"split":"train","input_audio":name,
+            "input_sha256":format!("{:x}", Sha256::digest(fs::read(path).unwrap())),
+            "authorization":{"kind":"licensed-synthetic","source":"fixture","license":"CC0-1.0"},
+            "instruction":"加一回答","answer":"十三"
+        }));
+    }
+    fs::write(
+        root.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"version":1,"records":records})).unwrap(),
+    )
+    .unwrap();
+    let data = AudioDataset::load(root.path(), &AtomicBool::new(false)).unwrap();
+    let example = AudioAnswer::from_dataset(&data, 1).unwrap();
+    // Independent PCM16/32768 reference for target.wav, not the first record.
+    assert_eq!(example.samples(), &[0.0, 0.5, -0.25, 0.125]);
+    assert_ne!(
+        AudioAnswer::from_dataset(&data, 0).unwrap().samples(),
+        example.samples()
+    );
+    assert!(AudioAnswer::from_dataset(&data, 2).is_err());
+}
+
+#[test]
 fn speech_targets_require_a_codec_binding_but_text_only_records_do_not() {
     let root = tempfile::tempdir().unwrap();
     let audio = root.path().join("input.wav");

@@ -67,6 +67,26 @@ fn final_event_and_chinese_quality_are_checked_without_trusting_language_labels(
 }
 
 #[test]
+fn earlier_token_limit_makes_a_later_final_event_incomplete_evidence() {
+    let partial = r#"{"text":"","language":"English","is_final":false,"cancelled":false,"token_limit_reached":true}"#;
+    let complete_partial = partial.replace(
+        "\"token_limit_reached\":true",
+        "\"token_limit_reached\":false",
+    );
+    let final_line = r#"{"text":"I want chengniu yao","language":"English","is_final":true,"cancelled":false,"token_limit_reached":false}"#;
+    assert!(final_event(&format!("{complete_partial}\n{final_line}")).is_ok());
+    assert!(final_event(&format!("{partial}\n{final_line}")).is_err());
+    let without_status = r#"{"text":"","is_final":false,"cancelled":false}"#;
+    assert!(final_event(&format!("{without_status}\n{final_line}")).is_err());
+    let captured = concat!(
+        r#"{"delta":"","text":"","language":"English","audio_seconds":2.16,"compute_ms":435.56925,"generated_tokens":4,"reused_audio_tokens":0,"is_final":false,"token_limit_reached":true,"total_compute_ms":435.56925,"event_count":1,"rtf":0.20165243055555557,"cancelled":false}"#,
+        "\n",
+        r#"{"delta":"I want chengniu yao","text":"I want chengniu yao","language":"English","audio_seconds":3.44,"compute_ms":382.709083,"generated_tokens":8,"reused_audio_tokens":0,"is_final":true,"token_limit_reached":false,"total_compute_ms":818.278333,"event_count":2,"rtf":0.23787160843023256,"cancelled":false}"#
+    );
+    assert!(final_event(captured).is_err());
+}
+
+#[test]
 fn fingerprints_bind_native_and_historical_evidence_to_the_model_and_binary() {
     let directory = tempfile::tempdir().unwrap();
     let model = directory.path().join("model");

@@ -1,12 +1,19 @@
 //! Checkpoints for audio-conditioned training, isolated from self-reading.
 use crate::{
+    fingerprint::codec_fingerprint,
+    speech_audio_data::AudioDataset,
     speech_checkpoint::{atomic_json, implementation_hash},
+    speech_data::file_hash,
     speech_training::{SpeechOptimizer, SpeechOptimizerSnapshot},
 };
 use burn::tensor::backend::AutodiffBackend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 /// The dataset digest must cover the immutable manifest and every referenced
 /// input/target file; admission and digest construction belong to its loader.
@@ -97,10 +104,78 @@ pub fn audio_implementation_hash() -> String {
 }
 
 impl AudioProtocol {
+    /// Build the identical model/data binding for training and evaluation.
+    pub fn for_dataset(
+        model: &Path,
+        dataset: &AudioDataset,
+        backend: String,
+        stop: &AtomicBool,
+    ) -> Result<Self, String> {
+        if stop.load(Ordering::Acquire) {
+            return Err("interrupted".into());
+        }
+        let base_hash = omni_lfm3::speech_adapter::source_fingerprint(model)
+            .map_err(|error| error.to_string())?;
+        let codec_hash = audio_codec_hash(model, stop)?;
+        for index in 0..dataset.len() {
+            let record = dataset.record(index).ok_or("missing audio record")?;
+            if record
+                .target_codec_sha256
+                .as_ref()
+                .is_some_and(|hash| hash != &codec_hash)
+            {
+                return Err("audio target codec does not match the current model".into());
+            }
+        }
+        let config: serde_json::Value = serde_json::from_slice(
+            &fs::read(model.join("config.json")).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let width = config
+            .pointer("/text_config/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|width| usize::try_from(width).ok())
+            .filter(|width| (4..=65_536).contains(width))
+            .ok_or("invalid audio model width")?;
+        Ok(Self {
+            version: 1,
+            base_hash,
+            codec_hash,
+            dataset_hash: dataset.digest().into(),
+            implementation_hash: audio_implementation_hash(),
+            backend,
+            width,
+            train_records: dataset.len(),
+            mask_seed: 159,
+        })
+    }
+
+    /// Check the files again after loading or evaluating the model.
+    pub fn verify_model(&self, model: &Path, stop: &AtomicBool) -> Result<(), String> {
+        if omni_lfm3::speech_adapter::source_fingerprint(model)
+            .map_err(|error| error.to_string())?
+            != self.base_hash
+            || audio_codec_hash(model, stop)? != self.codec_hash
+        {
+            return Err("audio model or codec changed".into());
+        }
+        Ok(())
+    }
+
     /// Derive the mask seed from checkpointed progress, including after resume.
     pub fn seed_for_step(&self, progress: &AudioProgress) -> Result<u64, String> {
         validate(self, progress)?;
         Ok(self.mask_seed.wrapping_add(progress.updates as u64))
+    }
+}
+
+// Preserve the established target and checkpoint digest for unsharded codecs.
+fn audio_codec_hash(model: &Path, stop: &AtomicBool) -> Result<String, String> {
+    let codec = model.join("audio_tokenizer");
+    if codec.join("model.safetensors.index.json").is_file() {
+        codec_fingerprint(&codec, stop)
+    } else {
+        file_hash(&codec.join("model.safetensors"))
     }
 }
 

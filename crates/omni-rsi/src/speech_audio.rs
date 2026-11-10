@@ -1,6 +1,9 @@
 //! Audio-conditioned answer training. Dataset admission and publication are separate.
-use crate::speech_training::{
-    SpeechOptimizer, speech_loss_with_media, text_loss_with_media, validate_speech_frames,
+use crate::{
+    speech_audio_data::AudioDataset,
+    speech_training::{
+        SpeechOptimizer, speech_loss_with_media, text_loss_with_media, validate_speech_frames,
+    },
 };
 use burn::tensor::{Tensor, backend::AutodiffBackend};
 use omni_lfm3::model::OmniModel;
@@ -16,6 +19,23 @@ pub struct AudioAnswer<'a> {
 }
 
 impl<'a> AudioAnswer<'a> {
+    /// Assemble one admitted record exactly as the foreground trainer does.
+    pub fn from_dataset(dataset: &'a AudioDataset, index: usize) -> Result<Self, String> {
+        let record = dataset.record(index).ok_or("missing audio record")?;
+        Self::with_frames(
+            record.samples(),
+            16_000,
+            &record.instruction,
+            &record.answer,
+            record.frames.as_deref(),
+        )
+    }
+
+    /// Decoded input PCM used for this example.
+    pub fn samples(&self) -> &[f32] {
+        self.samples
+    }
+
     pub fn new(
         samples: &'a [f32],
         sample_rate: u32,
