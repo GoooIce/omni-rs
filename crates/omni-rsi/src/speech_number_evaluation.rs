@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
-    path::Path,
+    io::{Read, Write},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -91,6 +91,62 @@ pub struct DevelopmentOptions<'a> {
     pub asr_binary: Option<&'a Path>,
 }
 
+/// A local file identity captured from bytes and rechecked after a run. This
+/// detects file changes but does not prove that an execution actually happened.
+pub struct EvaluationBinary {
+    path: PathBuf,
+    sha256: String,
+}
+
+impl EvaluationBinary {
+    pub fn capture(path: &Path) -> Result<Self, String> {
+        Ok(Self {
+            path: path.to_owned(),
+            sha256: hash_evaluation_binary(path)?,
+        })
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        if hash_evaluation_binary(&self.path)? != self.sha256 {
+            return Err("evaluation binary changed during comparison".into());
+        }
+        Ok(())
+    }
+}
+
+fn hash_evaluation_binary(path: &Path) -> Result<String, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    if !before.is_file() || before.len() == 0 {
+        return Err("invalid evaluation binary file".into());
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err("evaluation binary changed while hashing".into());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 fn checkpoint_id(state: &Path) -> Result<String, String> {
     let pointer = state.join("audio-conditioned-v1/latest.json");
     let info = fs::symlink_metadata(&pointer).map_err(|error| error.to_string())?;
@@ -124,6 +180,8 @@ pub fn evaluate_development<B: AutodiffBackend>(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_secs();
+    let evaluation_binary =
+        EvaluationBinary::capture(&std::env::current_exe().map_err(|error| error.to_string())?)?;
     let development = AudioDataset::load_rule_split(options.data, "dev", stop)?;
     let training = AudioDataset::load(options.data, stop)?;
     if training.digest() != development.digest() {
@@ -267,27 +325,26 @@ pub fn evaluate_development<B: AutodiffBackend>(
     {
         return Err("model, checkpoint or rule dataset changed during comparison".into());
     }
-    if let (Some((model, binary)), Some(expected)) = (asr, asr_ids.as_ref()) {
-        if speech_asr::fingerprints(model, binary)?.native != expected.native {
-            return Err("R2T2 changed during comparison".into());
-        }
+    if let (Some((model, binary)), Some(expected)) = (asr, asr_ids.as_ref())
+        && speech_asr::fingerprints(model, binary)?.native != expected.native
+    {
+        return Err("R2T2 changed during comparison".into());
     }
+    evaluation_binary.verify()?;
     report["dataset_sha256"] = training.digest().into();
     report["base_sha256"] = base_hash.into();
     report["codec_sha256"] = codec_hash.into();
     report["candidate_checkpoint_sha256"] = candidate.into();
     report["started_unix_seconds"] = started.into();
     report["training_implementation_sha256"] = protocol.implementation_hash.clone().into();
-    report["evaluation_implementation_sha256"] = format!(
-        "{:x}",
-        Sha256::digest(include_bytes!("speech_number_evaluation.rs"))
-    )
-    .into();
+    report["evaluation_implementation_sha256"] = evaluation_implementation_hash().into();
+    report["evaluation_binary_sha256"] = evaluation_binary.sha256().into();
     report["parameters"] = serde_json::json!({
         "decode": "greedy", "max_tokens": 32, "sample_rate": 16000,
         "context": "fresh for every input", "backend": protocol.backend, "precision": "f32"
     });
     report["input_audio_verification"] = "declared_in_plan_not_executed".into();
+    report["holdout_blinding"] = "not_verified_legacy_v2".into();
     report["output_speech_r2t2_cer"] = if let Some(ids) = asr_ids {
         let observations: Vec<NumberObservation> =
             serde_json::from_value(report["observations"].clone())
@@ -324,6 +381,175 @@ fn normalized(text: &str) -> String {
         .nfkc()
         .filter(|ch| ch.is_alphanumeric())
         .collect()
+}
+
+// This identifies the local comparison/scoring sources and locked dependencies.
+// It does not attest that a report was generated by an actual model execution.
+fn evaluation_implementation_hash() -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"omni-rsi-number-evaluation-implementation-v1\0");
+    for bytes in [
+        include_bytes!("speech_number_evaluation.rs").as_slice(),
+        include_bytes!("speech_asr.rs").as_slice(),
+        include_bytes!("speech_audio_data.rs").as_slice(),
+        include_bytes!("speech_audio_checkpoint.rs").as_slice(),
+        include_bytes!("speech_checkpoint.rs").as_slice(),
+        include_bytes!("fingerprint.rs").as_slice(),
+        include_bytes!("../data/opencc/TSPhrases.txt").as_slice(),
+        include_bytes!("../data/opencc/TSCharacters.txt").as_slice(),
+        include_bytes!("../../lfm3-omni/src/generate.rs").as_slice(),
+        include_bytes!("../../lfm3-omni/src/model.rs").as_slice(),
+        include_bytes!("../../lfm3-omni/src/media_io.rs").as_slice(),
+        include_bytes!("../../lfm3-omni/src/sampling.rs").as_slice(),
+        include_bytes!("../Cargo.toml").as_slice(),
+        include_bytes!("../Cargo.lock").as_slice(),
+    ] {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn trim_answer_wrappers(mut text: &str) -> &str {
+    loop {
+        text = text.trim_end_matches(['。', '.', '!', '！']).trim();
+        let inner = [
+            ('“', '”'),
+            ('‘', '’'),
+            ('"', '"'),
+            ('\'', '\''),
+            ('(', ')'),
+            ('《', '》'),
+        ]
+        .into_iter()
+        .find_map(|(open, close)| {
+            text.strip_prefix(open)
+                .and_then(|value| value.strip_suffix(close))
+        });
+        match inner {
+            Some(value) => text = value.trim(),
+            None => break,
+        }
+    }
+    text
+}
+
+// Only one integer, optionally with a fixed answer label, is accepted. Free
+// explanations, decimals and conflicting answers are not inferred as correct.
+fn answer_number(text: &str) -> Option<u16> {
+    // Only map full-width digits and presentation punctuation. General NFKC
+    // would turn `1³` or `①③` into `13` and falsely award a different value.
+    let normalized: String = text
+        .chars()
+        .map(|ch| match ch {
+            '０'..='９' => char::from_u32(ch as u32 - '０' as u32 + '0' as u32).unwrap(),
+            '（' => '(',
+            '）' => ')',
+            '！' => '!',
+            '．' => '.',
+            _ => ch,
+        })
+        .collect();
+    let text = trim_answer_wrappers(normalized.trim());
+    let text = [
+        "答案是",
+        "答案为",
+        "答案為",
+        "结果是",
+        "结果为",
+        "結果是",
+        "結果為",
+    ]
+    .into_iter()
+    .find_map(|label| text.strip_prefix(label))
+    .map(trim_answer_wrappers)
+    .unwrap_or(text);
+    if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()) {
+        return text.parse::<u16>().ok().filter(|value| *value <= 100);
+    }
+    let digit = |ch| match ch {
+        '零' | '〇' => Some(0),
+        '一' | '壹' => Some(1),
+        '二' | '两' | '兩' | '贰' | '貳' => Some(2),
+        '三' | '叁' | '參' => Some(3),
+        '四' | '肆' => Some(4),
+        '五' | '伍' => Some(5),
+        '六' | '陆' | '陸' => Some(6),
+        '七' | '柒' => Some(7),
+        '八' | '捌' => Some(8),
+        '九' | '玖' => Some(9),
+        _ => None,
+    };
+    let is_ten = |ch| ch == '十' || ch == '拾';
+    let chars: Vec<_> = text.chars().collect();
+    match chars.as_slice() {
+        [ch] if is_ten(*ch) => Some(10),
+        [ch] => digit(*ch),
+        [one, hundred] if digit(*one) == Some(1) && matches!(hundred, '百' | '佰') => Some(100),
+        [ten, ones] if is_ten(*ten) => digit(*ones)
+            .filter(|value| *value > 0)
+            .map(|value| 10 + value),
+        [tens, ten] if is_ten(*ten) => digit(*tens)
+            .filter(|value| *value > 0)
+            .map(|value| value * 10),
+        [tens, ten, ones] if is_ten(*ten) => {
+            let tens = digit(*tens).filter(|value| *value > 0)?;
+            let ones = digit(*ones).filter(|value| *value > 0)?;
+            Some(tens * 10 + ones)
+        }
+        _ => None,
+    }
+}
+
+// Deliberately conservative: this is a literal numeral mention, not a semantic
+// judgment about whether a sentence asserts or denies an unsupported number.
+fn mentions_number(text: &str) -> bool {
+    if text.chars().any(|ch| {
+        ch.is_numeric()
+            || "零〇一二两兩三四五六七八九十百千万亿萬億兆壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌幺"
+                .contains(ch)
+    }) {
+        return true;
+    }
+    const WORDS: &[&str] = &[
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+        "thirty",
+        "forty",
+        "fifty",
+        "sixty",
+        "seventy",
+        "eighty",
+        "ninety",
+        "hundred",
+        "thousand",
+        "million",
+        "billion",
+        "trillion",
+    ];
+    let normalized: String = text.nfkc().collect();
+    normalized
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| WORDS.iter().any(|number| word.eq_ignore_ascii_case(number)))
 }
 
 fn character_errors(reference: &str, observed: &str) -> Result<(usize, usize), String> {
@@ -496,7 +722,13 @@ pub fn summarize(
             _ => return Err("invalid comparison condition".into()),
         };
         if let Some((condition, answer)) = answer {
-            if row.stopped && !row.text.is_empty() && normalized(&row.text) == normalized(answer) {
+            if condition == 2 {
+                counters[arm][condition] += usize::from(mentions_number(&row.text));
+            } else if row.stopped
+                && answer_number(&row.text)
+                    .zip(answer_number(answer))
+                    .is_some_and(|(actual, expected)| actual == expected)
+            {
                 counters[arm][condition] += 1;
             }
         }
@@ -516,7 +748,9 @@ pub fn summarize(
             "original_correct": values[0], "swapped_correct": values[1],
             "original_accuracy": values[0] as f64 / data.len() as f64,
             "swapped_accuracy": values[1] as f64 / data.len() as f64,
-            "silence_matching_original": values[2], "normal_end": values[3],
+            "silence_numeric_responses": values[2],
+            "silence_numeric_rate": values[2] as f64 / data.len() as f64,
+            "normal_end": values[3],
             "normal_end_rate": values[3] as f64 / (data.len() * 3) as f64
         })
     };
@@ -533,6 +767,10 @@ pub fn summarize(
         "cases": data.len(), "baseline": metrics(counters[0]), "candidate": metrics(counters[1]),
         "coverage": {"synthetic_cases": synthetic_cases,
             "declared_user_provided_cases": human.len(), "declared_user_provided_speakers": human_speakers.len()},
+        "scoring_protocol": {"answer":"single-integer-or-answer-label-0-100-v1",
+            "silence":"numeric-mention-v1", "normal_end_required_for_correct_answer":true,
+            "silence_includes_unfinished":true,
+            "implementation_sha256":evaluation_implementation_hash()},
         "status": "insufficient_evidence", "candidate_eligible": false, "observations": observations
     }))
 }

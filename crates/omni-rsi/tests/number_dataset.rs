@@ -451,7 +451,7 @@ fn swapped_audio_is_scored_against_the_audio_not_the_prompt_case() {
     })
     .unwrap();
     assert_eq!(generated["candidate"]["swapped_correct"], 2);
-    assert_eq!(generated["candidate"]["silence_matching_original"], 0);
+    assert_eq!(generated["candidate"]["silence_numeric_responses"], 0);
     assert_eq!(generated["status"], "insufficient_evidence");
 
     let speech: Vec<_> = observations
