@@ -15,8 +15,11 @@ use std::{
 const LAYOUT: &[u8] = b"omni-rsi-number-train-dev-v3\n";
 const MAX_MANIFEST: usize = 8 * 1024 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_MEDIA: usize = 128 * 1024 * 1024;
 const MAX_SAMPLES: usize = 16_000 * 20;
 const MAX_TOTAL_SAMPLES: usize = 16_000 * 1_200;
+// Bound v3 target output to 128 codebooks and 200 total frames.
+const MAX_TARGET_CODEBOOKS: usize = 128;
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +52,7 @@ pub struct SpeechTarget {
     preparation_sha256: String,
     audio_file: String,
     source: serde_json::Map<String, serde_json::Value>,
+    source_group: BlindSource,
 }
 
 impl SpeechTarget {
@@ -63,6 +67,9 @@ impl SpeechTarget {
     }
     pub fn source(&self) -> &serde_json::Map<String, serde_json::Value> {
         &self.source
+    }
+    pub fn source_group(&self) -> &BlindSource {
+        &self.source_group
     }
 }
 
@@ -88,6 +95,8 @@ struct GroupManifest {
 struct GroupCase {
     id: String,
     source: BlindSource,
+    #[serde(default)]
+    target_source: Option<BlindSource>,
 }
 
 pub struct DevelopmentRecord {
@@ -202,11 +211,15 @@ impl DevelopmentData {
         let train_dir = open_child(&root, "train-media", true)?;
         let dev_dir = open_child(&root, "dev-media", true)?;
         let mut total_samples = 0;
+        let mut total_bytes = 0;
+        let mut target_cache = HashMap::new();
         let train = load_media(
             train,
             &train_dir,
             train_target_dir.as_ref(),
             &mut total_samples,
+            &mut total_bytes,
+            &mut target_cache,
             stop,
         )?;
         let dev = load_media(
@@ -214,6 +227,8 @@ impl DevelopmentData {
             &dev_dir,
             dev_target_dir.as_ref(),
             &mut total_samples,
+            &mut total_bytes,
+            &mut target_cache,
             stop,
         )?;
         let train_pcm: HashSet<_> = train.iter().map(|record| &record.pcm_sha256).collect();
@@ -222,6 +237,43 @@ impl DevelopmentData {
             .any(|record| train_pcm.contains(&record.pcm_sha256))
         {
             return Err("decoded PCM crosses train/dev partitions".into());
+        }
+        let train_targets: HashSet<_> = train
+            .iter()
+            .filter_map(|record| record.record.speech_target.as_ref())
+            .map(|target| &target.target_audio_sha256)
+            .collect();
+        let train_wavs: HashSet<_> = train
+            .iter()
+            .map(|record| &record.record.audio_sha256)
+            .collect();
+        let mut train_target_pcm = HashSet::new();
+        let mut train_target_input_pcm = HashSet::new();
+        for target in train
+            .iter()
+            .filter_map(|record| record.record.speech_target.as_ref())
+        {
+            let pcm = target_cache
+                .get(&target.target_audio_sha256)
+                .ok_or("missing validated target PCM")?;
+            train_target_pcm.insert(&pcm.pcm_24k_sha256);
+            train_target_input_pcm.insert(&pcm.pcm_16k_sha256);
+        }
+        for record in &dev {
+            let mut crosses = train_targets.contains(&record.record.audio_sha256)
+                || train_target_input_pcm.contains(&record.pcm_sha256);
+            if let Some(target) = &record.record.speech_target {
+                let pcm = target_cache
+                    .get(&target.target_audio_sha256)
+                    .ok_or("missing validated target PCM")?;
+                crosses |= train_targets.contains(&target.target_audio_sha256)
+                    || train_wavs.contains(&target.target_audio_sha256)
+                    || train_target_pcm.contains(&pcm.pcm_24k_sha256)
+                    || train_pcm.contains(&pcm.pcm_16k_sha256);
+            }
+            if crosses {
+                return Err("target audio or PCM crosses train/dev partitions".into());
+            }
         }
         let target_binding = if has_targets {
             Some(validate_target_model(
@@ -268,8 +320,14 @@ fn validate_groups(
     let mut recordings = HashMap::new();
     for (split, source, case_id) in train
         .iter()
-        .map(|r| (0, &r.source, Some(&r.id)))
-        .chain(dev.iter().map(|r| (1, &r.source, Some(&r.id))))
+        .flat_map(|r| {
+            std::iter::once((0, &r.source, Some(&r.id)))
+                .chain(r.target_source.iter().map(|source| (0, source, None)))
+        })
+        .chain(dev.iter().flat_map(|r| {
+            std::iter::once((1, &r.source, Some(&r.id)))
+                .chain(r.target_source.iter().map(|source| (1, source, None)))
+        }))
         .chain(holdout.iter().map(|source| (2, source, None)))
     {
         if case_id.is_some_and(|id| !case_ids.insert(id.clone())) {
@@ -318,6 +376,17 @@ fn valid_hash(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn valid_source(source: &BlindSource) -> bool {
+    [
+        &source.speaker_sha256,
+        &source.session_sha256,
+        &source.recording_sha256,
+        &source.family_sha256,
+    ]
+    .iter()
+    .all(|value| valid_hash(value))
+}
+
 fn parse_groups(bytes: &[u8], partition: &str) -> Result<Vec<GroupCase>, String> {
     let manifest: GroupManifest =
         serde_json::from_slice(bytes).map_err(|e| format!("invalid v3 group manifest: {e}"))?;
@@ -335,14 +404,11 @@ fn parse_groups(bytes: &[u8], partition: &str) -> Result<Vec<GroupCase>, String>
             || row.id.len() > 128
             || row.id.chars().any(char::is_control)
             || !ids.insert(&row.id)
-            || [
-                &row.source.speaker_sha256,
-                &row.source.session_sha256,
-                &row.source.recording_sha256,
-                &row.source.family_sha256,
-            ]
-            .iter()
-            .any(|value| !valid_hash(value))
+            || !valid_source(&row.source)
+            || row
+                .target_source
+                .as_ref()
+                .is_some_and(|source| !valid_source(source))
         {
             return Err("invalid v3 group identity".into());
         }
@@ -352,10 +418,15 @@ fn parse_groups(bytes: &[u8], partition: &str) -> Result<Vec<GroupCase>, String>
 
 fn check_group_manifest(records: &[ManifestRecord], groups: &[GroupCase]) -> Result<(), String> {
     if records.len() != groups.len()
-        || records
-            .iter()
-            .zip(groups)
-            .any(|(record, group)| record.id != group.id || record.source != group.source)
+        || records.iter().zip(groups).any(|(record, group)| {
+            record.id != group.id
+                || record.source != group.source
+                || record
+                    .speech_target
+                    .as_ref()
+                    .map(|target| &target.source_group)
+                    != group.target_source.as_ref()
+        })
     {
         return Err("v3 cases differ from their source group manifest".into());
     }
@@ -407,14 +478,7 @@ fn parse_split(bytes: &[u8], partition: &str) -> Result<Vec<ManifestRecord>, Str
             || !valid_hash(&record.audio_sha256)
             || record.spoken_number > 99
             || record.answer != record.spoken_number + 1
-            || [
-                &source.speaker_sha256,
-                &source.session_sha256,
-                &source.recording_sha256,
-                &source.family_sha256,
-            ]
-            .iter()
-            .any(|value| !valid_hash(value))
+            || !valid_source(source)
         {
             return Err("invalid v3 case or source identity".into());
         }
@@ -513,32 +577,55 @@ fn valid_declaration(record: &ManifestRecord) -> bool {
     }
 }
 
+#[derive(Clone)]
+struct TargetPcmIdentities {
+    pcm_24k_sha256: String,
+    pcm_16k_sha256: String,
+}
+
 fn load_media(
     records: Vec<ManifestRecord>,
     directory: &File,
     target_directory: Option<&File>,
     total_samples: &mut usize,
+    total_bytes: &mut usize,
+    target_cache: &mut HashMap<String, TargetPcmIdentities>,
     stop: &AtomicBool,
 ) -> Result<Vec<DevelopmentRecord>, String> {
     let mut loaded = Vec::with_capacity(records.len());
     let mut labels = HashMap::new();
     for record in records {
         if let Some(target) = &record.speech_target {
-            let bytes = read_child(
+            let bytes = read_media(
                 target_directory.ok_or("missing target media directory")?,
                 &target.audio_file,
-                MAX_MEDIA,
+                total_bytes,
                 stop,
             )?;
             if format!("{:x}", Sha256::digest(&bytes)) != target.target_audio_sha256 {
                 return Err("target audio hash mismatch".into());
             }
-            validate_target_wav(&bytes, stop)?;
+            let identities = validate_target_wav(
+                &bytes,
+                total_samples,
+                target_cache.get(&target.target_audio_sha256),
+                stop,
+            )?;
+            target_cache
+                .entry(target.target_audio_sha256.clone())
+                .or_insert_with(|| identities.clone());
         }
-        let bytes = read_child(directory, &record.audio_file, MAX_MEDIA, stop)?;
+        let bytes = read_media(directory, &record.audio_file, total_bytes, stop)?;
         if format!("{:x}", Sha256::digest(&bytes)) != record.audio_sha256 {
             return Err("v3 media hash mismatch".into());
         }
+        let wav = hound::WavReader::new(std::io::Cursor::new(&bytes)).map_err(|e| e.to_string())?;
+        let rate = wav.spec().sample_rate;
+        if rate == 0 || u64::from(wav.duration()) > u64::from(rate) * 20 {
+            return Err("v3 WAV duration exceeds the per-file limit".into());
+        }
+        let predicted = normalized_samples(wav.duration(), rate)?;
+        check_sample_budget(*total_samples, predicted)?;
         let samples = omni_lfm3::media_io::decode_wav(&bytes, stop).map_err(|e| e.to_string())?;
         if samples.is_empty()
             || samples.len() > MAX_SAMPLES
@@ -546,18 +633,8 @@ fn load_media(
         {
             return Err("invalid v3 audio samples".into());
         }
-        *total_samples = total_samples
-            .checked_add(samples.len())
-            .ok_or("v3 dataset sample count overflow")?;
-        if *total_samples > MAX_TOTAL_SAMPLES {
-            return Err("v3 dataset exceeds decoded sample limit".into());
-        }
-        let mut hash = Sha256::new();
-        for sample in &samples {
-            let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-            hash.update(bits.to_le_bytes());
-        }
-        let pcm_sha256 = format!("{:x}", hash.finalize());
+        *total_samples = check_sample_budget(*total_samples, samples.len())?;
+        let pcm_sha256 = pcm_sha256(&samples);
         let label = (record.spoken_number, record.answer);
         if labels
             .insert(pcm_sha256.clone(), label)
@@ -574,7 +651,56 @@ fn load_media(
     Ok(loaded)
 }
 
-fn validate_target_wav(bytes: &[u8], stop: &AtomicBool) -> Result<(), String> {
+fn read_media(
+    directory: &File,
+    name: &str,
+    total_bytes: &mut usize,
+    stop: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    check_stop(stop)?;
+    let file = open_child(directory, name, false)?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let remaining = MAX_TOTAL_MEDIA
+        .checked_sub(*total_bytes)
+        .ok_or("v3 media byte limit")?;
+    if metadata.is_file() && metadata.len() > remaining as u64 {
+        return Err("v3 dataset exceeds media byte limit".into());
+    }
+    let bytes = read_open_file(file, MAX_MEDIA.min(remaining), stop)?;
+    *total_bytes += bytes.len();
+    Ok(bytes)
+}
+
+fn normalized_samples(frames: u32, rate: u32) -> Result<usize, String> {
+    if rate == 0 {
+        return Err("invalid WAV sample rate".into());
+    }
+    let samples = (u64::from(frames) * 16_000).div_ceil(u64::from(rate));
+    usize::try_from(samples).map_err(|_| "v3 dataset sample count overflow".into())
+}
+
+fn check_sample_budget(total: usize, additional: usize) -> Result<usize, String> {
+    total
+        .checked_add(additional)
+        .filter(|sum| *sum <= MAX_TOTAL_SAMPLES)
+        .ok_or_else(|| "v3 dataset exceeds decoded sample limit".into())
+}
+
+fn pcm_sha256(samples: &[f32]) -> String {
+    let mut hash = Sha256::new();
+    for sample in samples {
+        let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
+        hash.update(bits.to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn validate_target_wav(
+    bytes: &[u8],
+    total_samples: &mut usize,
+    cached: Option<&TargetPcmIdentities>,
+    stop: &AtomicBool,
+) -> Result<TargetPcmIdentities, String> {
     let mut wav = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let spec = wav.spec();
     if spec.channels != 1
@@ -584,13 +710,28 @@ fn validate_target_wav(bytes: &[u8], stop: &AtomicBool) -> Result<(), String> {
     {
         return Err("target WAV must be bounded mono 24 kHz PCM".into());
     }
+    if !matches!(
+        (spec.sample_format, spec.bits_per_sample),
+        (hound::SampleFormat::Int, 16) | (hound::SampleFormat::Float, 32)
+    ) {
+        return Err("target WAV must be PCM16 or float32".into());
+    }
+    let predicted = normalized_samples(wav.duration(), spec.sample_rate)?;
+    *total_samples = check_sample_budget(*total_samples, predicted)?;
+    if let Some(cached) = cached {
+        check_stop(stop)?;
+        return Ok(cached.clone());
+    }
+    let mut hash = Sha256::new();
     match (spec.sample_format, spec.bits_per_sample) {
         (hound::SampleFormat::Int, 16) => {
             for (i, sample) in wav.samples::<i16>().enumerate() {
                 if i % 4096 == 0 {
                     check_stop(stop)?;
                 }
-                sample.map_err(|e| e.to_string())?;
+                let sample = f32::from(sample.map_err(|e| e.to_string())?) / 32768.0;
+                let bits = if sample == 0.0 { 0 } else { sample.to_bits() };
+                hash.update(bits.to_le_bytes());
             }
         }
         (hound::SampleFormat::Float, 32) => {
@@ -602,11 +743,20 @@ fn validate_target_wav(bytes: &[u8], stop: &AtomicBool) -> Result<(), String> {
                 if !sample.is_finite() || sample.abs() > 1.0 {
                     return Err("invalid target WAV sample".into());
                 }
+                let bits = if sample == 0.0 { 0 } else { sample.to_bits() };
+                hash.update(bits.to_le_bytes());
             }
         }
         _ => return Err("target WAV must be PCM16 or float32".into()),
     }
-    Ok(())
+    let samples = omni_lfm3::media_io::decode_wav(bytes, stop).map_err(|e| e.to_string())?;
+    if samples.is_empty() || samples.len() > predicted || samples.iter().any(|v| !v.is_finite()) {
+        return Err("invalid resampled target PCM".into());
+    }
+    Ok(TargetPcmIdentities {
+        pcm_24k_sha256: format!("{:x}", hash.finalize()),
+        pcm_16k_sha256: pcm_sha256(&samples),
+    })
 }
 
 #[cfg(unix)]
@@ -732,13 +882,58 @@ struct CaseIdentity {
     declaration_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     speech_target_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_provenance: Option<SourceProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_provenance: Option<SourceProvenance>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Swap {
+struct SourceProvenance {
+    status: String,
+    created_at: Option<String>,
+    teacher_sha256: Option<String>,
+    verifier_sha256: Option<String>,
+    missing: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenSwap {
     case_id: String,
     audio_case_id: String,
+}
+
+impl FrozenSwap {
+    pub fn case_id(&self) -> &str {
+        &self.case_id
+    }
+    pub fn audio_case_id(&self) -> &str {
+        &self.audio_case_id
+    }
+}
+
+/// The frozen mapping and the protocol hash that binds it, borrowed together.
+///
+/// ```compile_fail
+/// use omni_rsi::number_development::RegisteredDevelopment;
+/// fn change_mapping(registration: &RegisteredDevelopment) {
+///     registration.swaps().entries()[0].audio_case_id = "different".into();
+/// }
+/// ```
+pub struct FrozenSwaps<'a> {
+    protocol_sha256: &'a str,
+    entries: &'a [FrozenSwap],
+}
+
+impl<'a> FrozenSwaps<'a> {
+    pub fn protocol_sha256(&self) -> &'a str {
+        self.protocol_sha256
+    }
+    pub fn entries(&self) -> &'a [FrozenSwap] {
+        self.entries
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq)]
@@ -760,7 +955,7 @@ struct FrozenProtocol {
     dev_groups_sha256: String,
     train_cases: Vec<CaseIdentity>,
     dev_cases: Vec<CaseIdentity>,
-    swaps: Vec<Swap>,
+    swaps: Vec<FrozenSwap>,
     blind_public_fingerprint: String,
     base_model_sha256: String,
     codec_sha256: String,
@@ -785,6 +980,7 @@ struct Envelope {
 pub struct RegisteredDevelopment {
     data: DevelopmentData,
     protocol_sha256: String,
+    swaps: Vec<FrozenSwap>,
 }
 
 impl RegisteredDevelopment {
@@ -793,6 +989,13 @@ impl RegisteredDevelopment {
     }
     pub fn protocol_sha256(&self) -> &str {
         &self.protocol_sha256
+    }
+    /// Reuse this mapping in evaluation; it grants no holdout access.
+    pub fn swaps(&self) -> FrozenSwaps<'_> {
+        FrozenSwaps {
+            protocol_sha256: &self.protocol_sha256,
+            entries: &self.swaps,
+        }
     }
     pub fn status(&self) -> &'static str {
         "insufficient_evidence"
@@ -815,6 +1018,100 @@ struct RegressionPlan {
 struct RegressionGroup {
     name: String,
     manifest_file: String,
+}
+
+fn valid_timestamp(text: &str) -> bool {
+    fn number(bytes: &[u8]) -> Option<u32> {
+        bytes.iter().try_fold(0_u32, |value, byte| {
+            byte.is_ascii_digit()
+                .then(|| value * 10 + u32::from(byte - b'0'))
+        })
+    }
+    let bytes = text.as_bytes();
+    if !(20..=64).contains(&bytes.len())
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(&bytes[0..4]),
+        number(&bytes[5..7]),
+        number(&bytes[8..10]),
+        number(&bytes[11..13]),
+        number(&bytes[14..16]),
+        number(&bytes[17..19]),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+    let mut zone = &bytes[19..];
+    if zone.first() == Some(&b'.') {
+        let digits = zone[1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return false;
+        }
+        zone = &zone[1 + digits..];
+    }
+    match zone {
+        [b'Z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            number(&[*h1, *h2]).is_some_and(|hours| hours <= 23)
+                && number(&[*m1, *m2]).is_some_and(|minutes| minutes <= 59)
+        }
+        _ => false,
+    }
+}
+
+fn source_provenance(declaration: &serde_json::Map<String, serde_json::Value>) -> SourceProvenance {
+    let value = |key: &str| declaration.get(key).and_then(serde_json::Value::as_str);
+    let created_at = value("created_at")
+        .filter(|text| valid_timestamp(text))
+        .map(str::to_owned);
+    let teacher_sha256 = value("teacher_sha256")
+        .filter(|hash| valid_hash(hash))
+        .map(str::to_owned);
+    let verifier_sha256 = value("verifier_sha256")
+        .filter(|hash| valid_hash(hash))
+        .map(str::to_owned);
+    let mut missing = Vec::new();
+    if created_at.is_none() {
+        missing.push("created_at".into());
+    }
+    if teacher_sha256.is_none() {
+        missing.push("teacher_sha256".into());
+    }
+    if verifier_sha256.is_none() {
+        missing.push("verifier_sha256".into());
+    }
+    SourceProvenance {
+        status: if missing.is_empty() {
+            "declared_unverified"
+        } else {
+            "incomplete"
+        }
+        .into(),
+        created_at,
+        teacher_sha256,
+        verifier_sha256,
+        missing,
+    }
 }
 
 fn case_identities(records: &[DevelopmentRecord]) -> Result<Vec<CaseIdentity>, String> {
@@ -842,28 +1139,56 @@ fn case_identities(records: &[DevelopmentRecord]) -> Result<Vec<CaseIdentity>, S
                             .map_err(|e| e.to_string())
                     })
                     .transpose()?,
+                source_provenance: Some(source_provenance(&row.record.declaration)),
+                target_provenance: row
+                    .record
+                    .speech_target
+                    .as_ref()
+                    .map(|target| source_provenance(&target.source)),
             })
         })
         .collect()
 }
 
-fn swap_mapping(dev: &[DevelopmentRecord]) -> Result<Vec<Swap>, String> {
+fn swap_mapping(dev: &[DevelopmentRecord]) -> Result<Vec<FrozenSwap>, String> {
     if dev.len() < 2 {
         return Err("development requires at least two distinct answers".into());
     }
-    dev.iter()
+    if dev
+        .iter()
+        .map(|row| &row.pcm_sha256)
+        .collect::<HashSet<_>>()
+        .len()
+        != dev.len()
+    {
+        return Err("development swaps require unique decoded PCM".into());
+    }
+    let mut counts = HashMap::new();
+    for row in dev {
+        *counts.entry(row.answer()).or_insert(0_usize) += 1;
+    }
+    let largest = counts
+        .values()
+        .copied()
+        .max()
+        .ok_or("missing development answers")?;
+    if largest > dev.len() / 2 {
+        return Err("development answers cannot form a one-to-one distinct-answer swap".into());
+    }
+    let mut sorted: Vec<_> = (0..dev.len()).collect();
+    sorted.sort_by_key(|index| dev[*index].answer());
+    let mut paired = vec![0_usize; dev.len()];
+    for (position, index) in sorted.iter().copied().enumerate() {
+        paired[index] = sorted[(position + largest) % sorted.len()];
+    }
+    Ok(dev
+        .iter()
         .enumerate()
-        .map(|(index, row)| {
-            let other = (1..dev.len())
-                .map(|offset| &dev[(index + offset) % dev.len()])
-                .find(|other| other.answer() != row.answer())
-                .ok_or("development requires distinct answers")?;
-            Ok(Swap {
-                case_id: row.id().into(),
-                audio_case_id: other.id().into(),
-            })
+        .map(|(index, row)| FrozenSwap {
+            case_id: row.id().into(),
+            audio_case_id: dev[paired[index]].id().into(),
         })
-        .collect()
+        .collect())
 }
 
 fn valid_json_file(name: &str) -> bool {
@@ -1084,6 +1409,9 @@ fn model_and_codec_fingerprints(
     path: &Path,
     stop: &AtomicBool,
 ) -> Result<(String, String), String> {
+    // The general codec fingerprint opens paths directly. Keep this v3
+    // descriptor-relative reader until that shared API can accept a nofollow
+    // opener; replacing it with path opens would weaken the artifact boundary.
     let model = open_root(path)?;
     check_artifact_tree(path, stop)?;
     check_stop(stop)?;
@@ -1167,7 +1495,7 @@ fn validate_target_model(
         .ok_or("invalid codec levels")?;
     if codec_format.fsq_levels.is_empty()
         || codec_format.sampling_rate != 24_000
-        || codec_format.n_q == 0
+        || !(1..=MAX_TARGET_CODEBOOKS).contains(&codec_format.n_q)
         || codec_format.n_q != model_format.num_codebooks
         || model_format.audio_eos_code < code_count
         || model_format.audio_eos_code as usize >= model_format.codebook_size
@@ -1238,6 +1566,13 @@ fn snapshot(
     {
         return Err("invalid preregistered backend".into());
     }
+    let swaps = swap_mapping(&data.dev)?;
+    let distinct_swap_pcm = data
+        .dev
+        .iter()
+        .map(|row| &row.pcm_sha256)
+        .collect::<HashSet<_>>()
+        .len();
     let (regression_plan_sha256, regression_inputs) =
         regression_identities(options.data_root, stop)?;
     let (base_model_sha256, codec_sha256) = model_and_codec_fingerprints(&options.model_dir, stop)?;
@@ -1282,6 +1617,8 @@ fn snapshot(
         "statistics_implementation_sha256": format!("{:x}", Sha256::digest(include_bytes!("number_gate.rs"))),
         "statistics": {"method":"bonferroni-clopper-pearson-95-v1", "minimum_independent_cases":30,
             "minimum_gain_percentage_points":5, "lower_bound":"strictly_positive", "normal_end":"no_degradation"},
+        "audio_swaps": {"mapping":"different-answer-bijection-v1", "distinct_pcm":distinct_swap_pcm,
+            "source_identity":"dev_cases_by_audio_case_id"},
         "decode": {"backend":options.backend, "precision":"f32", "text":"greedy", "text_max_tokens":32,
             "input_sample_rate":16000, "context":"fresh_per_input", "speech_max_slots":180,
             "speech_seed":42, "speech_temperature_milli":400, "speech_repetition_penalty_milli":1200,
@@ -1297,7 +1634,7 @@ fn snapshot(
         dev_groups_sha256: data.dev_groups_sha256.clone(),
         train_cases: case_identities(&data.train)?,
         dev_cases: case_identities(&data.dev)?,
-        swaps: swap_mapping(&data.dev)?,
+        swaps,
         blind_public_fingerprint: data.blind.fingerprint()?,
         base_model_sha256,
         codec_sha256,
@@ -1377,6 +1714,7 @@ pub fn preregister(
     Ok(RegisteredDevelopment {
         data,
         protocol_sha256,
+        swaps: envelope.protocol.swaps,
     })
 }
 
@@ -1419,6 +1757,7 @@ pub fn verify_registration(
     Ok(RegisteredDevelopment {
         data,
         protocol_sha256: envelope.protocol_sha256,
+        swaps: envelope.protocol.swaps,
     })
 }
 
