@@ -166,12 +166,12 @@ impl NumberAudioV3 {
             .answers
             .get(index)
             .ok_or("missing v3 training answer")?;
-        match row.speech_target() {
-            Some(target) => {
-                AudioAnswer::new(row.samples(), 16_000, INSTRUCTION, answer, target.frames())
-            }
-            None => AudioAnswer::new_text_only(row.samples(), 16_000, INSTRUCTION, answer),
-        }
+        AudioAnswer::from_validated_wav(
+            row.validated_wav(),
+            INSTRUCTION,
+            answer,
+            row.speech_target().map(|target| target.frames()),
+        )
     }
 }
 

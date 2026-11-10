@@ -1,6 +1,6 @@
 //! Audio-conditioned answer training. Dataset admission and publication are separate.
 use crate::{
-    speech_audio_data::AudioDataset,
+    speech_audio_data::{AudioDataset, ValidatedWavPcm},
     speech_training::{
         SpeechOptimizer, speech_loss_with_media, text_loss_with_media, validate_speech_frames,
     },
@@ -22,9 +22,8 @@ impl<'a> AudioAnswer<'a> {
     /// Assemble one admitted record exactly as the foreground trainer does.
     pub fn from_dataset(dataset: &'a AudioDataset, index: usize) -> Result<Self, String> {
         let record = dataset.record(index).ok_or("missing audio record")?;
-        Self::with_frames(
-            record.samples(),
-            16_000,
+        Self::from_validated_wav(
+            record.validated_wav(),
             &record.instruction,
             &record.answer,
             record.frames.as_deref(),
@@ -44,6 +43,7 @@ impl<'a> AudioAnswer<'a> {
         self.frames
     }
 
+    /// Accept direct 16 kHz PCM whose finite samples are in [-1, 1].
     pub fn new(
         samples: &'a [f32],
         sample_rate: u32,
@@ -51,17 +51,39 @@ impl<'a> AudioAnswer<'a> {
         answer: &'a str,
         frames: &'a [Vec<u32>],
     ) -> Result<Self, String> {
-        Self::with_frames(samples, sample_rate, instruction, answer, Some(frames))
+        Self::from_direct_pcm(samples, sample_rate, instruction, answer, Some(frames))
     }
 
-    /// Train the answer text without requiring a synthesized speech target.
+    /// Train the answer text from direct normalized PCM without a speech target.
     pub fn new_text_only(
         samples: &'a [f32],
         sample_rate: u32,
         instruction: &'a str,
         answer: &'a str,
     ) -> Result<Self, String> {
-        Self::with_frames(samples, sample_rate, instruction, answer, None)
+        Self::from_direct_pcm(samples, sample_rate, instruction, answer, None)
+    }
+
+    pub(crate) fn from_validated_wav(
+        pcm: &'a ValidatedWavPcm,
+        instruction: &'a str,
+        answer: &'a str,
+        frames: Option<&'a [Vec<u32>]>,
+    ) -> Result<Self, String> {
+        Self::with_frames(pcm.samples(), 16_000, instruction, answer, frames)
+    }
+
+    fn from_direct_pcm(
+        samples: &'a [f32],
+        sample_rate: u32,
+        instruction: &'a str,
+        answer: &'a str,
+        frames: Option<&'a [Vec<u32>]>,
+    ) -> Result<Self, String> {
+        if samples.len() > 20 * 16_000 || samples.iter().any(|sample| sample.abs() > 1.0) {
+            return Err("invalid audio answer example".into());
+        }
+        Self::with_frames(samples, sample_rate, instruction, answer, frames)
     }
 
     fn with_frames(
@@ -74,9 +96,7 @@ impl<'a> AudioAnswer<'a> {
         if sample_rate != 16_000
             || samples.is_empty()
             || samples.len() > 20 * 16_000
-            || samples
-                .iter()
-                .any(|sample| !sample.is_finite() || sample.abs() > 1.0)
+            || samples.iter().any(|sample| !sample.is_finite())
             || instruction.trim().is_empty()
             || instruction.len() > 2048
             || instruction.contains("<|")
