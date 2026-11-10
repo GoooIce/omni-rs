@@ -7,7 +7,7 @@ use burn::{
 use omni_lfm3::{Precision, model::OmniModel};
 use omni_rsi::{
     speech_audio::{AudioAnswer, train_step},
-    speech_training::{SpeechOptimizer, text_loss_with_media},
+    speech_training::{SpeechOptimizer, speech_loss_with_media, text_loss_with_media},
 };
 use serde::Deserialize;
 use std::{path::PathBuf, sync::atomic::AtomicBool};
@@ -150,8 +150,8 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
     let mut optimizer = SpeechOptimizer::<CpuTraining>::from_values(
         model.text.hidden_size(),
         4,
-        reference.a,
-        reference.b,
+        reference.a.clone(),
+        reference.b.clone(),
         &device,
     )
     .unwrap();
@@ -241,6 +241,85 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
         &reference.gradient_b,
     );
 
+    // Backward consumes Burn's graph, so each independent objective starts
+    // from fresh LoRA tensors with the exact same values and fresh audio media.
+    let text_optimizer = SpeechOptimizer::<CpuTraining>::from_values(
+        model.text.hidden_size(),
+        4,
+        reference.a.clone(),
+        reference.b.clone(),
+        &device,
+    )
+    .unwrap();
+    text_optimizer
+        .adapter()
+        .install(&mut model.text, 23)
+        .unwrap();
+    let text_media = [model.prepare_audio(&samples, 16_000).unwrap()];
+    let text_gradients = text_loss_with_media(
+        &model,
+        &reference.messages,
+        &text_media,
+        &reference.target_ids,
+    )
+    .unwrap()
+    .backward();
+    let (_, b) = text_optimizer.adapter().weights();
+    let text_gradient = b
+        .grad(&text_gradients)
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    assert!(text_gradient.iter().all(|value| value.is_finite()));
+    assert!(
+        text_gradient
+            .iter()
+            .any(|value| value.is_finite() && value.abs() > 1e-10)
+    );
+    let speech_optimizer = SpeechOptimizer::<CpuTraining>::from_values(
+        model.text.hidden_size(),
+        4,
+        reference.a.clone(),
+        reference.b.clone(),
+        &device,
+    )
+    .unwrap();
+    speech_optimizer
+        .adapter()
+        .install(&mut model.text, 23)
+        .unwrap();
+    let speech_media = [model.prepare_audio(&samples, 16_000).unwrap()];
+    let speech = speech_loss_with_media(
+        &model,
+        &reference.messages,
+        &speech_media,
+        &reference.frames,
+        159,
+    )
+    .unwrap();
+    let speech_gradients = (speech.content + speech.end * 0.01).backward();
+    let (_, b) = speech_optimizer.adapter().weights();
+    let speech_gradient = b
+        .grad(&speech_gradients)
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    assert!(speech_gradient.iter().all(|value| value.is_finite()));
+    assert!(
+        speech_gradient
+            .iter()
+            .any(|value| value.is_finite() && value.abs() > 1e-10)
+    );
+
+    model.text.clear_conv_lora(23).unwrap();
+    let base_loss =
+        text_loss_with_media(&model, &reference.messages, &media, &reference.target_ids)
+            .unwrap()
+            .into_scalar();
+    optimizer.adapter().install(&mut model.text, 23).unwrap();
+
     let example = AudioAnswer::new(
         &samples,
         16_000,
@@ -263,6 +342,12 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
     .unwrap();
     assert!(result.gradient_norm.is_finite() && result.gradient_norm > 0.0);
     assert_ne!(before, optimizer.export().unwrap());
+    model.text.clear_conv_lora(23).unwrap();
+    let base_loss_after =
+        text_loss_with_media(&model, &reference.messages, &media, &reference.target_ids)
+            .unwrap()
+            .into_scalar();
+    assert!((base_loss_after - base_loss).abs() < 1e-6);
     assert_eq!(
         base_embeddings,
         model
@@ -273,4 +358,30 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
             .to_vec::<f32>()
             .unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires the official LFM3 checkpoint"]
+fn text_only_audio_answer_can_update_the_adapter() {
+    let source = PathBuf::from(std::env::var("LFM3_MODEL").expect("set LFM3_MODEL"));
+    let device = Default::default();
+    let mut model = OmniModel::<CpuTraining>::load(&source, Precision::F32, &device).unwrap();
+    let mut optimizer =
+        SpeechOptimizer::<CpuTraining>::new(model.text.hidden_size(), 4, 761, &device).unwrap();
+    let before = optimizer.export().unwrap();
+    let samples = vec![0.0; 6400];
+    let example =
+        AudioAnswer::new_text_only(&samples, 16_000, "把听到的数字加一，用中文回答。", "十三")
+            .unwrap();
+    let result = train_step(
+        &mut model,
+        &mut optimizer,
+        &example,
+        159,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!result.speech_supervised);
+    assert!(result.gradient_norm > 0.0);
+    assert_ne!(before, optimizer.export().unwrap());
 }
