@@ -94,6 +94,10 @@ impl<B: Backend> AudioInputStream<B> {
         self.samples
     }
 
+    pub(crate) fn has_completed_tokens(&self) -> bool {
+        !self.chunks.is_empty()
+    }
+
     /// Return completed audio embeddings without flushing or advancing the stream.
     pub fn snapshot(&self) -> Result<Option<PreparedMedia<B>>> {
         if self.failed {

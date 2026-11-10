@@ -16,7 +16,7 @@ fn prior_audio_checkpoints_without_patched_backend_identity_are_rejected() {
     type Cpu = Autodiff<NdArray<f32>>;
     // Captured from the unchanged 856b313 source identity before this test.
     const OLD: &str = "bcf40480cfd095d8534a49e161c029cccbab3241c21d7498bb6e7de1c6f55eb4";
-    assert_ne!(audio_implementation_hash(), OLD);
+    assert_ne!(audio_implementation_hash().unwrap(), OLD);
     let device = Default::default();
     let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
     let protocol = AudioProtocol {

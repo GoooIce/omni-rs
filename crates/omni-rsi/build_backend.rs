@@ -11,9 +11,6 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn uncomment(line: &str) -> Result<&str, String> {
-    if line.contains("\"\"\"") || line.contains("'''") {
-        return Err("multiline TOML strings are unsupported here".into());
-    }
     let mut quote = None;
     let mut escaped = false;
     for (i, byte) in line.bytes().enumerate() {
@@ -30,6 +27,13 @@ pub fn uncomment(line: &str) -> Result<&str, String> {
                 quote = None;
             }
         } else if byte == b'"' || byte == b'\'' {
+            if line
+                .as_bytes()
+                .get(i..i + 3)
+                .is_some_and(|next| next == [byte; 3])
+            {
+                return Err("multiline TOML strings are unsupported here".into());
+            }
             quote = Some(byte);
         } else if byte == b'#' {
             return Ok(&line[..i]);
@@ -47,11 +51,47 @@ pub fn keys(mut input: &str) -> Result<Vec<String>, String> {
         input = input.trim_start();
         let (key, rest) = if input.starts_with(['"', '\'']) {
             let quote = input.as_bytes()[0] as char;
-            let end = input[1..].find(quote).ok_or("invalid quoted TOML key")? + 1;
-            let key = &input[1..end];
-            if key.contains('\\') {
-                return Err("escaped TOML keys are unsupported".into());
+            let mut chars = input[1..].char_indices();
+            let mut key = String::new();
+            let mut end = None;
+            while let Some((offset, ch)) = chars.next() {
+                if ch == quote {
+                    end = Some(offset + 1);
+                    break;
+                }
+                if quote == '"' && ch == '\\' {
+                    let escape = chars.next().ok_or("invalid TOML key escape")?.1;
+                    let decoded = match escape {
+                        'b' => '\u{0008}',
+                        't' => '\t',
+                        'n' => '\n',
+                        'f' => '\u{000c}',
+                        'r' => '\r',
+                        '"' => '"',
+                        '\\' => '\\',
+                        'u' | 'U' => {
+                            let mut value = 0_u32;
+                            for _ in 0..if escape == 'u' { 4 } else { 8 } {
+                                let digit =
+                                    chars.next().ok_or("invalid TOML key unicode escape")?.1;
+                                if !digit.is_ascii_hexdigit() {
+                                    return Err("invalid TOML key unicode escape".into());
+                                }
+                                value = value
+                                    .checked_mul(16)
+                                    .and_then(|v| v.checked_add(digit.to_digit(16)?))
+                                    .ok_or("invalid TOML key unicode escape")?;
+                            }
+                            char::from_u32(value).ok_or("invalid TOML key unicode scalar")?
+                        }
+                        _ => return Err("unsupported TOML key escape".into()),
+                    };
+                    key.push(decoded);
+                } else {
+                    key.push(ch);
+                }
             }
+            let end = end.ok_or("invalid quoted TOML key")?;
             (key, &input[end + 1..])
         } else {
             let len = input
@@ -61,12 +101,12 @@ pub fn keys(mut input: &str) -> Result<Vec<String>, String> {
             if len == 0 {
                 return Err("invalid TOML key".into());
             }
-            (&input[..len], &input[len..])
+            (input[..len].to_owned(), &input[len..])
         };
         if key.is_empty() {
             return Err("empty TOML key".into());
         }
-        result.push(key.to_owned());
+        result.push(key);
         let rest = rest.trim_start();
         if rest.is_empty() {
             return Ok(result);
@@ -193,9 +233,11 @@ pub fn validate_config(config: &str) -> Result<(), String> {
             {
                 return Err("Cargo configuration path overrides are unsupported".into());
             }
-        } else if let Ok((lhs, _)) = assignment(line) {
+        } else if section.is_empty()
+            && let Ok((lhs, _)) = assignment(line)
+        {
             let key = keys(lhs)?;
-            if section.is_empty() && key.first().is_some_and(|k| k == "patch" || k == "paths") {
+            if key.first().is_some_and(|k| k == "patch" || k == "paths") {
                 return Err("Cargo configuration path overrides are unsupported".into());
             }
         }

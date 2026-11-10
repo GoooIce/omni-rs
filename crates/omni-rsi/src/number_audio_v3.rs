@@ -39,12 +39,12 @@ pub(crate) fn v3_audio_sources() -> Vec<(&'static str, &'static [u8])> {
     ]
 }
 
-pub(crate) fn v3_audio_implementation_hash_for_backend(backend: &str) -> String {
-    hash_audio_sources(
+pub(crate) fn v3_audio_implementation_hash_for_backend(backend: &str) -> Result<String, String> {
+    Ok(hash_audio_sources(
         b"omni-audio-v3-v2\0",
-        &audio_implementation_hash_for_backend(backend),
+        &audio_implementation_hash_for_backend(backend)?,
         &v3_audio_sources(),
-    )
+    ))
 }
 use sha2::{Digest, Sha256};
 use std::{
@@ -64,6 +64,7 @@ impl AudioProtocol {
         if stop.load(Ordering::Acquire) {
             return Err("interrupted".into());
         }
+        let implementation_hash = v3_audio_implementation_hash_for_backend(&backend)?;
         crate::number_development::check_artifact_tree(model, stop)?;
         let base_hash =
             omni_lfm3::speech_adapter::source_fingerprint(model).map_err(|e| e.to_string())?;
@@ -104,7 +105,7 @@ impl AudioProtocol {
             base_hash,
             codec_hash,
             dataset_hash: dataset.digest().into(),
-            implementation_hash: v3_audio_implementation_hash_for_backend(&backend),
+            implementation_hash,
             backend,
             width,
             train_records: dataset.len(),

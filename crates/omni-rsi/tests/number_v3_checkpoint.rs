@@ -21,7 +21,7 @@ fn loaded_checkpoint_must_match_the_first_candidate_pointer() {
         base_hash: "1".repeat(64),
         codec_hash: "2".repeat(64),
         dataset_hash: "3".repeat(64),
-        implementation_hash: audio_implementation_hash(),
+        implementation_hash: audio_implementation_hash().unwrap(),
         backend: Cpu::name(&device),
         width: 16,
         train_records: 2,

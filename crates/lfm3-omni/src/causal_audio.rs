@@ -490,51 +490,71 @@ impl<'a, B: Backend> AudioSession<'a, B> {
             return Err(Error::ResourceLimit("session input is too long"));
         }
         let mut guard = PoisonOnDrop::new(&self.scope);
-        let before = self.stream.samples();
-        let tokens = self
-            .stream
-            .push(
-                self.encoder,
-                samples,
-                sample_rate,
-                is_final,
-                &self.scope.cancelled,
-            )
-            .map_err(Error::Stream)?;
-        if !self.scope.available() {
-            return Err(Error::StreamUnavailable);
-        }
-        let after = self.stream.samples();
-        if after > before {
-            let end = u64::try_from(after).map_err(|_| {
-                Error::Stream(omni_r2t2::Error::Audio("audio length overflow".into()))
-            })?;
-            self.conversation
-                .apply(
-                    at,
-                    Event::InputAvailable {
-                        session: self.session,
-                        end,
-                    },
+        let result = (|| {
+            let before = self.stream.samples();
+            let tokens = self
+                .stream
+                .push(
+                    self.encoder,
+                    samples,
+                    sample_rate,
+                    is_final,
+                    &self.scope.cancelled,
                 )
-                .map_err(Error::Protocol)?;
+                .map_err(Error::Stream)?;
+            if !self.scope.available() {
+                return Err(Error::StreamUnavailable);
+            }
+            let after = self.stream.samples();
+            if after > before {
+                let end = u64::try_from(after).map_err(|_| {
+                    Error::Stream(omni_r2t2::Error::Audio("audio length overflow".into()))
+                })?;
+                self.conversation
+                    .apply(
+                        at,
+                        Event::InputAvailable {
+                            session: self.session,
+                            end,
+                        },
+                    )
+                    .map_err(Error::Protocol)?;
+            }
+            if is_final {
+                let end = u64::try_from(after).map_err(|_| {
+                    Error::Stream(omni_r2t2::Error::Audio("audio length overflow".into()))
+                })?;
+                self.conversation
+                    .apply(
+                        at,
+                        Event::InputFinalized {
+                            session: self.session,
+                            end,
+                        },
+                    )
+                    .map_err(Error::Protocol)?;
+            }
+            Ok(tokens)
+        })();
+        match result {
+            Ok(tokens) => {
+                guard.commit();
+                Ok(tokens)
+            }
+            Err(error) => {
+                // The preflight established this session and time, and any
+                // events appended during the attempted push use the same time.
+                self.conversation
+                    .apply(
+                        at,
+                        Event::InputFailed {
+                            session: self.session,
+                        },
+                    )
+                    .expect("preflighted input failure must fit the timeline");
+                Err(error)
+            }
         }
-        if is_final {
-            let end = u64::try_from(after).map_err(|_| {
-                Error::Stream(omni_r2t2::Error::Audio("audio length overflow".into()))
-            })?;
-            self.conversation
-                .apply(
-                    at,
-                    Event::InputFinalized {
-                        session: self.session,
-                        end,
-                    },
-                )
-                .map_err(Error::Protocol)?;
-        }
-        guard.commit();
-        Ok(tokens)
     }
 
     /// Capture the completed encoding at the current ingested prefix, without
@@ -542,6 +562,13 @@ impl<'a, B: Backend> AudioSession<'a, B> {
     pub fn snapshot(&self) -> Result<Option<AudioSnapshot<B>>, Error> {
         if !self.scope.available() {
             return Err(Error::StreamUnavailable);
+        }
+        if !self.stream.has_completed_tokens() {
+            return if self.scope.available() {
+                Ok(None)
+            } else {
+                Err(Error::StreamUnavailable)
+            };
         }
         let mut snapshots = self
             .snapshots

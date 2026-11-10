@@ -68,6 +68,10 @@ pub enum Event {
         session: SessionId,
         end: u64,
     },
+    /// The input stream failed and was invalidated at this event's time.
+    InputFailed {
+        session: SessionId,
+    },
     UserPaused {
         session: SessionId,
         input_end: u64,
@@ -138,6 +142,7 @@ pub enum TimelineEvent {
     InputFinalized {
         end: u64,
     },
+    InputFailed,
     UserPaused {
         input_end: u64,
     },
@@ -283,6 +288,12 @@ impl Conversation {
                     return Err(Error::InvalidSampleBoundary);
                 }
                 (TimelineEvent::InputFinalized { end }, Outcome::Applied)
+            }
+            Event::InputFailed { session } => {
+                if session != self.session {
+                    return Err(Error::WrongSession);
+                }
+                (TimelineEvent::InputFailed, Outcome::Applied)
             }
             Event::UserPaused { session, input_end } => {
                 if session != self.session {

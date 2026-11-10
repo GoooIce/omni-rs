@@ -7,6 +7,21 @@ use std::{fs, path::Path, sync::atomic::AtomicBool};
 mod number_v3_fixture;
 use number_v3_fixture::*;
 
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn unknown_backend_cannot_claim_a_v3_training_identity() {
+    use omni_rsi::speech_audio_checkpoint::AudioProtocol;
+    let root = fixture();
+    let model = root.path().join("model");
+    let stop = AtomicBool::new(false);
+    let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
+    let result = AudioProtocol::for_v3(&model, &data, "custom-unknown-backend".into(), &stop);
+    assert!(
+        result.is_err(),
+        "an unsupported backend must not get a training identity"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn v3_training_examples_preserve_real_pcm_chinese_answer_and_eos() {
@@ -28,7 +43,7 @@ fn v3_training_examples_preserve_real_pcm_chinese_answer_and_eos() {
     assert!(second.frames().is_none());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_training_snapshot_does_not_open_holdout_files() {
     use omni_rsi::speech_audio_checkpoint::AudioProtocol;
@@ -44,11 +59,11 @@ fn v3_training_snapshot_does_not_open_holdout_files() {
     let model = root.path().join("model");
     let stop = AtomicBool::new(false);
     let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
-    let protocol = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop).unwrap();
+    let protocol = AudioProtocol::for_v3(&model, &data, "autodiff<ndarray>".into(), &stop).unwrap();
     assert_eq!(protocol.train_records, 2);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_training_protocol_binds_model_and_refuses_stale_target_codec() {
     use omni_rsi::speech_audio_checkpoint::AudioProtocol;
@@ -56,20 +71,21 @@ fn v3_training_protocol_binds_model_and_refuses_stale_target_codec() {
     let model = root.path().join("model");
     let stop = AtomicBool::new(false);
     let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
-    let first = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop).unwrap();
+    let first = AudioProtocol::for_v3(&model, &data, "autodiff<ndarray>".into(), &stop).unwrap();
     assert_eq!(first.dataset_hash, data.digest());
     assert_eq!(first.train_records, 2);
     let path = model.join("model.safetensors");
     let original = fs::read(&path).unwrap();
     fs::write(&path, b"changed synthetic model").unwrap();
-    assert!(AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop).is_err());
+    assert!(AudioProtocol::for_v3(&model, &data, "autodiff<ndarray>".into(), &stop).is_err());
     let reloaded = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
-    let changed = AudioProtocol::for_v3(&model, &reloaded, "cpu-fixture".into(), &stop).unwrap();
+    let changed =
+        AudioProtocol::for_v3(&model, &reloaded, "autodiff<ndarray>".into(), &stop).unwrap();
     assert_ne!(first.base_hash, changed.base_hash);
     fs::write(path, original).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_training_uses_a_distinct_version_and_implementation_identity() {
     use omni_rsi::speech_audio_checkpoint::{AudioProtocol, audio_implementation_hash};
@@ -77,9 +93,12 @@ fn v3_training_uses_a_distinct_version_and_implementation_identity() {
     let model = root.path().join("model");
     let stop = AtomicBool::new(false);
     let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
-    let protocol = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop).unwrap();
+    let protocol = AudioProtocol::for_v3(&model, &data, "autodiff<ndarray>".into(), &stop).unwrap();
     assert_eq!(protocol.version, 2);
-    assert_ne!(protocol.implementation_hash, audio_implementation_hash());
+    assert_ne!(
+        protocol.implementation_hash,
+        audio_implementation_hash().unwrap()
+    );
 }
 
 #[cfg(feature = "cpu")]
@@ -1483,6 +1502,11 @@ fn v3_report_pcm_identity_matches_frozen_signed_zero_audio() {
         report["observations"][0]["audio_pcm_sha256"],
         protocol["protocol"]["dev_cases"][0]["pcm_sha256"]
     );
+    // Independent SHA-256 of 16 LE bytes for [0.0, 0.375, -0.375, 0.0].
+    assert_eq!(
+        report["observations"][0]["audio_pcm_sha256"],
+        "90a6cd8fc460002e4cb732813a7a78f0678c3b603e73e1d668b06764f329aea6"
+    );
 }
 
 #[cfg(all(unix, feature = "cpu"))]
@@ -2120,7 +2144,7 @@ fn v3_target_redecoding_shares_the_initial_duration_budget() {
     assert_training_budget_fails_before_checkpoint(root.path(), "sample limit");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn text_only_v3_preflights_the_model_tree_before_fingerprinting() {
     use omni_rsi::speech_audio_checkpoint::AudioProtocol;
@@ -2149,14 +2173,14 @@ fn text_only_v3_preflights_the_model_tree_before_fingerprinting() {
     let weight = model.join("model.safetensors");
     fs::remove_file(&weight).unwrap();
     symlink(root.path().join("layout.v3"), &weight).unwrap();
-    let error = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop)
+    let error = AudioProtocol::for_v3(&model, &data, "autodiff<ndarray>".into(), &stop)
         .err()
         .unwrap();
     assert!(error.contains("symlink or special file"), "{error}");
     fs::remove_file(&weight).unwrap();
     let name = CString::new(weight.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    let error = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop)
+    let error = AudioProtocol::for_v3(&model, &data, "autodiff<ndarray>".into(), &stop)
         .err()
         .unwrap();
     assert!(error.contains("symlink or special file"), "{error}");

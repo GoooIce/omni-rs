@@ -1,6 +1,7 @@
 //! Compile-time identities for this repository's supported local Cargo patches.
 pub mod build_backend;
 pub mod build_environment;
+pub mod build_invocation;
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -69,16 +70,31 @@ pub fn manifest_and_repo(manifest: &Path) -> Result<(PathBuf, PathBuf), String> 
     Ok((manifest, repo))
 }
 
-fn config_identity(hash: &mut Sha256, cwd: &Path, manifest: &Path) -> Result<(), String> {
+fn watch_config_changes() -> Result<(), String> {
     build_environment::watch_configuration_environment();
-    let home = build_environment::cargo_home_from_env().map(|home| {
-        if home.is_absolute() {
-            home
-        } else {
-            cwd.join(home)
-        }
-    });
-    let dirs = config_dirs(cwd, manifest, home.as_deref());
+    // Cargo follows symlinks when watching files and does not track files that
+    // did not exist when a build script last ran. Force a recheck on each Cargo
+    // invocation without recursively watching Cargo home or filesystem roots.
+    let guard = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing build output directory")?)
+        .join("__omni_rsi_recheck_cargo_configuration__");
+    match fs::symlink_metadata(&guard) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Ok(_) => return Err("reserved Cargo configuration guard already exists".into()),
+        Err(error) => return Err(error.to_string()),
+    }
+    println!("cargo:rerun-if-changed={}", guard.display());
+    Ok(())
+}
+
+pub fn config_identity(hash: &mut Sha256, cwd: &Path, manifest: &Path) -> Result<(), String> {
+    watch_config_changes()?;
+    let home = build_environment::cargo_home_from_env().ok_or("cannot determine Cargo home")?;
+    let home = if home.is_absolute() {
+        home
+    } else {
+        cwd.join(home)
+    };
+    let dirs = config_dirs(cwd, manifest, Some(&home));
     for dir in dirs {
         // Watching Cargo home itself would rebuild on unrelated registry/cache changes.
         // Watch existing config files, and an existing repository-local .cargo directory.
@@ -333,10 +349,19 @@ pub fn backend_digests(
 fn run() -> Result<(), String> {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest")?);
     let (manifest, repo) = manifest_and_repo(&manifest)?;
-    let cwd = env::var_os("PWD")
-        .map(PathBuf::from)
-        .and_then(|p| fs::canonicalize(p).ok())
-        .unwrap_or_else(|| repo.clone());
+    let unverified = |reason: &str| -> Result<(), String> {
+        watch_config_changes()?;
+        println!("cargo:warning={reason}; audio training identity is unavailable");
+        println!("cargo:rustc-env=OMNI_RSI_BACKEND_CPU=backend-unverified-context");
+        println!("cargo:rustc-env=OMNI_RSI_BACKEND_GPU=backend-unverified-context");
+        Ok(())
+    };
+    let Some(cwd) = build_invocation::cargo_invocation_cwd(&repo) else {
+        return unverified("Cannot verify Cargo's invocation directory");
+    };
+    if build_environment::cargo_home_from_env().is_none() {
+        return unverified("Cannot determine Cargo home");
+    }
     let manifest_file = manifest.join("Cargo.toml");
     let patches = build_backend::patch_paths(
         &fs::read_to_string(&manifest_file).map_err(|e| e.to_string())?,
@@ -366,6 +391,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", manifest_file.display());
     println!("cargo:rerun-if-changed=build_backend.rs");
     println!("cargo:rerun-if-changed=build_environment.rs");
+    println!("cargo:rerun-if-changed=build_invocation.rs");
     let (cpu_digest, gpu_digest) = backend_digests(
         env::var_os("CARGO_FEATURE_CPU").is_some(),
         env::var_os("CARGO_FEATURE_METAL").is_some(),

@@ -3,7 +3,8 @@ use crate::{
     lease::Lease,
     number_audio_v3::NumberAudioV3,
     number_development::{
-        RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, verify_registration,
+        RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, update_pcm_digest,
+        verify_registration,
     },
     number_gate::{
         PairedCase, PairedOutcome, PairedStatistics, gain_at_least_five_points, paired_statistics,
@@ -953,13 +954,6 @@ fn count_text_observation(
         counts[2] += usize::from(mentions_number(text));
     }
     counts[3 + condition] += usize::from(stopped);
-}
-
-fn update_pcm_digest(digest: &mut Sha256, samples: &[f32]) {
-    for sample in samples {
-        let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-        digest.update(bits.to_le_bytes());
-    }
 }
 
 fn control_metrics(values: [usize; 6], cases: usize) -> serde_json::Value {

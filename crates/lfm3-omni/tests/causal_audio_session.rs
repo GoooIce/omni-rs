@@ -417,7 +417,11 @@ fn input_failure_poisons_the_stream_and_previously_created_snapshots() {
             .push(Duration::from_millis(2), &[f32::NAN], 16_000, false)
             .is_err()
     );
-    assert_eq!(session.conversation().timeline().len(), timeline_len);
+    assert_eq!(session.conversation().timeline().len(), timeline_len + 1);
+    assert!(matches!(
+        session.conversation().timeline().last().unwrap().event,
+        TimelineEvent::InputFailed
+    ));
     assert!(session.snapshot().is_err());
     assert!(
         session
@@ -612,6 +616,190 @@ fn losing_the_media_turn_keeps_explicit_stop_and_barrier_control() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn failed_input_cannot_be_stopped_before_the_failure_time() {
+    use omni_lfm3::causal_audio::ControlEvent;
+    use omni_lfm3::interruptible::State;
+    let encoder = synthetic_encoder();
+    let mut session = AudioSession::new(
+        SessionId(131),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let turn = session
+        .start_generation(
+            Duration::from_millis(2),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let control = session.current_control().unwrap();
+    assert!(
+        session
+            .push(Duration::from_millis(10), &[f32::NAN], 16_000, false)
+            .is_err()
+    );
+    assert!(turn.media().is_err());
+    assert!(
+        session
+            .conversation()
+            .timeline()
+            .iter()
+            .any(|entry| entry.at == Duration::from_millis(10)
+                && matches!(entry.event, TimelineEvent::InputFailed))
+    );
+    assert!(
+        session
+            .apply_control(
+                Duration::from_millis(3),
+                &control,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled
+                }
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        session.conversation().state(),
+        State::Responding { .. }
+    ));
+    session
+        .apply_control(
+            Duration::from_millis(10),
+            &control,
+            ControlEvent::Stop {
+                reason: StopReason::Cancelled,
+            },
+        )
+        .unwrap();
+    session
+        .apply_control(
+            Duration::from_millis(11),
+            &control,
+            ControlEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+    assert!(matches!(session.conversation().state(), State::Listening));
+    assert!(
+        session
+            .conversation()
+            .timeline()
+            .iter()
+            .all(|event| event.at != Duration::from_millis(3))
+    );
+}
+
+#[test]
+fn recoverable_input_limit_rejection_does_not_advance_the_time() {
+    use omni_lfm3::causal_audio::ControlEvent;
+    let encoder = synthetic_encoder();
+    let mut session = AudioSession::new(
+        SessionId(132),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let turn = session
+        .start_generation(
+            Duration::from_millis(2),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let control = session.current_control().unwrap();
+    assert!(
+        session
+            .push(Duration::from_millis(10), &vec![0.0; 80_001], 16_000, false)
+            .is_err()
+    );
+    assert!(turn.media().is_ok());
+    session
+        .apply_control(
+            Duration::from_millis(3),
+            &control,
+            ControlEvent::Stop {
+                reason: StopReason::Cancelled,
+            },
+        )
+        .unwrap();
+    session
+        .apply_control(
+            Duration::from_millis(4),
+            &control,
+            ControlEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+}
+
+#[test]
+fn empty_new_session_returns_none_even_with_old_snapshot_quota_full() {
+    use omni_lfm3::causal_audio::AudioLimits;
+    let encoder = synthetic_encoder();
+    let limits = AudioLimits {
+        max_push_samples: 3200,
+        max_session_samples: 6400,
+        max_live_snapshots: 1,
+    };
+    let mut session = AudioSession::with_limits(
+        SessionId(133),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+        limits,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let old = session.snapshot().unwrap().unwrap();
+    session
+        .change_session(Duration::from_millis(2), SessionId(134))
+        .unwrap();
+    assert!(session.snapshot().unwrap().is_none());
+    session
+        .push(Duration::from_millis(3), &synthetic_pcm(40), 16_000, false)
+        .unwrap();
+    assert!(session.snapshot().unwrap().is_none());
+    session
+        .push(
+            Duration::from_millis(4),
+            &synthetic_pcm(3160),
+            16_000,
+            false,
+        )
+        .unwrap();
+    assert!(
+        session.snapshot().is_err(),
+        "old live snapshot still consumes the quota"
+    );
+    drop(old);
+    assert!(session.snapshot().unwrap().is_some());
 }
 
 #[test]

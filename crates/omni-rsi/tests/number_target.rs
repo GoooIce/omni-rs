@@ -435,6 +435,7 @@ fn codec_codebook_and_total_output_limits_are_enforced() {
     assert_eq!(result.frames().iter().map(Vec::len).sum::<usize>(), 25_600);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
     use omni_rsi::{
@@ -507,7 +508,8 @@ fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
         assert_eq!(manifest["records"][0]["frames"][4], json!(vec![2016; 12]));
         let dataset = AudioDataset::load(&data, &stop).unwrap();
         let protocol =
-            AudioProtocol::for_dataset(&model, &dataset, "fixture".into(), &stop).unwrap();
+            AudioProtocol::for_dataset(&model, &dataset, "autodiff<ndarray>".into(), &stop)
+                .unwrap();
         assert_eq!(protocol.codec_hash, expected_codec, "sharded={sharded}");
 
         // A changed codec configuration must invalidate a freshly encoded target
@@ -517,8 +519,8 @@ fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
             br#"{"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":24000,"stft_hop_length":320}"#,
         )
         .unwrap();
-        let error =
-            AudioProtocol::for_dataset(&model, &dataset, "fixture".into(), &stop).unwrap_err();
+        let error = AudioProtocol::for_dataset(&model, &dataset, "autodiff<ndarray>".into(), &stop)
+            .unwrap_err();
         assert!(error.contains("codec"), "sharded={sharded}: {error}");
 
         // Older unsharded data without the optional full fingerprint retains
@@ -535,7 +537,8 @@ fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
             )
             .unwrap();
             let dataset = AudioDataset::load(&data, &stop).unwrap();
-            AudioProtocol::for_dataset(&model, &dataset, "fixture".into(), &stop).unwrap();
+            AudioProtocol::for_dataset(&model, &dataset, "autodiff<ndarray>".into(), &stop)
+                .unwrap();
         }
     }
 }

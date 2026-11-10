@@ -49,6 +49,14 @@ fn source_identity_binds_changes_additions_deletions_and_native_build_files() {
 }
 
 #[test]
+fn independent_self_reading_implementation_identity_is_unchanged() {
+    assert_eq!(
+        omni_rsi::speech_checkpoint::implementation_hash(),
+        "a568757885a24df1a6666287c6d418f180243b98c7f494413d1a481cf30de6c1"
+    );
+}
+
+#[test]
 fn build_outputs_are_ignored_but_symlinked_sources_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
@@ -126,6 +134,8 @@ fn visible_cargo_path_overrides_are_rejected() {
         "[patch.crates-io]\nburn = { path = \"../replacement\" }\n",
         "[\"patch\".crates-io]\nburn.path = \"../replacement\"\n",
         "patch.crates-io.burn.path = \"../replacement\"\n",
+        "\"\\u0070aths\" = [\"../replacement\"]\n",
+        "[\"\\u0070atch\".crates-io]\nburn.path = \"../replacement\"\n",
     ] {
         assert!(
             build_backend::validate_config(config).is_err(),
@@ -136,6 +146,12 @@ fn visible_cargo_path_overrides_are_rejected() {
     assert!(
         build_backend::validate_config("[alias]\npatch = \"fmt --check\"\npaths = \"metadata\"\n")
             .is_ok()
+    );
+    assert!(
+        build_backend::validate_config(
+            "# comment \"\"\"\n[\"ali\\u0061s\"]\n\"a\\u002db\" = 'check'\n"
+        )
+        .is_ok()
     );
 }
 
@@ -173,6 +189,52 @@ fn cargo_home_resolution_uses_windows_profile_when_home_is_unset() {
         ),
         Some(std::path::PathBuf::from("unix-home").join(".cargo"))
     );
+}
+
+#[test]
+fn cargo_parent_requires_the_expected_executable_and_an_existing_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let expected = root.path().join("cargo");
+    let other = root.path().join("other");
+    fs::write(&expected, b"cargo fixture").unwrap();
+    fs::write(&other, b"other fixture").unwrap();
+    assert_eq!(
+        build_script::build_invocation::verified_parent_cwd(&expected, &expected, root.path()),
+        Some(fs::canonicalize(root.path()).unwrap())
+    );
+    assert!(
+        build_script::build_invocation::verified_parent_cwd(&expected, &other, root.path())
+            .is_none()
+    );
+    assert!(
+        build_script::build_invocation::verified_parent_cwd(
+            &expected,
+            &expected,
+            &root.path().join("missing")
+        )
+        .is_none()
+    );
+    assert!(
+        build_script::build_invocation::verified_parent_cwd(
+            Path::new("cargo"),
+            &expected,
+            root.path()
+        )
+        .is_none()
+    );
+    assert!(
+        build_script::build_invocation::verified_parent_cwd(root.path(), root.path(), root.path())
+            .is_none()
+    );
+}
+
+#[test]
+fn foreign_proc_namespace_is_not_accepted_as_the_current_process() {
+    use build_script::build_invocation::proc_self_matches_pid;
+    assert!(proc_self_matches_pid(Path::new("731"), 731));
+    assert!(!proc_self_matches_pid(Path::new("732"), 731));
+    assert!(!proc_self_matches_pid(Path::new("/proc/731"), 731));
+    assert!(!proc_self_matches_pid(Path::new("self"), 731));
 }
 
 #[test]
