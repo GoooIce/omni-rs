@@ -50,6 +50,20 @@ fn plan(split: &str, cases: Vec<Value>) -> ToneEvaluationPlan {
     .unwrap()
 }
 
+#[cfg(unix)]
+fn reference_pcm_hash(samples: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"omni-rsi/tone-pcm/v1\0");
+    hash.update(16_000_u32.to_be_bytes());
+    hash.update((samples.len() as u64).to_be_bytes());
+    for sample in samples {
+        hash.update((if *sample == 0.0 { 0 } else { sample.to_bits() }).to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+#[cfg(unix)]
 #[test]
 fn development_inputs_materialize_masks_without_opening_holdout() {
     let root = tempfile::tempdir().unwrap();
@@ -272,6 +286,7 @@ fn rejects_symlinks_at_each_audio_path_component() {
     assert!(result.is_err(), "a symlinked parent was accepted");
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_preparation_rejects_per_file_and_aggregate_resource_overflow() {
     let root = tempfile::tempdir().unwrap();
@@ -357,6 +372,7 @@ fn bounded_preparation_rejects_per_file_and_aggregate_resource_overflow() {
     assert!(error.contains("limit"), "{error}");
 }
 
+#[cfg(unix)]
 #[test]
 fn stereo_24khz_wav_produces_equal_length_16khz_masks() {
     let root = tempfile::tempdir().unwrap();
@@ -403,6 +419,297 @@ fn stereo_24khz_wav_produces_equal_length_16khz_masks() {
     assert!(inputs[1].samples().iter().all(|sample| *sample == 0.0));
 }
 
+#[cfg(unix)]
+#[test]
+fn sinc_overshoot_remains_unchanged_in_all_prepared_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let mut development = record(root.path(), "dev", "wave", None);
+    std::fs::create_dir(root.path().join("dev")).unwrap();
+    let path = root.path().join("dev/wave.wav");
+    let mut wav = hound::WavWriter::create(
+        &path,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for n in 0..240 {
+        wav.write_sample(if n < 120 { 32767_i16 } else { -32767_i16 })
+            .unwrap();
+    }
+    wav.finalize().unwrap();
+    development["audio"]["sha256"] = json!(file_hash(&path).unwrap());
+    let bytes = std::fs::read(&path).unwrap();
+    let stop = AtomicBool::new(false);
+    let decoded = omni_lfm3::media_io::decode_wav(&bytes, &stop).unwrap();
+    let peak = decoded
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max);
+    assert_eq!(decoded.len(), 160);
+    assert!(peak > 1.13 && peak < 1.14, "unexpected sinc peak {peak}");
+    let features = omni_lfm3::audio::extract(&decoded, 16_000).expect("extract finite overshoot");
+    assert!(features.frames > 0 && features.values.iter().all(|sample| sample.is_finite()));
+    let expected_hash = reference_pcm_hash(&decoded);
+    eprintln!(
+        "review counterexample: peak={peak} samples={} pcm_sha256={expected_hash}",
+        decoded.len()
+    );
+    let plan = plan(
+        "dev",
+        vec![
+            json!({"id":"full","record_id":"wave","input":"full"}),
+            json!({"id":"audio","record_id":"wave","input":"audio_masked"}),
+            json!({"id":"text","record_id":"wave","input":"text_masked"}),
+        ],
+    );
+    let limits = ToneInputLimits {
+        max_file_bytes: bytes.len(),
+        max_total_bytes: bytes.len(),
+        max_record_samples: 160,
+        max_total_samples: 160,
+    };
+    let prepared = prepare_development_inputs(
+        &dataset(vec![
+            development,
+            record(root.path(), "holdout", "secret", None),
+        ]),
+        &plan,
+        root.path(),
+        &limits,
+        &stop,
+    )
+    .unwrap();
+    let inputs = prepared.cases();
+    assert!(
+        inputs[0]
+            .samples()
+            .iter()
+            .zip(&decoded)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    assert_eq!(inputs[0].samples().len(), decoded.len());
+    assert_eq!(inputs[2].samples(), inputs[0].samples());
+    assert_eq!(inputs[0].pcm_sha256(), expected_hash);
+    assert_eq!(inputs[2].pcm_sha256(), expected_hash);
+    assert_eq!(inputs[1].samples().len(), decoded.len());
+    assert!(inputs[1].samples().iter().all(|sample| *sample == 0.0));
+    assert_ne!(inputs[1].pcm_sha256(), expected_hash);
+    assert_eq!(inputs[0].sample_rate(), 16_000);
+    assert_eq!(inputs[1].sample_rate(), 16_000);
+    assert_eq!(inputs[2].sample_rate(), 16_000);
+    assert_eq!(inputs[0].transcript(), Some("测试文本wave"));
+    assert_eq!(inputs[2].transcript(), None);
+    assert_eq!(prepared.holdout_pcm_independence(), "unverified");
+}
+
+#[cfg(unix)]
+#[test]
+fn pcm16_rate_and_channel_boundaries_preserve_decoder_samples_and_budgets() {
+    for (rate, channels) in [(16_000, 1), (16_000, 2), (24_000, 1), (24_000, 2)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut development = record(root.path(), "dev", "wave", None);
+        std::fs::create_dir(root.path().join("dev")).unwrap();
+        let path = root.path().join("dev/wave.wav");
+        let mut wav = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        let frames = rate / 100;
+        for n in 0..frames {
+            for _ in 0..channels {
+                wav.write_sample(if n < frames / 2 { i16::MAX } else { i16::MIN })
+                    .unwrap();
+            }
+        }
+        wav.finalize().unwrap();
+        let file_hash = file_hash(&path).unwrap();
+        development["audio"]["sha256"] = json!(file_hash);
+        let bytes = std::fs::read(&path).unwrap();
+        let stop = AtomicBool::new(false);
+        let decoded = omni_lfm3::media_io::decode_wav(&bytes, &stop).unwrap();
+        assert_eq!(decoded.len(), 160, "{rate} Hz / {channels} channel(s)");
+        if rate == 24_000 {
+            assert!(
+                decoded.iter().any(|sample| sample.abs() > 1.0),
+                "expected sinc overshoot"
+            );
+        } else {
+            assert!(decoded.contains(&-1.0), "PCM16 lower endpoint was changed");
+            assert!(
+                decoded.contains(&(32767.0 / 32768.0)),
+                "PCM16 upper endpoint was changed"
+            );
+        }
+        let hash = reference_pcm_hash(&decoded);
+        let plan = plan(
+            "dev",
+            vec![
+                json!({"id":"full","record_id":"wave","input":"full"}),
+                json!({"id":"audio","record_id":"wave","input":"audio_masked"}),
+                json!({"id":"text","record_id":"wave","input":"text_masked"}),
+            ],
+        );
+        let data = dataset(vec![
+            development,
+            record(root.path(), "holdout", "secret", None),
+        ]);
+        let exact = ToneInputLimits {
+            max_file_bytes: bytes.len(),
+            max_total_bytes: bytes.len(),
+            max_record_samples: 160,
+            max_total_samples: 160,
+        };
+        let prepared =
+            prepare_development_inputs(&data, &plan, root.path(), &exact, &stop).unwrap();
+        let inputs = prepared.cases();
+        assert_eq!(inputs.len(), 3);
+        assert!(
+            inputs[0]
+                .samples()
+                .iter()
+                .zip(&decoded)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert_eq!(inputs[0].samples().len(), decoded.len());
+        assert_eq!(inputs[2].samples(), inputs[0].samples());
+        assert_eq!(inputs[0].pcm_sha256(), hash);
+        assert_eq!(inputs[2].pcm_sha256(), hash);
+        assert_eq!(inputs[0].source_audio_sha256(), file_hash);
+        assert_eq!(inputs[1].samples().len(), decoded.len());
+        assert!(
+            inputs[1]
+                .samples()
+                .iter()
+                .all(|sample| sample.to_bits() == 0)
+        );
+        assert_eq!(inputs[1].pcm_sha256(), reference_pcm_hash(&vec![0.0; 160]));
+        assert_ne!(inputs[1].pcm_sha256(), hash);
+        for input in inputs {
+            assert_eq!(input.sample_rate(), 16_000);
+        }
+        assert_eq!(inputs[0].transcript(), Some("测试文本wave"));
+        assert_eq!(inputs[1].transcript(), inputs[0].transcript());
+        assert_eq!(inputs[2].transcript(), None);
+        assert_eq!(inputs[0].instruction(), inputs[2].instruction());
+        for limits in [
+            ToneInputLimits {
+                max_record_samples: 159,
+                ..exact
+            },
+            ToneInputLimits {
+                max_total_samples: 159,
+                ..exact
+            },
+            ToneInputLimits {
+                max_file_bytes: bytes.len() - 1,
+                ..exact
+            },
+            ToneInputLimits {
+                max_total_bytes: bytes.len() - 1,
+                ..exact
+            },
+        ] {
+            let error =
+                prepare_development_inputs(&data, &plan, root.path(), &limits, &stop).unwrap_err();
+            assert!(
+                error.contains("limit"),
+                "{rate} Hz / {channels} channels: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn float_input_boundaries_remain_strict_before_resampling() {
+    for (rate, channels) in [(16_000, 1), (16_000, 2), (24_000, 1), (24_000, 2)] {
+        for value in [
+            -1.0_f32,
+            1.0,
+            -1.000_001,
+            1.000_001,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut development = record(root.path(), "dev", "wave", None);
+            std::fs::create_dir(root.path().join("dev")).unwrap();
+            let path = root.path().join("dev/wave.wav");
+            let mut wav = hound::WavWriter::create(
+                &path,
+                hound::WavSpec {
+                    channels,
+                    sample_rate: rate,
+                    bits_per_sample: 32,
+                    sample_format: hound::SampleFormat::Float,
+                },
+            )
+            .unwrap();
+            let frames = rate / 100;
+            let valid = value.is_finite() && value.abs() <= 1.0;
+            for n in 0..frames {
+                for channel in 0..channels {
+                    let sample = if n < frames / 2 { value } else { -value };
+                    // Invalid stereo channels may average to zero; validate each input channel.
+                    wav.write_sample(if !valid && channel == 1 {
+                        -sample
+                    } else {
+                        sample
+                    })
+                    .unwrap();
+                }
+            }
+            wav.finalize().unwrap();
+            development["audio"]["sha256"] = json!(file_hash(&path).unwrap());
+            let plan = plan(
+                "dev",
+                vec![json!({"id":"full","record_id":"wave","input":"full"})],
+            );
+            let result = prepare_development_inputs(
+                &dataset(vec![development]),
+                &plan,
+                root.path(),
+                &ToneInputLimits::default(),
+                &AtomicBool::new(false),
+            );
+            if valid {
+                let prepared = result.expect("finite boundary float rejected");
+                let decoded = omni_lfm3::media_io::decode_wav(
+                    &std::fs::read(&path).unwrap(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(prepared.cases()[0].samples(), decoded);
+                assert_eq!(
+                    prepared.cases()[0].pcm_sha256(),
+                    reference_pcm_hash(&decoded)
+                );
+                if rate == 24_000 {
+                    assert!(decoded.iter().any(|sample| sample.abs() > 1.0));
+                }
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("invalid tone WAV sample"),
+                    "{rate} Hz / {channels} channels / {value}: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn audio_safety_rejects_tampered_truncated_and_nonfinite_wav() {
     let root = tempfile::tempdir().unwrap();
@@ -493,6 +800,7 @@ fn invalid_pair_references_are_rejected_before_opening_audio() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn input_identity_binds_case_run_and_public_partition_declarations() {
     let root = tempfile::tempdir().unwrap();
@@ -550,6 +858,7 @@ fn input_identity_binds_case_run_and_public_partition_declarations() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn holdout_public_groups_need_no_private_content() {
     let root = tempfile::tempdir().unwrap();
@@ -619,6 +928,7 @@ fn only_requested_recordings_are_opened_and_fifos_are_rejected() {
     assert!(error.contains("regular file"), "{error}");
 }
 
+#[cfg(unix)]
 #[test]
 fn train_plan_opens_only_its_selected_train_recording() {
     let root = tempfile::tempdir().unwrap();
@@ -645,6 +955,28 @@ fn train_plan_opens_only_its_selected_train_recording() {
     )
     .unwrap();
     assert_eq!(prepared.cases()[0].record_id(), "train-a");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn input_preparation_fails_closed_where_nofollow_is_unsupported() {
+    let root = tempfile::tempdir().unwrap();
+    let dev = record(root.path(), "dev", "dev-a", Some(&[100, -100]));
+    let holdout = record(root.path(), "holdout", "secret", None);
+    let plan = plan(
+        "dev",
+        vec![json!({"id":"case","record_id":"dev-a","input":"full"})],
+    );
+    let error = prepare_development_inputs(
+        &dataset(vec![dev, holdout]),
+        &plan,
+        root.path(),
+        &ToneInputLimits::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("unsupported"), "{error}");
+    assert!(!root.path().join("holdout").exists());
 }
 
 #[test]
@@ -700,6 +1032,7 @@ fn oversized_annotation_label_hits_metadata_limit_before_lookup() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn text_mask_is_independent_of_transcript_and_prepared_pcm_is_a_snapshot() {
     let root = tempfile::tempdir().unwrap();

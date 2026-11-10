@@ -577,6 +577,17 @@ fn read_audio(
     Ok(bytes)
 }
 
+fn validate_decoded_samples(samples: &[f32], predicted: usize) -> Result<(), String> {
+    if samples.is_empty()
+        || samples.len() > predicted
+        || samples.iter().any(|sample| !sample.is_finite())
+    {
+        Err("invalid decoded tone samples".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn decode_audio(
     bytes: &[u8],
     limits: &ToneInputLimits,
@@ -642,12 +653,9 @@ fn decode_audio(
         return Err("truncated tone WAV".into());
     }
     let samples = omni_lfm3::media_io::decode_wav(bytes, stop).map_err(|e| e.to_string())?;
-    if samples.is_empty()
-        || samples.len() > predicted
-        || samples.iter().any(|v| !v.is_finite() || v.abs() > 1.0)
-    {
-        return Err("invalid decoded tone samples".into());
-    }
+    // Sinc resampling can overshoot normalized input without making the PCM
+    // invalid; retain the finite decoder output exactly for model input/hash.
+    validate_decoded_samples(&samples, predicted)?;
     *total = next_total;
     Ok(samples.into())
 }
@@ -710,4 +718,19 @@ pub fn prepare_development_inputs(
         cases,
         declaration_sha256,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_decoded_samples;
+
+    #[test]
+    fn decoded_sample_guard_accepts_finite_overshoot_and_rejects_nonfinite_or_over_budget() {
+        assert!(validate_decoded_samples(&[1.133_402_8, -1.133_402_8], 2).is_ok());
+        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_decoded_samples(&[0.0, sample], 2).is_err());
+        }
+        assert!(validate_decoded_samples(&[], 2).is_err());
+        assert!(validate_decoded_samples(&[0.0, 0.0], 1).is_err());
+    }
 }
