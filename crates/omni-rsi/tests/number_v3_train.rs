@@ -3025,6 +3025,41 @@ fn voice_recheck_read_pipe_to_eof<R: std::io::Read + std::os::fd::AsRawFd>(
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_command_output(
+    mut command: std::process::Command,
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        drop(child.stdout.take());
+        drop(child.stderr.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("CLI diagnostic did not finish within its deadline");
+    }
+    let status = child.wait().unwrap();
+    let stdout = voice_recheck_read_pipe_to_eof(child.stdout.take().unwrap());
+    let stderr = voice_recheck_read_pipe_to_eof(child.stderr.take().unwrap());
+    (status, stdout, stderr)
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
 fn voice_recheck_cli_blocked_output(block_stderr: bool) {
     use std::{
         io::Read,
@@ -3263,31 +3298,50 @@ fn voice_recheck_cli_displays_normal_errors_without_recursive_reporters() {
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
-fn voice_recheck_cpu_only_blocked_stderr(send_interrupt: bool) {
+fn voice_recheck_blocked_error(binary_env: &str, unusable_tmp: bool, send_interrupt: bool) {
     use std::{
         os::fd::AsRawFd,
         process::{Command, Stdio},
         thread,
         time::{Duration, Instant},
     };
-    let example =
-        std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
+    let example = std::env::var_os(binary_env).expect("set the CLI test executable");
+    let root = tempfile::tempdir().unwrap();
     let command = || {
         let mut command = Command::new(&example);
         command.args([
             "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu", "unused",
             "unused",
         ]);
+        if unusable_tmp {
+            command.env("TMPDIR", root.path().join("missing"));
+        }
         command
     };
-    let reference = command().output().unwrap();
-    assert!(!reference.status.success());
-    assert!(String::from_utf8_lossy(&reference.stderr).contains("requires the native feature"));
+    let (status, stdout, stderr) = voice_recheck_command_output(command());
+    assert!(!status.success());
+    assert!(stdout.is_empty());
+    let expected = if binary_env == "VOICE_RECHECK_CPU_EXAMPLE" {
+        "requires the native feature"
+    } else {
+        "No such file or directory"
+    };
+    assert!(String::from_utf8_lossy(&stderr).contains(expected));
     let (reader, writer, _) = voice_recheck_full_pipe();
     let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
     let witness = writer.try_clone().unwrap();
     let mut actual = command();
-    actual.stdout(Stdio::null()).stderr(Stdio::from(writer));
+    actual.stderr(Stdio::from(writer));
+    let blocked_stdout = if unusable_tmp {
+        let (reader, writer, _) = voice_recheck_full_pipe();
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let witness = writer.try_clone().unwrap();
+        actual.stdout(Stdio::from(writer));
+        Some((reader, witness, flags))
+    } else {
+        actual.stdout(Stdio::null());
+        None
+    };
     let mut child = actual.spawn().unwrap();
     drop(actual);
     if send_interrupt {
@@ -3308,7 +3362,7 @@ fn voice_recheck_cpu_only_blocked_stderr(send_interrupt: bool) {
         }
         let _ = child.kill();
         let _ = child.wait();
-        panic!("CPU-only CLI remained blocked on stderr");
+        panic!("CLI remained blocked on stderr");
     }
     assert!(!child.wait().unwrap().success());
     assert_eq!(
@@ -3317,20 +3371,231 @@ fn voice_recheck_cpu_only_blocked_stderr(send_interrupt: bool) {
     );
     drop(witness);
     let _ = voice_recheck_read_pipe_to_eof(reader);
+    if let Some((reader, witness, flags)) = blocked_stdout {
+        assert_eq!(
+            unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        drop(witness);
+        let _ = voice_recheck_read_pipe_to_eof(reader);
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
 #[test]
 #[ignore = "requires the separately built CPU-only number_voice_recheck example"]
 fn voice_recheck_cpu_only_bounds_an_unread_stderr() {
-    voice_recheck_cpu_only_blocked_stderr(false);
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", false, false);
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
 #[test]
 #[ignore = "requires the separately built CPU-only number_voice_recheck example"]
 fn voice_recheck_cpu_only_interrupts_without_leaking_error_writer() {
-    voice_recheck_cpu_only_blocked_stderr(true);
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", false, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_bad_tmpdir_unread_stderr_and_sigint_are_bounded() {
+    voice_recheck_blocked_error("VOICE_RECHECK_EXAMPLE", true, false);
+    voice_recheck_blocked_error("VOICE_RECHECK_EXAMPLE", true, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_bad_tmpdir_unread_stderr_and_sigint_are_bounded() {
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", true, false);
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", true, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_reports_unusable_tmpdir() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let ordinary_file = root.path().join("not-a-directory");
+    let readonly = root.path().join("not-writable");
+    fs::write(&ordinary_file, b"synthetic").unwrap();
+    fs::create_dir(&readonly).unwrap();
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    for tmp in [missing, ordinary_file, readonly] {
+        for valid_args in [false, true] {
+            let mut command = Command::new(&example);
+            if valid_args {
+                command.args([
+                    "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu",
+                    "unused", "unused",
+                ]);
+            }
+            command.env("TMPDIR", &tmp);
+            let (status, stdout, stderr) = voice_recheck_command_output(command);
+            assert!(!status.success());
+            assert!(stdout.is_empty());
+            let error = String::from_utf8_lossy(&stderr);
+            assert!(
+                error.contains(if valid_args { "os error" } else { "Usage:" }),
+                "missing diagnostic: {error:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_reports_unusable_tmpdir() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let ordinary_file = root.path().join("not-a-directory");
+    let readonly = root.path().join("not-writable");
+    fs::write(&ordinary_file, b"synthetic").unwrap();
+    fs::create_dir(&readonly).unwrap();
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
+    let example =
+        std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
+    for tmp in [missing, ordinary_file, readonly] {
+        for valid_args in [false, true] {
+            let mut command = Command::new(&example);
+            if valid_args {
+                command.args([
+                    "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu",
+                    "unused", "unused",
+                ]);
+            }
+            command.env("TMPDIR", &tmp);
+            let (status, stdout, stderr) = voice_recheck_command_output(command);
+            assert!(!status.success());
+            assert!(stdout.is_empty());
+            let error = String::from_utf8_lossy(&stderr);
+            assert!(
+                error.contains(if valid_args {
+                    "requires the native feature"
+                } else {
+                    "Usage:"
+                }),
+                "missing diagnostic: {error:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires native and CPU-only number_voice_recheck examples"]
+fn voice_recheck_internal_error_worker_refuses_oversized_input() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    for variable in ["VOICE_RECHECK_EXAMPLE", "VOICE_RECHECK_CPU_EXAMPLE"] {
+        let example = std::env::var_os(variable).expect("set both CLI test executables");
+        for size in [4096, 4097] {
+            let mut child = Command::new(&example)
+                .arg("--internal-voice-recheck-error")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&vec![b'x'; size])
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            if size == 4096 {
+                assert!(output.status.success());
+                assert_eq!(output.stderr, vec![b'x'; size]);
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "oversized diagnostic must not be reported as complete"
+                );
+                assert!(
+                    output.stderr.is_empty(),
+                    "oversized diagnostic must not be emitted"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires native and CPU-only number_voice_recheck examples"]
+fn voice_recheck_exhausted_descriptor_budget_fails_without_hanging() {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    for variable in ["VOICE_RECHECK_EXAMPLE", "VOICE_RECHECK_CPU_EXAMPLE"] {
+        let example = std::env::var_os(variable).expect("set both CLI test executables");
+        for help in [true, false] {
+            let mut command = Command::new(&example);
+            if help {
+                command.arg("--help");
+            } else {
+                command.args([
+                    "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu",
+                    "unused", "unused",
+                ]);
+            }
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: 4,
+                        rlim_max: 4,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            drop(command);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("descriptor exhaustion caused an unbounded wait");
+            }
+            let output = child.wait_with_output().unwrap();
+            if help {
+                assert!(
+                    output.status.success(),
+                    "limited process could not start: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+            } else {
+                assert!(!output.status.success());
+                assert!(output.stdout.is_empty());
+                assert!(
+                    output.stderr.is_empty(),
+                    "socket allocation should fail with one free descriptor"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]

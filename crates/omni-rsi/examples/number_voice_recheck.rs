@@ -24,10 +24,15 @@ fn write_result() -> Result<(), String> {
 }
 
 fn write_error_result() -> Result<(), String> {
-    use std::io::Write;
-    let mut input = std::io::stdin().lock();
+    use std::io::{Read, Write};
+    let mut input = std::io::stdin().lock().take((ERROR_LIMIT + 1) as u64);
+    let mut message = Vec::with_capacity(ERROR_LIMIT + 1);
+    input.read_to_end(&mut message).map_err(|e| e.to_string())?;
+    if message.len() > ERROR_LIMIT {
+        return Err("internal diagnostic exceeds limit".into());
+    }
     let mut output = std::io::stderr().lock();
-    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+    output.write_all(&message).map_err(|e| e.to_string())?;
     output.flush().map_err(|e| e.to_string())
 }
 
@@ -151,20 +156,44 @@ fn execute(args: &[OsString], stop: &AtomicBool) -> Result<(), String> {
 #[cfg(unix)]
 fn report_error(error: &str) {
     use std::{
-        io::{Seek, Write},
+        io::{ErrorKind, Write},
+        os::{fd::OwnedFd, unix::net::UnixStream},
         process::{Command, Stdio},
-        time::Duration,
+        time::{Duration, Instant},
     };
     let attempt = || -> Result<(), String> {
-        let mut message = tempfile::tempfile().map_err(|e| e.to_string())?;
-        message
-            .write_all(bounded_error(error).as_bytes())
-            .map_err(|e| e.to_string())?;
-        message.rewind().map_err(|e| e.to_string())?;
+        let (mut sender, receiver) = UnixStream::pair().map_err(|e| e.to_string())?;
+        sender.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let message = bounded_error(error);
+        let bytes = message.as_bytes();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let mut written = 0;
+        while written < bytes.len() {
+            match sender.write(&bytes[written..]) {
+                Ok(0) => break,
+                Ok(count) => written += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => (),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    if written == 0 {
+                        return Err(error.to_string());
+                    }
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        if written == 0 {
+            return Err("unable to send diagnostic".into());
+        }
+        drop(sender);
+        let receiver: OwnedFd = receiver.into();
         let mut writer = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
         writer
             .arg(ERROR_WORKER)
-            .stdin(Stdio::from(message))
+            .stdin(Stdio::from(receiver))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         let _ = omni_rsi::child::run_with_timeout(
