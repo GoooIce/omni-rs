@@ -2952,6 +2952,435 @@ fn voice_recheck_cli_uses_only_development_material() {
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_full_pipe() -> (fs::File, fs::File, usize) {
+    use std::{
+        fs::File,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let reader = unsafe { File::from_raw_fd(fds[0]) };
+    let writer = unsafe { File::from_raw_fd(fds[1]) };
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0
+    );
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let filler = [b'~'; 4096];
+    let mut filled = 0_usize;
+    loop {
+        let n = unsafe { libc::write(writer.as_raw_fd(), filler.as_ptr().cast(), filler.len()) };
+        if n < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            break;
+        }
+        assert!(n > 0);
+        filled += n as usize;
+    }
+    assert!(filled >= 4096);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+        0
+    );
+    (reader, writer, filled)
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_read_pipe_to_eof<R: std::io::Read + std::os::fd::AsRawFd>(
+    mut reader: R,
+) -> Vec<u8> {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut bytes = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 4096];
+        match reader.read(&mut buffer) {
+            Ok(0) => return bytes,
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) => panic!("pipe did not reach EOF within its deadline: {error}"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_cli_blocked_output(block_stderr: bool) {
+    use std::{
+        io::Read,
+        os::fd::AsRawFd,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = voice_recheck_fixture();
+    let options = voice_recheck_options(&fixture);
+    let root = fixture.registration_dir.parent().unwrap();
+    let tool = options.r2t2.as_ref().unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let command = || {
+        let mut command = Command::new(&example);
+        command
+            .arg(&options.model_dir)
+            .arg(root)
+            .arg(&options.candidate_file)
+            .arg(&options.evaluator_file)
+            .arg(&fixture.registration_dir)
+            .arg(root.join("report.json"))
+            .arg(&fixture.voice_dir)
+            .arg(&options.backend)
+            .arg(&tool.model)
+            .arg(&tool.binary);
+        command
+    };
+    let reference = command().output().unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert!(
+        reference.stdout.len() > 4096,
+        "the actual CLI result must exceed the released pipe space"
+    );
+    let (mut reader, writer, filled) = voice_recheck_full_pipe();
+    let mut actual = command();
+    actual.stdout(Stdio::from(writer));
+    let blocked_stderr = if block_stderr {
+        let (reader, writer, _) = voice_recheck_full_pipe();
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let witness = writer.try_clone().unwrap();
+        actual.stderr(Stdio::from(writer));
+        Some((reader, witness, flags))
+    } else {
+        actual.stderr(Stdio::piped());
+        None
+    };
+    let mut child = actual.spawn().unwrap();
+    // Command retains its configured descriptors after spawn; close those
+    // copies so the test can observe EOF once the CLI and its workers exit.
+    drop(actual);
+    reader.read_exact(&mut [0; 4096]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut started = false;
+    while Instant::now() < deadline {
+        let mut available: libc::c_int = 0;
+        assert_eq!(
+            unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut available) },
+            0
+        );
+        if available as usize >= filled {
+            started = true;
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !started {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI did not begin writing into the blocked output pipe");
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stderr_flags_changed = false;
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        if let Some((_, witness, flags)) = blocked_stderr.as_ref() {
+            stderr_flags_changed |=
+                unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) } != *flags;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI remained blocked after SIGINT");
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "a cancelled output is not a completed result"
+    );
+    if !block_stderr {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("interrupted") && error.contains("partial result"),
+            "{error}"
+        );
+    }
+    if let Some((stderr_reader, witness, flags)) = blocked_stderr {
+        assert!(
+            !stderr_flags_changed,
+            "stderr flags changed while reporting cancellation"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) },
+            flags,
+            "stderr flags must be restored"
+        );
+        drop(witness);
+        let _ = voice_recheck_read_pipe_to_eof(stderr_reader);
+    }
+    let bytes = voice_recheck_read_pipe_to_eof(reader);
+    let prefix = filled - 4096;
+    assert!(
+        bytes.len() > prefix,
+        "some real CLI output should already have been written"
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&bytes[prefix..]).is_err(),
+        "the received result is partial"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_interrupts_a_partially_written_blocked_stdout() {
+    voice_recheck_cli_blocked_output(false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_interrupts_when_stdout_and_stderr_are_blocked() {
+    voice_recheck_cli_blocked_output(true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_bounds_a_large_error_when_stderr_is_unread() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let registration = root.join("registration");
+    fs::create_dir(&registration).unwrap();
+    let protocol = format!("{{\"{}\":null}}", "x".repeat(1024 * 1024));
+    fs::write(registration.join("protocol.json"), protocol).unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut child = Command::new(example)
+        .args(["unused", "unused", "unused", "unused"])
+        .arg(registration)
+        .args(["unused", "unused", "cpu", "unused", "unused"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        // Stop only this CLI and its worker; close the unread pipe so failure
+        // cleanup itself cannot remain blocked on the intentionally full pipe.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        drop(child.stderr.take());
+        thread::sleep(Duration::from_millis(300));
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI remained blocked while emitting a large error");
+    }
+    let status = child.wait().unwrap();
+    let error = voice_recheck_read_pipe_to_eof(child.stderr.take().unwrap());
+    assert!(!status.success());
+    assert!(
+        !error.is_empty(),
+        "a writable stderr should receive a diagnostic"
+    );
+    assert!(error.len() <= 8192, "stderr must have a bounded diagnostic");
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_displays_normal_errors_without_recursive_reporters() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let registration = root.join("registration");
+    fs::create_dir(&registration).unwrap();
+    fs::write(registration.join("protocol.json"), b"{unfinished").unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut child = Command::new(example)
+        .args(["unused", "unused", "unused", "unused"])
+        .arg(registration)
+        .args(["unused", "unused", "cpu", "unused", "unused"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        drop(child.stderr.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("CLI did not finish reporting an ordinary error");
+    }
+    assert!(!child.wait().unwrap().success());
+    let bytes = voice_recheck_read_pipe_to_eof(child.stderr.take().unwrap());
+    let error = String::from_utf8(bytes).unwrap();
+    assert!(error.contains("invalid JSON"), "{error}");
+    assert!(error.len() <= 4096, "diagnostic must be bounded");
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_cpu_only_blocked_stderr(send_interrupt: bool) {
+    use std::{
+        os::fd::AsRawFd,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let example =
+        std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
+    let command = || {
+        let mut command = Command::new(&example);
+        command.args([
+            "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu", "unused",
+            "unused",
+        ]);
+        command
+    };
+    let reference = command().output().unwrap();
+    assert!(!reference.status.success());
+    assert!(String::from_utf8_lossy(&reference.stderr).contains("requires the native feature"));
+    let (reader, writer, _) = voice_recheck_full_pipe();
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    let witness = writer.try_clone().unwrap();
+    let mut actual = command();
+    actual.stdout(Stdio::null()).stderr(Stdio::from(writer));
+    let mut child = actual.spawn().unwrap();
+    drop(actual);
+    if send_interrupt {
+        thread::sleep(Duration::from_millis(60));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the full stderr should still have an active reporter"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("CPU-only CLI remained blocked on stderr");
+    }
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+    drop(witness);
+    let _ = voice_recheck_read_pipe_to_eof(reader);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_bounds_an_unread_stderr() {
+    voice_recheck_cpu_only_blocked_stderr(false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_interrupts_without_leaking_error_writer() {
+    voice_recheck_cpu_only_blocked_stderr(true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_returns_failure_if_output_reader_closes() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = voice_recheck_fixture();
+    let options = voice_recheck_options(&fixture);
+    let root = fixture.registration_dir.parent().unwrap();
+    let tool = options.r2t2.as_ref().unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut child = Command::new(example)
+        .arg(&options.model_dir)
+        .arg(root)
+        .arg(&options.candidate_file)
+        .arg(&options.evaluator_file)
+        .arg(&fixture.registration_dir)
+        .arg(root.join("report.json"))
+        .arg(&fixture.voice_dir)
+        .arg(&options.backend)
+        .arg(&tool.model)
+        .arg(&tool.binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI failed to exit after its output reader closed");
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("partial result"));
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
 #[test]
 #[ignore = "requires the separately built native number_voice_recheck example and lsof"]
 fn voice_recheck_cli_interrupts_an_in_progress_legacy_identity_hash() {
