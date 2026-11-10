@@ -449,6 +449,40 @@ fn v3_loading_fails_closed_when_safe_directory_handles_are_unsupported() {
 
 #[cfg(all(not(unix), feature = "cpu"))]
 #[test]
+fn v3_registration_and_comparison_fail_closed_without_cooperative_leases() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, evaluate_v3_with, preregister_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: root.path(),
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let error = preregister_v3::<Cpu>(&options, &Default::default(), &stop)
+        .err()
+        .unwrap();
+    assert!(error.contains("not supported"), "{error}");
+    let error = evaluate_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+        panic!("unsupported platform reached inference")
+    })
+    .err()
+    .unwrap();
+    assert!(error.contains("not supported"), "{error}");
+    assert!(!registration.exists());
+    assert!(!output.exists());
+}
+
+#[cfg(all(not(unix), feature = "cpu"))]
+#[test]
 fn v3_training_fails_closed_without_cooperative_leases() {
     use burn::backend::{Autodiff, NdArray};
     use omni_rsi::speech_audio_round::{AudioRoundOptions, train_v3_audio_round};
@@ -502,12 +536,12 @@ fn v3_and_legacy_trainers_share_the_parent_training_lease() {
     );
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 fn evaluation_fixture() -> tempfile::TempDir {
     evaluation_fixture_with_signed_zero(false)
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
     use burn::{
         backend::{Autodiff, NdArray},
@@ -530,6 +564,7 @@ fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
         ("audio_out_token_id", 4),
         ("audio_start_token_id", 5),
         ("mixed_start_token_id", 6),
+        ("text_end_token_id", 9),
     ] {
         config[key] = value.into();
     }
@@ -628,7 +663,573 @@ fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
     root
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
+fn fake_r2t2(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let model = root.join("r2t2");
+    fs::create_dir(&model).unwrap();
+    for name in [
+        "model.safetensors",
+        "config.json",
+        "tokenizer.json",
+        "preprocessor_config.json",
+    ] {
+        fs::write(model.join(name), b"synthetic verifier file").unwrap();
+    }
+    let binary = root.join("r2t2-binary");
+    fs::write(&binary, b"synthetic executable").unwrap();
+    (model, binary)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_mock_speech_tracks_swapped_audio_and_preserves_raw_output() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        number_v3_evaluation::{
+            DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+            preregister_v3_with_asr,
+        },
+        speech_asr::AsrEvent,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let voice_dir = root.path().join("voice-output");
+    let r2t2 = root.path().join("r2t2");
+    fs::create_dir(&r2t2).unwrap();
+    for name in [
+        "model.safetensors",
+        "config.json",
+        "tokenizer.json",
+        "preprocessor_config.json",
+    ] {
+        fs::write(r2t2.join(name), b"synthetic verifier file").unwrap();
+    }
+    let asr_binary = root.path().join("r2t2-binary");
+    fs::write(&asr_binary, b"synthetic executable").unwrap();
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &asr_binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let policy: Value =
+        serde_json::from_slice(&fs::read(registration.join("v3-evaluation-policy.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        policy["parameters"]["output_speech"]["asr"]["backend"],
+        "cpu"
+    );
+    assert_eq!(
+        policy["parameters"]["output_speech"]["asr"]["precision"],
+        "f32"
+    );
+    assert_eq!(
+        policy["parameters"]["output_speech"]["asr"]["max_new_tokens"],
+        32
+    );
+    assert_eq!(
+        policy["parameters"]["output_speech"]["asr"]["verifier"],
+        "omni-r2t2-native-cpu-f32-exact-tuning-v1"
+    );
+    assert!(
+        evaluate_v3_voice_with::<Cpu>(
+            &options,
+            &voice_dir,
+            &device,
+            &stop,
+            V3AsrMode::MetalF16,
+            |_, _, _| panic!("unregistered mode reached speech inference"),
+            |_| panic!("unregistered mode reached ASR"),
+        )
+        .is_err()
+    );
+    assert!(!voice_dir.exists());
+    let report = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, instruction, samples| {
+            assert_eq!(instruction, "把听到的数字加一，用中文回答。");
+            let value = if samples.iter().all(|v| *v == 0.0) {
+                0.125
+            } else if samples[1] < 0.4 {
+                0.5
+            } else {
+                0.25
+            };
+            Ok((
+                DecodedText {
+                    text: "fixture".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![7],
+                    frames: vec![vec![1; 12], vec![2016; 12]],
+                    samples: vec![value, -value],
+                    end: TextEnd::Stop(7),
+                },
+            ))
+        },
+        |wav| {
+            let sample = hound::WavReader::open(wav)
+                .unwrap()
+                .samples::<f32>()
+                .next()
+                .unwrap()
+                .unwrap();
+            Ok(AsrEvent {
+                text: if sample == 0.5 {
+                    "十六"
+                } else if sample == 0.25 {
+                    "13"
+                } else {
+                    "我听到的是零，加一就是一。"
+                }
+                .into(),
+                language: if sample == 0.25 { "" } else { "zh" }.into(),
+            })
+        },
+    )
+    .unwrap();
+    let rows = report["observations"].as_array().unwrap();
+    assert_eq!(rows.len(), 12);
+    assert_eq!(rows[0]["audio_case_id"], "dev-a");
+    assert_eq!(rows[0]["speech"]["transcript"], "十六");
+    assert_eq!(rows[0]["speech"]["cer"], 0.0);
+    assert_eq!(rows[1]["audio_case_id"], "dev-b");
+    assert_eq!(rows[1]["speech"]["transcript"], "13");
+    assert_eq!(rows[1]["speech"]["reference"], "十三");
+    assert_eq!(rows[1]["speech"]["cer"], 1.0);
+    assert_eq!(rows[1]["speech"]["numeric_correct"], true);
+    assert_eq!(rows[1]["speech"]["language_raw"], "");
+    assert!(rows[1]["speech"]["language"].is_null());
+    assert_eq!(rows[1]["speech"]["language_status"], "unknown");
+    assert!(rows[2]["speech"]["cer"].is_null());
+    assert_eq!(rows[2]["speech"]["silence_numeric"], true);
+    assert_eq!(
+        rows[0]["speech"]["transcript_source"],
+        "injected_unverified"
+    );
+    let wav = voice_dir.join(rows[0]["speech"]["audio_file"].as_str().unwrap());
+    let frames = voice_dir.join(rows[0]["speech"]["frames_file"].as_str().unwrap());
+    assert!(wav.is_file());
+    let raw: Value = serde_json::from_slice(&fs::read(frames).unwrap()).unwrap();
+    assert_eq!(raw["frames"][1], json!(vec![2016; 12]));
+    assert_eq!(report["status"], "insufficient_evidence");
+    assert_eq!(report["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_speech_marks_abnormal_end_and_invalid_silent_output() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        number_v3_evaluation::{
+            DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+            preregister_v3_with_asr,
+        },
+        speech_asr::AsrEvent,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let (r2t2, binary) = fake_r2t2(root.path());
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let voice_dir = root.path().join("voice-output");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let report = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |arm, _, samples| {
+            let silent = samples.iter().all(|v| *v == 0.0);
+            Ok((
+                DecodedText {
+                    text: "十六".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![],
+                    frames: vec![vec![
+                        1;
+                        if arm == "candidate" && !silent {
+                            11
+                        } else {
+                            12
+                        }
+                    ]],
+                    samples: if silent {
+                        vec![0.0, 0.0]
+                    } else {
+                        vec![0.5, -0.5]
+                    },
+                    end: TextEnd::Limit,
+                },
+            ))
+        },
+        |_| {
+            Ok(AsrEvent {
+                text: "十六".into(),
+                language: "zh".into(),
+            })
+        },
+    )
+    .unwrap();
+    let original = &report["observations"][0]["speech"];
+    assert_eq!(original["valid"], true);
+    assert_eq!(original["normal_end"], false);
+    assert_eq!(original["numeric_correct"], false);
+    assert_eq!(original["cer"], 0.0);
+    assert_eq!(original["end"]["kind"], "limit");
+    let silence = &report["observations"][2]["speech"];
+    assert_eq!(silence["valid"], false);
+    assert_eq!(silence["transcript_source"], "not_run_invalid_audio");
+    assert!(silence["cer"].is_null());
+    assert!(silence["silence_numeric"].is_null());
+    let malformed = &report["observations"][3]["speech"];
+    assert_eq!(malformed["valid"], false);
+    assert_eq!(malformed["transcript_source"], "not_run_invalid_audio");
+    assert!(malformed["cer"].is_null());
+    assert_eq!(
+        report["output_speech_r2t2_cer"]["status"],
+        "partial_unverified"
+    );
+    let second_output = root.path().join("second-report.json");
+    let second_dir = root.path().join("second-voice");
+    let second = V3Options {
+        output: &second_output,
+        ..options
+    };
+    let report = evaluate_v3_voice_with::<Cpu>(
+        &second,
+        &second_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, _| {
+            Ok((
+                DecodedText {
+                    text: "不知道".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![],
+                    frames: vec![vec![1; 12]],
+                    samples: vec![0.0, 0.0],
+                    end: TextEnd::Limit,
+                },
+            ))
+        },
+        |_| panic!("invalid silent output reached ASR"),
+    )
+    .unwrap();
+    assert_eq!(
+        report["output_speech_r2t2_cer"]["status"],
+        "not_run_no_valid_audio"
+    );
+    assert_eq!(report["output_speech_r2t2_cer"]["asr_runs"], 0);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_speech_rejects_r2t2_change_during_transcription_and_keeps_output_reserved() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        number_v3_evaluation::{
+            DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+            preregister_v3_with_asr,
+        },
+        speech_asr::AsrEvent,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let (r2t2, binary) = fake_r2t2(root.path());
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let voice_dir = root.path().join("voice-output");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let result = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, _| {
+            Ok((
+                DecodedText {
+                    text: "十三".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![7],
+                    frames: vec![vec![1; 12], vec![2016; 12]],
+                    samples: vec![0.5, -0.5],
+                    end: TextEnd::Stop(7),
+                },
+            ))
+        },
+        |_| {
+            fs::write(&binary, b"changed during ASR").unwrap();
+            Ok(AsrEvent {
+                text: "十三".into(),
+                language: "zh".into(),
+            })
+        },
+    );
+    assert!(result.is_err());
+    assert!(!output.exists());
+    assert!(voice_dir.is_dir());
+    let old_artifact = fs::read(voice_dir.join("000000.wav")).unwrap();
+    fs::write(&binary, b"synthetic executable").unwrap();
+    assert!(
+        evaluate_v3_voice_with::<Cpu>(
+            &options,
+            &voice_dir,
+            &device,
+            &stop,
+            V3AsrMode::CpuF32,
+            |_, _, _| panic!("reserved voice directory reached inference"),
+            |_| panic!("reserved voice directory reached ASR")
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(voice_dir.join("000000.wav")).unwrap(),
+        old_artifact
+    );
+    assert!(!output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_speech_rejects_audio_modified_during_transcription() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        number_v3_evaluation::{
+            DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+            preregister_v3_with_asr,
+        },
+        speech_asr::AsrEvent,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let (r2t2, binary) = fake_r2t2(root.path());
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let voice_dir = root.path().join("voice-output");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let result = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, _| {
+            Ok((
+                DecodedText {
+                    text: "十三".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![7],
+                    frames: vec![vec![1; 12], vec![2016; 12]],
+                    samples: vec![0.5, -0.5],
+                    end: TextEnd::Stop(7),
+                },
+            ))
+        },
+        |wav| {
+            fs::write(wav, b"changed waveform").unwrap();
+            Ok(AsrEvent {
+                text: "十三".into(),
+                language: "zh".into(),
+            })
+        },
+    );
+    assert!(result.is_err());
+    assert!(!output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_cancelled_speech_leaves_no_report_and_does_not_reuse_directory() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+        preregister_v3_with_asr,
+    };
+    use std::sync::atomic::Ordering;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let (r2t2, binary) = fake_r2t2(root.path());
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let voice_dir = root.path().join("voice-output");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let result = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, _| {
+            stop.store(true, Ordering::Release);
+            Ok((
+                DecodedText {
+                    text: "十三".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![],
+                    frames: vec![],
+                    samples: vec![],
+                    end: TextEnd::Cancelled,
+                },
+            ))
+        },
+        |_| panic!("cancelled speech reached ASR"),
+    );
+    assert!(result.is_err());
+    assert!(!output.exists());
+    assert!(voice_dir.is_dir());
+    stop.store(false, Ordering::Release);
+    assert!(
+        evaluate_v3_voice_with::<Cpu>(
+            &options,
+            &voice_dir,
+            &device,
+            &stop,
+            V3AsrMode::CpuF32,
+            |_, _, _| panic!("reserved directory reached inference"),
+            |_| panic!("reached ASR")
+        )
+        .is_err()
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_oversized_speech_is_rejected_before_asr_or_report() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+        preregister_v3_with_asr,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let (r2t2, binary) = fake_r2t2(root.path());
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let voice_dir = root.path().join("voice-output");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let result = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, _| {
+            Ok((
+                DecodedText {
+                    text: "十三".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![],
+                    frames: vec![vec![1; 12]],
+                    samples: vec![0.1; 24_000 * 30 + 1],
+                    end: TextEnd::Limit,
+                },
+            ))
+        },
+        |_| panic!("oversized speech reached ASR"),
+    );
+    let error = result.err().unwrap();
+    assert!(error.contains("limit"), "{error}");
+    assert!(!output.exists());
+    assert!(!voice_dir.join("000000.wav").exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_registered_mock_requires_checkpoint_and_cannot_overwrite_report() {
     use burn::backend::{Autodiff, NdArray};
@@ -690,7 +1291,7 @@ fn v3_registered_mock_requires_checkpoint_and_cannot_overwrite_report() {
     assert_eq!(fs::read(output).unwrap(), bytes);
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_comparison_routes_each_frozen_audio_and_scores_its_answer() {
     use burn::backend::{Autodiff, NdArray};
@@ -746,7 +1347,7 @@ fn v3_comparison_routes_each_frozen_audio_and_scores_its_answer() {
     assert_eq!(report["observations"][1]["end"]["stop_token"], 7);
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_report_pcm_identity_matches_frozen_signed_zero_audio() {
     use burn::backend::{Autodiff, NdArray};
@@ -789,7 +1390,7 @@ fn v3_report_pcm_identity_matches_frozen_signed_zero_audio() {
     );
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_rejects_changed_inputs_and_cancellation_without_writing_report() {
     use burn::backend::{Autodiff, NdArray};
@@ -872,7 +1473,7 @@ fn v3_rejects_changed_inputs_and_cancellation_without_writing_report() {
     assert!(!output.exists());
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_concurrent_report_creation_is_never_overwritten() {
     use burn::backend::{Autodiff, NdArray};
@@ -911,7 +1512,7 @@ fn v3_concurrent_report_creation_is_never_overwritten() {
     assert_eq!(fs::read(output).unwrap(), b"external report");
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn incomplete_v3_policy_cannot_be_used_or_silently_replaced() {
     use burn::backend::{Autodiff, NdArray};
@@ -951,6 +1552,104 @@ fn incomplete_v3_policy_cannot_be_used_or_silently_replaced() {
 
 #[cfg(all(unix, feature = "cpu"))]
 #[test]
+fn published_report_is_retained_when_parent_directory_sync_fails() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_v3_with, preregister_v3,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    type Cpu = Autodiff<NdArray<f32>>;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("permission-based directory sync test requires a non-root user");
+        return;
+    }
+    let root = evaluation_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let directory = root.path().join("write-only-output");
+    fs::create_dir(&directory).unwrap();
+    let output = directory.join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3::<Cpu>(&options, &device, &stop).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o300)).unwrap();
+    let result = evaluate_v3_with::<Cpu>(&options, &device, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "不知道".into(),
+            end: TextEnd::Stop(7),
+        })
+    });
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.expect_err("directory sync should fail");
+    assert!(
+        error.contains("published") && error.contains("durability"),
+        "{error}"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(report["candidate_eligible"], false);
+    let original = fs::read(&output).unwrap();
+    assert!(
+        evaluate_v3_with::<Cpu>(&options, &device, &stop, |_, _, _| panic!(
+            "report was overwritten"
+        ))
+        .is_err()
+    );
+    assert_eq!(fs::read(output).unwrap(), original);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_evaluation_and_registration_respect_nested_training_lease() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        lease::Lease,
+        number_v3_evaluation::{V3Options, evaluate_v3_with, preregister_v3},
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let lock = state.join("number-audio-v3/audio-training.lock");
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    let held = Lease::try_acquire(&lock).unwrap().unwrap();
+    assert!(preregister_v3::<Cpu>(&options, &device, &stop).is_err());
+    assert!(!registration.exists());
+    drop(held);
+    preregister_v3::<Cpu>(&options, &device, &stop).unwrap();
+    let _held = Lease::try_acquire(&lock).unwrap().unwrap();
+    assert!(
+        evaluate_v3_with::<Cpu>(&options, &device, &stop, |_, _, _| {
+            panic!("nested training lease reached inference")
+        })
+        .is_err()
+    );
+    assert!(!output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
 fn v3_registration_respects_the_shared_foreground_lock() {
     use burn::backend::{Autodiff, NdArray};
     use omni_rsi::{
@@ -979,7 +1678,7 @@ fn v3_registration_respects_the_shared_foreground_lock() {
     assert!(!registration.exists());
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_registered_local_tool_identities_are_rechecked_but_not_executed() {
     use burn::backend::{Autodiff, NdArray};
@@ -1043,7 +1742,7 @@ fn v3_registered_local_tool_identities_are_rechecked_but_not_executed() {
     assert_eq!(report["candidate_eligible"], false);
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 #[ignore = "requires an explicit local model, matching trained v3 state and development data"]
 fn v3_real_registered_development_with_local_weights() {
@@ -1076,7 +1775,7 @@ fn v3_real_registered_development_with_local_weights() {
     assert!(output.is_file());
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_rechecks_inputs_after_inference_before_writing_report() {
     use burn::backend::{Autodiff, NdArray};
@@ -1116,7 +1815,7 @@ fn v3_rechecks_inputs_after_inference_before_writing_report() {
     assert!(!output.exists());
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_unfinished_answers_and_silence_use_existing_scoring_rules() {
     use burn::backend::{Autodiff, NdArray};

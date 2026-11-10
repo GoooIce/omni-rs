@@ -6,11 +6,16 @@ use crate::{
         RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, verify_registration,
     },
     number_gate::{PairedCase, PairedOutcome, paired_statistics},
+    speech_asr::AsrEvent,
     speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol},
-    speech_number_evaluation::{answer_number, mentions_number},
+    speech_number_evaluation::{answer_number, character_error_rate, mentions_number},
 };
 use burn::tensor::backend::AutodiffBackend;
-use omni_lfm3::{Precision, generate::EndReason, model::OmniModel};
+use omni_lfm3::{
+    Precision,
+    generate::{EndReason, GenerationOptions, generate_greedy},
+    model::OmniModel,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,6 +28,9 @@ use std::{
 
 const INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
 
+#[path = "number_v3_voice.rs"]
+mod voice;
+
 #[derive(Clone, Debug)]
 pub enum TextEnd {
     Stop(u32),
@@ -33,6 +41,35 @@ pub enum TextEnd {
 pub struct DecodedText {
     pub text: String,
     pub end: TextEnd,
+}
+
+/// Raw output at the injected speech-inference boundary. It is not execution proof.
+pub struct DecodedSpeech {
+    pub tokens: Vec<u32>,
+    pub frames: Vec<Vec<u32>>,
+    pub samples: Vec<f32>,
+    pub end: TextEnd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V3AsrMode {
+    MetalF16,
+    CpuF32,
+}
+
+/// Execute a local R2T2 transcription with the explicitly selected v3 mode.
+/// The result alone is not a verified-development credential.
+pub fn transcribe_v3_r2t2(
+    audio: &Path,
+    model: &Path,
+    binary: &Path,
+    mode: V3AsrMode,
+    stop: &AtomicBool,
+) -> Result<AsrEvent, String> {
+    match mode {
+        V3AsrMode::MetalF16 => crate::speech_asr::transcribe(audio, model, binary, stop),
+        V3AsrMode::CpuF32 => voice::transcribe_cpu(audio, model, binary, stop),
+    }
 }
 
 pub struct V3Options<'a> {
@@ -53,6 +90,8 @@ struct Prepared {
     candidate_file: PathBuf,
     evaluator: PathBuf,
     parameters: serde_json::Value,
+    text_options: GenerationOptions,
+    voice: Option<voice::VoiceFormat>,
 }
 
 fn interrupted(stop: &AtomicBool) -> Result<(), String> {
@@ -132,7 +171,10 @@ fn hash_regular(path: &Path, limit: u64, stop: &AtomicBool) -> Result<String, St
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn text_parameters(model: &Path, backend: &str) -> Result<serde_json::Value, String> {
+fn text_parameters(
+    model: &Path,
+    backend: &str,
+) -> Result<(serde_json::Value, GenerationOptions), String> {
     let config: serde_json::Value =
         serde_json::from_slice(&read_regular(&model.join("config.json"), 8 * 1024 * 1024)?)
             .map_err(|e| e.to_string())?;
@@ -182,20 +224,35 @@ fn text_parameters(model: &Path, backend: &str) -> Result<serde_json::Value, Str
     {
         return Err("invalid registered generation parameters".into());
     }
-    Ok(
-        serde_json::json!({"backend":backend,"precision":"f32","decode":"greedy","max_tokens":32,
+    let options = GenerationOptions {
+        max_tokens: 32,
+        stop_tokens: stops,
+        suppress_tokens: suppress,
+    };
+    let parameters = serde_json::json!({"backend":backend,"precision":"f32","decode":"greedy","max_tokens":options.max_tokens,
         "input_sample_rate":16000,"context":"fresh_per_input","max_context_tokens":context,
-        "stop_tokens":stops,"suppress_tokens":suppress,"instruction":INSTRUCTION,"output_speech":"not_run"}),
-    )
+        "stop_tokens":options.stop_tokens,"suppress_tokens":options.suppress_tokens,"instruction":INSTRUCTION,"output_speech":"not_run"});
+    Ok((parameters, options))
 }
 
 fn prepare<B: AutodiffBackend>(
     options: &V3Options<'_>,
     device: &B::Device,
     stop: &AtomicBool,
+    asr_mode: V3AsrMode,
 ) -> Result<Prepared, String> {
     interrupted(stop)?;
     let dataset = NumberAudioV3::load(options.data, options.model, stop)?;
+    if options.r2t2.is_some()
+        && dataset
+            .development()
+            .dev()
+            .len()
+            .checked_mul(6)
+            .is_none_or(|count| count > voice::MAX_OBSERVATIONS)
+    {
+        return Err("speech comparison exceeds the observation limit".into());
+    }
     let backend = B::name(device);
     let protocol = AudioProtocol::for_v3(options.model, &dataset, backend.clone(), stop)?;
     let checkpoint_state = options.state.join("number-audio-v3");
@@ -214,8 +271,7 @@ fn prepare<B: AutodiffBackend>(
         })
         .ok_or("invalid v3 candidate pointer")?
         .to_owned();
-    let checkpoint =
-        AudioCheckpoint::load(&checkpoint_state, &protocol)?.ok_or("missing v3 checkpoint")?;
+    let checkpoint = load_matching_checkpoint(&checkpoint_state, &protocol, &candidate)?;
     if checkpoint.progress().updates == 0 {
         return Err("v3 candidate has no training updates".into());
     }
@@ -226,7 +282,18 @@ fn prepare<B: AutodiffBackend>(
         return Err("v3 candidate content mismatch".into());
     }
     let evaluator = std::env::current_exe().map_err(|e| e.to_string())?;
-    let parameters = text_parameters(options.model, &backend)?;
+    let (mut parameters, text_options) = text_parameters(options.model, &backend)?;
+    let voice = if options.r2t2.is_some() {
+        let format = voice::VoiceFormat::load(options.model)?;
+        let mut speech_policy = format.policy(asr_mode);
+        speech_policy["text_stop_tokens"] = serde_json::json!(text_options.stop_tokens);
+        speech_policy["text_suppress_tokens"] =
+            serde_json::json!(&text_options.suppress_tokens[..4]);
+        parameters["output_speech"] = speech_policy;
+        Some(format)
+    } else {
+        None
+    };
     interrupted(stop)?;
     Ok(Prepared {
         dataset,
@@ -236,7 +303,26 @@ fn prepare<B: AutodiffBackend>(
         candidate_file,
         evaluator,
         parameters,
+        text_options,
+        voice,
     })
+}
+
+/// Bind the loaded snapshot itself to the candidate observed by the caller.
+/// This checks identity only; it does not attest training or quality.
+pub fn load_matching_checkpoint(
+    state: &Path,
+    protocol: &AudioProtocol,
+    candidate: &str,
+) -> Result<AudioCheckpoint, String> {
+    let checkpoint = AudioCheckpoint::load(state, protocol)?.ok_or("missing v3 checkpoint")?;
+    // `AudioCheckpoint::save` hashes the JSON value, not the struct directly.
+    let value = serde_json::to_value(&checkpoint).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    if format!("{:x}", Sha256::digest(&bytes)) != candidate {
+        return Err("loaded checkpoint identity differs from the candidate pointer".into());
+    }
+    Ok(checkpoint)
 }
 
 fn registration_options<'a>(
@@ -260,20 +346,23 @@ fn registration_options<'a>(
     }
 }
 
-fn leases(state: &Path) -> Result<(Lease, Lease, Lease), String> {
+fn leases(state: &Path) -> Result<(Lease, Lease, Lease, Lease), String> {
     let foreground = Lease::try_acquire(&state.join("foreground.lock"))?
         .ok_or("another RSI foreground request is active")?;
     let device = Lease::try_acquire(&state.join("device.lock"))?
         .ok_or("another RSI process owns the device lease")?;
     let training = Lease::try_acquire(&state.join("audio-training.lock"))?
         .ok_or("another audio trainer owns this state")?;
-    Ok((foreground, device, training))
+    let checkpoint = Lease::try_acquire(&state.join("number-audio-v3/audio-training.lock"))?
+        .ok_or("another audio trainer owns this state")?;
+    Ok((foreground, device, training, checkpoint))
 }
 
 fn policy(prepared: &Prepared, registered: &RegisteredDevelopment) -> serde_json::Value {
     serde_json::json!({"version":1,"protocol_sha256":registered.protocol_sha256(),
         "parameters":prepared.parameters,"candidate_sha256":prepared.candidate,
-        "v3_evaluation_source_sha256":format!("{:x}",Sha256::digest(include_bytes!("number_v3_evaluation.rs")))})
+        "v3_evaluation_source_sha256":format!("{:x}",Sha256::digest(include_bytes!("number_v3_evaluation.rs"))),
+        "v3_voice_source_sha256":format!("{:x}",Sha256::digest(include_bytes!("number_v3_voice.rs")))})
 }
 
 fn ensure_same_data(prepared: &Prepared, registered: &RegisteredDevelopment) -> Result<(), String> {
@@ -304,7 +393,12 @@ fn write_noclobber(path: &Path, bytes: &[u8], stop: &AtomicBool) -> Result<(), S
         .map_err(|e| e.error.to_string())?;
     fs::File::open(parent)
         .and_then(|file| file.sync_all())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "file published at {} but directory durability is unconfirmed: {e}",
+                path.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -314,6 +408,28 @@ pub fn preregister_v3<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
+    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16)
+}
+
+/// Register an explicitly selected local R2T2 backend and precision.
+pub fn preregister_v3_with_asr<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+    mode: V3AsrMode,
+) -> Result<serde_json::Value, String> {
+    if options.r2t2.is_none() {
+        return Err("ASR mode requires a local R2T2 model and executable".into());
+    }
+    preregister_with_mode::<B>(options, device, stop, mode)
+}
+
+fn preregister_with_mode<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+    mode: V3AsrMode,
+) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
     let _leases = leases(options.state)?;
     match fs::symlink_metadata(options.registration) {
@@ -321,7 +437,7 @@ pub fn preregister_v3<B: AutodiffBackend>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let before = prepare::<B>(options, device, stop)?;
+    let before = prepare::<B>(options, device, stop, mode)?;
     // Validate the actual optimizer snapshot before a registration can be frozen.
     drop(before.checkpoint.restore::<B>(device)?);
     let registration = preregister(
@@ -330,7 +446,7 @@ pub fn preregister_v3<B: AutodiffBackend>(
         stop,
     )?;
     ensure_same_data(&before, &registration)?;
-    let after = prepare::<B>(options, device, stop)?;
+    let after = prepare::<B>(options, device, stop, mode)?;
     if before.candidate != after.candidate
         || before.protocol != after.protocol
         || before.parameters != after.parameters
@@ -380,6 +496,7 @@ fn run_v3<B: AutodiffBackend>(
     options: &V3Options<'_>,
     device: &B::Device,
     stop: &AtomicBool,
+    mode: V3AsrMode,
     run: impl FnOnce(&Prepared, &RegisteredDevelopment) -> Result<serde_json::Value, String>,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
@@ -389,7 +506,7 @@ fn run_v3<B: AutodiffBackend>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let before = prepare::<B>(options, device, stop)?;
+    let before = prepare::<B>(options, device, stop, mode)?;
     let registered = verify_registration(
         &registration_options(options, &before),
         options.registration,
@@ -400,7 +517,7 @@ fn run_v3<B: AutodiffBackend>(
     validate_frozen_mapping(&registered)?;
     let mut report = run(&before, &registered)?;
     interrupted(stop)?;
-    let after = prepare::<B>(options, device, stop)?;
+    let after = prepare::<B>(options, device, stop, mode)?;
     if before.candidate != after.candidate
         || before.protocol != after.protocol
         || before.parameters != after.parameters
@@ -441,9 +558,165 @@ pub fn evaluate_v3_with<B: AutodiffBackend>(
     stop: &AtomicBool,
     infer: impl FnMut(&str, &str, &[f32]) -> Result<DecodedText, String>,
 ) -> Result<serde_json::Value, String> {
-    run_v3::<B>(options, device, stop, |_, registered| {
-        compare_registered_with(registered, stop, infer)
+    run_v3::<B>(
+        options,
+        device,
+        stop,
+        V3AsrMode::MetalF16,
+        |_, registered| compare_registered_with(registered, stop, infer),
+    )
+}
+
+/// Injected speech and ASR are explicitly unverified, including when paths are registered.
+pub fn evaluate_v3_voice_with<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    voice_dir: &Path,
+    device: &B::Device,
+    stop: &AtomicBool,
+    mode: V3AsrMode,
+    infer: impl FnMut(&str, &str, &[f32]) -> Result<(DecodedText, DecodedSpeech), String>,
+    transcribe: impl FnMut(&Path) -> Result<AsrEvent, String>,
+) -> Result<serde_json::Value, String> {
+    if options.r2t2.is_none() {
+        return Err("speech comparison requires a registered local R2T2".into());
+    }
+    run_v3::<B>(options, device, stop, mode, |prepared, registered| {
+        compare_voice(
+            registered,
+            prepared,
+            voice_dir,
+            stop,
+            infer,
+            transcribe,
+            "injected_unverified",
+        )
     })
+}
+
+fn compare_voice(
+    registered: &RegisteredDevelopment,
+    prepared: &Prepared,
+    voice_dir: &Path,
+    stop: &AtomicBool,
+    mut infer: impl FnMut(&str, &str, &[f32]) -> Result<(DecodedText, DecodedSpeech), String>,
+    mut transcribe: impl FnMut(&Path) -> Result<AsrEvent, String>,
+    source: &'static str,
+) -> Result<serde_json::Value, String> {
+    let format = prepared.voice.as_ref().ok_or("speech was not registered")?;
+    if registered
+        .data()
+        .dev()
+        .len()
+        .checked_mul(6)
+        .is_none_or(|count| count > voice::MAX_OBSERVATIONS)
+    {
+        return Err("speech comparison exceeds the observation limit".into());
+    }
+    let mut writer = voice::VoiceWriter::new(voice_dir, format)?;
+    let mut speech = Vec::new();
+    let mut report = compare_registered_with(registered, stop, |arm, instruction, samples| {
+        let (text, audio) = infer(arm, instruction, samples)?;
+        speech.push(writer.observe(audio, stop, &mut transcribe, source)?);
+        Ok(text)
+    })?;
+    writer.finish(stop)?;
+    let cases: HashMap<_, _> = registered
+        .data()
+        .dev()
+        .iter()
+        .map(|c| (c.id(), c))
+        .collect();
+    let rows = report["observations"]
+        .as_array_mut()
+        .ok_or("missing observations")?;
+    if rows.len() != speech.len() {
+        return Err("missing speech observations".into());
+    }
+    let mut asr_runs = 0_usize;
+    for (row, mut output) in rows.iter_mut().zip(speech) {
+        let transcript = output["transcript"]
+            .as_str()
+            .ok_or("missing transcript")?
+            .to_owned();
+        if let Some(id) = row["audio_case_id"].as_str() {
+            let answer = cases.get(id).ok_or("unknown speech input")?.answer();
+            let reference =
+                crate::speech_audio_data::number_text(answer).ok_or("invalid answer")?;
+            let correct = if output["valid"] == true {
+                serde_json::json!(
+                    output["normal_end"] == true
+                        && answer_number(&transcript) == u16::try_from(answer).ok()
+                )
+            } else {
+                serde_json::Value::Null
+            };
+            let cer = if output["valid"] == true {
+                serde_json::json!(character_error_rate(&reference, &transcript)?)
+            } else {
+                serde_json::Value::Null
+            };
+            output["reference"] = reference.into();
+            output["cer"] = cer;
+            output["numeric_correct"] = correct;
+        } else {
+            output["cer"] = serde_json::Value::Null;
+            output["silence_numeric"] = if output["valid"] == true {
+                mentions_number(&transcript).into()
+            } else {
+                serde_json::Value::Null
+            };
+        }
+        asr_runs += usize::from(output["valid"] == true);
+        row["speech"] = output;
+    }
+    let total = rows.len();
+    let mut arms = serde_json::Map::new();
+    for arm in ["baseline", "candidate"] {
+        let mut conditions = serde_json::Map::new();
+        for condition in ["original", "swapped", "silence"] {
+            let selected: Vec<_> = rows
+                .iter()
+                .filter(|row| row["arm"] == arm && row["condition"] == condition)
+                .collect();
+            let cer: Vec<_> = selected
+                .iter()
+                .filter_map(|row| row["speech"]["cer"].as_f64())
+                .collect();
+            let mean_cer = if cer.is_empty() {
+                None
+            } else {
+                Some(cer.iter().sum::<f64>() / cer.len() as f64)
+            };
+            conditions.insert(condition.into(), serde_json::json!({"observations":selected.len(),
+                "valid_audio":selected.iter().filter(|row| row["speech"]["valid"] == true).count(),
+                "normal_end":selected.iter().filter(|row| row["speech"]["normal_end"] == true).count(),
+                "cer_cases":cer.len(),"mean_case_cer":mean_cer,
+                "numeric_correct":selected.iter().filter(|row| row["speech"]["numeric_correct"] == true).count(),
+                "silence_numeric_mentions":selected.iter().filter(|row| row["speech"]["silence_numeric"] == true).count()}));
+        }
+        arms.insert(arm.into(), conditions.into());
+    }
+    let status = if asr_runs == 0 {
+        "not_run_no_valid_audio"
+    } else if asr_runs < total {
+        "partial_unverified"
+    } else {
+        "measured_unverified"
+    };
+    report["output_speech_r2t2_cer"] = serde_json::json!({"status":status,"asr_runs":asr_runs,
+        "transcript_source":if asr_runs == 0 { "not_run" } else { source },
+        "reference":"rule_chinese_answer","silence_reference":null,
+        "by_arm":arms});
+    if let Some(missing) = report["missing_evidence"].as_array_mut() {
+        if asr_runs == total {
+            missing.retain(|value| value.as_str() != Some("output speech and local R2T2"));
+        }
+        missing.push("independent human listening of generated speech".into());
+        if source == "injected_unverified" {
+            missing.push("actual local speech and R2T2 execution".into());
+        }
+    }
+    Ok(report)
 }
 
 /// Run real local Rust/Burn base and candidate inference; no candidate is activated.
@@ -452,56 +725,202 @@ pub fn evaluate_v3<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    run_v3::<B>(options, device, stop, |prepared, registered| {
+    if options.r2t2.is_some() {
+        return Err("registered R2T2 requires the explicit v3 speech output directory".into());
+    }
+    run_v3::<B>(
+        options,
+        device,
+        stop,
+        V3AsrMode::MetalF16,
+        |prepared, registered| {
+            let optimizer = prepared.checkpoint.restore::<B>(device)?;
+            let (a, b) = optimizer.export()?;
+            drop(optimizer);
+            let mut model = OmniModel::<B>::load(options.model, Precision::F32, device)
+                .map_err(|e| e.to_string())?;
+            if model.text.hidden_size() != prepared.protocol.width {
+                return Err("loaded v3 model width changed".into());
+            }
+            prepared.protocol.verify_model(options.model, stop)?;
+            let mut report =
+                compare_registered_with(registered, stop, |arm, instruction, samples| {
+                    interrupted(stop)?;
+                    if arm == "baseline" {
+                        model.text.clear_conv_lora(23).map_err(|e| e.to_string())?;
+                    } else {
+                        model
+                            .text
+                            .install_conv_lora(23, 4, &a, &b)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    let messages = [serde_json::json!({"role":"user","content":[
+                {"type":"text","text":instruction},{"type":"audio"}]})];
+                    let media = [model
+                        .prepare_audio(samples, 16_000)
+                        .map_err(|e| e.to_string())?];
+                    let prompt = model
+                        .prepare_prompt(&messages, None, &media)
+                        .map_err(|e| e.to_string())?;
+                    // These are the same options serialized into the frozen policy.
+                    let result = generate_greedy(
+                        &model.text,
+                        prompt.embeddings,
+                        &mut model.new_text_cache(),
+                        &prepared.text_options,
+                        stop,
+                        |_| true,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let text = model
+                        .tokenizer
+                        .decode(&result.tokens, true)
+                        .map_err(|e| e.to_string())?;
+                    let end = match result.reason {
+                        EndReason::Stop(id) => TextEnd::Stop(id),
+                        EndReason::Limit => TextEnd::Limit,
+                        EndReason::Cancelled => TextEnd::Cancelled,
+                    };
+                    Ok(DecodedText { text, end })
+                })?;
+            report["execution"] = "local_rust_burn_unverified".into();
+            Ok(report)
+        },
+    )
+}
+
+/// Compare real local model speech and transcribe it using the registered R2T2.
+pub fn evaluate_v3_voice<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    voice_dir: &Path,
+    device: &B::Device,
+    stop: &AtomicBool,
+    mode: V3AsrMode,
+) -> Result<serde_json::Value, String> {
+    let (asr_model, asr_binary) = options
+        .r2t2
+        .ok_or("speech comparison requires local R2T2")?;
+    run_v3::<B>(options, device, stop, mode, |prepared, registered| {
+        let format = prepared.voice.as_ref().ok_or("speech was not registered")?;
         let optimizer = prepared.checkpoint.restore::<B>(device)?;
         let (a, b) = optimizer.export()?;
         drop(optimizer);
         let mut model = OmniModel::<B>::load(options.model, Precision::F32, device)
             .map_err(|e| e.to_string())?;
-        if model.text.hidden_size() != prepared.protocol.width {
-            return Err("loaded v3 model width changed".into());
+        let speech_options = voice::omni_options();
+        let sampling = speech_options
+            .effective_audio_sampling(model.audio_sampling_defaults())
+            .map_err(|e| e.to_string())?;
+        if model.text.hidden_size() != prepared.protocol.width
+            || model.speech_code_format() != (format.codebooks, format.vocab, format.eos)
+            || model.codec.sample_rate() != 24_000
+            || sampling.temperature != speech_options.audio_temperature
+            || sampling.top_k != format.top_k
+            || sampling.repetition_penalty != speech_options.audio_repetition_penalty
+        {
+            return Err("loaded model speech parameters differ from the frozen protocol".into());
         }
         prepared.protocol.verify_model(options.model, stop)?;
-        let mut report = compare_registered_with(registered, stop, |arm, instruction, samples| {
-            interrupted(stop)?;
-            if arm == "baseline" {
-                model.text.clear_conv_lora(23).map_err(|e| e.to_string())?;
-            } else {
-                model
-                    .text
-                    .install_conv_lora(23, 4, &a, &b)
+        let mut report = compare_voice(
+            registered,
+            prepared,
+            voice_dir,
+            stop,
+            |arm, instruction, samples| {
+                interrupted(stop)?;
+                if arm == "baseline" {
+                    model.text.clear_conv_lora(23).map_err(|e| e.to_string())?;
+                } else {
+                    model
+                        .text
+                        .install_conv_lora(23, 4, &a, &b)
+                        .map_err(|e| e.to_string())?;
+                }
+                let messages = [serde_json::json!({"role":"user","content":[
+                    {"type":"text","text":instruction},{"type":"audio"}]})];
+                let media = [model
+                    .prepare_audio(samples, 16_000)
+                    .map_err(|e| e.to_string())?];
+                let prompt = model
+                    .prepare_prompt(&messages, None, &media)
                     .map_err(|e| e.to_string())?;
-            }
-            let messages = [serde_json::json!({"role":"user","content":[
-                {"type":"text","text":instruction},{"type":"audio"}]})];
-            let media = [model
-                .prepare_audio(samples, 16_000)
-                .map_err(|e| e.to_string())?];
-            let result = model
-                .generate_text(
-                    &messages,
-                    None,
-                    &media,
+                let text_result = generate_greedy(
+                    &model.text,
+                    prompt.embeddings,
                     &mut model.new_text_cache(),
-                    32,
+                    &prepared.text_options,
                     stop,
                     |_| true,
                 )
                 .map_err(|e| e.to_string())?;
-            let text = model
-                .tokenizer
-                .decode(&result.tokens, true)
-                .map_err(|e| e.to_string())?;
-            let end = match result.reason {
-                EndReason::Stop(id) => TextEnd::Stop(id),
-                EndReason::Limit => TextEnd::Limit,
-                EndReason::Cancelled => TextEnd::Cancelled,
-            };
-            Ok(DecodedText { text, end })
-        })?;
+                let text = model
+                    .tokenizer
+                    .decode(&text_result.tokens, true)
+                    .map_err(|e| e.to_string())?;
+                let mut streamed_samples = 0_usize;
+                let mut invalid_stream = false;
+                let audio = model
+                    .generate_omni(
+                        &messages,
+                        None,
+                        &media,
+                        &mut model.new_text_cache(),
+                        &speech_options,
+                        stop,
+                        |event| {
+                            if let omni_lfm3::generate::OmniEvent::Pcm {
+                                samples,
+                                sample_rate,
+                            } = event
+                            {
+                                match streamed_samples.checked_add(samples.len()) {
+                                    Some(next)
+                                        if *sample_rate == 24_000 && next <= voice::MAX_SAMPLES =>
+                                    {
+                                        streamed_samples = next;
+                                    }
+                                    _ => {
+                                        invalid_stream = true;
+                                        return false;
+                                    }
+                                }
+                            }
+                            true
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
+                if invalid_stream {
+                    return Err(
+                        "speech stream exceeds the registered PCM format or sample limit".into(),
+                    );
+                }
+                Ok((
+                    DecodedText {
+                        text,
+                        end: text_end(text_result.reason),
+                    },
+                    DecodedSpeech {
+                        tokens: audio.tokens,
+                        frames: audio.audio_frames,
+                        samples: audio.samples,
+                        end: text_end(audio.reason),
+                    },
+                ))
+            },
+            |wav| transcribe_v3_r2t2(wav, asr_model, asr_binary, mode, stop),
+            "local_r2t2_run_unverified",
+        )?;
         report["execution"] = "local_rust_burn_unverified".into();
         Ok(report)
     })
+}
+
+fn text_end(reason: EndReason) -> TextEnd {
+    match reason {
+        EndReason::Stop(id) => TextEnd::Stop(id),
+        EndReason::Limit => TextEnd::Limit,
+        EndReason::Cancelled => TextEnd::Cancelled,
+    }
 }
 
 #[derive(Serialize)]

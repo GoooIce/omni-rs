@@ -1,7 +1,10 @@
 //! Explicit local rule-data construction and development comparison.
 use omni_rsi::{
     lease::Lease,
-    number_v3_evaluation::{V3Options, evaluate_v3, preregister_v3},
+    number_v3_evaluation::{
+        V3AsrMode, V3Options, evaluate_v3, evaluate_v3_voice, preregister_v3,
+        preregister_v3_with_asr,
+    },
     speech_asr,
     speech_audio_data::generate_rule_manifest,
     speech_audio_target::encode_target,
@@ -25,7 +28,7 @@ type ModelBackend = burn::backend::NdArray<f32>;
 compile_error!("select the cpu or metal feature");
 type TrainingBackend = burn::backend::Autodiff<ModelBackend>;
 
-const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n  number_audio preregister-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR [TOOL OPTIONS]\n  number_audio dev-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON [TOOL OPTIONS]\n\nTOOL OPTIONS: --r2t2-model PATH --r2t2-binary PATH --breeze-model PATH --breeze-binary PATH (each model/binary pair is optional). V3 output speech is not_run. Reports never activate a candidate.";
+const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n  number_audio preregister-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR [TOOL OPTIONS]\n  number_audio dev-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON [TOOL OPTIONS]\n\nTOOL OPTIONS: --r2t2-model PATH --r2t2-binary PATH [--r2t2-mode cpu-f32|metal-f16] --breeze-model PATH --breeze-binary PATH. For dev-v3 with R2T2, --voice-dir NEW_DIRECTORY is required. Reports never activate a candidate.";
 
 #[derive(Default)]
 struct LocalTools {
@@ -33,6 +36,8 @@ struct LocalTools {
     r2t2_binary: Option<PathBuf>,
     breeze_model: Option<PathBuf>,
     breeze_binary: Option<PathBuf>,
+    r2t2_mode: Option<V3AsrMode>,
+    voice_dir: Option<PathBuf>,
 }
 
 fn local_tools(args: &[std::ffi::OsString]) -> Result<LocalTools, String> {
@@ -41,11 +46,23 @@ fn local_tools(args: &[std::ffi::OsString]) -> Result<LocalTools, String> {
         return Err("local tool options require paths".into());
     }
     for pair in args.as_chunks::<2>().0 {
+        if pair[0] == "--r2t2-mode" {
+            let mode = match pair[1].to_str() {
+                Some("cpu-f32") => V3AsrMode::CpuF32,
+                Some("metal-f16") => V3AsrMode::MetalF16,
+                _ => return Err("invalid R2T2 mode".into()),
+            };
+            if result.r2t2_mode.replace(mode).is_some() {
+                return Err("duplicate R2T2 mode".into());
+            }
+            continue;
+        }
         let slot = match pair[0].to_str() {
             Some("--r2t2-model") => &mut result.r2t2_model,
             Some("--r2t2-binary") => &mut result.r2t2_binary,
             Some("--breeze-model") => &mut result.breeze_model,
             Some("--breeze-binary") => &mut result.breeze_binary,
+            Some("--voice-dir") => &mut result.voice_dir,
             _ => return Err("unknown local tool option".into()),
         };
         if slot.replace(PathBuf::from(&pair[1])).is_some() {
@@ -57,7 +74,20 @@ fn local_tools(args: &[std::ffi::OsString]) -> Result<LocalTools, String> {
     {
         return Err("local tools require both model and binary".into());
     }
+    if result.r2t2_model.is_none() && (result.r2t2_mode.is_some() || result.voice_dir.is_some()) {
+        return Err("R2T2 mode and voice directory require a model and binary".into());
+    }
     Ok(result)
+}
+
+fn validate_v3_tool_options(is_registration: bool, tools: &LocalTools) -> Result<(), String> {
+    if is_registration && tools.voice_dir.is_some() {
+        return Err("voice directory is selected only for dev-v3".into());
+    }
+    if !is_registration && tools.r2t2_model.is_some() && tools.voice_dir.is_none() {
+        return Err("dev-v3 with R2T2 requires --voice-dir NEW_DIRECTORY".into());
+    }
+    Ok(())
 }
 
 fn execute() -> Result<(), String> {
@@ -163,6 +193,7 @@ fn execute() -> Result<(), String> {
                 return Err(USAGE.into());
             }
             let tools = local_tools(&args[positional..])?;
+            validate_v3_tool_options(is_registration, &tools)?;
             let model = Path::new(&args[1]);
             let data = Path::new(&args[2]);
             let state = Path::new(&args[3]);
@@ -188,8 +219,24 @@ fn execute() -> Result<(), String> {
                     .as_deref()
                     .zip(tools.breeze_binary.as_deref()),
             };
-            let result = if is_registration {
+            let mode = tools.r2t2_mode.unwrap_or(V3AsrMode::MetalF16);
+            let result = if is_registration && options.r2t2.is_some() {
+                preregister_v3_with_asr::<TrainingBackend>(
+                    &options,
+                    &Default::default(),
+                    &stop,
+                    mode,
+                )?
+            } else if is_registration {
                 preregister_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
+            } else if let Some(directory) = tools.voice_dir.as_deref() {
+                evaluate_v3_voice::<TrainingBackend>(
+                    &options,
+                    directory,
+                    &Default::default(),
+                    &stop,
+                    mode,
+                )?
             } else {
                 evaluate_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
             };
@@ -231,5 +278,42 @@ mod tests {
         assert!(local_tools(&args(&["--cloud", "m"])).is_err());
         assert!(local_tools(&args(&["--r2t2-model", "m", "--r2t2-binary", "b"])).is_ok());
         assert!(local_tools(&args(&["--breeze-model", "m", "--breeze-binary", "b"])).is_ok());
+        assert!(local_tools(&args(&["--r2t2-mode", "cpu-f32"])).is_err());
+        assert!(local_tools(&args(&["--voice-dir", "out"])).is_err());
+        assert!(
+            local_tools(&args(&[
+                "--r2t2-model",
+                "m",
+                "--r2t2-binary",
+                "b",
+                "--r2t2-mode",
+                "cpu-f32",
+                "--voice-dir",
+                "out"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            local_tools(&args(&[
+                "--r2t2-model",
+                "m",
+                "--r2t2-binary",
+                "b",
+                "--r2t2-mode",
+                "cloud"
+            ]))
+            .is_err()
+        );
+    }
+    #[test]
+    fn dev_v3_requires_a_voice_directory_when_r2t2_is_selected() {
+        let args = ["--r2t2-model", "m", "--r2t2-binary", "b"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        let tools = local_tools(&args).unwrap();
+        let error = validate_v3_tool_options(false, &tools).unwrap_err();
+        assert!(error.contains("--voice-dir"), "{error}");
+        assert!(validate_v3_tool_options(true, &tools).is_ok());
     }
 }

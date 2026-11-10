@@ -4,15 +4,34 @@
 
 [独立 v3 数据入口和开发协议预注册](number-development-preregistration.md)提供输入隔离、目标语音码和显式训练路径。新增的 v3 本地比较可以执行真实开发推理，但尚不能完成正式验收；格式及 mock 测试不能作为联合训练质量的证据。
 
-`number_audio preregister-v3 MODEL DATA STATE REGISTRATION` 在训练后检查 v3 检查点、实际模型与数据、当前评估程序和已有回归计划，再在新目录冻结协议及 `v3-evaluation-policy.json`。`number_audio dev-v3 MODEL DATA STATE REGISTRATION REPORT` 只接受该注册：重算身份并使用冻结的不同答案一对一交换，在底座和候选上各运行原音、交换音、等长静音；每次使用全新 cache，并保留逐题原文、实际音频 PCM 身份、臂、条件及终止原因。评估只向模型提供固定指令和 PCM。注册和报告均不可覆盖，过程使用前台、设备和训练租约；失败或取消不产生完整报告。
+`number_audio preregister-v3 MODEL DATA STATE REGISTRATION` 在训练后检查 v3 检查点、实际模型与数据、当前评估程序和已有回归计划，再在新目录冻结协议及 `v3-evaluation-policy.json`。`number_audio dev-v3 MODEL DATA STATE REGISTRATION REPORT` 只接受该注册：重算身份并使用冻结的不同答案一对一交换，在底座和候选上各运行原音、交换音、等长静音；每次使用全新 cache，并保留逐题原文、实际音频 PCM 身份、臂、条件及终止原因。评估只向模型提供固定指令和 PCM。注册和报告均不可覆盖，过程持有前台、设备、父状态及实际检查点目录的训练租约。
+
+发布前失败或取消不会发布完整报告；报告或注册策略文件成功发布后，若父目录同步失败，错误会明确提示文件已发布但持久化未确认。此时文件可能存在且不可直接用同一路径重试，操作者应检查原工件；程序不会自动删除或覆盖它。语音输出目录在生成前独占创建，失败或取消可能留下不完整目录，同样不会自动覆盖或删除。
 
 显式本地权重验证可运行 `number_v3_train` 测试中被忽略的 `v3_real_registered_development_with_local_weights`，先设置 `LFM3_MODEL`、`LFM3_NUMBER_V3_DATA`、`LFM3_NUMBER_V3_STATE`，使用匹配源码训练出的检查点，并传 `-- --ignored --exact`。探索数据的假盲承诺只能用于烟雾检查；该测试的成功不表示来源、回归或模型质量已验收。
 
-冻结文本解码策略记录由实际模型配置和生成配置解析的停止/抑制 token、上下文长度、后端，以及 FP32、贪心、32 token 和 16 kHz；评估前后重验模型、候选、数据、二进制、策略和注册。配置和代码身份约束遵守流程的本机运行，不能作为操作系统对进程映像或真实来源的认证。可用 `--r2t2-model`/`--r2t2-binary` 和 `--breeze-model`/`--breeze-binary` 成对绑定本地工具，但此入口尚未运行语音生成或 R2T2，报告明确为 `not_run`；五类回归也只冻结输入，未执行。
+冻结文本解码策略记录由实际模型配置和生成配置解析的停止/抑制 token、上下文长度、后端，以及 FP32、贪心、32 token 和 16 kHz；真实文本生成直接使用生成该记录的同一组选项。评估前后重验模型、候选、数据、二进制、策略和注册；加载到内存的检查点也按保存使用的规范 JSON 重算身份。配置和代码身份约束遵守流程的本机运行，不能作为操作系统对进程映像或真实来源的认证。
 
-报告中的数字评分复用已有中文/阿拉伯数字和静音字面规则，成对统计复用 `number_gate`；其来源独立性仍只是分组声明。当前真实或注入执行均固定为 `insufficient_evidence`、`candidate_eligible=false`，不构造保留集凭据、不读取保留秘密或发布候选。注入回调标记为 `injected_unverified`，不能作为真实执行或质量证据。
+提供 `--r2t2-model MODEL --r2t2-binary BINARY` 时，注册和运行均可显式选择 `--r2t2-mode cpu-f32` 或 `metal-f16`；省略模式保留旧的 Metal/F16 默认。注册后 `dev-v3` 必须使用同一模式、同一工具身份，并额外指定尚不存在的 `--voice-dir DIRECTORY`。CPU/F32 使用独立验证器标识，固定中间 token 上限 32、最终上限 128；任一转写事件报告截断、取消或缺少最终状态均失败关闭。Metal/F16 沿用既有调用参数。语音生成的停止条件、采样参数、codec 格式和 R2T2 参数均冻结并重验。未配置 R2T2 时输出语音明确为 `not_run`；`--breeze-model`/`--breeze-binary` 只绑定身份，五类回归也只冻结输入，均未执行。
 
-本切片改动了预注册源码和交换策略，而 v3 训练数据身份绑定该源码；应先合入并审查训练/预注册修复，再以稳定的同一源码和二进制训练、注册、比较。已有旧检查点和旧注册不得伪装迁移；保留原工件和原二进制。并行修复的 `FrozenSwaps` 只读接口在合并时需核对协议身份绑定和一对一语义。
+例如，在操作者已准备好本地模型、匹配的训练状态和隔离数据后，可用同一构建程序显式注册和比较（`REGISTRATION`、`REPORT`、`VOICE_DIR` 均须是新路径）：
+
+```sh
+cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu --example number_audio -- \
+  preregister-v3 "$MODEL" "$DATA" "$STATE" "$REGISTRATION" \
+  --r2t2-model "$R2T2_MODEL" --r2t2-binary "$R2T2_BINARY" --r2t2-mode cpu-f32
+cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu --example number_audio -- \
+  dev-v3 "$MODEL" "$DATA" "$STATE" "$REGISTRATION" "$REPORT" \
+  --r2t2-model "$R2T2_MODEL" --r2t2-binary "$R2T2_BINARY" --r2t2-mode cpu-f32 --voice-dir "$VOICE_DIR"
+```
+
+语音目录保存每个条件/臂的原始 tokens、codec 帧和 24 kHz float WAV，报告记录相对于 `--voice-dir` 的文件名、SHA-256、生成结束原因、有效性、转写原文与按实际输入答案计算的逐题 CER；应同时保留报告和完整语音目录以便复核。按臂和条件统计的 `mean_case_cer` 是已有逐题 CER 的算术平均，并记录可计算题数。有效性只检查帧形状、码值、结束标记位置及有限非零 PCM，不证明可懂度或语音质量；正常结束还要求已登记的文本停止 token 和最终全码本 EOS。有效但异常结束的语音可以计算转写 CER，数字正确标志仍为假；不能仅凭 CER 判断通过。无效音频不运行 ASR，CER 为 `null`；全部或部分无效时分别标记 ASR 未运行或部分运行。静音没有规则答案，CER 为 `null`。CER 沿用既有字符口径，数字同值另用现有数字评分判断。R2T2 返回空语种时保留空原文并标记 `unknown`，不据此推断中文。即使没有截断标记，ASR 仍可能漏词；生成语音的独立人工听审仍未完成，工具转写不是人工真值。
+
+语音比较预先限制最多 6,000 条条件观察（即 1,000 个完整开发题）、每条最多 180 个生成 slot 和 30 秒输出、总输出不超过 1,200 秒；超限拒绝，不抽样截断。CPU/F32 R2T2 每条通过独立本地进程调用，单次超时为 300 秒，实际耗时可能很长；其标准输出/错误在进程退出后检查 4 MiB 上限，运行期间的临时文件增长不能视作严格磁盘配额。模型和工具目录仍须由操作者保持可信、稳定并与保留秘密隔离。
+
+报告中的数字评分复用已有中文/阿拉伯数字和静音字面规则，成对统计复用 `number_gate`；其来源独立性仍只是分组声明。`silence_numeric_rate` 是输出中出现数字字面的比例，不等同于幻觉率，例如“请再说一遍”也可能被计入。当前真实或注入执行均固定为 `insufficient_evidence`、`candidate_eligible=false`，不构造保留集凭据、不读取保留秘密或发布候选。注入回调标记为 `injected_unverified`，不能作为真实执行或质量证据。
+
+本语音评测切片不修改训练源码或 `number_development.rs` 的数据、冻结交换实现；相对于相同训练基线，不能仅凭它要求重新训练。它扩展了评测入口的预注册策略，评测程序和策略身份会改变，因此旧注册不得伪装迁移，应保留旧文件及原二进制，并用新评测程序选择新的注册目录。其他合并若改变训练实现或数据源码，须按其实际检查点身份单独判断兼容性。
 
 真实本地评估入口沿用训练协议：从模型目录、codec、实际数据快照和候选检查点计算身份，运行后重新核对；还记录评分/比较相关源码与锁定依赖的指纹，以及评估程序文件运行前后的 SHA-256。报告中的评分协议固定整数判定和静音字面检测方法。程序文件哈希是对磁盘文件的变化检查，不是操作系统对进程加载映像或实际计算的证明；来源、授权、人工标注等声明也不会因哈希存在就变真。
 
