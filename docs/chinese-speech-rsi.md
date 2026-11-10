@@ -16,6 +16,8 @@
 
 音频条件听答路线已开始实现：训练前向通过推理所用的媒体绑定路径接收 16 kHz 输入音频，以答案文字、语音码和结束帧共同更新独立 LoRA；答案文字不放进输入提示。[训练步骤](../crates/omni-rsi/src/speech_audio.rs)和[独立检查点](../crates/omni-rsi/src/speech_audio_checkpoint.rs)已实现，检查点校验模型、codec、数据、后端、源码与进度，并保存在 `audio-conditioned-v1` 子目录。该路线**尚未接入闲时调度**：规则真值数据的生成与准入、训练入口及独立生成验收仍待完成（见 [#81](https://github.com/GoooIce/omni-rs/issues/81)、[#82](https://github.com/GoooIce/omni-rs/issues/82)）。现有 `speech-watch` 仍执行自朗读路线；音频条件前向的数值对照和参数更新不代表听答能力已提高。
 
+[语气数据与反事实评估合同](speech-tone-contract.md)是独立的 Rust 准入与已有预测汇总基础设施，保留多人分歧、弃判及逐题来源；它尚未接入训练或模型推理，也不证明真实语气识别能力。
+
 检查点绑定训练源码。更新相关实现后，旧源码生成的检查点会拒绝续训；历史状态不被删除或自动迁移。开发用官方模型对照脚本只生成测试参考，实际训练和优化仍使用 Rust／Burn。
 
 ## 流程与边界
