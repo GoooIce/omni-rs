@@ -111,6 +111,102 @@ fn identical_audio_cannot_be_hidden_behind_new_provenance() {
 }
 
 #[test]
+fn identical_pcm_in_one_split_requires_the_same_rule_answer() {
+    let (root, mut manifest) = fixture();
+    let mut repeated = manifest["records"][0].clone();
+    repeated["id"] = "repeated-train".into();
+    manifest["records"].as_array_mut().unwrap().push(repeated);
+    write_manifest(root.path(), &manifest);
+    assert!(AudioDataset::load(root.path(), &AtomicBool::new(false)).is_ok());
+
+    let repeated = &mut manifest["records"][3];
+    repeated["spoken_number"] = 15.into();
+    repeated["spoken_text"] = "十五".into();
+    repeated["answer"] = "十六".into();
+    repeated["provenance"]["verified_text"] = "十五".into();
+    write_manifest(root.path(), &manifest);
+    let error = AudioDataset::load(root.path(), &AtomicBool::new(false))
+        .err()
+        .expect("accepted contradictory answers for identical PCM");
+    assert!(
+        error.contains("audio") && error.contains("answer"),
+        "{error}"
+    );
+}
+
+#[test]
+fn realistic_number_research_dataset_fits_the_bounded_snapshot() {
+    let (root, mut manifest) = fixture();
+    let originals = manifest["records"].as_array().unwrap().clone();
+    let mut records = Vec::new();
+    for (source, count, amplitude) in originals
+        .into_iter()
+        .zip([120, 30, 50])
+        .zip([1_i16, 2, 3])
+        .map(|((record, count), amplitude)| (record, count, amplitude))
+    {
+        let path = root.path().join(source["input_audio"].as_str().unwrap());
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..16_000 * 4 {
+            writer.write_sample(amplitude).unwrap();
+        }
+        writer.finalize().unwrap();
+        let digest = format!("{:x}", Sha256::digest(fs::read(path).unwrap()));
+        for index in 0..count {
+            let mut record = source.clone();
+            record["id"] = format!("{}-{index}", source["id"].as_str().unwrap()).into();
+            record["input_sha256"] = digest.clone().into();
+            records.push(record);
+        }
+    }
+    manifest["records"] = records.into();
+    write_manifest(root.path(), &manifest);
+    let dataset = AudioDataset::load(root.path(), &AtomicBool::new(false)).unwrap();
+    assert_eq!(dataset.len(), 120);
+    drop(dataset);
+    let extra = manifest["records"][0].clone();
+    for index in 0..101 {
+        let mut record = extra.clone();
+        record["id"] = format!("extra-{index}").into();
+        manifest["records"].as_array_mut().unwrap().push(record);
+    }
+    write_manifest(root.path(), &manifest);
+    assert!(AudioDataset::load(root.path(), &AtomicBool::new(false)).is_err());
+}
+
+#[test]
+fn short_nonempty_speech_is_transcribed_without_assuming_it_is_correct() {
+    use omni_rsi::speech_number_evaluation::inspect_speech_output;
+    use std::cell::Cell;
+    let calls = Cell::new(0);
+    let frames = vec![vec![1, 2], vec![3, 4], vec![9, 9]];
+    let output = inspect_speech_output(&frames, &[0.1, -0.1], 9, true, |_| {
+        calls.set(calls.get() + 1);
+        Ok(("十七".into(), "Chinese".into()))
+    })
+    .unwrap();
+    assert!(output.normal_end && output.valid);
+    assert_eq!(output.transcript, "十七");
+    assert_eq!(calls.get(), 1);
+    for samples in [&[0.0_f32, 0.0][..], &[f32::NAN][..], &[][..]] {
+        let output = inspect_speech_output(&frames, samples, 9, true, |_| {
+            panic!("invalid audio must not reach ASR")
+        })
+        .unwrap();
+        assert!(!output.valid);
+    }
+}
+
+#[test]
 fn the_recorded_spoken_text_must_match_the_rule_input() {
     let (root, mut manifest) = fixture();
     manifest["records"][0]["spoken_text"] = "十五".into();

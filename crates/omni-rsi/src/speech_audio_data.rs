@@ -17,7 +17,8 @@ use unicode_normalization::UnicodeNormalization;
 const MAX_MANIFEST: u64 = 8 * 1024 * 1024;
 const MAX_WAV: u64 = 32 * 1024 * 1024;
 const MAX_SAMPLES: usize = 16_000 * 20;
-const MAX_DATASET_SAMPLES: usize = 16_000 * 600;
+// At most 1,200 seconds across every split (76.8 MB of decoded f32 PCM).
+const MAX_DATASET_SAMPLES: usize = 16_000 * 1_200;
 const NUMBER_INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
 
 #[derive(Deserialize)]
@@ -395,11 +396,15 @@ impl AudioDataset {
                     pcm.update(bits.to_le_bytes());
                 }
                 let pcm_hash = pcm.finalize();
-                if audio_splits
-                    .insert(pcm_hash, record.split.clone())
-                    .is_some_and(|previous| previous != record.split)
-                {
-                    return Err(format!("audio crosses splits: {}", record.id));
+                if let Some((split, answer)) = audio_splits.get(&pcm_hash) {
+                    if split != &record.split {
+                        return Err(format!("audio crosses splits: {}", record.id));
+                    }
+                    if answer != &record.answer {
+                        return Err(format!("audio has contradictory answers: {}", record.id));
+                    }
+                } else {
+                    audio_splits.insert(pcm_hash, (record.split.clone(), record.answer.clone()));
                 }
             }
             if record.split == partition {

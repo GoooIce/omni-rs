@@ -73,6 +73,10 @@ fn model() -> TextModel<TrainingBackend> {
 
 fn close(actual: Vec<f32>, expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
+    assert!(
+        actual.iter().chain(expected).all(|value| value.is_finite()),
+        "non-finite numerical comparison"
+    );
     let error = actual
         .iter()
         .zip(expected)
@@ -82,6 +86,17 @@ fn close(actual: Vec<f32>, expected: &[f32], tolerance: f32) {
         error < tolerance,
         "maximum error {error}, tolerance {tolerance}"
     );
+}
+
+#[test]
+fn numerical_comparison_rejects_nonfinite_values() {
+    for (actual, expected) in [
+        (f32::NAN, 0.0),
+        (0.0, f32::NAN),
+        (f32::INFINITY, f32::INFINITY),
+    ] {
+        assert!(std::panic::catch_unwind(|| close(vec![actual], &[expected], 0.01)).is_err());
+    }
 }
 
 #[test]

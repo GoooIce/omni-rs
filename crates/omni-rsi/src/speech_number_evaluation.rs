@@ -1,7 +1,7 @@
 //! Paired observations for the rule-labelled audio-answer task.
 use crate::{
     speech_asr,
-    speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol, audio_implementation_hash},
+    speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol},
     speech_audio_data::AudioDataset,
     speech_data::file_hash,
     speech_ingest::write_pcm,
@@ -11,7 +11,6 @@ use omni_lfm3::{
     Precision,
     generate::{EndReason, OmniOptions, OutputMode},
     model::OmniModel,
-    speech_adapter::source_fingerprint,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +42,44 @@ pub struct SpeechOutput {
     pub language: String,
     pub normal_end: bool,
     pub valid: bool,
+}
+
+/// Assess generated speech and invoke the supplied local transcriber only for
+/// decodable audio. Transcript quality is assessed separately against the rule.
+pub fn inspect_speech_output<F>(
+    audio_frames: &[Vec<u32>],
+    samples: &[f32],
+    eos: u32,
+    ended_normally: bool,
+    mut transcribe: F,
+) -> Result<SpeechOutput, String>
+where
+    F: FnMut(&[f32]) -> Result<(String, String), String>,
+{
+    let normal_end = ended_normally
+        && audio_frames
+            .last()
+            .is_some_and(|frame| frame.iter().all(|code| *code == eos));
+    let frames = audio_frames.len().saturating_sub(usize::from(normal_end));
+    let valid = frames > 0
+        && audio_frames
+            .iter()
+            .take(frames)
+            .all(|frame| !frame.is_empty() && frame.iter().all(|code| *code < eos))
+        && !samples.is_empty()
+        && samples.iter().all(|sample| sample.is_finite())
+        && samples.iter().any(|sample| sample.abs() >= 0.001);
+    let (transcript, language) = if valid {
+        transcribe(samples)?
+    } else {
+        (String::new(), String::new())
+    };
+    Ok(SpeechOutput {
+        transcript,
+        language,
+        normal_end,
+        valid,
+    })
 }
 
 pub struct DevelopmentOptions<'a> {
@@ -117,29 +154,9 @@ pub fn evaluate_development<B: AutodiffBackend>(
     } else {
         None
     };
-    let base_hash = source_fingerprint(options.model).map_err(|error| error.to_string())?;
-    let codec_hash = file_hash(&options.model.join("audio_tokenizer/model.safetensors"))?;
-    let config: serde_json::Value = serde_json::from_slice(
-        &fs::read(options.model.join("config.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let width = config
-        .pointer("/text_config/hidden_size")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|width| usize::try_from(width).ok())
-        .filter(|width| (4..=65_536).contains(width))
-        .ok_or("invalid audio model width")?;
-    let protocol = AudioProtocol {
-        version: 1,
-        base_hash: base_hash.clone(),
-        codec_hash: codec_hash.clone(),
-        dataset_hash: training.digest().into(),
-        implementation_hash: audio_implementation_hash(),
-        backend: B::name(device),
-        width,
-        train_records: training.len(),
-        mask_seed: 159,
-    };
+    let protocol = AudioProtocol::for_dataset(options.model, &training, B::name(device), stop)?;
+    let base_hash = protocol.base_hash.clone();
+    let codec_hash = protocol.codec_hash.clone();
     let candidate = checkpoint_id(options.state)?;
     let checkpoint =
         AudioCheckpoint::load(options.state, &protocol)?.ok_or("missing audio checkpoint")?;
@@ -151,7 +168,7 @@ pub fn evaluate_development<B: AutodiffBackend>(
     drop(optimizer);
     let mut model = OmniModel::<B>::load(options.model, Precision::F32, device)
         .map_err(|error| error.to_string())?;
-    if model.text.hidden_size() != width {
+    if model.text.hidden_size() != protocol.width {
         return Err("loaded audio model width changed".into());
     }
     let mut spoken = Vec::new();
@@ -215,51 +232,31 @@ pub fn evaluate_development<B: AutodiffBackend>(
                 return Err("interrupted".into());
             }
             let (_, _, eos) = model.speech_code_format();
-            let normal_end = matches!(&result.reason, EndReason::Stop(_))
-                && result
-                    .audio_frames
-                    .last()
-                    .is_some_and(|frame| frame.iter().all(|code| *code == eos));
-            let frames = result
-                .audio_frames
-                .len()
-                .saturating_sub(usize::from(normal_end));
-            let valid = frames >= 7
-                && result
-                    .audio_frames
-                    .iter()
-                    .take(frames)
-                    .all(|frame| frame.iter().all(|code| *code < eos))
-                && !result.samples.is_empty()
-                && result.samples.iter().all(|sample| sample.is_finite())
-                && result.samples.iter().any(|sample| sample.abs() >= 0.001);
-            let (transcript, language) = if valid {
-                let path = scratch
-                    .as_ref()
-                    .ok_or("missing speech scratch directory")?
-                    .path()
-                    .join(format!("{:06}.wav", spoken.len()));
-                write_pcm(&path, &result.samples, 24_000)?;
-                let event = speech_asr::transcribe(&path, asr_model, asr_binary, stop)?;
-                (event.text, event.language)
-            } else {
-                (String::new(), String::new())
-            };
-            spoken.push(SpeechOutput {
-                transcript,
-                language,
-                normal_end,
-                valid,
-            });
+            let output = inspect_speech_output(
+                &result.audio_frames,
+                &result.samples,
+                eos,
+                matches!(&result.reason, EndReason::Stop(_)),
+                |samples| {
+                    let path = scratch
+                        .as_ref()
+                        .ok_or("missing speech scratch directory")?
+                        .path()
+                        .join(format!("{:06}.wav", spoken.len()));
+                    write_pcm(&path, samples, 24_000)?;
+                    let event = speech_asr::transcribe(&path, asr_model, asr_binary, stop)?;
+                    Ok((event.text, event.language))
+                },
+            )?;
+            spoken.push(output);
         }
         Ok((text, matches!(result.reason, EndReason::Stop(_))))
     })?;
     if stop.load(Ordering::Acquire) {
         return Err("interrupted".into());
     }
-    if source_fingerprint(options.model).map_err(|error| error.to_string())? != base_hash
-        || file_hash(&options.model.join("audio_tokenizer/model.safetensors"))? != codec_hash
-        || checkpoint_id(options.state)? != candidate
+    protocol.verify_model(options.model, stop)?;
+    if checkpoint_id(options.state)? != candidate
         || file_hash(
             &options
                 .state

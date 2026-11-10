@@ -341,6 +341,14 @@ pub fn final_event(output: &str) -> Result<AsrEvent, String> {
     {
         return Err("R2T2 did not return exactly one final event".into());
     }
+    // The limit belongs to each decode turn. A later turn may no longer have
+    // all earlier audio or may retain a committed prefix from a capped turn.
+    if events
+        .iter()
+        .any(|event| event.get("token_limit_reached") != Some(&serde_json::Value::Bool(false)))
+    {
+        return Err("R2T2 transcription reached a token limit or omitted its status".into());
+    }
     let event = events.last().ok_or("R2T2 returned no event")?;
     if event.get("is_final") != Some(&serde_json::Value::Bool(true))
         || event.get("cancelled") != Some(&serde_json::Value::Bool(false))

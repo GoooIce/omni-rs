@@ -2,15 +2,12 @@
 use crate::{
     lease::Lease,
     speech_audio::{AudioAnswer, train_step},
-    speech_audio_checkpoint::{
-        AudioCheckpoint, AudioProgress, AudioProtocol, audio_implementation_hash,
-    },
-    speech_audio_data::{AudioDataset, AudioRecord},
-    speech_data::file_hash,
+    speech_audio_checkpoint::{AudioCheckpoint, AudioProgress, AudioProtocol},
+    speech_audio_data::AudioDataset,
     speech_training::{SpeechOptimizer, validate_speech_frames},
 };
 use burn::tensor::backend::AutodiffBackend;
-use omni_lfm3::{Precision, model::OmniModel, speech_adapter::source_fingerprint};
+use omni_lfm3::{Precision, model::OmniModel};
 use serde::Serialize;
 use std::{
     path::Path,
@@ -42,24 +39,6 @@ fn cancelled(stop: &AtomicBool) -> Result<(), String> {
     }
 }
 
-fn answer(record: &AudioRecord) -> Result<AudioAnswer<'_>, String> {
-    match &record.frames {
-        Some(frames) => AudioAnswer::new(
-            record.samples(),
-            16_000,
-            &record.instruction,
-            &record.answer,
-            frames,
-        ),
-        None => AudioAnswer::new_text_only(
-            record.samples(),
-            16_000,
-            &record.instruction,
-            &record.answer,
-        ),
-    }
-}
-
 pub fn train_audio_round<B: AutodiffBackend>(
     options: &AudioRoundOptions<'_>,
     device: &B::Device,
@@ -86,43 +65,11 @@ pub fn train_audio_round<B: AutodiffBackend>(
         _ => {}
     }
     let dataset = AudioDataset::load(options.data, stop)?;
-    let base_hash = source_fingerprint(options.model).map_err(|error| error.to_string())?;
-    cancelled(stop)?;
-    let codec_hash = file_hash(&options.model.join("audio_tokenizer/model.safetensors"))?;
+    let protocol = AudioProtocol::for_dataset(options.model, &dataset, B::name(device), stop)?;
     for index in 0..dataset.len() {
-        let record = dataset.record(index).ok_or("missing audio record")?;
-        if record
-            .target_codec_sha256
-            .as_ref()
-            .is_some_and(|hash| hash != &codec_hash)
-        {
-            return Err("audio target codec does not match the current model".into());
-        }
-        answer(record)?;
+        AudioAnswer::from_dataset(&dataset, index)?;
     }
     cancelled(stop)?;
-    let config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(options.model.join("config.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let width = config
-        .get("text_config")
-        .and_then(|text| text.get("hidden_size"))
-        .and_then(|width| width.as_u64())
-        .and_then(|width| usize::try_from(width).ok())
-        .filter(|width| (4..=65_536).contains(width))
-        .ok_or("invalid audio training model width")?;
-    let protocol = AudioProtocol {
-        version: 1,
-        base_hash,
-        codec_hash,
-        dataset_hash: dataset.digest().to_owned(),
-        implementation_hash: audio_implementation_hash(),
-        backend: B::name(device),
-        width,
-        train_records: dataset.len(),
-        mask_seed: 159,
-    };
     let saved = if options.resume {
         Some(
             AudioCheckpoint::load(options.state, &protocol)?
@@ -135,11 +82,8 @@ pub fn train_audio_round<B: AutodiffBackend>(
     let mut model = OmniModel::<B>::load(options.model, Precision::F32, device)
         .map_err(|error| error.to_string())?;
     cancelled(stop)?;
-    if source_fingerprint(options.model).map_err(|error| error.to_string())? != protocol.base_hash
-        || file_hash(&options.model.join("audio_tokenizer/model.safetensors"))?
-            != protocol.codec_hash
-        || model.text.hidden_size() != protocol.width
-    {
+    protocol.verify_model(options.model, stop)?;
+    if model.text.hidden_size() != protocol.width {
         return Err("audio training model changed while loading".into());
     }
     for index in 0..dataset.len() {
@@ -161,10 +105,7 @@ pub fn train_audio_round<B: AutodiffBackend>(
     let mut count = 0;
     while progress.epoch < options.epochs && count < options.max_updates {
         cancelled(stop)?;
-        let record = dataset
-            .record(progress.next_index)
-            .ok_or("invalid audio checkpoint index")?;
-        let example = answer(record)?;
+        let example = AudioAnswer::from_dataset(&dataset, progress.next_index)?;
         let seed = protocol.seed_for_step(&progress)?;
         train_step(&mut model, &mut optimizer, &example, seed, stop)?;
         progress.updates += 1;

@@ -120,6 +120,125 @@ fn model_fingerprint_matches_the_training_protocol() {
         omni_lfm3::speech_adapter::source_fingerprint(root.path()).unwrap(),
         "0b18187cb93ae794dd516170f2da8b01a0406eea316ce32701d39263987ffb57"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let codec = root.path().join("audio_tokenizer");
+        fs::rename(
+            codec.join("config.json"),
+            root.path().join("codec-config.data"),
+        )
+        .unwrap();
+        symlink("../codec-config.data", codec.join("config.json")).unwrap();
+        let first = omni_lfm3::speech_adapter::source_fingerprint(root.path()).unwrap();
+        fs::write(
+            root.path().join("codec-config.data"),
+            b"changed codec config",
+        )
+        .unwrap();
+        assert_ne!(
+            first,
+            omni_lfm3::speech_adapter::source_fingerprint(root.path()).unwrap()
+        );
+        fs::rename(
+            codec.join("model.safetensors"),
+            root.path().join("codec-weights.data"),
+        )
+        .unwrap();
+        symlink("../codec-weights.data", codec.join("model.safetensors")).unwrap();
+        let first = omni_lfm3::speech_adapter::source_fingerprint(root.path()).unwrap();
+        fs::write(
+            root.path().join("codec-weights.data"),
+            b"changed codec weights",
+        )
+        .unwrap();
+        assert_ne!(
+            first,
+            omni_lfm3::speech_adapter::source_fingerprint(root.path()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn indexed_model_fingerprint_tracks_the_index_and_loaded_shards() {
+    let root = tempfile::tempdir().unwrap();
+    for name in [
+        "model.safetensors",
+        "config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+        "audio_tokenizer/config.json",
+        "audio_tokenizer/model.safetensors",
+        "model-01.safetensors",
+        "model-02.safetensors",
+    ] {
+        let path = root.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("{name}\n")).unwrap();
+    }
+    let index = root.path().join("model.safetensors.index.json");
+    fs::write(
+        &index,
+        br#"{"weight_map":{"a":"model-01.safetensors","b":"model-02.safetensors"}}"#,
+    )
+    .unwrap();
+    let fingerprint = || omni_lfm3::speech_adapter::source_fingerprint(root.path());
+    let first = fingerprint().unwrap();
+    fs::write(root.path().join("model.safetensors"), b"unused single file").unwrap();
+    assert_eq!(first, fingerprint().unwrap());
+    fs::write(root.path().join("model-02.safetensors"), b"changed shard").unwrap();
+    let changed = fingerprint().unwrap();
+    assert_ne!(first, changed);
+    fs::write(
+        &index,
+        br#"{ "weight_map":{"a":"model-01.safetensors","b":"model-02.safetensors"}}"#,
+    )
+    .unwrap();
+    assert_ne!(changed, fingerprint().unwrap());
+    fs::remove_file(root.path().join("model.safetensors")).unwrap();
+    assert!(fingerprint().is_ok());
+    fs::remove_file(root.path().join("model-01.safetensors")).unwrap();
+    assert!(fingerprint().is_err());
+}
+
+#[test]
+fn indexed_codec_fingerprint_tracks_the_index_and_loaded_shards() {
+    let root = tempfile::tempdir().unwrap();
+    for name in [
+        "model.safetensors",
+        "config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+        "audio_tokenizer/config.json",
+        "audio_tokenizer/part.safetensors",
+        "audio_tokenizer/model.safetensors",
+    ] {
+        let path = root.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("{name}\n")).unwrap();
+    }
+    let codec = root.path().join("audio_tokenizer");
+    let index = codec.join("model.safetensors.index.json");
+    fs::write(&index, br#"{"weight_map":{"a":"part.safetensors"}}"#).unwrap();
+    let fingerprint = || omni_lfm3::speech_adapter::source_fingerprint(root.path());
+    let first = fingerprint().unwrap();
+    fs::write(codec.join("model.safetensors"), b"unused single file").unwrap();
+    assert_eq!(first, fingerprint().unwrap());
+    fs::write(&index, br#"{ "weight_map":{"a":"part.safetensors"}}"#).unwrap();
+    let changed_index = fingerprint().unwrap();
+    assert_ne!(first, changed_index);
+    fs::write(codec.join("part.safetensors"), b"changed shard").unwrap();
+    assert_ne!(changed_index, fingerprint().unwrap());
+    fs::remove_file(codec.join("model.safetensors")).unwrap();
+    assert!(fingerprint().is_ok());
+    fs::remove_file(codec.join("part.safetensors")).unwrap();
+    assert!(fingerprint().is_err());
 }
 
 #[test]
