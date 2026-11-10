@@ -146,10 +146,13 @@ pub(crate) fn ensure_safe_acl(file: &File) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(
-    target_os = "linux",
-    target_endian = "little",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn validate_linux_acl(bytes: &[u8], mode_owner: Option<u16>) -> Result<(), String> {
     if bytes.len() < 4
@@ -184,6 +187,10 @@ fn validate_linux_acl(bytes: &[u8], mode_owner: Option<u16>) -> Result<(), Strin
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "private_acl_linux_tests.rs"]
+mod linux_acl_tests;
 
 #[cfg(not(any(
     target_os = "macos",

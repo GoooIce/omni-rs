@@ -18,6 +18,16 @@ v2 清单承诺为 `SHA256(domain || salt || len(manifest) || manifest || len(si
 
 私有封存和盲读的平台范围有限：macOS 拒绝扩展 ACL；Linux 仅在小端 x86_64/aarch64、文件描述符识别为 tmpfs 或 btrfs，且对象属当前有效用户、显式安全访问 ACL 可读、目录另有显式安全默认 ACL 时支持。ACL 不能授予其他用户或组权限；`ENODATA`、权限错误、ACL 不支持和未知文件系统均失败关闭。没有这些 ACL 的普通目录、除 btrfs 外的普通磁盘文件系统和 overlayfs 仍不支持；这是对旧 Linux 私有 API 的窄范围恢复。隔离容器的非特权合成测试覆盖这两种文件系统和架构，并不证明所有挂载与存储安全。tmpfs 会随重启丢失，账本和审计日志不能只保存在 tmpfs；使用可信持久存储与备份。其他平台的私有路径不支持，公开格式和独立账本计算仍可用。更详细的并发替换边界见 [正式保留流程](number-formal-holdout.md)。
 
+仓内 ACL 字节解析回归使用固定合成向量，可在非 Linux 平台运行；它不证明当地文件系统支持 Linux ACL。涉及真实继承的 Linux 合成测试默认标记为 ignored，因为普通临时目录可能不在受支持的文件系统上。提供一个供当前非特权用户写入的 tmpfs（或将 `RSI_EXPECT_FS` 改为 `btrfs` 并提供相应目录），可显式运行：
+
+```sh
+RSI_ACL_TEST_ROOT=/path/to/test-tmpfs RSI_EXPECT_FS=tmpfs cargo test --offline --locked \
+  --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features cpu \
+  --lib number_blind_holdout::tests::linux_acl_tests -- --ignored --nocapture
+```
+
+测试会先核对文件系统类型并显式设置 ACL；不支持 ACL、权限不足或类型不符时失败，不把跳过计为通过。这些是临时合成数据，不授予真实保留读取资格。
+
 ## 读取和失败语义
 
 评估侧仅解析公开 JSON。未来只有真实证据验证器产生的不可伪造凭据才能调用正式读取路径。当前独立实现先核对凭据与公开元数据指纹；Linux 在占用前还只检查私有目录本身的身份、权限和 ACL，不读取秘密内容。之后通过共享账本为承诺及来源身份同步记录占用，再检查私有目录并打开盐、秘密清单和媒体。任何账本锁冲突、已用来源、记录损坏或占用失败都发生在私有文件访问之前。

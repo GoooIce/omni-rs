@@ -2,6 +2,14 @@
 //! constructible in a production build and never establish model quality.
 use super::*;
 
+#[cfg(all(
+    target_os = "linux",
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "number_blind_holdout_linux_tests.rs"]
+mod linux_acl_tests;
+
 fn manifest() -> BlindManifest {
     BlindManifest {
         cases: vec![BlindCase {
