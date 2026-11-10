@@ -24,6 +24,7 @@ pub mod speech_ingest;
 pub mod speech_publish;
 pub mod speech_round;
 pub mod speech_seed;
+pub mod speech_tone;
 pub mod speech_training;
 pub mod storage;
 pub mod watchdog;
