@@ -12,6 +12,8 @@
 
 上述结果来自历史 PyTorch 实验。现在种子数据准备、`speech-watch` 的录音入队、LiquidCodec 编解码、语音损失、LoRA 更新、开发集生成验收与候选发布均走 Rust／Burn；Breeze-TTS 和 R2T2 使用本仓库的 Rust 可执行文件。模型对照脚本保留为开发测试工具。新的 Burn 检查点与历史 PyTorch 检查点分开保存，不自动互相续训。
 
+2026-11-10 的隔离 Rust／Burn 实验以本机 6 条种子完成一轮 Metal 训练，并用固定 10 题与 R2T2 比较：底座 CER 为 60.3%，候选为 87.2%，正常结束分别为 10/10 和 8/10。候选未通过门槛，没有发布；该开发集结果不能代表最终保留集表现。闲时调度的 mock 验证独立进行。
+
 ## 流程与边界
 
 1. 已有种子集按训练、开发、测试预先分组，由冻结的 LFM3 和本仓库 Breeze-TTS-2 生成中文文字与语音。24 kHz 源波形经 LFM3 的 LiquidCodec 编码，再重解码为训练目标；记录源音频、目标音频、语音码及模型／可执行文件指纹。
@@ -41,7 +43,15 @@ target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$QUALITY_ST
   --epochs 1 --updates-per-round 6
 ```
 
-本机种子训练集当前有 6 条，完整 epoch 的报告位于 `$QUALITY_STATE/speech-native/epoch-1.json`。这是开发集比较，不是最终保留集结果；前台执行会占用计算资源，任务中断后可用相同命令和状态目录续跑。历史 PyTorch 对照的候选未通过开发门槛；当前 Rust/Burn 训练尚无完整生成对照，mock 调度通过不能证明语音质量提高。
+本机种子训练集当前有 6 条，完整 epoch 的报告位于 `$QUALITY_STATE/speech-native/epoch-1.json`。这是开发集比较，不是最终保留集结果；前台执行会占用计算资源，任务中断后可用相同命令和状态目录续跑。历史 PyTorch 对照的候选未通过开发门槛；Rust/Burn 的效果以其独立报告为准，mock 调度通过不能证明语音质量提高。
+
+报告生成后可用同一份固定题集独立汇总 CER、正常结束数量和开发门槛，不加载模型：
+
+```sh
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/Cargo.toml \
+  --no-default-features --features native,cpu --example speech_quality_report -- \
+  "$QUALITY_STATE/speech-native/epoch-1.json"
+```
 
 ## 在线语音：启用、状态与停止
 

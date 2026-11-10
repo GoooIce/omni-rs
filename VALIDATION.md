@@ -2126,4 +2126,10 @@ WebGPU 提供原生 WGSL 后端和浏览器 Wasm/module worker。权重分成最
 - 屏蔽 `uv`、`python` 和 `python3` 命令后，真实 LFM3 权重在 CPU 上完成两次 Burn 更新，中间从完整检查点恢复；这是隔离状态下的功能测试，不是语音质量结论。见 `artifacts/rust-burn-speech/real-cpu-round.log`。
 - 真实 LiquidCodec 配合确定性 R2T2 测试替身完成了录音认领、编码、核验和原子发布；原生队列、历史和新 R2T2 指纹、数据隔离、优化器恢复及候选加载器均有独立回归。15 条保留真人录音的源文件与采集指纹也已核对。
 - 新种子入口使用已有 Breeze 浮点波形和真实 LiquidCodec，在确定性 Breeze／R2T2 测试替身下完成转码、核验、原子发布和续跑；篡改语音码后拒绝复用。见 `artifacts/rust-burn-speech/seed-real-codec-test.log`。这不等于实际运行 Breeze 或 R2T2 的 GPU 质量验证。
-- 真实 R2T2／Metal 录音入训测试在检测到前台操作时主动让出；最终 Metal 训练和真实 R2T2 入训验证尚待空闲时完成。无合格候选，未建立中文语音质量改善；旧 PyTorch 检查点不会自动迁移。
+- 真实 R2T2／Metal 录音入训测试在检测到前台操作时主动让出；后续独立完成的 Metal 训练和语音生成对照见下节，真实录音入训仍未完成。无合格候选，未建立中文语音质量改善；旧 PyTorch 检查点不会自动迁移。
+
+### 调度与质量分别验证（2026-11-10）
+
+- 调度生命周期使用 mock 空闲信号和 mock 工作负载验证了等待、活动时让出、前台请求让出、恢复、待处理任务不计轮数和停止。该测试不证明实际系统信号或语音质量，日志见 `artifacts/idle-quality-validation/mock-idle-final.log`。
+- 独立状态 `artifacts/chinese-speech/quality-native-v1` 使用真实 LFM3 权重、Metal／Burn 和 R2T2 跑完种子集 6 次更新及 10 题开发集基线／候选对照。基线 CER 60.3%，候选 87.2%；正常结束分别为 10/10 和 8/10，候选未通过门槛且没有发布。朗读组基线／候选分别有 0／2 个字符错误，对话组为 47／66 个；CER 按固定题集的字母数字规范化计算，英语等插入也计入错误。完整结果见该状态目录下的 `speech-native/epoch-1.json`，汇总见 `artifacts/idle-quality-validation/quality-summary.json`。这是一次小规模开发集实验，不能代表最终保留集或其他能力表现。
+- 原在线学习调度器已恢复运行，目前等待用户主动提供语音；没有排队或已核验的在线录音，尚未重新完成真实录音入训验证。旧检查点与这次隔离质量实验仍然分开。
