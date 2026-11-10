@@ -314,6 +314,7 @@ fn missing_rustup_locations_are_reported_even_with_test_output_capture() {
         .args([
             "--exact",
             "rustup_injected_cargo_home_keeps_valid_identity_and_detects_override",
+            "--ignored",
         ])
         .env_remove("HOME")
         .env_remove("CARGO_HOME")
@@ -329,6 +330,86 @@ fn missing_rustup_locations_are_reported_even_with_test_output_capture() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+fn direct_cargo_suite_works_without_rustup_and_reports_missing_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+    let registry_home = std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
+    symlink(registry_home.join("registry"), cargo_home.join("registry")).unwrap();
+    let output = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let sysroot = String::from_utf8(output.stdout).unwrap();
+    let bin = Path::new(sysroot.trim()).join("bin");
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--test-threads=1",
+            "--skip",
+            "direct_cargo_suite_works_without_rustup_and_reports_missing_coverage",
+        ])
+        .env("CARGO_HOME", &cargo_home)
+        .env("RUSTUP_HOME", root.path().join("missing-rustup"))
+        .env("RUSTC", bin.join("rustc"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(
+            "test direct_cargo_with_explicit_home_is_verified_and_rejects_override ... ok"
+        )
+    );
+    for test in [
+        "rustup_injected_cargo_home_keeps_valid_identity_and_detects_override",
+        "rustup_probe_accepts_missing_home_when_locations_are_explicit",
+    ] {
+        assert!(
+            stdout.contains(&format!("test {test} ... ignored")),
+            "{stdout}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn explicitly_requested_rustup_probes_fail_without_a_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    let cargo_home = root.path().join("cargo-home");
+    let rustup_home = root.path().join("rustup-home");
+    fs::create_dir(&cargo_home).unwrap();
+    fs::create_dir(&rustup_home).unwrap();
+    for test in [
+        "rustup_injected_cargo_home_keeps_valid_identity_and_detects_override",
+        "rustup_probe_accepts_missing_home_when_locations_are_explicit",
+    ] {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--ignored"])
+            .env("CARGO_HOME", &cargo_home)
+            .env("RUSTUP_HOME", &rustup_home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "stdout={stdout}\nstderr={stderr}");
+        assert!(stdout.contains("rustup proxy unavailable"), "{stdout}");
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[ignore = "requires a rustup Cargo proxy and rustup home; run explicitly with --ignored"]
 fn rustup_probe_accepts_missing_home_when_locations_are_explicit() {
     let (cargo_home, rustup_home) = rustup_locations()
         .expect("rustup locations unavailable; positive rustup probe is not verified");
@@ -340,6 +421,7 @@ fn rustup_probe_accepts_missing_home_when_locations_are_explicit() {
         .args([
             "--exact",
             "rustup_injected_cargo_home_keeps_valid_identity_and_detects_override",
+            "--ignored",
             "--nocapture",
         ])
         .env_remove("HOME")
@@ -358,6 +440,7 @@ fn rustup_probe_accepts_missing_home_when_locations_are_explicit() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+#[ignore = "requires a rustup Cargo proxy and rustup home; run explicitly with --ignored"]
 fn rustup_injected_cargo_home_keeps_valid_identity_and_detects_override() {
     let (cargo_home, rustup_home) = rustup_locations()
         .expect("rustup locations unavailable; positive rustup probe is not verified");

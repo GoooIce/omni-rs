@@ -31,6 +31,15 @@ jobs:
             exit 1
           fi
           python scripts/check.py cpu
+      - name: Verify rustup build context
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+          CARGO_BUILD_JOBS: 1
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME:?HOME or CARGO_HOME is required}/.cargo}"
+          cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
+            --no-default-features --features native,cpu --target-dir "$PWD/target/minicpm-v-cpu" \
+            --test backend_production_context rustup_ -- --ignored --test-threads=1
       - name: Show check reports
         if: always()
         run: python scripts/check.py status

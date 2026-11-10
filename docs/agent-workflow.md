@@ -46,7 +46,16 @@ After interruption, inspect `./scripts/check status`, then use the report's `res
 
 The CPU audio context precondition is rerun on resume along with the rest of the CPU profile, and `CARGO_HOME` is part of the recorded environment. If sources or the recorded environment have changed, CPU resume still starts all steps from the beginning; it keeps the earlier report only as history. A resume for a different profile is rejected.
 
-The positive Rust build-context probes require a discoverable rustup proxy or direct Cargo executable and an inspectable supported parent process. When those prerequisites are absent, the positive probe fails explicitly instead of counting an unverified identity as a pass; the direct-Cargo failure-closed test remains separate.
+The build-context tests run the direct-Cargo verified and failure-closed probes in the normal CPU suite. Two rustup-specific positive probes are marked ignored there, so a direct-Cargo installation does not need a rustup proxy. An ignored probe is **not verified coverage**. GitHub CI runs them separately after installing rustup; on a host with a rustup proxy at `$CARGO_HOME/bin/cargo` and a valid `RUSTUP_HOME` (or its default), run:
+
+```sh
+CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
+  cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
+  --no-default-features --features native,cpu --test backend_production_context \
+  rustup_ -- --ignored --test-threads=1
+```
+
+The explicit rustup command fails if the proxy, rustup home, inspectable Cargo parent or verified identity is unavailable; it does not turn those conditions into a passing probe. Set `CARGO_HOME` before launching Cargo. On systems without rustup, report the rustup-specific coverage as not run; the production audio identity remains fail-closed when Cargo's actual parent or home cannot be verified.
 
 Before a long operation, keep the current objective, approved scope, accepted decisions, changed paths, last report path and next command in `artifacts/task-checkpoint.json`. Refresh it when a phase completes or a blocker changes. On continuation, read it and the reports before repeating exploration or requesting another approval. A model/server streaming failure may prevent a final message even after files were written: inspect artifacts and running processes first. This repository's runner preserves local work; it cannot retry the hosting assistant's failed model stream.
 
