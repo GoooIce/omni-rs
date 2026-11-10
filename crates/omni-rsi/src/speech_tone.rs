@@ -616,11 +616,11 @@ fn summarize(rows: &[ToneResultRow], labels: &[String]) -> ToneMetrics {
     }
 }
 
-fn valid_key(value: &str) -> bool {
+pub(crate) fn valid_key(value: &str) -> bool {
     !value.is_empty() && value.trim() == value
 }
 
-fn normalized_text(text: &str) -> String {
+pub(crate) fn normalized_text(text: &str) -> String {
     text.nfkc()
         .flat_map(char::to_lowercase)
         .filter(|ch| ch.is_alphanumeric())
