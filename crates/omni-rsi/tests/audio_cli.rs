@@ -34,6 +34,7 @@ fn v3_training_is_an_explicit_cli_choice() {
     assert!(help.contains("--number-v3"), "{help}");
 }
 
+#[cfg(unix)]
 #[test]
 fn v3_cli_resume_uses_its_own_checkpoint_namespace() {
     use std::fs;
@@ -59,18 +60,61 @@ fn v3_cli_resume_uses_its_own_checkpoint_namespace() {
     assert!(state.join("number-audio-v3").is_dir());
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "requires an explicit local LFM3 checkpoint and a v3 dataset with speech then text targets"]
 fn v3_real_cli_trains_speech_and_text_then_resumes() {
     use omni_rsi::number_audio_v3::NumberAudioV3;
-    use std::{path::PathBuf, sync::atomic::AtomicBool};
+    use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
     let model = PathBuf::from(std::env::var_os("LFM3_MODEL").expect("LFM3_MODEL"));
-    let data = PathBuf::from(std::env::var_os("LFM3_NUMBER_V3_DATA").expect("LFM3_NUMBER_V3_DATA"));
+    let source =
+        PathBuf::from(std::env::var_os("LFM3_NUMBER_V3_DATA").expect("LFM3_NUMBER_V3_DATA"));
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("v3-data");
+    fs::create_dir(&data).unwrap();
+    for name in [
+        "layout.v3",
+        "holdout-public.json",
+        "train.groups.v3.json",
+        "dev.groups.v3.json",
+        "train.v3.json",
+        "dev.v3.json",
+    ] {
+        fs::copy(source.join(name), data.join(name)).unwrap();
+    }
+    for name in [
+        "train-media",
+        "dev-media",
+        "train-target-media",
+        "dev-target-media",
+    ] {
+        let from = source.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = data.join(name);
+        fs::create_dir(&to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+    // A declaration about preparation on another backend is not evidence and
+    // must not reject frames that the current codec actually reproduces.
+    let train_path = data.join("train.v3.json");
+    let mut train: serde_json::Value =
+        serde_json::from_slice(&fs::read(&train_path).unwrap()).unwrap();
+    assert_eq!(
+        train["records"][0]["speech_target"]["encoding"],
+        "local_liquidcodec_f32"
+    );
+    train["records"][0]["speech_target"]["runtime_backend"] = "different-historical-backend".into();
+    fs::write(train_path, serde_json::to_vec(&train).unwrap()).unwrap();
     let snapshot = NumberAudioV3::load(&data, &model, &AtomicBool::new(false)).unwrap();
     assert!(snapshot.len() >= 2);
     assert!(snapshot.example(0).unwrap().frames().is_some());
     assert!(snapshot.example(1).unwrap().frames().is_none());
-    let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");
     let run = |resume: bool| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_omni-rsi-audio"));

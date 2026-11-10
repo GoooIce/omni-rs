@@ -175,7 +175,7 @@ fn hex_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn number_text(number: u32) -> Option<String> {
+pub(crate) fn number_text(number: u32) -> Option<String> {
     const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
     match number {
         0..=9 => Some(DIGITS[number as usize].into()),

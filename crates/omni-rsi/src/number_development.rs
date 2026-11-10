@@ -65,6 +65,18 @@ impl SpeechTarget {
     pub fn target_audio_sha256(&self) -> &str {
         &self.target_audio_sha256
     }
+    pub(crate) fn encoding(&self) -> &str {
+        &self.encoding
+    }
+    pub(crate) fn runtime_backend(&self) -> &str {
+        &self.runtime_backend
+    }
+    pub(crate) fn codec_fingerprint_sha256(&self) -> &str {
+        &self.codec_fingerprint_sha256
+    }
+    pub(crate) fn model_config_sha256(&self) -> &str {
+        &self.model_config_sha256
+    }
     pub fn source(&self) -> &serde_json::Map<String, serde_json::Value> {
         &self.source
     }
@@ -845,6 +857,32 @@ fn read_child(
     read_open_file(open_child(directory, name, false)?, limit, stop)
 }
 
+/// Reopen a previously admitted target through no-follow directory handles.
+/// The bytes checked here are the same owned bytes the verifier decodes.
+pub(crate) fn read_target_snapshot(
+    root: &Path,
+    partition: &str,
+    target: &SpeechTarget,
+    stop: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    let directory = match partition {
+        "train" => "train-target-media",
+        "dev" => "dev-target-media",
+        _ => return Err("invalid target partition".into()),
+    };
+    let root = open_root(root)?;
+    let directory = open_child(&root, directory, true)?;
+    let bytes = read_child(&directory, &target.audio_file, MAX_MEDIA, stop)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != target.target_audio_sha256 {
+        return Err("target WAV changed after data loading".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_model_config(path: &Path, stop: &AtomicBool) -> Result<Vec<u8>, String> {
+    read_child(&open_root(path)?, "config.json", MAX_MANIFEST, stop)
+}
+
 fn read_open_file(mut file: File, limit: usize, stop: &AtomicBool) -> Result<Vec<u8>, String> {
     let before = file.metadata().map_err(|e| e.to_string())?;
     if !before.is_file() || before.len() == 0 || before.len() > limit as u64 {
@@ -1375,7 +1413,7 @@ fn fingerprint_files(
 // Existing training/tool fingerprint functions use path-based opens. Only
 // admit a stable, locally controlled tree containing ordinary files and
 // directories; symlinked artifacts cannot redirect them to other inputs.
-fn check_artifact_tree(path: &Path, stop: &AtomicBool) -> Result<(), String> {
+pub(crate) fn check_artifact_tree(path: &Path, stop: &AtomicBool) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err("artifact root must be a real directory".into());
