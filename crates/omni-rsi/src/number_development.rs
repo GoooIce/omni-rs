@@ -171,6 +171,11 @@ impl MediaBudget {
         self.bytes = MAX_TOTAL_MEDIA.checked_sub(remaining).unwrap();
     }
 
+    #[cfg(all(test, unix, feature = "cpu"))]
+    pub(crate) fn test_remaining_samples(&mut self, remaining: usize) {
+        self.samples = MAX_TOTAL_SAMPLES.checked_sub(remaining).unwrap();
+    }
+
     /// Charge a further target decode before allocating its samples.
     pub(crate) fn reserve_target_decode(&mut self, bytes: &[u8]) -> Result<(), String> {
         let wav = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;

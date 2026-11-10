@@ -1,10 +1,12 @@
 //! Compile-time identities for this repository's supported local Cargo patches.
 pub mod build_backend;
+pub mod build_environment;
 
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -13,19 +15,70 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
-fn config_identity(hash: &mut Sha256, cwd: &Path, manifest: &Path) -> Result<(), String> {
+pub fn config_dirs(cwd: &Path, _manifest: &Path, home: Option<&Path>) -> BTreeSet<PathBuf> {
     let mut dirs = BTreeSet::new();
-    for root in [cwd, manifest] {
-        for parent in root.ancestors() {
-            dirs.insert(parent.join(".cargo"));
-        }
+    for parent in cwd.ancestors() {
+        dirs.insert(parent.join(".cargo"));
     }
-    if let Some(home) = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".cargo")))
+    if let Some(home) = home {
+        dirs.insert(home.to_path_buf());
+    }
+    dirs
+}
+
+pub fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    const MAX_CONFIG: u64 = 4 * 1024 * 1024;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
     {
-        dirs.insert(home);
+        use std::os::unix::fs::OpenOptionsExt;
+        // Cargo permits symlinked configs; do not block on a substituted FIFO.
+        options.custom_flags(libc::O_NONBLOCK);
     }
+    match options.open(path) {
+        Ok(file) => {
+            let meta = file.metadata().map_err(|e| e.to_string())?;
+            if !meta.is_file() || meta.len() > MAX_CONFIG {
+                return Err(format!("invalid Cargo configuration: {}", path.display()));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_CONFIG + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > MAX_CONFIG {
+                return Err(format!(
+                    "Cargo configuration exceeds size limit: {}",
+                    path.display()
+                ));
+            }
+            Ok(Some(bytes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub fn manifest_and_repo(manifest: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let manifest = fs::canonicalize(manifest).map_err(|e| e.to_string())?;
+    let repo = manifest
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("missing repo")?
+        .to_path_buf();
+    Ok((manifest, repo))
+}
+
+fn config_identity(hash: &mut Sha256, cwd: &Path, manifest: &Path) -> Result<(), String> {
+    build_environment::watch_configuration_environment();
+    let home = build_environment::cargo_home_from_env().map(|home| {
+        if home.is_absolute() {
+            home
+        } else {
+            cwd.join(home)
+        }
+    });
+    let dirs = config_dirs(cwd, manifest, home.as_deref());
     for dir in dirs {
         // Watching Cargo home itself would rebuild on unrelated registry/cache changes.
         // Watch existing config files, and an existing repository-local .cargo directory.
@@ -38,22 +91,21 @@ fn config_identity(hash: &mut Sha256, cwd: &Path, manifest: &Path) -> Result<(),
         {
             println!("cargo:rerun-if-changed={}", dir.display());
         }
+        // Cargo gives the legacy `config` precedence when both names exist.
         for name in ["config", "config.toml"] {
             let path = dir.join(name);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) => {
-                    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
-                        return Err(format!("invalid Cargo configuration: {}", path.display()));
-                    }
-                    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-                    let config = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-                    build_backend::validate_config(config)?;
-                    field(hash, name.as_bytes());
-                    field(hash, &bytes);
-                    println!("cargo:rerun-if-changed={}", path.display());
+            if let Some(bytes) = read_config(&path)? {
+                let config = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+                build_backend::validate_config(config)?;
+                field(hash, name.as_bytes());
+                field(hash, &bytes);
+                println!("cargo:rerun-if-changed={}", path.display());
+                if let Ok(target) = fs::canonicalize(&path)
+                    && target != path
+                {
+                    println!("cargo:rerun-if-changed={}", target.display());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.to_string()),
+                break;
             }
         }
     }
@@ -260,18 +312,30 @@ fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
     Ok(known)
 }
 
+pub fn backend_digests(
+    cpu_enabled: bool,
+    metal_enabled: bool,
+    mut digest: impl FnMut(&str) -> Result<String, String>,
+) -> Result<(String, String), String> {
+    let cpu = if cpu_enabled {
+        digest("cpu")?
+    } else {
+        "backend-not-enabled".into()
+    };
+    let gpu = if metal_enabled {
+        digest("gpu")?
+    } else {
+        "backend-not-enabled".into()
+    };
+    Ok((cpu, gpu))
+}
+
 fn run() -> Result<(), String> {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest")?);
-    let repo = fs::canonicalize(
-        manifest
-            .parent()
-            .and_then(Path::parent)
-            .ok_or("missing repo")?,
-    )
-    .map_err(|e| e.to_string())?;
+    let (manifest, repo) = manifest_and_repo(&manifest)?;
     let cwd = env::var_os("PWD")
         .map(PathBuf::from)
-        .filter(|p| p.is_dir())
+        .and_then(|p| fs::canonicalize(p).ok())
         .unwrap_or_else(|| repo.clone());
     let manifest_file = manifest.join("Cargo.toml");
     let patches = build_backend::patch_paths(
@@ -301,14 +365,17 @@ fn run() -> Result<(), String> {
     let common = common.finalize();
     println!("cargo:rerun-if-changed={}", manifest_file.display());
     println!("cargo:rerun-if-changed=build_backend.rs");
-    println!(
-        "cargo:rustc-env=OMNI_RSI_BACKEND_CPU={}",
-        graph_identity(&repo, cpu, &common, "cpu")?
-    );
-    println!(
-        "cargo:rustc-env=OMNI_RSI_BACKEND_GPU={}",
-        graph_identity(&repo, gpu, &common, "gpu")?
-    );
+    println!("cargo:rerun-if-changed=build_environment.rs");
+    let (cpu_digest, gpu_digest) = backend_digests(
+        env::var_os("CARGO_FEATURE_CPU").is_some(),
+        env::var_os("CARGO_FEATURE_METAL").is_some(),
+        |backend| match backend {
+            "cpu" => graph_identity(&repo, cpu.clone(), &common, "cpu"),
+            _ => graph_identity(&repo, gpu.clone(), &common, "gpu"),
+        },
+    )?;
+    println!("cargo:rustc-env=OMNI_RSI_BACKEND_CPU={cpu_digest}");
+    println!("cargo:rustc-env=OMNI_RSI_BACKEND_GPU={gpu_digest}");
     Ok(())
 }
 

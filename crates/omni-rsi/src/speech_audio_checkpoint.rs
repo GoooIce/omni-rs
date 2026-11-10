@@ -100,6 +100,7 @@ fn audio_shared_sources() -> Vec<(&'static str, &'static [u8])> {
         source!("Cargo.toml", "../Cargo.toml"),
         source!("build.rs", "../build.rs"),
         source!("build_backend.rs", "../build_backend.rs"),
+        source!("build_environment.rs", "../build_environment.rs"),
         source!("root/Cargo.toml", "../../../Cargo.toml"),
         source!("lfm3/Cargo.toml", "../../lfm3-omni/Cargo.toml"),
         source!("lfm3/media_io.rs", "../../lfm3-omni/src/media_io.rs"),

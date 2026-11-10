@@ -63,6 +63,11 @@ pub enum Event {
         session: SessionId,
         end: u64,
     },
+    /// Input finalization has flushed the tail without adding padded samples.
+    InputFinalized {
+        session: SessionId,
+        end: u64,
+    },
     UserPaused {
         session: SessionId,
         input_end: u64,
@@ -128,6 +133,9 @@ pub enum TimelineEvent {
         input_rate: u32,
     },
     InputAvailable {
+        end: u64,
+    },
+    InputFinalized {
         end: u64,
     },
     UserPaused {
@@ -238,9 +246,8 @@ impl Conversation {
             .ok_or(Error::StaleTurn)
     }
 
-    /// Apply one event. The time must share one monotonic origin with all
-    /// previous events. Rejection leaves state and timeline unchanged.
-    pub fn apply(&mut self, at: Duration, event: Event) -> Result<Outcome, Error> {
+    /// Validate time before a caller performs an irreversible stream operation.
+    pub(crate) fn check_time(&self, at: Duration) -> Result<(), Error> {
         if at
             < self
                 .timeline
@@ -250,6 +257,13 @@ impl Conversation {
         {
             return Err(Error::TimeWentBackwards);
         }
+        Ok(())
+    }
+
+    /// Apply one event. The time must share one monotonic origin with all
+    /// previous events. Rejection leaves state and timeline unchanged.
+    pub fn apply(&mut self, at: Duration, event: Event) -> Result<Outcome, Error> {
+        self.check_time(at)?;
         let (event, outcome) = match event {
             Event::InputAvailable { session, end } => {
                 if session != self.session {
@@ -260,6 +274,15 @@ impl Conversation {
                 }
                 self.available = end;
                 (TimelineEvent::InputAvailable { end }, Outcome::Applied)
+            }
+            Event::InputFinalized { session, end } => {
+                if session != self.session {
+                    return Err(Error::WrongSession);
+                }
+                if end != self.available {
+                    return Err(Error::InvalidSampleBoundary);
+                }
+                (TimelineEvent::InputFinalized { end }, Outcome::Applied)
             }
             Event::UserPaused { session, input_end } => {
                 if session != self.session {

@@ -147,8 +147,7 @@ pub fn evaluate_development(input: &DevelopmentInput) -> Result<DevelopmentRepor
             missing.push("independent speakers, sessions, recordings and families".into());
         }
         if stats.n >= 30 && stats.interval_95.is_some() {
-            if ((stats.candidate_only as i128 - stats.baseline_only as i128) * 20) < stats.n as i128
-            {
+            if !gain_at_least_five_points(&stats) {
                 failures.push("accuracy improvement below five percentage points".into());
             }
             if stats.interval_95.is_some_and(|(lower, _)| lower <= 0.0) {
@@ -210,6 +209,11 @@ pub struct PairedStatistics {
     pub candidate_normal_end: usize,
     pub improvement: f64,
     pub interval_95: Option<(f64, f64)>,
+}
+
+/// Compare the exact integer difference against five percentage points.
+pub(crate) fn gain_at_least_five_points(stats: &PairedStatistics) -> bool {
+    (stats.candidate_only as i128 - stats.baseline_only as i128) * 20 >= stats.n as i128
 }
 
 /// Calculate a conservative 95% interval using Bonferroni-adjusted exact

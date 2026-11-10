@@ -107,6 +107,169 @@ fn same_prefix_and_different_future_leave_started_snapshots_unchanged() {
 }
 
 #[test]
+fn session_pcm_matches_fixed_official_features_and_rejects_a_perturbed_prefix() {
+    use burn::tensor::{Tensor, TensorData};
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Reference {
+        samples: Vec<f32>,
+        features: Vec<Vec<f32>>,
+    }
+    let reference: Reference =
+        serde_json::from_slice(include_bytes!("fixtures/audio_features.json")).unwrap();
+    let encoder = synthetic_encoder();
+    let device = Default::default();
+    let frames = reference.features[0].len();
+    assert_eq!(reference.features.len(), 128);
+    assert!(reference.features.iter().all(|row| row.len() == frames));
+    let features = reference.features.iter().flatten().copied().collect();
+    let expected = encoder
+        .encode(Tensor::from_data(
+            TensorData::new(features, [1, 128, frames]),
+            &device,
+        ))
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    let run = |id, samples: &[f32]| {
+        let mut session =
+            AudioSession::new(SessionId(id), &encoder, &device, Duration::ZERO).unwrap();
+        session
+            .push(Duration::from_millis(1), samples, 16_000, true)
+            .unwrap();
+        let snapshot = session.snapshot().unwrap().unwrap();
+        let turn = session
+            .start_generation(Duration::from_millis(2), snapshot, 24_000)
+            .unwrap();
+        encoded_values(&turn)
+    };
+    let compare = |actual: &[f32]| {
+        actual.len() == expected.len()
+            && actual.iter().all(|x| x.is_finite())
+            && actual
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| (a - b).abs() < 0.0001)
+    };
+    assert!(!expected.is_empty() && expected.iter().all(|x| x.is_finite()));
+    assert!(
+        compare(&run(51, &reference.samples)),
+        "session must assemble the official reference PCM"
+    );
+    let mut changed = reference.samples.clone();
+    changed[..800].fill(0.0);
+    assert!(
+        !compare(&run(52, &changed)),
+        "perturbed prefix must fail the same comparison"
+    );
+}
+
+#[test]
+fn oversized_input_chunk_is_rejected_without_advancing_or_poisoning_the_session() {
+    let encoder = synthetic_encoder();
+    let mut session =
+        AudioSession::new(SessionId(53), &encoder, &Default::default(), Duration::ZERO).unwrap();
+    assert!(
+        session
+            .push(
+                Duration::from_millis(1),
+                &vec![0.0; 16_000 * 5 + 1],
+                16_000,
+                false
+            )
+            .is_err()
+    );
+    assert_eq!(session.conversation().timeline().len(), 1);
+    session
+        .push(
+            Duration::from_millis(2),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    assert_eq!(session.snapshot().unwrap().unwrap().input_end(), 3200);
+}
+
+#[test]
+fn outstanding_snapshots_have_a_recoverable_per_session_limit() {
+    let encoder = synthetic_encoder();
+    let mut session =
+        AudioSession::new(SessionId(54), &encoder, &Default::default(), Duration::ZERO).unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let mut snapshots: Vec<_> = (0..8)
+        .map(|_| session.snapshot().unwrap().unwrap())
+        .collect();
+    assert!(
+        session.snapshot().is_err(),
+        "a ninth live snapshot exceeds the limit"
+    );
+    snapshots.pop();
+    assert!(session.snapshot().unwrap().is_some());
+}
+
+#[test]
+fn tighter_limits_bound_total_input_and_snapshots_across_session_changes() {
+    use omni_lfm3::causal_audio::AudioLimits;
+    let encoder = synthetic_encoder();
+    let limits = AudioLimits {
+        max_push_samples: 3200,
+        max_session_samples: 3200,
+        max_live_snapshots: 2,
+    };
+    let mut session = AudioSession::with_limits(
+        SessionId(55),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+        limits,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let first = session.snapshot().unwrap().unwrap();
+    let second = session.snapshot().unwrap().unwrap();
+    assert!(
+        session
+            .push(Duration::from_millis(2), &[0.0], 16_000, false)
+            .is_err()
+    );
+    assert_eq!(first.input_end(), 3200);
+    session
+        .change_session(Duration::from_millis(3), SessionId(56))
+        .unwrap();
+    session
+        .push(
+            Duration::from_millis(4),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    assert!(
+        session.snapshot().is_err(),
+        "old outstanding tensors still consume the session quota"
+    );
+    drop(first);
+    assert!(session.snapshot().unwrap().is_some());
+    drop(second);
+}
+
+#[test]
 fn snapshot_from_another_stream_with_the_same_session_id_is_rejected() {
     let encoder = synthetic_encoder();
     let device = Default::default();
@@ -132,12 +295,18 @@ fn snapshot_from_another_stream_with_the_same_session_id_is_rejected() {
     let snapshot = original.snapshot().unwrap().unwrap();
     let timeline_len = other.conversation().timeline().len();
 
-    assert!(
-        other
-            .start_generation(Duration::from_millis(2), snapshot, 24_000)
-            .is_err()
-    );
+    let error = other
+        .start_generation(Duration::from_millis(2), snapshot, 24_000)
+        .err()
+        .expect("foreign stream must reject the snapshot");
+    let (_, returned) = error.into_parts();
+    assert_eq!(returned.input_end(), 3200);
     assert_eq!(other.conversation().timeline().len(), timeline_len);
+    assert!(
+        original
+            .start_generation(Duration::from_millis(2), returned, 24_000)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -334,6 +503,115 @@ fn accepted_stop_revokes_only_that_turn_and_input_can_continue() {
             .is_err()
     );
     assert!(turn.media().is_err());
+}
+
+#[test]
+fn losing_the_media_turn_keeps_explicit_stop_and_barrier_control() {
+    use omni_lfm3::causal_audio::ControlEvent;
+    use omni_lfm3::interruptible::{Outcome, State};
+    let encoder = synthetic_encoder();
+    let mut session =
+        AudioSession::new(SessionId(31), &encoder, &Default::default(), Duration::ZERO).unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let first = session
+        .start_generation(
+            Duration::from_millis(2),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let saved = session.current_control().unwrap();
+    let mut other =
+        AudioSession::new(SessionId(31), &encoder, &Default::default(), Duration::ZERO).unwrap();
+    other
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let other_turn = other
+        .start_generation(
+            Duration::from_millis(2),
+            other.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    assert!(
+        other
+            .apply_control(
+                Duration::from_millis(3),
+                &saved,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled
+                }
+            )
+            .is_err()
+    );
+    assert!(other_turn.media().is_ok());
+    drop(first);
+    let recovered = session
+        .current_control()
+        .expect("active turn remains controllable");
+    assert!(matches!(
+        session.conversation().state(),
+        State::Responding { .. }
+    ));
+    assert!(matches!(
+        session
+            .apply_control(
+                Duration::from_millis(3),
+                &recovered,
+                ControlEvent::Stop {
+                    reason: StopReason::GenerationFailed
+                }
+            )
+            .unwrap(),
+        Outcome::Stop(_)
+    ));
+    assert!(matches!(
+        session.conversation().state(),
+        State::Stopping { .. }
+    ));
+    assert!(
+        session
+            .change_session(Duration::from_millis(4), SessionId(32))
+            .is_err()
+    );
+    // A caller, not the reducer, confirms the producer and playback barrier.
+    session
+        .apply_control(
+            Duration::from_millis(5),
+            &recovered,
+            ControlEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+    assert!(matches!(session.conversation().state(), State::Listening));
+    let next = session
+        .start_generation(
+            Duration::from_millis(6),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    assert!(next.media().is_ok());
+    assert!(
+        session
+            .apply_control(
+                Duration::from_millis(7),
+                &saved,
+                ControlEvent::Stopped { played_end: 0 }
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -620,6 +898,51 @@ fn snapshot_requires_completed_tokens_and_final_padding_keeps_the_true_boundary(
 }
 
 #[test]
+fn empty_final_flush_advances_the_causal_time_before_generation() {
+    let encoder = synthetic_encoder();
+    let device = Default::default();
+    let mut session = AudioSession::new(SessionId(91), &encoder, &device, Duration::ZERO).unwrap();
+    session
+        .push(Duration::from_millis(1), &synthetic_pcm(40), 16_000, false)
+        .unwrap();
+    assert!(session.snapshot().unwrap().is_none());
+    session
+        .push(Duration::from_millis(10), &[], 16_000, true)
+        .unwrap();
+    let snapshot = session
+        .snapshot()
+        .unwrap()
+        .expect("final flush emits encoded tail");
+    assert_eq!(snapshot.input_end(), 40);
+    assert_eq!(
+        session.conversation().timeline().last().unwrap().at,
+        Duration::from_millis(10)
+    );
+    assert!(matches!(
+        session.conversation().timeline().last().unwrap().event,
+        TimelineEvent::InputFinalized { end: 40 }
+    ));
+    assert!(
+        session
+            .start_generation(Duration::from_millis(2), snapshot, 24_000)
+            .is_err()
+    );
+    assert!(
+        session
+            .push(Duration::from_millis(9), &[], 16_000, true)
+            .is_err()
+    );
+    let snapshot = session.snapshot().unwrap().unwrap();
+    assert_eq!(
+        session
+            .start_generation(Duration::from_millis(10), snapshot, 24_000)
+            .unwrap()
+            .input_end(),
+        40
+    );
+}
+
+#[test]
 fn snapshots_taken_before_and_after_more_pcm_keep_their_own_boundaries() {
     let encoder = synthetic_encoder();
     let mut session =
@@ -665,6 +988,65 @@ fn snapshots_taken_before_and_after_more_pcm_keep_their_own_boundaries() {
         }
     ));
     assert!(encoded_values(&second).len() > first_values.len());
+}
+
+#[test]
+fn rejected_start_returns_the_same_snapshot_for_retry_after_input_advances() {
+    let encoder = synthetic_encoder();
+    let device = Default::default();
+    let mut session = AudioSession::new(SessionId(41), &encoder, &device, Duration::ZERO).unwrap();
+    let pcm = synthetic_pcm(6503);
+    session
+        .push(Duration::from_millis(1), &pcm[..3200], 16_000, false)
+        .unwrap();
+    let snapshot = session.snapshot().unwrap().unwrap();
+    session
+        .push(Duration::from_millis(2), &pcm[3200..], 16_000, false)
+        .unwrap();
+    let failed = session
+        .start_generation(Duration::from_millis(1), snapshot, 24_000)
+        .err()
+        .expect("backwards start must fail");
+    let (_, snapshot) = failed.into_parts();
+    let failed = session
+        .start_generation(Duration::from_millis(3), snapshot, 0)
+        .err()
+        .expect("zero output rate must fail");
+    let (_, snapshot) = failed.into_parts();
+    let active = session
+        .start_generation(
+            Duration::from_millis(4),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let failed = session
+        .start_generation(Duration::from_millis(5), snapshot, 24_000)
+        .err()
+        .expect("active turn must reject another start");
+    let (_, same_snapshot) = failed.into_parts();
+    assert_eq!(same_snapshot.input_end(), 3200);
+    session
+        .apply_turn(
+            Duration::from_millis(6),
+            &active,
+            TurnEvent::Stop {
+                reason: StopReason::Cancelled,
+            },
+        )
+        .unwrap();
+    session
+        .apply_turn(
+            Duration::from_millis(7),
+            &active,
+            TurnEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+    let started = session
+        .start_generation(Duration::from_millis(8), same_snapshot, 24_000)
+        .unwrap();
+    assert_eq!(started.input_end(), 3200);
+    assert!(started.media().is_ok());
 }
 
 #[test]

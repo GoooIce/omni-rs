@@ -5,7 +5,9 @@ use crate::{
     number_development::{
         RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, verify_registration,
     },
-    number_gate::{PairedCase, PairedOutcome, PairedStatistics, paired_statistics},
+    number_gate::{
+        PairedCase, PairedOutcome, PairedStatistics, gain_at_least_five_points, paired_statistics,
+    },
     speech_asr::AsrEvent,
     speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol},
     speech_number_evaluation::{answer_number, character_error_rate, mentions_number},
@@ -13,7 +15,7 @@ use crate::{
 use burn::tensor::backend::AutodiffBackend;
 use omni_lfm3::{
     Precision,
-    generate::{EndReason, GenerationOptions, generate_greedy},
+    generate::{EndReason, GenerationOptions, OmniEvent, generate_greedy},
     model::OmniModel,
 };
 use serde::Serialize;
@@ -792,6 +794,24 @@ pub fn evaluate_v3<B: AutodiffBackend>(
     )
 }
 
+fn run_bounded_speech<T>(
+    remaining: usize,
+    generate: impl FnOnce(&mut dyn FnMut(&OmniEvent) -> bool) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut budget = voice::StreamPcmBudget::new(remaining);
+    let result = generate(&mut |event| match event {
+        OmniEvent::Pcm {
+            samples,
+            sample_rate,
+        } => budget.accept(samples.len(), *sample_rate),
+        _ => true,
+    })?;
+    if budget.invalid() {
+        return Err("speech stream exceeds the registered PCM format or sample limit".into());
+    }
+    Ok(result)
+}
+
 /// Compare real local model speech and transcribe it using the registered R2T2.
 pub fn evaluate_v3_voice<B: AutodiffBackend>(
     options: &V3Options<'_>,
@@ -860,32 +880,19 @@ pub fn evaluate_v3_voice<B: AutodiffBackend>(
                     .tokenizer
                     .decode(&text_result.tokens, true)
                     .map_err(|e| e.to_string())?;
-                let mut stream_budget = voice::StreamPcmBudget::new(remaining);
-                let audio = model
-                    .generate_omni(
-                        &messages,
-                        None,
-                        &media,
-                        &mut model.new_text_cache(),
-                        &speech_options,
-                        stop,
-                        |event| {
-                            if let omni_lfm3::generate::OmniEvent::Pcm {
-                                samples,
-                                sample_rate,
-                            } = event
-                            {
-                                return stream_budget.accept(samples.len(), *sample_rate);
-                            }
-                            true
-                        },
-                    )
-                    .map_err(|e| e.to_string())?;
-                if stream_budget.invalid() {
-                    return Err(
-                        "speech stream exceeds the registered PCM format or sample limit".into(),
-                    );
-                }
+                let audio = run_bounded_speech(remaining, |on_event| {
+                    model
+                        .generate_omni(
+                            &messages,
+                            None,
+                            &media,
+                            &mut model.new_text_cache(),
+                            &speech_options,
+                            stop,
+                            on_event,
+                        )
+                        .map_err(|e| e.to_string())
+                })?;
                 Ok((
                     DecodedText {
                         text,
@@ -929,6 +936,32 @@ struct Observation {
     correct: Option<bool>,
 }
 
+fn score_text_observation(text: &str, stopped: bool, answer: Option<u32>) -> Option<bool> {
+    answer.map(|answer| stopped && answer_number(text) == u16::try_from(answer).ok())
+}
+
+fn count_text_observation(
+    counts: &mut [usize; 6],
+    condition: usize,
+    correct: Option<bool>,
+    text: &str,
+    stopped: bool,
+) {
+    if condition < 2 {
+        counts[condition] += usize::from(correct == Some(true));
+    } else {
+        counts[2] += usize::from(mentions_number(text));
+    }
+    counts[3 + condition] += usize::from(stopped);
+}
+
+fn update_pcm_digest(digest: &mut Sha256, samples: &[f32]) {
+    for sample in samples {
+        let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
+        digest.update(bits.to_le_bytes());
+    }
+}
+
 fn control_metrics(values: [usize; 6], cases: usize) -> serde_json::Value {
     serde_json::json!({
         "original_correct":values[0],"swapped_correct":values[1],"silence_numeric_responses":values[2],
@@ -946,6 +979,104 @@ fn paired_metrics(stats: &PairedStatistics) -> serde_json::Value {
         "baseline_only":stats.baseline_only,"both_correct":stats.both_correct,"both_wrong":stats.both_wrong,
         "improvement":stats.improvement,"interval_95":stats.interval_95
     })
+}
+
+// Do not coerce integers, strings or nulls into floats. For floating values
+// compare the exact bit pattern, including the sign of zero.
+fn exact_json(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) if a.is_f64() && b.is_f64() => {
+            a.as_f64().map(f64::to_bits) == b.as_f64().map(f64::to_bits)
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| exact_json(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, value)| b.get(key).is_some_and(|other| exact_json(value, other)))
+        }
+        _ => left == right,
+    }
+}
+
+/// Accept the recomputation itself or its one actual JSON encode/decode result.
+fn matches_derived(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> Result<bool, String> {
+    if exact_json(actual, expected) {
+        return Ok(true);
+    }
+    let bytes = serde_json::to_vec(expected).map_err(|e| e.to_string())?;
+    let decoded = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok(exact_json(actual, &decoded))
+}
+
+fn checked_statistics_with(
+    pairs: &[PairedCase],
+    stop: &AtomicBool,
+    compute: impl FnOnce(&[PairedCase]) -> Result<PairedStatistics, String>,
+) -> Result<PairedStatistics, String> {
+    let statistics = compute(pairs)?;
+    interrupted(stop)?;
+    Ok(statistics)
+}
+
+#[cfg(test)]
+mod late_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_at_the_end_of_statistics_rejects_the_result() {
+        let stop = AtomicBool::new(false);
+        let pairs = [PairedCase {
+            case_id: "case".into(),
+            original_id: "recording".into(),
+            family_id: "family".into(),
+            speaker_id: "speaker".into(),
+            session_id: "session".into(),
+            baseline: PairedOutcome {
+                correct: false,
+                normal_end: true,
+            },
+            candidate: PairedOutcome {
+                correct: true,
+                normal_end: true,
+            },
+        }];
+        let result = checked_statistics_with(&pairs, &stop, |pairs| {
+            let result = paired_statistics(pairs);
+            stop.store(true, Ordering::Release);
+            result
+        });
+        assert!(matches!(result, Err(ref error) if error == "interrupted"));
+    }
+
+    #[test]
+    fn production_generation_callback_rejects_synthetic_pcm_over_budget() {
+        let pcm = || OmniEvent::Pcm {
+            samples: vec![0.1; 3],
+            sample_rate: 24_000,
+        };
+        let mut writer_would_run = false;
+        let result = run_bounded_speech(5, |callback| {
+            assert!(callback(&OmniEvent::TextToken(1)));
+            assert!(callback(&pcm()));
+            assert!(
+                !callback(&pcm()),
+                "the second 3-sample event must stop generation"
+            );
+            Ok(())
+        })
+        .map(|()| writer_would_run = true);
+        assert!(result.unwrap_err().contains("sample limit"));
+        assert!(
+            !writer_would_run,
+            "an over-budget result cannot reach WAV/report writing"
+        );
+    }
 }
 
 fn validate_frozen_mapping(
@@ -1015,14 +1146,11 @@ fn recheck_with_stop_tokens(
         let mut hash = Sha256::new();
         for chunk in case.samples().chunks(4096) {
             interrupted(stop)?;
-            for sample in chunk {
-                let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-                hash.update(bits.to_le_bytes());
-            }
+            update_pcm_digest(&mut hash, chunk);
         }
         pcm.insert(case.id(), format!("{:x}", hash.finalize()));
         let count = case.samples().len();
-        if !silence.contains_key(&count) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = silence.entry(count) {
             let mut hash = Sha256::new();
             let mut remaining = count.checked_mul(4).ok_or("silence length overflow")?;
             let zeros = [0_u8; 4096];
@@ -1032,7 +1160,7 @@ fn recheck_with_stop_tokens(
                 hash.update(&zeros[..length]);
                 remaining -= length;
             }
-            silence.insert(count, format!("{:x}", hash.finalize()));
+            entry.insert(format!("{:x}", hash.finalize()));
         }
     }
     let observations = report["observations"]
@@ -1111,19 +1239,19 @@ fn recheck_with_stop_tokens(
         if text.len() > 4096 || total_text > 16 * 1024 * 1024 {
             return Err("comparison text exceeds limit".into());
         }
-        let correct = expected
-            .map(|id| cases.get(id).ok_or("unknown audio case"))
-            .transpose()?
-            .map(|audio| stopped && answer_number(text) == u16::try_from(audio.answer()).ok());
+        let answer = expected
+            .map(|id| {
+                cases
+                    .get(id)
+                    .map(|audio| audio.answer())
+                    .ok_or("unknown audio case")
+            })
+            .transpose()?;
+        let correct = score_text_observation(text, stopped, answer);
         if row["correct"] != serde_json::json!(correct) {
             return Err("observation score differs from raw answer".into());
         }
-        if condition < 2 {
-            counts[arm][condition] += usize::from(correct == Some(true));
-        } else {
-            counts[arm][2] += usize::from(mentions_number(text));
-        }
-        counts[arm][3 + condition] += usize::from(stopped);
+        count_text_observation(&mut counts[arm], condition, correct, text, stopped);
         if condition == 0 {
             originals.entry(case).or_insert_with(|| [None, None])[arm] = Some(PairedOutcome {
                 correct: correct == Some(true),
@@ -1133,7 +1261,9 @@ fn recheck_with_stop_tokens(
     }
     let baseline = control_metrics(counts[0], cases.len());
     let candidate = control_metrics(counts[1], cases.len());
-    if report["baseline"] != baseline || report["candidate"] != candidate {
+    if !matches_derived(&report["baseline"], &baseline)?
+        || !matches_derived(&report["candidate"], &candidate)?
+    {
         return Err("comparison summary differs from raw observations".into());
     }
     let pairs = registered
@@ -1156,21 +1286,19 @@ fn recheck_with_stop_tokens(
             })
         })
         .collect::<Result<Vec<_>, &str>>()?;
-    let stats = paired_statistics(&pairs)?;
+    let stats = checked_statistics_with(&pairs, stop, paired_statistics)?;
     let paired = paired_metrics(&stats);
-    if report["paired_statistics"] != paired {
+    if !matches_derived(&report["paired_statistics"], &paired)? {
         return Err("paired statistics differ from raw observations".into());
     }
     let enough = stats.n >= 30 && stats.interval_95.is_some();
-    let gain = enough.then(|| {
-        (stats.candidate_only as i128 - stats.baseline_only as i128) * 20 >= stats.n as i128
-    });
+    let gain = enough.then(|| gain_at_least_five_points(&stats));
     let confidence = if enough {
         stats.interval_95.map(|(lower, _)| lower > 0.0)
     } else {
         None
     };
-    Ok(serde_json::json!({
+    let checked = serde_json::json!({
         "status": "insufficient_evidence",
         "candidate_eligible": false,
         "protocol_sha256": registered.protocol_sha256(),
@@ -1189,7 +1317,9 @@ fn recheck_with_stop_tokens(
             "confidence_lower_positive": confidence,
             "text_normal_end_no_degradation": stop_tokens.map(|_| (3..6).all(|i| counts[1][i] >= counts[0][i]))
         },
-    }))
+    });
+    interrupted(stop)?;
+    Ok(checked)
 }
 
 /// Run an injected comparison for behavior tests. Caller outputs are never
@@ -1259,15 +1389,14 @@ pub fn compare_registered_with(
                     TextEnd::Limit => serde_json::json!({"kind":"limit"}),
                     TextEnd::Cancelled => return Err("interrupted".into()),
                 };
-                let correct = expected.map(|answer| {
-                    stopped && answer_number(&output.text) == u16::try_from(answer).ok()
-                });
-                if condition_index < 2 {
-                    counts[arm_index][condition_index] += usize::from(correct == Some(true));
-                } else {
-                    counts[arm_index][2] += usize::from(mentions_number(&output.text));
-                }
-                counts[arm_index][3 + condition_index] += usize::from(stopped);
+                let correct = score_text_observation(&output.text, stopped, expected);
+                count_text_observation(
+                    &mut counts[arm_index],
+                    condition_index,
+                    correct,
+                    &output.text,
+                    stopped,
+                );
                 if condition_index == 0 {
                     originals[arm_index] = PairedOutcome {
                         correct: correct == Some(true),
@@ -1275,11 +1404,9 @@ pub fn compare_registered_with(
                     };
                 }
                 let mut digest = Sha256::new();
-                for sample in samples {
-                    // Match the preregistration identity, which treats both
-                    // IEEE-754 zero encodings as the same PCM value.
-                    let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-                    digest.update(bits.to_le_bytes());
+                for chunk in samples.chunks(4096) {
+                    interrupted(stop)?;
+                    update_pcm_digest(&mut digest, chunk);
                 }
                 observations.push(Observation {
                     arm,

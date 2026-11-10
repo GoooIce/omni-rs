@@ -2303,6 +2303,91 @@ fn observation_recheck_binds_pcm_and_equal_length_silence() {
 
 #[cfg(unix)]
 #[test]
+fn observation_recheck_accepts_a_real_json_roundtrip_and_rejects_tampering() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+    for (cases, baseline_correct, candidate_correct) in [(30, 7, 14), (33, 3, 10)] {
+        let root = fixture();
+        artifacts(root.path());
+        let records: Vec<_> = (0..cases)
+            .map(|i| {
+                case(
+                    root.path(),
+                    "dev",
+                    &format!("roundtrip-{i}"),
+                    i,
+                    tagged_source(&format!("roundtrip-{i}")),
+                    1000 + i as i16 * 100,
+                )
+            })
+            .collect();
+        let groups: Vec<_> = records
+            .iter()
+            .map(|row| json!({"id":row["id"], "source":row["source"]}))
+            .collect();
+        write_json(
+            &root.path().join("dev.groups.v3.json"),
+            &json!({"version":3,"partition":"dev","records":groups}),
+        );
+        write_json(
+            &root.path().join("dev.v3.json"),
+            &json!({"version":3,"partition":"dev","rule":"number-plus-one-v1","records":records}),
+        );
+        let stop = AtomicBool::new(false);
+        let registered =
+            preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+        let report = compare_registered_with(&registered, &stop, |arm, _, samples| {
+            let number = ((samples[1] * 32768.0).round() as i32 - 1000) / 100;
+            let correct = !samples.iter().all(|s| *s == 0.0)
+                && number
+                    < if arm == "baseline" {
+                        baseline_correct
+                    } else {
+                        candidate_correct
+                    };
+            Ok(DecodedText {
+                text: if correct {
+                    (number + 1).to_string()
+                } else {
+                    "不知道".into()
+                },
+                end: TextEnd::Stop(7),
+            })
+        })
+        .unwrap();
+        assert_eq!(report["baseline"]["original_correct"], baseline_correct);
+        assert!(recheck_registered_observations(&registered, &report, &stop).is_ok());
+        let path = root.path().join("roundtrip-report.json");
+        fs::write(&path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        let loaded: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_ne!(
+            report["baseline"]["original_accuracy"], loaded["baseline"]["original_accuracy"],
+            "fixture must exercise the serde_json rounding difference"
+        );
+        let checked = recheck_registered_observations(&registered, &loaded, &stop).unwrap();
+        assert_eq!(checked["baseline"]["original_correct"], baseline_correct);
+        assert_eq!(checked["candidate_eligible"], false);
+        for (section, key, value) in [
+            ("baseline", "original_correct", json!(baseline_correct + 1)),
+            ("candidate", "original_accuracy", json!(0.99)),
+            ("paired_statistics", "candidate_only", json!(0)),
+        ] {
+            let mut altered = loaded.clone();
+            altered[section][key] = value;
+            assert!(
+                recheck_registered_observations(&registered, &altered, &stop).is_err(),
+                "{section}.{key}"
+            );
+        }
+        let mut negative_zero = loaded.clone();
+        negative_zero["baseline"]["silence_numeric_rate"] = json!(-0.0);
+        assert!(recheck_registered_observations(&registered, &negative_zero, &stop).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn observation_recheck_recomputes_independent_paired_statistics() {
     use omni_rsi::number_v3_evaluation::{
         DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,

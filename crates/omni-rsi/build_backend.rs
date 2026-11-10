@@ -173,13 +173,21 @@ pub fn dependency_assignment(line: &str, paths: &mut Vec<String>) -> Result<(), 
 }
 
 pub fn validate_config(config: &str) -> Result<(), String> {
+    let mut section = Vec::new();
     for original in config.lines() {
         let line = uncomment(original)?.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            if keys(section)?
+        if line.starts_with('[') {
+            let header = if line.starts_with("[[") {
+                line.strip_prefix("[[").and_then(|s| s.strip_suffix("]]"))
+            } else {
+                line.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+            }
+            .ok_or("invalid Cargo configuration table")?;
+            section = keys(header)?;
+            if section
                 .first()
                 .is_some_and(|k| k == "patch" || k == "paths")
             {
@@ -187,7 +195,7 @@ pub fn validate_config(config: &str) -> Result<(), String> {
             }
         } else if let Ok((lhs, _)) = assignment(line) {
             let key = keys(lhs)?;
-            if key.first().is_some_and(|k| k == "patch" || k == "paths") {
+            if section.is_empty() && key.first().is_some_and(|k| k == "patch" || k == "paths") {
                 return Err("Cargo configuration path overrides are unsupported".into());
             }
         }

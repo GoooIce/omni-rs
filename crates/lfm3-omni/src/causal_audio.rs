@@ -6,7 +6,7 @@
 use std::{
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -27,6 +27,7 @@ pub enum Error {
     Stream(omni_r2t2::Error),
     WrongStream,
     StreamUnavailable,
+    ResourceLimit(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -38,6 +39,7 @@ impl fmt::Display for Error {
                 f.write_str("snapshot or turn belongs to a different audio stream")
             }
             Self::StreamUnavailable => f.write_str("audio stream or turn is no longer available"),
+            Self::ResourceLimit(reason) => write!(f, "audio session resource limit: {reason}"),
         }
     }
 }
@@ -119,6 +121,7 @@ pub struct AudioSnapshot<B: Backend> {
     input_end: u64,
     media: PreparedMedia<B>,
     scope: Arc<Scope>,
+    _lease: Arc<()>,
 }
 
 impl<B: Backend> AudioSnapshot<B> {
@@ -128,6 +131,46 @@ impl<B: Backend> AudioSnapshot<B> {
 
     pub fn input_end(&self) -> u64 {
         self.input_end
+    }
+}
+
+/// A rejected start and the unchanged snapshot the caller may retry.
+pub struct StartError<B: Backend> {
+    error: Error,
+    snapshot: Box<AudioSnapshot<B>>,
+}
+
+impl<B: Backend> StartError<B> {
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    pub fn into_parts(self) -> (Error, AudioSnapshot<B>) {
+        (self.error, *self.snapshot)
+    }
+}
+
+impl<B: Backend> fmt::Debug for StartError<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartError")
+            .field("error", &self.error)
+            .field("session", &self.snapshot.session)
+            .field("input_end", &self.snapshot.input_end)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: Backend> fmt::Display for StartError<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<B: Backend> std::error::Error for StartError<B> {}
+
+impl<B: Backend> From<StartError<B>> for Error {
+    fn from(error: StartError<B>) -> Self {
+        error.error
     }
 }
 
@@ -158,6 +201,22 @@ impl<B: Backend> AudioTurn<B> {
     }
 }
 
+/// Instance-bound control without access to the producer's encoded media.
+#[derive(Clone)]
+pub struct AudioTurnControl {
+    turn: TurnId,
+    scope: Arc<Scope>,
+    live: Arc<AtomicBool>,
+}
+
+/// Events needed to stop and drain a turn even if its media owner is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlEvent {
+    Played { end: u64 },
+    Stop { reason: StopReason },
+    Stopped { played_end: u64 },
+}
+
 /// An event for the particular, instance-bound token supplied to `apply_turn`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnEvent {
@@ -167,6 +226,28 @@ pub enum TurnEvent {
     GenerationFinished,
     Stop { reason: StopReason },
     Stopped { played_end: u64 },
+}
+
+pub const MAX_PUSH_SAMPLES: usize = 16_000 * 5;
+pub const MAX_SESSION_SAMPLES: usize = 16_000 * 60 * 10;
+pub const MAX_LIVE_SNAPSHOTS: usize = 8;
+
+/// Per-session bounds; callers may choose tighter values but not raise them.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioLimits {
+    pub max_push_samples: usize,
+    pub max_session_samples: usize,
+    pub max_live_snapshots: usize,
+}
+
+impl Default for AudioLimits {
+    fn default() -> Self {
+        Self {
+            max_push_samples: MAX_PUSH_SAMPLES,
+            max_session_samples: MAX_SESSION_SAMPLES,
+            max_live_snapshots: MAX_LIVE_SNAPSHOTS,
+        }
+    }
 }
 
 /// Owns a reducer and the PCM stream from which its snapshots are made.
@@ -182,6 +263,8 @@ pub struct AudioSession<'a, B: Backend> {
     session: SessionId,
     scope: Arc<Scope>,
     turn_live: Option<Arc<AtomicBool>>,
+    limits: AudioLimits,
+    snapshots: Mutex<Vec<Weak<()>>>,
 }
 
 impl<'a, B: Backend> AudioSession<'a, B> {
@@ -191,6 +274,26 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         device: &B::Device,
         at: Duration,
     ) -> Result<Self, Error> {
+        Self::with_limits(session, encoder, device, at, AudioLimits::default())
+    }
+
+    pub fn with_limits(
+        session: SessionId,
+        encoder: &'a AudioEncoder<B>,
+        device: &B::Device,
+        at: Duration,
+        limits: AudioLimits,
+    ) -> Result<Self, Error> {
+        if limits.max_push_samples == 0
+            || limits.max_push_samples > MAX_PUSH_SAMPLES
+            || limits.max_session_samples == 0
+            || limits.max_session_samples > MAX_SESSION_SAMPLES
+            || limits.max_push_samples > limits.max_session_samples
+            || limits.max_live_snapshots == 0
+            || limits.max_live_snapshots > MAX_LIVE_SNAPSHOTS
+        {
+            return Err(Error::ResourceLimit("invalid session limits"));
+        }
         Ok(Self {
             encoder,
             device: device.clone(),
@@ -199,11 +302,43 @@ impl<'a, B: Backend> AudioSession<'a, B> {
             session,
             scope: Arc::new(Scope::new()),
             turn_live: None,
+            limits,
+            snapshots: Mutex::new(Vec::new()),
         })
     }
 
     pub fn conversation(&self) -> &Conversation {
         &self.conversation
+    }
+
+    /// Recover control of the current turn without reconstructing media.
+    /// This does not stop a producer or acknowledge the playback barrier.
+    pub fn current_control(&self) -> Option<AudioTurnControl> {
+        let turn = match self.conversation.state() {
+            State::Listening => return None,
+            State::Responding { turn } | State::Stopping { turn, .. } => turn,
+        };
+        Some(AudioTurnControl {
+            turn,
+            scope: Arc::clone(&self.scope),
+            live: Arc::clone(self.turn_live.as_ref()?),
+        })
+    }
+
+    /// Apply control only to the originating turn. `Stopped` is an explicit
+    /// adapter assertion that its producer and playback barrier completed.
+    pub fn apply_control(
+        &mut self,
+        at: Duration,
+        control: &AudioTurnControl,
+        event: ControlEvent,
+    ) -> Result<Outcome, Error> {
+        let event = match event {
+            ControlEvent::Played { end } => TurnEvent::Played { end },
+            ControlEvent::Stop { reason } => TurnEvent::Stop { reason },
+            ControlEvent::Stopped { played_end } => TurnEvent::Stopped { played_end },
+        };
+        self.apply_bound(at, control, event)
     }
 
     /// Cancel this input stream permanently, including all its snapshots.
@@ -223,13 +358,27 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         turn: &AudioTurn<B>,
         event: TurnEvent,
     ) -> Result<Outcome, Error> {
-        if !Arc::ptr_eq(&self.scope, &turn.snapshot.scope) {
+        let control = AudioTurnControl {
+            turn: turn.turn,
+            scope: Arc::clone(&turn.snapshot.scope),
+            live: Arc::clone(&turn.live),
+        };
+        self.apply_bound(at, &control, event)
+    }
+
+    fn apply_bound(
+        &mut self,
+        at: Duration,
+        control: &AudioTurnControl,
+        event: TurnEvent,
+    ) -> Result<Outcome, Error> {
+        if !Arc::ptr_eq(&self.scope, &control.scope) {
             return Err(Error::WrongStream);
         }
         if !self
             .turn_live
             .as_ref()
-            .is_some_and(|live| Arc::ptr_eq(live, &turn.live))
+            .is_some_and(|live| Arc::ptr_eq(live, &control.live))
         {
             return Err(Error::Protocol(crate::interruptible::Error::StaleTurn));
         }
@@ -245,24 +394,24 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         }
         let reducer_event = match event {
             TurnEvent::Generated { end } => Event::Generated {
-                turn: turn.turn,
+                turn: control.turn,
                 end,
             },
             TurnEvent::Queued { end } => Event::Queued {
-                turn: turn.turn,
+                turn: control.turn,
                 end,
             },
             TurnEvent::Played { end } => Event::Played {
-                turn: turn.turn,
+                turn: control.turn,
                 end,
             },
-            TurnEvent::GenerationFinished => Event::GenerationFinished { turn: turn.turn },
+            TurnEvent::GenerationFinished => Event::GenerationFinished { turn: control.turn },
             TurnEvent::Stop { reason } => Event::Stop {
-                turn: turn.turn,
+                turn: control.turn,
                 reason,
             },
             TurnEvent::Stopped { played_end } => Event::Stopped {
-                turn: turn.turn,
+                turn: control.turn,
                 played_end,
             },
         };
@@ -274,7 +423,7 @@ impl<'a, B: Backend> AudioSession<'a, B> {
             event,
             TurnEvent::Stop { .. } | TurnEvent::GenerationFinished | TurnEvent::Stopped { .. }
         ) {
-            turn.live.store(false, Ordering::Release);
+            control.live.store(false, Ordering::Release);
         }
         if self.conversation.state() == State::Listening {
             self.turn_live = None;
@@ -328,10 +477,17 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         if !self.scope.available() {
             return Err(Error::StreamUnavailable);
         }
-        if at < self.conversation.timeline().last().unwrap().at {
-            return Err(Error::Protocol(
-                crate::interruptible::Error::TimeWentBackwards,
-            ));
+        self.conversation.check_time(at).map_err(Error::Protocol)?;
+        if samples.len() > self.limits.max_push_samples {
+            return Err(Error::ResourceLimit("input chunk is too large"));
+        }
+        if self
+            .stream
+            .samples()
+            .checked_add(samples.len())
+            .is_none_or(|total| total > self.limits.max_session_samples)
+        {
+            return Err(Error::ResourceLimit("session input is too long"));
         }
         let mut guard = PoisonOnDrop::new(&self.scope);
         let before = self.stream.samples();
@@ -363,6 +519,20 @@ impl<'a, B: Backend> AudioSession<'a, B> {
                 )
                 .map_err(Error::Protocol)?;
         }
+        if is_final {
+            let end = u64::try_from(after).map_err(|_| {
+                Error::Stream(omni_r2t2::Error::Audio("audio length overflow".into()))
+            })?;
+            self.conversation
+                .apply(
+                    at,
+                    Event::InputFinalized {
+                        session: self.session,
+                        end,
+                    },
+                )
+                .map_err(Error::Protocol)?;
+        }
         guard.commit();
         Ok(tokens)
     }
@@ -373,19 +543,28 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         if !self.scope.available() {
             return Err(Error::StreamUnavailable);
         }
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| Error::StreamUnavailable)?;
+        snapshots.retain(|lease| lease.strong_count() > 0);
+        if snapshots.len() >= self.limits.max_live_snapshots {
+            return Err(Error::ResourceLimit("too many live snapshots"));
+        }
         let mut guard = PoisonOnDrop::new(&self.scope);
         let end = u64::try_from(self.stream.samples())
             .map_err(|_| Error::Stream(omni_r2t2::Error::Audio("audio length overflow".into())))?;
-        let snapshot = self
-            .stream
-            .snapshot()
-            .map_err(Error::Stream)?
-            .map(|media| AudioSnapshot {
+        let snapshot = self.stream.snapshot().map_err(Error::Stream)?.map(|media| {
+            let lease = Arc::new(());
+            snapshots.push(Arc::downgrade(&lease));
+            AudioSnapshot {
                 session: self.session,
                 input_end: end,
                 media,
                 scope: Arc::clone(&self.scope),
-            });
+                _lease: lease,
+            }
+        });
         if !self.scope.available() {
             return Err(Error::StreamUnavailable);
         }
@@ -410,25 +589,36 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         at: Duration,
         snapshot: AudioSnapshot<B>,
         output_rate: u32,
-    ) -> Result<AudioTurn<B>, Error> {
+    ) -> Result<AudioTurn<B>, StartError<B>> {
         if !Arc::ptr_eq(&self.scope, &snapshot.scope) {
-            return Err(Error::WrongStream);
+            return Err(StartError {
+                error: Error::WrongStream,
+                snapshot: Box::new(snapshot),
+            });
         }
         if !self.scope.available() {
-            return Err(Error::StreamUnavailable);
+            return Err(StartError {
+                error: Error::StreamUnavailable,
+                snapshot: Box::new(snapshot),
+            });
         }
         let live = Arc::new(AtomicBool::new(true));
-        let outcome = self
-            .conversation
-            .apply(
-                at,
-                Event::StartGeneration {
-                    session: snapshot.session,
-                    input_end: snapshot.input_end,
-                    output_rate,
-                },
-            )
-            .map_err(Error::Protocol)?;
+        let outcome = match self.conversation.apply(
+            at,
+            Event::StartGeneration {
+                session: snapshot.session,
+                input_end: snapshot.input_end,
+                output_rate,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(StartError {
+                    error: Error::Protocol(error),
+                    snapshot: Box::new(snapshot),
+                });
+            }
+        };
         let Outcome::Started(turn) = outcome else {
             unreachable!("start generation returns its turn")
         };

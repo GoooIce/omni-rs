@@ -96,12 +96,19 @@ fn target_samples(
 #[cfg(all(test, unix, feature = "cpu"))]
 thread_local! {
     static TEST_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static TEST_SAMPLES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static TEST_REENCODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, unix, feature = "cpu"))]
 pub(crate) fn test_mock_reencoding_budget(remaining: Option<usize>) -> usize {
     TEST_BUDGET.with(|value| value.set(remaining));
+    TEST_REENCODED.with(|count| count.replace(0))
+}
+
+#[cfg(all(test, unix, feature = "cpu"))]
+fn test_mock_reencoding_samples(remaining: Option<usize>) -> usize {
+    TEST_SAMPLES.with(|value| value.set(remaining));
     TEST_REENCODED.with(|count| count.replace(0))
 }
 
@@ -156,6 +163,10 @@ pub(crate) fn verify<B: AutodiffBackend>(
     if let Some(remaining) = TEST_BUDGET.with(|value| value.get()) {
         media_budget.test_remaining_bytes(remaining);
     }
+    #[cfg(all(test, unix, feature = "cpu"))]
+    if let Some(remaining) = TEST_SAMPLES.with(|value| value.get()) {
+        media_budget.test_remaining_samples(remaining);
+    }
 
     // Check identities and resource limits before constructing the encoder.
     for (partition, target) in targets() {
@@ -184,7 +195,9 @@ pub(crate) fn verify<B: AutodiffBackend>(
     // This test-only codec exercises the real snapshot/decode budget path and
     // can never return a VerifiedCodec or authorize training.
     #[cfg(all(test, unix, feature = "cpu"))]
-    if TEST_BUDGET.with(|value| value.get()).is_some() {
+    if TEST_BUDGET.with(|value| value.get()).is_some()
+        || TEST_SAMPLES.with(|value| value.get()).is_some()
+    {
         for (partition, target) in targets() {
             let samples = target_samples(root, partition, target, &mut media_budget, stop)?;
             if samples.is_empty() {
@@ -309,6 +322,54 @@ mod tests {
         assert_eq!(test_mock_reencoding_budget(None), 2);
         assert!(error.contains("mock cannot authorize"), "{error}");
         assert!(!state.join("number-audio-v3/audio-conditioned-v1").exists());
+    }
+
+    #[test]
+    fn reencoding_sample_budget_failure_preserves_new_and_resumed_state() {
+        use crate::{
+            number_v3_fixture::repeated_target_budget_fixture,
+            speech_audio_round::{AudioRoundOptions, train_v3_audio_round},
+        };
+        use burn::backend::{Autodiff, NdArray};
+        type Cpu = Autodiff<NdArray<f32>>;
+        let root = repeated_target_budget_fixture(113, None, 2);
+        let model = root.path().join("model");
+        // 113 samples at 24 kHz cost 76 at the 16 kHz budget rate. Two
+        // preflight reads and the first repeated decode fit; the next does not.
+        for resume in [false, true] {
+            let state = root.path().join(if resume {
+                "sample-resume"
+            } else {
+                "sample-new"
+            });
+            let directory = state.join("number-audio-v3/audio-conditioned-v1");
+            let pointer = directory.join("latest.json");
+            if resume {
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(&pointer, b"original pointer").unwrap();
+            }
+            let options = AudioRoundOptions {
+                model: &model,
+                data: root.path(),
+                state: &state,
+                epochs: 1,
+                max_updates: 1,
+                resume,
+            };
+            test_mock_reencoding_samples(Some(76 * 3));
+            let error =
+                train_v3_audio_round::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                    .err()
+                    .unwrap();
+            assert_eq!(test_mock_reencoding_samples(None), 1);
+            assert!(error.contains("decoded sample limit"), "{error}");
+            if resume {
+                assert_eq!(fs::read(&pointer).unwrap(), b"original pointer");
+                assert!(!directory.join("checkpoints").exists());
+            } else {
+                assert!(!directory.exists());
+            }
+        }
     }
 
     #[test]

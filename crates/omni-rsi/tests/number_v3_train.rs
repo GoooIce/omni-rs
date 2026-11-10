@@ -289,6 +289,70 @@ fn legacy_checkpoint_from_previous_implementation_is_rejected_without_overwrite(
 
 #[cfg(all(unix, feature = "cpu"))]
 #[test]
+fn v3_checkpoint_with_856_implementation_is_rejected_without_overwrite() {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::{
+        speech_audio_checkpoint::{AudioCheckpoint, AudioProgress, AudioProtocol},
+        speech_audio_round::{AudioRoundOptions, train_v3_audio_round},
+        speech_training::SpeechOptimizer,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    // Derived from the actual 856b313 source inputs, not a claim that this
+    // synthetic checkpoint was created by the historical binary.
+    const OLD_V3: &str = "bdc32a47c21314bf9af76fda6202a322afd302482bd863c182bc097a234c1d29";
+    let root = fixture();
+    for (file, key) in [
+        ("train.v3.json", "speech_target"),
+        ("train.groups.v3.json", "target_source"),
+    ] {
+        let path = root.path().join(file);
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for row in value["records"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove(key);
+        }
+        write_json(&path, &value);
+    }
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
+    let protocol = AudioProtocol::for_v3(&model, &data, Cpu::name(&device), &stop).unwrap();
+    assert_ne!(protocol.implementation_hash, OLD_V3);
+    let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
+    let checkpoint = AudioCheckpoint::new(protocol, AudioProgress::default(), &optimizer).unwrap();
+    let mut value = serde_json::to_value(checkpoint).unwrap();
+    value["protocol"]["implementation_hash"] = OLD_V3.into();
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let id = format!("{:x}", Sha256::digest(&bytes));
+    let directory = state.join("number-audio-v3/audio-conditioned-v1");
+    fs::create_dir_all(directory.join("checkpoints")).unwrap();
+    let content = directory.join("checkpoints").join(format!("{id}.json"));
+    fs::write(&content, &bytes).unwrap();
+    let pointer = directory.join("latest.json");
+    write_json(&pointer, &json!({"sha256":id}));
+    let original_pointer = fs::read(&pointer).unwrap();
+    let options = AudioRoundOptions {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        epochs: 1,
+        max_updates: 1,
+        resume: true,
+    };
+    let error = train_v3_audio_round::<Cpu>(&options, &device, &stop)
+        .err()
+        .unwrap();
+    assert!(error.contains("implementation changed"), "{error}");
+    assert_eq!(fs::read(pointer).unwrap(), original_pointer);
+    assert_eq!(fs::read(content).unwrap(), bytes);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
 fn v3_checkpoint_resumes_optimizer_and_rejects_changed_frames_in_separate_state() {
     use burn::{
         backend::{Autodiff, NdArray},
