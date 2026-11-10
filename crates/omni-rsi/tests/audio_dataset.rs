@@ -117,3 +117,64 @@ fn training_data_rejects_dev_test_and_missing_split() {
         assert!(error.contains("split"), "unclear split error: {error}");
     }
 }
+
+#[test]
+fn rule_dataset_admits_only_training_audio_and_rejects_cross_split_speakers() {
+    let root = tempfile::tempdir().unwrap();
+    let mut records = Vec::new();
+    for (index, split, number, spoken, answer) in [
+        (1, "train", 12, "十二", "十三"),
+        (2, "dev", 15, "十五", "十六"),
+        (3, "test", 18, "十八", "十九"),
+    ] {
+        let filename = format!("{split}.wav");
+        let audio = root.path().join(&filename);
+        let mut writer = hound::WavWriter::create(
+            &audio,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in [0_i16, index * 8192, -index * 8192, 0] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        let hash = format!("{:x}", Sha256::digest(fs::read(audio).unwrap()));
+        records.push(serde_json::json!({
+            "id": format!("case-{split}"), "split": split,
+            "input_audio": filename, "input_sha256": hash,
+            "authorization": {"kind": "licensed-synthetic", "source": "test fixture", "license": "CC0-1.0"},
+            "instruction": "把听到的数字加一，用中文回答。", "answer": answer,
+            "rule": "number-plus-one-v1", "spoken_number": number, "spoken_text": spoken,
+            "provenance": {
+                "speaker_id": format!("speaker-{split}"), "session_id": format!("session-{split}"),
+                "recording_id": format!("recording-{split}"), "family_id": format!("family-{split}"),
+                "teacher_sha256": "1".repeat(64), "verifier_sha256": "2".repeat(64),
+                "verified_text": spoken, "created_at": "2026-11-10T00:00:00Z"
+            }
+        }));
+    }
+    let mut manifest = serde_json::json!({"version": 2, "records": records});
+    let path = root.path().join("manifest.json");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let stop = AtomicBool::new(false);
+
+    let dataset = AudioDataset::load(root.path(), &stop).unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_eq!(
+        dataset.record(0).unwrap().samples(),
+        &[0.0, 0.25, -0.25, 0.0]
+    );
+
+    manifest["records"][1]["provenance"]["speaker_id"] = "speaker-train".into();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let error = match AudioDataset::load(root.path(), &stop) {
+        Ok(_) => panic!("accepted a speaker shared by training and development"),
+        Err(error) => error,
+    };
+    assert!(error.contains("speaker"), "unclear leakage error: {error}");
+}
