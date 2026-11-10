@@ -685,12 +685,22 @@ impl<B: Backend> OmniModel<B> {
         messages: &[serde_json::Value],
         frames: &[Vec<u32>],
     ) -> Result<Tensor<B, 3>> {
+        self.teacher_forced_speech_states_with_media(messages, &[], frames)
+    }
+
+    /// The same speech objective, with media bound through the normal prompt path.
+    pub fn teacher_forced_speech_states_with_media(
+        &self,
+        messages: &[serde_json::Value],
+        media: &[PreparedMedia<B>],
+        frames: &[Vec<u32>],
+    ) -> Result<Tensor<B, 3>> {
         if frames.is_empty() {
             return Err(Error::Audio(
                 "speech training needs at least one frame".into(),
             ));
         }
-        let prompt = self.prepare_prompt(messages, None, &[])?;
+        let prompt = self.prepare_prompt(messages, None, media)?;
         if prompt.ids.is_empty() {
             return Err(Error::Inference("speech training prompt is empty".into()));
         }
@@ -709,6 +719,17 @@ impl<B: Backend> OmniModel<B> {
             .forward_embeddings(Tensor::cat(embeddings, 1), &mut self.new_text_cache())?;
         let width = hidden.dims()[2];
         Ok(hidden.slice([0..1, first..first + frames.len(), 0..width]))
+    }
+
+    /// Predict answer tokens after a prompt assembled by the inference path.
+    pub fn teacher_forced_text_logits(
+        &self,
+        messages: &[serde_json::Value],
+        media: &[PreparedMedia<B>],
+        targets: &[u32],
+    ) -> Result<Tensor<B, 3>> {
+        let prompt = self.prepare_prompt(messages, None, media)?;
+        self.text.teacher_forced_logits(prompt.embeddings, targets)
     }
 
     /// Number of codebooks, vocabulary size, and all-codebook end marker.

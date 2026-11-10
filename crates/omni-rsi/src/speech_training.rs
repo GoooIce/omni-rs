@@ -8,11 +8,12 @@ use burn::{
     optim::{AdamW, AdamWConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
     tensor::{
-        Tensor, TensorData,
+        Int, Tensor, TensorData,
+        activation::log_softmax,
         backend::{AutodiffBackend, Backend},
     },
 };
-use omni_lfm3::{TextModel, model::OmniModel};
+use omni_lfm3::{TextModel, model::OmniModel, prepared::PreparedMedia};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 
@@ -67,22 +68,20 @@ pub fn speech_loss<B: Backend>(
     frames: &[Vec<u32>],
     seed: u64,
 ) -> Result<SpeechLoss<B>, String> {
-    let (books, vocabulary, end) = model.speech_code_format();
-    if frames.len() < 5
-        || frames.len() > 200
-        || frames.iter().any(|frame| frame.len() != books)
-        || frames
-            .last()
-            .is_none_or(|frame| frame.iter().any(|code| *code != end))
-        || frames[..frames.len() - 1]
-            .iter()
-            .flatten()
-            .any(|code| *code == end || *code as usize >= vocabulary)
-    {
-        return Err("invalid teacher-forced speech frames".into());
-    }
+    speech_loss_with_media(model, messages, &[], frames, seed)
+}
+
+/// Score output speech with the same ordered input media used at inference.
+pub fn speech_loss_with_media<B: Backend>(
+    model: &OmniModel<B>,
+    messages: &[serde_json::Value],
+    media: &[PreparedMedia<B>],
+    frames: &[Vec<u32>],
+    seed: u64,
+) -> Result<SpeechLoss<B>, String> {
+    let (books, _, _) = validate_speech_frames(model, frames)?;
     let states = model
-        .teacher_forced_speech_states(messages, frames)
+        .teacher_forced_speech_states_with_media(messages, media, frames)
         .map_err(|error| error.to_string())?;
     let width = states.dims()[2];
     let n = frames.len() - 1;
@@ -122,6 +121,50 @@ pub fn speech_loss<B: Backend>(
         content,
         end: end / end_count as f32,
     })
+}
+
+pub(crate) fn validate_speech_frames<B: Backend>(
+    model: &OmniModel<B>,
+    frames: &[Vec<u32>],
+) -> Result<(usize, usize, u32), String> {
+    let (books, vocabulary, end) = model.speech_code_format();
+    if frames.len() < 5
+        || frames.len() > 200
+        || frames.iter().any(|frame| frame.len() != books)
+        || frames
+            .last()
+            .is_none_or(|frame| frame.iter().any(|code| *code != end))
+        || frames[..frames.len() - 1]
+            .iter()
+            .flatten()
+            .any(|code| *code == end || *code as usize >= vocabulary)
+    {
+        return Err("invalid teacher-forced speech frames".into());
+    }
+    Ok((books, vocabulary, end))
+}
+
+/// Mean answer-token cross entropy. The caller includes the end-of-turn token.
+pub fn text_loss_with_media<B: Backend>(
+    model: &OmniModel<B>,
+    messages: &[serde_json::Value],
+    media: &[PreparedMedia<B>],
+    targets: &[u32],
+) -> Result<Tensor<B, 1>, String> {
+    let logits = model
+        .teacher_forced_text_logits(messages, media, targets)
+        .map_err(|error| error.to_string())?;
+    let [_, count, vocabulary] = logits.dims();
+    let indices = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(
+            targets.iter().map(|id| i64::from(*id)).collect(),
+            [count, 1],
+        ),
+        &logits.device(),
+    );
+    Ok(-log_softmax(logits.reshape([count, vocabulary]), 1)
+        .gather(1, indices)
+        .mean())
 }
 
 impl<B: AutodiffBackend> SpeechOptimizer<B> {

@@ -1,11 +1,13 @@
 use burn::{
     backend::{Autodiff, NdArray},
-    tensor::{Tensor, TensorData},
+    tensor::{Int, Tensor, TensorData, activation::log_softmax},
 };
 use omni_lfm3::{
     Precision, TextModel,
     config::Config,
     depth::{DepthConfig, DepthDecoder},
+    media::{Segment, SegmentKind},
+    prepared::{MediaIds, PreparedMedia, bind_embeddings},
 };
 use omni_r2t2::weights::Weights;
 use serde::Deserialize;
@@ -24,6 +26,17 @@ struct AdapterReference {
 
 #[derive(Deserialize)]
 struct GradientReference {
+    loss: f32,
+    gradient_a: Vec<f32>,
+    gradient_b: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct AudioTextReference {
+    prompt_ids: Vec<u32>,
+    target_ids: Vec<u32>,
+    audio: Vec<f32>,
+    logits: Vec<f32>,
     loss: f32,
     gradient_a: Vec<f32>,
     gradient_b: Vec<f32>,
@@ -117,6 +130,131 @@ fn lora_gradients_through_real_text_backbone_match_official_model() {
         .unwrap();
     close(actual_a, &expected.gradient_a, 1e-8);
     close(actual_b, &expected.gradient_b, 1e-8);
+}
+
+#[test]
+fn audio_conditioned_text_logits_and_lora_gradients_match_official_model() {
+    let reference: AudioTextReference = serde_json::from_slice(
+        &std::fs::read(fixture().join("expected-audio-text-training.json")).unwrap(),
+    )
+    .unwrap();
+    let adapter: AdapterReference =
+        serde_json::from_slice(&std::fs::read(fixture().join("expected-lora.json")).unwrap())
+            .unwrap();
+    let device = Default::default();
+    let mut model = model();
+    let width = model.hidden_size();
+    let a = Tensor::<TrainingBackend, 2>::from_data(
+        TensorData::new(adapter.a, [adapter.rank, width]),
+        &device,
+    )
+    .require_grad();
+    let b = Tensor::<TrainingBackend, 2>::from_data(
+        TensorData::new(adapter.b, [width, adapter.rank]),
+        &device,
+    )
+    .require_grad();
+    model
+        .install_conv_lora_tensors(adapter.layer, a.clone(), b.clone())
+        .unwrap();
+    let media = [PreparedMedia::Audio(Tensor::from_data(
+        TensorData::new(reference.audio, [2, width]),
+        &device,
+    ))];
+    let prompt = bind_embeddings(
+        &reference.prompt_ids,
+        model.embed_tokens(&reference.prompt_ids).unwrap(),
+        &[Segment {
+            media_index: 0,
+            kind: SegmentKind::Audio,
+            tokens: 2,
+        }],
+        &media,
+        MediaIds {
+            image: 20,
+            audio: 22,
+            video: 21,
+        },
+    )
+    .unwrap();
+    let logits = model
+        .teacher_forced_logits(prompt, &reference.target_ids)
+        .unwrap();
+    close(
+        logits.clone().into_data().to_vec().unwrap(),
+        &reference.logits,
+        1e-5,
+    );
+    let count = reference.target_ids.len();
+    let targets = Tensor::<TrainingBackend, 2, Int>::from_data(
+        TensorData::new(
+            reference
+                .target_ids
+                .iter()
+                .map(|id| i64::from(*id))
+                .collect(),
+            [count, 1],
+        ),
+        &device,
+    );
+    let loss = -log_softmax(logits.reshape([count, model.vocab_size()]), 1)
+        .gather(1, targets)
+        .mean();
+    assert!((loss.clone().into_scalar() - reference.loss).abs() < 1e-5);
+    let gradients = loss.backward();
+    close(
+        a.grad(&gradients).unwrap().into_data().to_vec().unwrap(),
+        &reference.gradient_a,
+        1e-7,
+    );
+    close(
+        b.grad(&gradients).unwrap().into_data().to_vec().unwrap(),
+        &reference.gradient_b,
+        1e-7,
+    );
+}
+
+#[test]
+fn text_training_rejects_invalid_targets_and_does_not_see_future_tokens() {
+    let model = model();
+    let prompt = model.embed_tokens(&[1, 2, 3]).unwrap();
+    assert!(model.teacher_forced_logits(prompt.clone(), &[]).is_err());
+    assert!(
+        model
+            .teacher_forced_logits(prompt.clone(), &[model.vocab_size() as u32])
+            .is_err()
+    );
+    assert!(
+        model
+            .teacher_forced_logits(prompt.clone(), &vec![1; 10000])
+            .is_err()
+    );
+    let original = model
+        .teacher_forced_logits(prompt.clone(), &[4, 5, 6])
+        .unwrap();
+    let changed = model
+        .teacher_forced_logits(prompt.clone(), &[4, 5, 7])
+        .unwrap();
+    close(
+        original.clone().into_data().to_vec().unwrap(),
+        &changed.into_data().to_vec::<f32>().unwrap(),
+        1e-7,
+    );
+    let changed = model.teacher_forced_logits(prompt, &[4, 7, 6]).unwrap();
+    let vocabulary = model.vocab_size();
+    let original = original.into_data().to_vec::<f32>().unwrap();
+    let changed = changed.into_data().to_vec::<f32>().unwrap();
+    close(
+        original[..2 * vocabulary].to_vec(),
+        &changed[..2 * vocabulary],
+        1e-7,
+    );
+    assert!(
+        original[2 * vocabulary..]
+            .iter()
+            .zip(&changed[2 * vocabulary..])
+            .any(|(a, b)| (a - b).abs() > 1e-5)
+    );
 }
 
 #[test]

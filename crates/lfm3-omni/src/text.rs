@@ -577,6 +577,37 @@ impl<B: Backend> TextModel<B> {
     pub fn forward(&self, ids: &[u32], cache: &mut TextCache<B>) -> Result<Tensor<B, 3>> {
         self.forward_embeddings(self.embed_tokens(ids)?, cache)
     }
+    /// Predict each target using only the prompt and earlier target tokens.
+    /// The prompt may already contain encoded audio or other media.
+    pub fn teacher_forced_logits(
+        &self,
+        prompt: Tensor<B, 3>,
+        targets: &[u32],
+    ) -> Result<Tensor<B, 3>> {
+        let [batch, length, width] = prompt.dims();
+        if batch != 1
+            || length == 0
+            || width != self.hidden_size()
+            || targets.is_empty()
+            || targets.iter().any(|id| *id as usize >= self.vocab_size())
+            || length
+                .checked_add(targets.len() - 1)
+                .is_none_or(|n| n > self.config.max_position_embeddings)
+        {
+            return Err(Error::Inference("invalid teacher-forced text input".into()));
+        }
+        let embeddings = if targets.len() == 1 {
+            prompt
+        } else {
+            Tensor::cat(
+                vec![prompt, self.embed_tokens(&targets[..targets.len() - 1])?],
+                1,
+            )
+        };
+        let hidden = self.forward_embeddings(embeddings, &mut self.new_cache())?;
+        let hidden = hidden.slice([0..1, length - 1..length - 1 + targets.len(), 0..width]);
+        Ok(self.logits(hidden))
+    }
     pub fn forward_embeddings(
         &self,
         mut x: Tensor<B, 3>,
