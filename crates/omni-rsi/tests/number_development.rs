@@ -2163,3 +2163,389 @@ fn unsupported_platform_fails_closed_before_data_or_registration_access() {
         .unwrap();
     assert!(error.contains("unsupported"), "{error}");
 }
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_rejects_a_changed_frozen_audio_mapping() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let mut report = compare_registered_with(&registered, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "十三".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+
+    let checked = recheck_registered_observations(&registered, &report, &stop).unwrap();
+    assert_eq!(checked["status"], "insufficient_evidence");
+    assert_eq!(checked["candidate_eligible"], false);
+    assert_eq!(report["observations"][1]["audio_case_id"], "dev-b");
+    report["observations"][1]["audio_case_id"] = "dev-a".into();
+    assert!(recheck_registered_observations(&registered, &report, &stop).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_recomputes_each_control_instead_of_trusting_counts() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let mut report = compare_registered_with(&registered, &stop, |arm, _, samples| {
+        let text = if samples.iter().all(|sample| *sample == 0.0) {
+            if arm == "baseline" {
+                "我听到了零。"
+            } else {
+                "没有听到数字。"
+            }
+        } else if arm == "baseline" || samples[1] < 0.3 {
+            "十三"
+        } else {
+            "十六"
+        };
+        Ok(DecodedText {
+            text: text.into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+
+    let checked = recheck_registered_observations(&registered, &report, &stop).unwrap();
+    assert_eq!(checked["baseline"]["original_correct"], 1);
+    assert_eq!(checked["baseline"]["swapped_correct"], 1);
+    assert_eq!(checked["baseline"]["silence_numeric_responses"], 2);
+    assert_eq!(checked["candidate"]["original_correct"], 2);
+    assert_eq!(checked["candidate"]["swapped_correct"], 2);
+    assert_eq!(checked["candidate"]["silence_numeric_responses"], 0);
+    assert_eq!(checked["candidate_eligible"], false);
+    report["candidate"]["original_correct"] = 99.into();
+    assert!(recheck_registered_observations(&registered, &report, &stop).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_rejects_duplicate_conditions_even_when_totals_match() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let mut report = compare_registered_with(&registered, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "十三".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+    assert!(recheck_registered_observations(&registered, &report, &stop).is_ok());
+
+    // Replace dev-b's baseline silence with dev-a's identical-condition row.
+    // Aggregate counts remain unchanged even though one case is now missing.
+    report["observations"][8] = report["observations"][2].clone();
+    assert!(recheck_registered_observations(&registered, &report, &stop).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_binds_pcm_and_equal_length_silence() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let report = compare_registered_with(&registered, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "十三".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+    assert!(recheck_registered_observations(&registered, &report, &stop).is_ok());
+
+    let mut changed_pcm = report.clone();
+    changed_pcm["observations"][0]["audio_pcm_sha256"] = "0".repeat(64).into();
+    assert!(recheck_registered_observations(&registered, &changed_pcm, &stop).is_err());
+
+    let mut missing_silence_identity = report.clone();
+    missing_silence_identity["observations"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("audio_case_id");
+    assert!(
+        recheck_registered_observations(&registered, &missing_silence_identity, &stop).is_err()
+    );
+
+    let mut changed_silence = report;
+    changed_silence["observations"][2]["samples"] = 3.into();
+    assert!(recheck_registered_observations(&registered, &changed_silence, &stop).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_recomputes_independent_paired_statistics() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let records: Vec<_> = (0..30)
+        .map(|i| {
+            case(
+                root.path(),
+                "dev",
+                &format!("independent-{i}"),
+                i,
+                tagged_source(&format!("independent-{i}")),
+                1000 + i as i16 * 100,
+            )
+        })
+        .collect();
+    let groups: Vec<_> = records
+        .iter()
+        .map(|record| json!({"id":record["id"], "source":record["source"]}))
+        .collect();
+    write_json(
+        &root.path().join("dev.groups.v3.json"),
+        &json!({"version":3, "partition":"dev", "records":groups}),
+    );
+    write_json(
+        &root.path().join("dev.v3.json"),
+        &json!({"version":3, "partition":"dev", "rule":"number-plus-one-v1", "records":records}),
+    );
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let mut report = compare_registered_with(&registered, &stop, |arm, _, samples| {
+        let text = if samples.iter().all(|sample| *sample == 0.0) {
+            "没有听到数字".to_owned()
+        } else {
+            let amplitude = (samples[1] * 32768.0).round() as i32;
+            let number = (amplitude - 1000) / 100;
+            if arm == "candidate" || number >= 15 {
+                (number + 1).to_string()
+            } else {
+                "不确定".to_owned()
+            }
+        };
+        Ok(DecodedText {
+            text,
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+
+    let checked = recheck_registered_observations(&registered, &report, &stop).unwrap();
+    let stats = &checked["paired_statistics"];
+    assert_eq!(stats["n"], 30);
+    assert_eq!(stats["baseline_correct"], 15);
+    assert_eq!(stats["candidate_correct"], 30);
+    assert_eq!(stats["candidate_only"], 15);
+    assert_eq!(stats["baseline_only"], 0);
+    assert!((stats["improvement"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+    // Independent reference: Bonferroni/Clopper–Pearson, n=30, b=15, c=0.
+    assert!((stats["interval_95"][0].as_f64().unwrap() - 0.1546).abs() < 0.0001);
+    assert_eq!(
+        checked["numeric_thresholds_on_reported_stops"]["enough_cases_with_unique_declared_ids"],
+        true
+    );
+    assert_eq!(
+        checked["numeric_thresholds_on_reported_stops"]["gain_at_least_five_points"],
+        true
+    );
+    assert_eq!(
+        checked["numeric_thresholds_on_reported_stops"]["confidence_lower_positive"],
+        true
+    );
+    assert_eq!(checked["status"], "insufficient_evidence");
+    assert_eq!(checked["candidate_eligible"], false);
+    for (wins, gain_ok) in [(1, false), (3, true)] {
+        let weaker = compare_registered_with(&registered, &stop, |arm, _, samples| {
+            let text = if samples.iter().all(|sample| *sample == 0.0) {
+                "没有听到数字".to_owned()
+            } else {
+                let amplitude = (samples[1] * 32768.0).round() as i32;
+                let number = (amplitude - 1000) / 100;
+                if arm == "candidate" && number < wins {
+                    (number + 1).to_string()
+                } else {
+                    "不确定".to_owned()
+                }
+            };
+            Ok(DecodedText {
+                text,
+                end: TextEnd::Stop(7),
+            })
+        })
+        .unwrap();
+        let weaker = recheck_registered_observations(&registered, &weaker, &stop).unwrap();
+        assert_eq!(
+            weaker["numeric_thresholds_on_reported_stops"]["gain_at_least_five_points"],
+            gain_ok
+        );
+        assert_eq!(
+            weaker["numeric_thresholds_on_reported_stops"]["confidence_lower_positive"],
+            false
+        );
+        if wins == 3 {
+            assert!(
+                (weaker["paired_statistics"]["interval_95"][0]
+                    .as_f64()
+                    .unwrap()
+                    - (-0.1197))
+                    .abs()
+                    < 0.0001
+            );
+        }
+        assert_eq!(weaker["candidate_eligible"], false);
+    }
+    report["paired_statistics"]["candidate_only"] = 30.into();
+    assert!(recheck_registered_observations(&registered, &report, &stop).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn general_observation_recheck_does_not_claim_stop_token_policy_is_verified() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let report = compare_registered_with(&registered, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "十三".into(),
+            end: TextEnd::Stop(999),
+        })
+    })
+    .unwrap();
+
+    let checked = recheck_registered_observations(&registered, &report, &stop).unwrap();
+    assert_eq!(checked["termination_token_policy"], "not_checked");
+    assert_eq!(
+        checked["numeric_thresholds_on_reported_stops"]["enough_cases_with_unique_declared_ids"],
+        false
+    );
+    assert!(checked["numeric_thresholds_on_reported_stops"]["confidence_lower_positive"].is_null());
+    assert_eq!(checked["candidate_eligible"], false);
+    assert_eq!(checked["status"], "insufficient_evidence");
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_never_upgrades_self_reported_execution_or_human_review() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    let root = fixture();
+    artifacts(root.path());
+    let stop = AtomicBool::new(false);
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    let mut report = compare_registered_with(&registered, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "十三".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+    report["status"] = "passed".into();
+    report["candidate_eligible"] = true.into();
+    report["execution"] = "local_rust_burn_unverified".into();
+    report["independent_human_references"] = "verified".into();
+    report["source_authorization"] = "verified".into();
+    report["regressions"] = "passed".into();
+
+    let checked = recheck_registered_observations(&registered, &report, &stop).unwrap();
+    assert_eq!(checked["execution_verified"], false);
+    assert_eq!(checked["source_authorization"], "not_verified");
+    assert_eq!(checked["independent_human_references"], "not_verified");
+    assert_eq!(checked["regressions"], "not_verified");
+    assert_eq!(checked["candidate_eligible"], false);
+    assert_eq!(checked["status"], "insufficient_evidence");
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_recheck_treats_the_five_point_threshold_as_inclusive() {
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, compare_registered_with, recheck_registered_observations,
+    };
+
+    for (count, expected) in [(40, true), (41, false)] {
+        let root = fixture();
+        artifacts(root.path());
+        let records: Vec<_> = (0..count)
+            .map(|i| {
+                case(
+                    root.path(),
+                    "dev",
+                    &format!("boundary-{i}"),
+                    i,
+                    tagged_source(&format!("boundary-{i}")),
+                    1000 + i as i16 * 100,
+                )
+            })
+            .collect();
+        let groups: Vec<_> = records
+            .iter()
+            .map(|record| json!({"id":record["id"], "source":record["source"]}))
+            .collect();
+        write_json(
+            &root.path().join("dev.groups.v3.json"),
+            &json!({"version":3, "partition":"dev", "records":groups}),
+        );
+        write_json(
+            &root.path().join("dev.v3.json"),
+            &json!({"version":3, "partition":"dev", "rule":"number-plus-one-v1", "records":records}),
+        );
+        let stop = AtomicBool::new(false);
+        let registered =
+            preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+        let report = compare_registered_with(&registered, &stop, |arm, _, samples| {
+            let amplitude = (samples[1] * 32768.0).round() as i32;
+            let number = (amplitude - 1000) / 100;
+            Ok(DecodedText {
+                text: if arm == "candidate" && (0..2).contains(&number) {
+                    (number + 1).to_string()
+                } else {
+                    "不确定".into()
+                },
+                end: TextEnd::Stop(7),
+            })
+        })
+        .unwrap();
+        let checked = recheck_registered_observations(&registered, &report, &stop).unwrap();
+        assert_eq!(checked["paired_statistics"]["candidate_only"], 2);
+        assert_eq!(
+            checked["numeric_thresholds_on_reported_stops"]["gain_at_least_five_points"],
+            expected
+        );
+        assert_eq!(checked["candidate_eligible"], false);
+    }
+}

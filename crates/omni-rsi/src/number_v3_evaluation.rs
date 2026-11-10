@@ -5,7 +5,7 @@ use crate::{
     number_development::{
         RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, verify_registration,
     },
-    number_gate::{PairedCase, PairedOutcome, paired_statistics},
+    number_gate::{PairedCase, PairedOutcome, PairedStatistics, paired_statistics},
     speech_asr::AsrEvent,
     speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol},
     speech_number_evaluation::{answer_number, character_error_rate, mentions_number},
@@ -531,6 +531,12 @@ fn run_v3<B: AutodiffBackend>(
     }
     ensure_same_data(&after, &verified)?;
     check_policy(options, &after, &verified)?;
+    report["observation_recheck"] = recheck_with_stop_tokens(
+        &verified,
+        &report,
+        stop,
+        Some(&after.text_options.stop_tokens),
+    )?;
     report["candidate_checkpoint_sha256"] = after.candidate.into();
     report["dataset_sha256"] = after.dataset.digest().into();
     report["base_sha256"] = after.protocol.base_hash.clone().into();
@@ -923,6 +929,25 @@ struct Observation {
     correct: Option<bool>,
 }
 
+fn control_metrics(values: [usize; 6], cases: usize) -> serde_json::Value {
+    serde_json::json!({
+        "original_correct":values[0],"swapped_correct":values[1],"silence_numeric_responses":values[2],
+        "original_accuracy":values[0] as f64 / cases as f64,
+        "swapped_accuracy":values[1] as f64 / cases as f64,
+        "silence_numeric_rate":values[2] as f64 / cases as f64,
+        "normal_end":{"original":values[3],"swapped":values[4],"silence":values[5]}
+    })
+}
+
+fn paired_metrics(stats: &PairedStatistics) -> serde_json::Value {
+    serde_json::json!({
+        "n":stats.n,"baseline_correct":stats.baseline_correct,
+        "candidate_correct":stats.candidate_correct,"candidate_only":stats.candidate_only,
+        "baseline_only":stats.baseline_only,"both_correct":stats.both_correct,"both_wrong":stats.both_wrong,
+        "improvement":stats.improvement,"interval_95":stats.interval_95
+    })
+}
+
 fn validate_frozen_mapping(
     registered: &RegisteredDevelopment,
 ) -> Result<HashMap<String, String>, String> {
@@ -953,6 +978,218 @@ fn validate_frozen_mapping(
         }
     }
     Ok(mapping)
+}
+
+/// Recheck an untrusted comparison against the frozen development inputs.
+/// This diagnostic never establishes model execution or authorizes a holdout.
+/// General registrations do not bind v3 stop-token IDs, so termination counts
+/// here are provisional and do not verify the frozen v3 generation policy.
+pub fn recheck_registered_observations(
+    registered: &RegisteredDevelopment,
+    report: &serde_json::Value,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    recheck_with_stop_tokens(registered, report, stop, None)
+}
+
+fn recheck_with_stop_tokens(
+    registered: &RegisteredDevelopment,
+    report: &serde_json::Value,
+    stop: &AtomicBool,
+    stop_tokens: Option<&[u32]>,
+) -> Result<serde_json::Value, String> {
+    interrupted(stop)?;
+    if report["protocol_sha256"].as_str() != Some(registered.protocol_sha256()) {
+        return Err("observation protocol differs from registration".into());
+    }
+    let mapping = validate_frozen_mapping(registered)?;
+    let cases: HashMap<_, _> = registered
+        .data()
+        .dev()
+        .iter()
+        .map(|case| (case.id(), case))
+        .collect();
+    let mut pcm = HashMap::with_capacity(cases.len());
+    let mut silence = HashMap::new();
+    for case in registered.data().dev() {
+        let mut hash = Sha256::new();
+        for chunk in case.samples().chunks(4096) {
+            interrupted(stop)?;
+            for sample in chunk {
+                let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
+                hash.update(bits.to_le_bytes());
+            }
+        }
+        pcm.insert(case.id(), format!("{:x}", hash.finalize()));
+        let count = case.samples().len();
+        if !silence.contains_key(&count) {
+            let mut hash = Sha256::new();
+            let mut remaining = count.checked_mul(4).ok_or("silence length overflow")?;
+            let zeros = [0_u8; 4096];
+            while remaining > 0 {
+                interrupted(stop)?;
+                let length = remaining.min(zeros.len());
+                hash.update(&zeros[..length]);
+                remaining -= length;
+            }
+            silence.insert(count, format!("{:x}", hash.finalize()));
+        }
+    }
+    let observations = report["observations"]
+        .as_array()
+        .ok_or("missing observations")?;
+    if cases.len().checked_mul(6) != Some(observations.len()) {
+        return Err("incomplete development observations".into());
+    }
+    let mut seen = HashSet::with_capacity(observations.len());
+    let mut counts = [[0_usize; 6]; 2];
+    let mut originals: HashMap<&str, [Option<PairedOutcome>; 2]> = HashMap::new();
+    let mut total_text = 0_usize;
+    for row in observations {
+        interrupted(stop)?;
+        let fields = row.as_object().ok_or("invalid observation")?;
+        if !fields.contains_key("audio_case_id") || !fields.contains_key("correct") {
+            return Err("observation is missing a required field".into());
+        }
+        let case = row["case_id"].as_str().ok_or("missing case identity")?;
+        let swapped = mapping.get(case).ok_or("unknown observation case")?;
+        let arm = match row["arm"].as_str() {
+            Some("baseline") => 0,
+            Some("candidate") => 1,
+            _ => return Err("unknown observation arm".into()),
+        };
+        let (condition, expected) = match row["condition"].as_str() {
+            Some("original") => (0, Some(case)),
+            Some("swapped") => (1, Some(swapped.as_str())),
+            Some("silence") => (2, None),
+            _ => return Err("unknown observation condition".into()),
+        };
+        if !seen.insert((case, arm, condition)) {
+            return Err("duplicate development observation".into());
+        }
+        if row["audio_case_id"].as_str() != expected
+            || (expected.is_none() && !row["audio_case_id"].is_null())
+        {
+            return Err("observation does not match frozen audio mapping".into());
+        }
+        let input_case = expected.unwrap_or(case);
+        let input = cases.get(input_case).ok_or("unknown audio case")?;
+        let expected_hash = if expected.is_some() {
+            pcm.get(input_case).ok_or("missing audio identity")?
+        } else {
+            silence
+                .get(&input.samples().len())
+                .ok_or("missing silence identity")?
+        };
+        if row["samples"].as_u64() != u64::try_from(input.samples().len()).ok()
+            || row["audio_pcm_sha256"].as_str() != Some(expected_hash.as_str())
+        {
+            return Err("observation PCM identity or length changed".into());
+        }
+        let end = row["end"].as_object().ok_or("missing observation end")?;
+        let stopped = match (end.get("stop_token"), end.get("kind")) {
+            (Some(token), None) if end.len() == 1 => {
+                let token = token
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or("invalid observation stop token")?;
+                if stop_tokens.is_some_and(|tokens| !tokens.contains(&token)) {
+                    return Err("observation stop token differs from frozen v3 policy".into());
+                }
+                true
+            }
+            (None, Some(kind)) if end.len() == 1 && kind.as_str() == Some("limit") => false,
+            _ => return Err("invalid observation end".into()),
+        };
+        if row["stopped"].as_bool() != Some(stopped) {
+            return Err("observation termination summary differs".into());
+        }
+        let text = row["text"].as_str().ok_or("missing observation text")?;
+        total_text = total_text
+            .checked_add(text.len())
+            .ok_or("comparison text overflow")?;
+        if text.len() > 4096 || total_text > 16 * 1024 * 1024 {
+            return Err("comparison text exceeds limit".into());
+        }
+        let correct = expected
+            .map(|id| cases.get(id).ok_or("unknown audio case"))
+            .transpose()?
+            .map(|audio| stopped && answer_number(text) == u16::try_from(audio.answer()).ok());
+        if row["correct"] != serde_json::json!(correct) {
+            return Err("observation score differs from raw answer".into());
+        }
+        if condition < 2 {
+            counts[arm][condition] += usize::from(correct == Some(true));
+        } else {
+            counts[arm][2] += usize::from(mentions_number(text));
+        }
+        counts[arm][3 + condition] += usize::from(stopped);
+        if condition == 0 {
+            originals.entry(case).or_insert_with(|| [None, None])[arm] = Some(PairedOutcome {
+                correct: correct == Some(true),
+                normal_end: stopped,
+            });
+        }
+    }
+    let baseline = control_metrics(counts[0], cases.len());
+    let candidate = control_metrics(counts[1], cases.len());
+    if report["baseline"] != baseline || report["candidate"] != candidate {
+        return Err("comparison summary differs from raw observations".into());
+    }
+    let pairs = registered
+        .data()
+        .dev()
+        .iter()
+        .map(|case| {
+            let ends = originals
+                .get(case.id())
+                .ok_or("missing original observations")?;
+            let source = case.source();
+            Ok(PairedCase {
+                case_id: case.id().into(),
+                original_id: source.recording_sha256.clone(),
+                family_id: source.family_sha256.clone(),
+                speaker_id: source.speaker_sha256.clone(),
+                session_id: source.session_sha256.clone(),
+                baseline: ends[0].clone().ok_or("missing baseline original")?,
+                candidate: ends[1].clone().ok_or("missing candidate original")?,
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    let stats = paired_statistics(&pairs)?;
+    let paired = paired_metrics(&stats);
+    if report["paired_statistics"] != paired {
+        return Err("paired statistics differ from raw observations".into());
+    }
+    let enough = stats.n >= 30 && stats.interval_95.is_some();
+    let gain = enough.then(|| {
+        (stats.candidate_only as i128 - stats.baseline_only as i128) * 20 >= stats.n as i128
+    });
+    let confidence = if enough {
+        stats.interval_95.map(|(lower, _)| lower > 0.0)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "status": "insufficient_evidence",
+        "candidate_eligible": false,
+        "protocol_sha256": registered.protocol_sha256(),
+        "termination_token_policy": if stop_tokens.is_some() { "matched_registered_tokens" } else { "not_checked" },
+        "execution_verified": false,
+        "source_authorization": "not_verified",
+        "independent_human_references": "not_verified",
+        "output_speech_and_listening": "not_verified",
+        "regressions": "not_verified",
+        "baseline": baseline,
+        "candidate": candidate,
+        "paired_statistics": paired,
+        "numeric_thresholds_on_reported_stops": {
+            "enough_cases_with_unique_declared_ids": enough,
+            "gain_at_least_five_points": gain,
+            "confidence_lower_positive": confidence,
+            "text_normal_end_no_degradation": stop_tokens.map(|_| (3..6).all(|i| counts[1][i] >= counts[0][i]))
+        },
+    }))
 }
 
 /// Run an injected comparison for behavior tests. Caller outputs are never
@@ -1083,23 +1320,11 @@ pub fn compare_registered_with(
     if stats.interval_95.is_none() {
         missing.push("independent source groups");
     }
-    let metrics = |values: [usize; 6]| {
-        serde_json::json!({
-            "original_correct":values[0],"swapped_correct":values[1],"silence_numeric_responses":values[2],
-            "original_accuracy":values[0] as f64 / cases.len() as f64,
-            "swapped_accuracy":values[1] as f64 / cases.len() as f64,
-            "silence_numeric_rate":values[2] as f64 / cases.len() as f64,
-            "normal_end":{"original":values[3],"swapped":values[4],"silence":values[5]}
-        })
-    };
     Ok(
         serde_json::json!({"status":"insufficient_evidence","candidate_eligible":false,
         "execution":"injected_unverified","protocol_sha256":registered.protocol_sha256(),
-        "baseline":metrics(counts[0]),"candidate":metrics(counts[1]),"observations":observations,
-        "paired_statistics":{"n":stats.n,"baseline_correct":stats.baseline_correct,
-            "candidate_correct":stats.candidate_correct,"candidate_only":stats.candidate_only,
-            "baseline_only":stats.baseline_only,"both_correct":stats.both_correct,"both_wrong":stats.both_wrong,
-            "improvement":stats.improvement,"interval_95":stats.interval_95},
+        "baseline":control_metrics(counts[0], cases.len()),"candidate":control_metrics(counts[1], cases.len()),"observations":observations,
+        "paired_statistics":paired_metrics(&stats),
         "missing_evidence":missing,"output_speech_r2t2_cer":"not_run","regressions":"not_run",
         "independent_human_references":"not_verified","source_authorization":"not_verified"}),
     )
