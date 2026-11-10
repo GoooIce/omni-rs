@@ -8,44 +8,65 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
 const COMMITMENT_DOMAIN: &[u8] = b"omni-rsi/number-blind-holdout/manifest/v1\0";
+const COMMITMENT_V2_DOMAIN: &[u8] = b"omni-rsi/number-blind-holdout/manifest/v2\0";
 const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(all(test, unix))]
 #[path = "number_blind_holdout_tests.rs"]
 mod tests;
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BlindCase {
-    pub case_id: String,
-    pub spoken_number: u8,
-    pub answer: u16,
-    pub audio_file: String,
-    pub audio_sha256: String,
-    pub recording_sha256: String,
-    pub family_sha256: String,
-    pub speaker_sha256: String,
-    pub session_sha256: String,
-    /// Opaque source, license and reference material for later #82 validation.
-    /// Its presence is not a claim that the source was verified.
-    pub private_source: serde_json::Map<String, serde_json::Value>,
+// One identity schema drives both flat wire formats, the conversion and its
+// validation, while preserving existing public Rust fields and JSON bytes.
+macro_rules! blind_identity_types {
+    ($($identity:ident),+ $(,)?) => {
+        #[derive(Clone, Deserialize, Serialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct BlindCase {
+            pub case_id: String,
+            pub spoken_number: u8,
+            pub answer: u16,
+            pub audio_file: String,
+            pub audio_sha256: String,
+            $(pub $identity: String,)+
+            /// Opaque source, license and reference material for later #82 validation.
+            /// Its presence is not a claim that the source was verified.
+            pub private_source: serde_json::Map<String, serde_json::Value>,
+        }
+
+        /// Stable, opaque group identities shared with the training/dev source registry.
+        #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct BlindSource {
+            $(pub $identity: String,)+
+        }
+
+        impl BlindCase {
+            fn source(&self) -> BlindSource {
+                BlindSource { $($identity: self.$identity.clone(),)+ }
+            }
+        }
+
+        impl BlindSource {
+            fn is_valid(&self) -> bool {
+                [$(&self.$identity,)+].into_iter().all(|value| valid_hash(value))
+            }
+        }
+    };
 }
+
+blind_identity_types!(
+    recording_sha256,
+    family_sha256,
+    speaker_sha256,
+    session_sha256,
+);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlindManifest {
     pub cases: Vec<BlindCase>,
-}
-
-/// Stable, opaque group identities shared with the training/dev source registry.
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BlindSource {
-    pub recording_sha256: String,
-    pub family_sha256: String,
-    pub speaker_sha256: String,
-    pub session_sha256: String,
 }
 
 /// This public data deliberately carries no manifest, answer, media path or salt.
@@ -83,16 +104,11 @@ impl PublicMetadata {
             content_sha256: raw.content_sha256,
             sources: raw.sources,
         };
-        if public.version != 1
+        if !matches!(public.version, 1 | 2)
             || !valid_hash(&public.content_sha256)
             || public.sources.is_empty()
             || public.sources.len() > 10_000
-            || public.sources.iter().any(|source| {
-                !valid_hash(&source.recording_sha256)
-                    || !valid_hash(&source.family_sha256)
-                    || !valid_hash(&source.speaker_sha256)
-                    || !valid_hash(&source.session_sha256)
-            })
+            || public.sources.iter().any(|source| !source.is_valid())
             || public
                 .sources
                 .windows(2)
@@ -143,6 +159,7 @@ pub struct CustodianSeal {
     public: PublicMetadata,
     secret_salt: [u8; 32],
     manifest_bytes: Vec<u8>,
+    media_sizes: Option<Vec<u8>>,
 }
 
 /// An opaque future product of the real development-evidence verifier.
@@ -190,6 +207,9 @@ pub fn open_once(
     {
         return Err("verified development does not match frozen metadata".into());
     }
+    if checked.version != 2 {
+        return Err("public holdout metadata lacks a committed media capacity".into());
+    }
     crate::number_holdout_ledger::record_attempt(
         ledger_directory,
         &crate::number_holdout_ledger::Reservation {
@@ -231,7 +251,8 @@ pub fn open_once(
     let salt = read_private_file(private_directory, "salt.bin", 32)?;
     let salt: [u8; 32] = salt.try_into().map_err(|_| "invalid secret salt length")?;
     let manifest_bytes = read_private_file(private_directory, "manifest.json", MAX_MANIFEST_BYTES)?;
-    if manifest_commitment(&salt, &manifest_bytes) != checked.content_sha256 {
+    let media_sizes = read_private_file(private_directory, "media-sizes.bin", 10_001 * 8)?;
+    if manifest_commitment_v2(&salt, &manifest_bytes, &media_sizes) != checked.content_sha256 {
         return Err("private holdout commitment mismatch".into());
     }
     let manifest: BlindManifest =
@@ -240,20 +261,50 @@ pub fn open_once(
     if sources != checked.sources {
         return Err("private holdout source grouping mismatch".into());
     }
-    let mut total = 0usize;
+    if media_sizes.len() != (manifest.cases.len() + 1) * 8 {
+        return Err("private holdout media size table is invalid".into());
+    }
+    let audio_total_bytes = u64::from_be_bytes(
+        media_sizes[..8]
+            .try_into()
+            .map_err(|_| "invalid media total")?,
+    );
+    if audio_total_bytes == 0 || audio_total_bytes > MAX_TOTAL_MEDIA_BYTES {
+        return Err("private holdout media capacity is invalid".into());
+    }
+    let mut declared_total = 0_u64;
+    let mut sizes = Vec::with_capacity(manifest.cases.len());
+    for bytes in media_sizes[8..].as_chunks::<8>().0 {
+        let size = u64::from_be_bytes(*bytes);
+        if size == 0 || size > MAX_MEDIA_BYTES as u64 {
+            return Err("private holdout media size is invalid".into());
+        }
+        declared_total = declared_total
+            .checked_add(size)
+            .ok_or("media size overflow")?;
+        sizes.push(size);
+    }
+    if declared_total != audio_total_bytes {
+        return Err("private holdout media capacity does not match its commitment".into());
+    }
+    let mut total = 0_u64;
     let mut audio = Vec::with_capacity(manifest.cases.len());
-    for case in &manifest.cases {
+    for (case, size) in manifest.cases.iter().zip(sizes) {
         let bytes = read_private_file(private_directory, &case.audio_file, MAX_MEDIA_BYTES)?;
         total = total
-            .checked_add(bytes.len())
+            .checked_add(bytes.len() as u64)
             .ok_or("private holdout audio too large")?;
-        if total > 512 * 1024 * 1024
+        if bytes.len() as u64 != size
+            || total > audio_total_bytes
             || bytes.is_empty()
             || format!("{:x}", Sha256::digest(&bytes)) != case.audio_sha256
         {
             return Err("private holdout audio mismatch or size limit".into());
         }
         audio.push(bytes);
+    }
+    if total != audio_total_bytes {
+        return Err("private holdout audio size does not match its commitment".into());
     }
     Ok(OpenedHoldout { manifest, audio })
 }
@@ -305,6 +356,17 @@ fn manifest_commitment(salt: &[u8; 32], manifest_bytes: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+fn manifest_commitment_v2(salt: &[u8; 32], manifest_bytes: &[u8], media_sizes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(COMMITMENT_V2_DOMAIN);
+    hash.update(salt);
+    hash.update((manifest_bytes.len() as u64).to_be_bytes());
+    hash.update(manifest_bytes);
+    hash.update((media_sizes.len() as u64).to_be_bytes());
+    hash.update(media_sizes);
+    format!("{:x}", hash.finalize())
+}
+
 impl CustodianSeal {
     pub fn public(&self) -> &PublicMetadata {
         &self.public
@@ -323,10 +385,14 @@ impl CustodianSeal {
             .mode(0o700)
             .create(directory)
             .map_err(|error| error.to_string())?;
-        for (name, contents) in [
+        let mut files = vec![
             ("salt.bin", self.secret_salt.as_slice()),
             ("manifest.json", self.manifest_bytes.as_slice()),
-        ] {
+        ];
+        if let Some(sizes) = &self.media_sizes {
+            files.push(("media-sizes.bin", sizes.as_slice()));
+        }
+        for (name, contents) in files {
             let mut output = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -365,6 +431,7 @@ fn manifest_sources(manifest: &BlindManifest) -> Result<Vec<BlindSource>, String
     let mut ids = HashSet::new();
     let mut filenames = HashSet::new();
     for case in &manifest.cases {
+        let source = case.source();
         if case.case_id.trim().is_empty()
             || case.case_id.trim() != case.case_id
             || case.case_id.len() > 128
@@ -373,41 +440,25 @@ fn manifest_sources(manifest: &BlindManifest) -> Result<Vec<BlindSource>, String
             || !valid_audio_name(&case.audio_file)
             || !filenames.insert(&case.audio_file)
             || !valid_hash(&case.audio_sha256)
-            || !valid_hash(&case.recording_sha256)
-            || !valid_hash(&case.family_sha256)
-            || !valid_hash(&case.speaker_sha256)
-            || !valid_hash(&case.session_sha256)
+            || !source.is_valid()
             || case.spoken_number > 99
             || case.answer != u16::from(case.spoken_number) + 1
         {
             return Err("invalid private holdout case".into());
         }
-        let group = (
-            case.family_sha256.clone(),
-            case.speaker_sha256.clone(),
-            case.session_sha256.clone(),
-        );
         if sources
-            .insert(case.recording_sha256.clone(), group.clone())
-            .is_some_and(|previous| previous != group)
+            .insert(source.recording_sha256.clone(), source.clone())
+            .is_some_and(|previous| previous != source)
         {
             return Err("original recording has conflicting families".into());
         }
     }
-    Ok(sources
-        .into_iter()
-        .map(
-            |(recording_sha256, (family_sha256, speaker_sha256, session_sha256))| BlindSource {
-                recording_sha256,
-                family_sha256,
-                speaker_sha256,
-                session_sha256,
-            },
-        )
-        .collect())
+    Ok(sources.into_values().collect())
 }
 
-/// Seal an already supplied in-memory manifest. This performs no media reads.
+/// Produce the legacy v1 seal without inspecting media. Its public metadata can
+/// still be parsed, but `open_once` rejects it before reserving the holdout
+/// because it has no custodian-verified media capacity.
 pub fn seal_for_custodian(manifest: &BlindManifest) -> Result<CustodianSeal, String> {
     let sources = manifest_sources(manifest)?;
     let manifest_bytes = serde_json::to_vec(manifest).map_err(|error| error.to_string())?;
@@ -427,5 +478,45 @@ pub fn seal_for_custodian(manifest: &BlindManifest) -> Result<CustodianSeal, Str
         },
         secret_salt: salt,
         manifest_bytes,
+        media_sizes: None,
     })
+}
+
+/// Produce a v2 seal after inspecting each custodian media file's metadata.
+/// This reads no audio contents. Files must be frozen after this call and
+/// transferred unchanged into the private directory before publication.
+/// The v2 marker is an attestation by the custodian, not proof of its origin;
+/// the future development verifier must bind metadata from a trusted custodian.
+pub fn seal_for_custodian_with_media_metadata(
+    manifest: &BlindManifest,
+    media_directory: &std::path::Path,
+) -> Result<CustodianSeal, String> {
+    let mut seal = seal_for_custodian(manifest)?;
+    let directory =
+        std::fs::symlink_metadata(media_directory).map_err(|error| error.to_string())?;
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err("invalid custodian media directory".into());
+    }
+    let mut total = 0_u64;
+    let mut sizes = vec![0_u8; 8];
+    sizes.reserve(manifest.cases.len() * 8);
+    for case in &manifest.cases {
+        let metadata = std::fs::symlink_metadata(media_directory.join(&case.audio_file))
+            .map_err(|error| error.to_string())?;
+        let size = metadata.len();
+        if !metadata.is_file() || size == 0 || size > MAX_MEDIA_BYTES as u64 {
+            return Err("invalid custodian media size or file type".into());
+        }
+        total = total.checked_add(size).ok_or("media capacity overflow")?;
+        if total > MAX_TOTAL_MEDIA_BYTES {
+            return Err("custodian media capacity exceeds 512 MiB".into());
+        }
+        sizes.extend_from_slice(&size.to_be_bytes());
+    }
+    sizes[..8].copy_from_slice(&total.to_be_bytes());
+    seal.public.version = 2;
+    seal.public.content_sha256 =
+        manifest_commitment_v2(&seal.secret_salt, &seal.manifest_bytes, &sizes);
+    seal.media_sizes = Some(sizes);
+    Ok(seal)
 }

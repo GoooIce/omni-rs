@@ -19,6 +19,12 @@ fn manifest() -> BlindManifest {
     }
 }
 
+fn fixture_seal() -> CustodianSeal {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("secret.wav"), b"synthetic-audio").unwrap();
+    seal_for_custodian_with_media_metadata(&manifest(), root.path()).unwrap()
+}
+
 fn test_permit(public: &PublicMetadata) -> VerifiedDevelopment {
     VerifiedDevelopment {
         metadata_sha256: public.fingerprint().unwrap(),
@@ -28,9 +34,104 @@ fn test_permit(public: &PublicMetadata) -> VerifiedDevelopment {
 }
 
 #[test]
+fn unknown_media_capacity_is_rejected_before_reservation_or_private_access() {
+    let root = tempfile::tempdir().unwrap();
+    // Version 1 metadata has no committed media size.
+    let seal = super::seal_for_custodian(&manifest()).unwrap();
+    let ledger = root.path().join("ledger");
+    let private = root.path().join("private-must-not-be-opened");
+    let error = open_once(seal.public(), test_permit(seal.public()), &ledger, &private)
+        .err()
+        .unwrap();
+    assert!(error.contains("capacity"), "{error}");
+    assert!(!ledger.exists(), "unknown capacity consumed the holdout");
+    assert!(!private.exists());
+}
+
+#[test]
+fn private_media_total_is_committed_and_tampering_cannot_be_retried() {
+    for declared in [14_u64, 16] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("custodian-media");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("secret.wav"), b"synthetic-audio").unwrap();
+        let seal = seal_for_custodian_with_media_metadata(&manifest(), &source).unwrap();
+        let private = root.path().join("private");
+        seal.persist_private(&private).unwrap();
+        let sizes_path = private.join("media-sizes.bin");
+        let mut sizes = std::fs::read(&sizes_path).unwrap();
+        sizes[..8].copy_from_slice(&declared.to_be_bytes());
+        std::fs::write(sizes_path, sizes).unwrap();
+        let public = seal.public();
+        let ledger = root.path().join("ledger");
+        let error = open_once(public, test_permit(public), &ledger, &private)
+            .err()
+            .expect("accepted incorrect committed media size");
+        assert!(error.contains("commitment mismatch"), "{error}");
+        let retry = open_once(public, test_permit(public), &ledger, &private)
+            .err()
+            .unwrap();
+        assert!(retry.contains("already consumed"), "{retry}");
+    }
+}
+
+#[test]
+fn metadata_checked_seal_opens_the_same_media_after_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("custodian-media");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("secret.wav"), b"synthetic-audio").unwrap();
+    let seal = seal_for_custodian_with_media_metadata(&manifest(), &source).unwrap();
+    let private = root.path().join("private");
+    seal.persist_private(&private).unwrap();
+    assert_eq!(
+        std::fs::read(private.join("media-sizes.bin")).unwrap(),
+        [15_u64.to_be_bytes(), 15_u64.to_be_bytes()].concat()
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(private.join("media-sizes.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    std::fs::copy(source.join("secret.wav"), private.join("secret.wav")).unwrap();
+    let public = PublicMetadata::from_json(&seal.public().to_json().unwrap()).unwrap();
+    let ledger = root.path().join("ledger");
+    let opened = open_once(&public, test_permit(&public), &ledger, &private).unwrap();
+    assert_eq!(opened.audio(0).unwrap(), b"synthetic-audio");
+    assert!(open_once(&public, test_permit(&public), &ledger, &private).is_err());
+}
+
+#[test]
+fn media_size_changed_after_sealing_fails_and_stays_consumed() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("custodian-media");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("secret.wav"), b"synthetic-audio").unwrap();
+    let seal = seal_for_custodian_with_media_metadata(&manifest(), &source).unwrap();
+    let private = root.path().join("private");
+    seal.persist_private(&private).unwrap();
+    std::fs::write(private.join("secret.wav"), b"synthetic-audio-altered").unwrap();
+    let public = seal.public();
+    let ledger = root.path().join("ledger");
+    let error = open_once(public, test_permit(public), &ledger, &private)
+        .err()
+        .unwrap();
+    assert!(error.contains("audio"), "{error}");
+    std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
+    let error = open_once(public, test_permit(public), &ledger, &private)
+        .err()
+        .unwrap();
+    assert!(error.contains("already consumed"), "{error}");
+}
+
+#[test]
 fn unfrozen_metadata_is_rejected_before_opening_private_files_or_ledger() {
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let permit = VerifiedDevelopment {
         metadata_sha256: "0".repeat(64),
         protocol_sha256: "1".repeat(64),
@@ -49,7 +150,7 @@ fn unfrozen_metadata_is_rejected_before_opening_private_files_or_ledger() {
 fn occupied_ledger_fails_before_opening_the_private_directory() {
     use crate::number_holdout_ledger::{HoldoutIdentity, Reservation, record_attempt};
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let public = seal.public();
     let ledger = root.path().join("ledger");
     record_attempt(
@@ -81,7 +182,7 @@ fn occupied_ledger_fails_before_opening_the_private_directory() {
 #[test]
 fn reserved_holdout_opens_only_after_salt_manifest_and_media_match() {
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
@@ -94,10 +195,10 @@ fn reserved_holdout_opens_only_after_salt_manifest_and_media_match() {
 }
 
 #[test]
-fn tampered_salt_manifest_or_audio_never_releases_a_holdout_and_remains_consumed() {
-    for name in ["salt.bin", "manifest.json", "secret.wav"] {
+fn tampered_salt_manifest_sizes_or_audio_never_releases_a_holdout_and_remains_consumed() {
+    for name in ["salt.bin", "manifest.json", "media-sizes.bin", "secret.wav"] {
         let root = tempfile::tempdir().unwrap();
-        let seal = seal_for_custodian(&manifest()).unwrap();
+        let seal = fixture_seal();
         let private = root.path().join("private");
         seal.persist_private(&private).unwrap();
         std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
@@ -120,16 +221,18 @@ fn tampered_salt_manifest_or_audio_never_releases_a_holdout_and_remains_consumed
 
 #[test]
 fn altered_public_commitment_or_source_is_rejected_before_reservation() {
-    for field in ["content_sha256", "family_sha256"] {
+    for field in ["content_sha256", "family_sha256", "version"] {
         let root = tempfile::tempdir().unwrap();
-        let seal = seal_for_custodian(&manifest()).unwrap();
+        let seal = fixture_seal();
         let permit = test_permit(seal.public());
         let mut public: serde_json::Value =
             serde_json::from_slice(&seal.public().to_json().unwrap()).unwrap();
         if field == "content_sha256" {
             public[field] = "e".repeat(64).into();
-        } else {
+        } else if field == "family_sha256" {
             public["sources"][0][field] = "e".repeat(64).into();
+        } else {
+            public[field] = 1.into();
         }
         let changed = PublicMetadata::from_json(&serde_json::to_vec(&public).unwrap()).unwrap();
         let ledger = root.path().join("ledger");
@@ -160,7 +263,7 @@ fn process_exit_immediately_after_reservation_blocks_later_reading() {
         std::process::exit(0);
     }
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     std::fs::write(
         root.path().join("public.json"),
         seal.public().to_json().unwrap(),
@@ -189,7 +292,7 @@ fn process_exit_immediately_after_reservation_blocks_later_reading() {
 fn concurrent_callers_can_release_at_most_one_holdout() {
     use std::sync::Barrier;
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
@@ -218,8 +321,8 @@ fn concurrent_callers_can_release_at_most_one_holdout() {
 #[test]
 fn resealing_same_source_cannot_reopen_with_a_new_commitment() {
     let root = tempfile::tempdir().unwrap();
-    let first = seal_for_custodian(&manifest()).unwrap();
-    let second = seal_for_custodian(&manifest()).unwrap();
+    let first = fixture_seal();
+    let second = fixture_seal();
     let private = root.path().join("private");
     first.persist_private(&private).unwrap();
     std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
@@ -239,11 +342,52 @@ fn resealing_same_source_cannot_reopen_with_a_new_commitment() {
     assert!(error.contains("already consumed"), "{error}");
 }
 
+#[test]
+fn previously_consumed_v1_source_cannot_be_reopened_by_resealing_v2() {
+    use crate::number_holdout_ledger::{HoldoutIdentity, Reservation, record_attempt};
+    let root = tempfile::tempdir().unwrap();
+    let legacy = super::seal_for_custodian(&manifest()).unwrap();
+    let old = legacy.public();
+    let ledger = root.path().join("ledger");
+    record_attempt(
+        &ledger,
+        &Reservation {
+            protocol_sha256: "1".repeat(64),
+            candidate_sha256: "2".repeat(64),
+            holdout: HoldoutIdentity {
+                content_sha256: old.content_sha256.clone(),
+                sources: old
+                    .sources()
+                    .iter()
+                    .map(|source| HoldoutSource {
+                        recording_sha256: source.recording_sha256.clone(),
+                        family_sha256: source.family_sha256.clone(),
+                    })
+                    .collect(),
+            },
+        },
+    )
+    .unwrap();
+    let before = std::fs::read(ledger.join("ledger.json")).unwrap();
+    let new = fixture_seal();
+    let public = new.public();
+    let error = open_once(
+        public,
+        test_permit(public),
+        &ledger,
+        &root.path().join("no-private-files"),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("already consumed"), "{error}");
+    assert_eq!(std::fs::read(ledger.join("ledger.json")).unwrap(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn private_media_symlink_is_rejected_after_reservation() {
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     let outside = root.path().join("outside.wav");
@@ -286,7 +430,7 @@ fn separate_processes_cannot_both_open_the_same_holdout() {
         std::process::exit(if result.is_ok() { 0 } else { 17 });
     }
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
@@ -321,7 +465,7 @@ fn separate_processes_cannot_both_open_the_same_holdout() {
 #[test]
 fn held_ledger_lock_is_reported_before_any_private_access() {
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let ledger = root.path().join("ledger");
     std::fs::create_dir(&ledger).unwrap();
     let lease = crate::lease::Lease::try_acquire(&ledger.join("ledger.lock"))
@@ -346,7 +490,7 @@ fn held_ledger_lock_is_reported_before_any_private_access() {
 fn exposed_secret_salt_is_rejected_and_the_holdout_remains_consumed() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
@@ -377,7 +521,7 @@ fn exposed_secret_salt_is_rejected_and_the_holdout_remains_consumed() {
 fn public_private_directory_is_rejected_after_reservation() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -397,7 +541,7 @@ fn public_private_directory_is_rejected_after_reservation() {
 #[test]
 fn committed_manifest_must_match_public_sources_before_audio_is_opened() {
     let root = tempfile::tempdir().unwrap();
-    let seal = seal_for_custodian(&manifest()).unwrap();
+    let seal = fixture_seal();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
     // Deliberately omit the media file: a grouping error must be returned first.
@@ -449,13 +593,27 @@ fn fixed_domain_separated_commitment_matches_independent_sha256_reference() {
     )
     .unwrap();
     std::fs::write(private.join("a.wav"), b"abc").unwrap();
-    // Independently computed with Node's crypto SHA-256 over the specified bytes.
-    let public_json = serde_json::json!({
+    let legacy_json = serde_json::json!({
         "version": 1,
         "content_sha256": "6192465ecb1bcfcbbbee7be94a110eff24cbf69bd559224ce77326aeb96f9429",
         "sources": [{"recording_sha256":"b".repeat(64), "family_sha256":"c".repeat(64),
             "speaker_sha256":"d".repeat(64), "session_sha256":"e".repeat(64)}],
     });
+    let legacy = PublicMetadata::from_json(&serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+    assert_eq!(
+        legacy.fingerprint().unwrap(),
+        "4e59f59392994b32624cb44ac012e062caba36f8b97e06d97ec24276b25a56da"
+    );
+    std::fs::write(
+        private.join("media-sizes.bin"),
+        [3_u64.to_be_bytes(), 3_u64.to_be_bytes()].concat(),
+    )
+    .unwrap();
+    // Independently computed with Python's hashlib over the specified v2 bytes.
+    let mut public_json = legacy_json;
+    public_json["version"] = 2.into();
+    public_json["content_sha256"] =
+        "b6ac9193ca2b5c9a4cb3aca95b4019795da18b88bdba43abcc572ae3922be823".into();
     let public = PublicMetadata::from_json(&serde_json::to_vec(&public_json).unwrap()).unwrap();
     let opened = open_once(
         &public,

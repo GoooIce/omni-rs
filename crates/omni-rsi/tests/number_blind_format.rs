@@ -28,6 +28,48 @@ fn public_metadata_exposes_opaque_speaker_and_session_groups() {
 }
 
 #[test]
+fn private_and_public_source_identities_share_validation_and_flat_json() {
+    let input = manifest();
+    let private_json = serde_json::to_value(&input).unwrap();
+    let case = private_json["cases"][0].as_object().unwrap();
+    let fields = [
+        ("recording_sha256", 'b'),
+        ("family_sha256", 'c'),
+        ("speaker_sha256", 'd'),
+        ("session_sha256", 'e'),
+    ];
+    for (field, digit) in fields {
+        assert_eq!(case[field], digit.to_string().repeat(64));
+    }
+    assert!(!case.contains_key("source"));
+    let roundtrip: BlindManifest = serde_json::from_value(private_json.clone()).unwrap();
+    let seal = seal_for_custodian(&roundtrip).unwrap();
+    let public_json: serde_json::Value =
+        serde_json::from_slice(&seal.public().to_json().unwrap()).unwrap();
+    for (field, _) in fields {
+        assert_eq!(
+            public_json["sources"][0][field],
+            private_json["cases"][0][field]
+        );
+        for malformed in ["", "A", &"g".repeat(64), &"a".repeat(63), &"A".repeat(64)] {
+            let mut bad_private = private_json.clone();
+            bad_private["cases"][0][field] = malformed.into();
+            let bad_manifest: BlindManifest = serde_json::from_value(bad_private).unwrap();
+            assert!(
+                seal_for_custodian(&bad_manifest).is_err(),
+                "private {field}: {malformed}"
+            );
+            let mut bad_public = public_json.clone();
+            bad_public["sources"][0][field] = malformed.into();
+            assert!(
+                PublicMetadata::from_json(&serde_json::to_vec(&bad_public).unwrap()).is_err(),
+                "public {field}: {malformed}"
+            );
+        }
+    }
+}
+
+#[test]
 fn public_commitment_exposes_no_answer_number_or_audio_path() {
     let sealed = seal_for_custodian(&manifest()).unwrap();
     let public = sealed.public().to_json().unwrap();
@@ -83,7 +125,114 @@ fn public_reader_rejects_answer_and_media_fields() {
 }
 
 #[test]
-fn source_evidence_is_committed_privately_and_never_published() {
+fn public_reader_accepts_both_versions_and_rejects_extra_fields() {
+    let seal = seal_for_custodian(&manifest()).unwrap();
+    let legacy = seal.public().to_json().unwrap();
+    let legacy_metadata = PublicMetadata::from_json(&legacy).unwrap();
+    assert_eq!(legacy_metadata.to_json().unwrap(), legacy);
+    let mut public: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+    public["version"] = 2.into();
+    let metadata = PublicMetadata::from_json(&serde_json::to_vec(&public).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&metadata.to_json().unwrap()).unwrap(),
+        public
+    );
+    for version in [1, 2] {
+        public["version"] = version.into();
+        public["audio_total_bytes"] = 1.into();
+        assert!(PublicMetadata::from_json(&serde_json::to_vec(&public).unwrap()).is_err());
+        public.as_object_mut().unwrap().remove("audio_total_bytes");
+    }
+    public["version"] = 3.into();
+    assert!(PublicMetadata::from_json(&serde_json::to_vec(&public).unwrap()).is_err());
+}
+
+#[test]
+fn public_capacity_commitment_does_not_disclose_media_sizes() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("private-number-audio.wav"), b"audio").unwrap();
+    let seal = omni_rsi::number_blind_holdout::seal_for_custodian_with_media_metadata(
+        &manifest(),
+        root.path(),
+    )
+    .unwrap();
+    let public: serde_json::Value =
+        serde_json::from_slice(&seal.public().to_json().unwrap()).unwrap();
+    assert_eq!(public["version"], 2);
+    assert_eq!(public.as_object().unwrap().len(), 3);
+    assert!(public.get("audio_total_bytes").is_none());
+    assert!(public.get("media_sizes").is_none());
+}
+
+#[test]
+fn custodian_declares_capacity_before_sealing_without_reading_audio() {
+    use omni_rsi::number_blind_holdout::seal_for_custodian_with_media_metadata;
+    let root = tempfile::tempdir().unwrap();
+    let mut input = manifest();
+    let template = input.cases[0].clone();
+    input.cases = (0..17)
+        .map(|index| {
+            let mut case = template.clone();
+            case.case_id = format!("case-{index}");
+            case.audio_file = format!("missing-{index}.wav");
+            case
+        })
+        .collect();
+    let mib = 1024_u64 * 1024;
+    let mut sizes = vec![32 * mib; 15];
+    sizes.extend([32 * mib - 1, 1]);
+    for (case, size) in input.cases.iter().zip(&sizes) {
+        std::fs::File::create(root.path().join(&case.audio_file))
+            .unwrap()
+            .set_len(*size)
+            .unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.path().join("missing-0.wav"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    }
+    let seal = seal_for_custodian_with_media_metadata(&input, root.path()).unwrap();
+    let public = PublicMetadata::from_json(&seal.public().to_json().unwrap()).unwrap();
+    let public: serde_json::Value = serde_json::from_slice(&public.to_json().unwrap()).unwrap();
+    assert_eq!(public["version"], 2);
+    assert_eq!(public.as_object().unwrap().len(), 3);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("missing-16.wav"))
+        .unwrap()
+        .set_len(2)
+        .unwrap();
+    let error = seal_for_custodian_with_media_metadata(&input, root.path())
+        .err()
+        .expect("sealed an oversized holdout");
+    assert!(error.contains("capacity"), "{error}");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("missing-16.wav"))
+        .unwrap()
+        .set_len(32 * mib + 1)
+        .unwrap();
+    let error = seal_for_custodian_with_media_metadata(&input, root.path())
+        .err()
+        .expect("sealed a file over the individual limit");
+    assert!(error.contains("size"), "{error}");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("missing-16.wav"))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(seal_for_custodian_with_media_metadata(&input, root.path()).is_err());
+    std::fs::remove_file(root.path().join("missing-16.wav")).unwrap();
+    assert!(seal_for_custodian_with_media_metadata(&input, root.path()).is_err());
+}
+
+fn manifest_with_source_evidence() -> BlindManifest {
     let mut input = manifest();
     input.cases[0].private_source = serde_json::json!({
         "authorization": {"kind":"user-provided", "consent":"test-only consent"},
@@ -92,10 +241,21 @@ fn source_evidence_is_committed_privately_and_never_published() {
     .as_object()
     .unwrap()
     .clone();
-    let seal = seal_for_custodian(&input).unwrap();
+    input
+}
+
+#[test]
+fn source_evidence_is_never_published() {
+    let seal = seal_for_custodian(&manifest_with_source_evidence()).unwrap();
     let public = String::from_utf8(seal.public().to_json().unwrap()).unwrap();
     assert!(!public.contains("test-only consent"));
     assert!(!public.contains("private-reviewer"));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_evidence_is_persisted_in_the_private_manifest() {
+    let seal = seal_for_custodian(&manifest_with_source_evidence()).unwrap();
     let root = tempfile::tempdir().unwrap();
     let private = root.path().join("private");
     seal.persist_private(&private).unwrap();
@@ -104,6 +264,54 @@ fn source_evidence_is_committed_privately_and_never_published() {
     assert_eq!(
         saved["cases"][0]["private_source"]["human_reference"]["labeler"],
         "private-reviewer"
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn private_persistence_is_rejected_on_unsupported_platforms() {
+    let seal = seal_for_custodian(&manifest_with_source_evidence()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("private");
+    let error = seal.persist_private(&private).unwrap_err();
+    assert!(error.contains("not supported"), "{error}");
+    assert!(!private.exists());
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    std::fs::write(media.join("private-number-audio.wav"), b"audio").unwrap();
+    let seal = omni_rsi::number_blind_holdout::seal_for_custodian_with_media_metadata(
+        &manifest_with_source_evidence(),
+        &media,
+    )
+    .unwrap();
+    let error = seal.persist_private(&private).unwrap_err();
+    assert!(error.contains("not supported"), "{error}");
+    assert!(!private.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn custodian_rejects_symlink_or_non_file_media_metadata() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let audio = root.path().join("private-number-audio.wav");
+    std::fs::write(root.path().join("actual.wav"), b"audio").unwrap();
+    symlink("actual.wav", &audio).unwrap();
+    assert!(
+        omni_rsi::number_blind_holdout::seal_for_custodian_with_media_metadata(
+            &manifest(),
+            root.path()
+        )
+        .is_err()
+    );
+    std::fs::remove_file(&audio).unwrap();
+    std::fs::create_dir(&audio).unwrap();
+    assert!(
+        omni_rsi::number_blind_holdout::seal_for_custodian_with_media_metadata(
+            &manifest(),
+            root.path()
+        )
+        .is_err()
     );
 }
 
