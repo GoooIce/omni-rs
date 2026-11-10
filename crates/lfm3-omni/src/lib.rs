@@ -1,6 +1,7 @@
 //! Local LFM3 Omni model implementation.
 pub mod audio;
 pub mod audio_encoder;
+pub mod causal_audio;
 pub mod chat;
 pub mod codec;
 pub mod config;

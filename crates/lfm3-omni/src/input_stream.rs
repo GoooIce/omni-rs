@@ -90,6 +90,10 @@ impl<B: Backend> AudioInputStream<B> {
         Ok(PreparedMedia::Audio(embeddings.reshape([tokens, width])))
     }
 
+    pub(crate) fn samples(&self) -> usize {
+        self.samples
+    }
+
     /// Return completed audio embeddings without flushing or advancing the stream.
     pub fn snapshot(&self) -> Result<Option<PreparedMedia<B>>> {
         if self.failed {
