@@ -89,10 +89,23 @@ pub fn audio_implementation_hash() -> String {
         include_bytes!("speech_audio_checkpoint.rs").as_slice(),
         include_bytes!("speech_audio_data.rs").as_slice(),
         include_bytes!("speech_audio_round.rs").as_slice(),
+        include_bytes!("number_v3_target.rs").as_slice(),
+        include_bytes!("number_audio_v3.rs").as_slice(),
+        include_bytes!("number_development.rs").as_slice(),
+        include_bytes!("speech_audio_target.rs").as_slice(),
+        include_bytes!("fingerprint.rs").as_slice(),
         include_bytes!("audio_main.rs").as_slice(),
         include_bytes!("../Cargo.toml").as_slice(),
         include_bytes!("../../lfm3-omni/src/media_io.rs").as_slice(),
         include_bytes!("../../../src/input.rs").as_slice(),
+        include_bytes!("../../../src/weights.rs").as_slice(),
+        include_bytes!("../../../src/weights/layout.rs").as_slice(),
+        include_bytes!("../../../src/tensor/mod.rs").as_slice(),
+        include_bytes!("../../../src/tensor/norm.rs").as_slice(),
+        include_bytes!("../../../src/tensor/embedding.rs").as_slice(),
+        include_bytes!("../../../src/tensor/cache.rs").as_slice(),
+        include_bytes!("../../../src/tensor/decode_cache.rs").as_slice(),
+        include_bytes!("../../lfm3-omni/src/config.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/audio.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/audio_encoder.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/chat.rs").as_slice(),
@@ -116,6 +129,7 @@ impl AudioProtocol {
         if stop.load(Ordering::Acquire) {
             return Err("interrupted".into());
         }
+        crate::number_development::check_artifact_tree(model, stop)?;
         let base_hash =
             omni_lfm3::speech_adapter::source_fingerprint(model).map_err(|e| e.to_string())?;
         let full_codec_hash = codec_fingerprint(&model.join("audio_tokenizer"), stop)?;

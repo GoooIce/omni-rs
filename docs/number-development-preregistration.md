@@ -28,22 +28,27 @@ regression-plan.json     regression-inputs/*.json
 
 含语音目标的数据必须使用 `DevelopmentData::load_with_model` 并指定实际本地模型目录；无模型的 `load` 会拒绝含目标的数据，而不是丢弃它。入口保留所有帧和目标字段，按实际模型 `num_codebooks`、`codebook_size`、`audio_eos_code` 及 codec `n_q`、`fsq_levels`、采样率检查：总帧数 5–200，码本数最多 128，每帧宽度匹配码本，内容码在 codec 和模型范围内，只有最后一帧是全码本 EOS。目标模型配置哈希、codec 配置和权重的完整指纹，以及 #82 使用的目标 codec 身份必须与实际文件一致；单文件和索引分片各按原有算法处理。
 
-冻结的每条目标身份是整个目标对象的规范 JSON 哈希，因而绑定实际帧值、目标 WAV 字节身份、文件名和完整来源声明；加载后的记录仍可取回全部 `frames`，而不是只保留哈希。哈希不能证明 frames 确由该 WAV 和 codec 生成，也不能证实来源、许可或真人标注。显式 v3 训练入口将经模型和 codec 校验的目标 frames、EOS 连同规则文本和实际输入 PCM 交给同一个训练步骤；文本目标缺少语音码时只计算文本损失。来源核查和正式验收仍须另行接线。
+冻结的每条目标身份是整个目标对象的规范 JSON 哈希，因而绑定实际帧值、目标 WAV 字节身份、文件名和完整来源声明；加载后的记录仍可取回全部 `frames`，而不是只保留哈希。哈希本身不能证明 frames 确由该 WAV 和 codec 生成，也不能证实来源、许可或真人标注。显式 v3 训练会在新建检查点或恢复更新之前，对 train/dev 的每条语音目标重新读取并校验 WAV 字节，从同一份有界字节快照解码，以实际 codec 的 FP32 编码器逐帧、逐码本复算并核对 EOS；`caller_supplied_unverified` 不可用于该训练入口。模型的 codec 解码器使用与复算相同的配置及权重快照。文本目标缺少语音码时只计算文本损失；来源核查和正式验收仍须另行接线。
 
 ## 显式 v3 训练
 
 使用 `omni-rsi-audio --number-v3` 才会选择 v3 入口，省略此参数保留 v1/v2 数据加载路径。`--model`、`--data` 和 `--state` 均须显式指定；例如在已准备好本地模型和隔离数据后：
 
 ```sh
-CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 UV_CACHE_DIR="$PWD/artifacts/uv-cache" \
+uv run --offline --no-project python scripts/share-target.py
+CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=2 \
   cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
   --bin omni-rsi-audio -- --number-v3 --model /path/to/local/model --data /path/to/v3-data \
   --state /path/to/state --epochs 1 --max-updates 1
 ```
 
-入口只加载 train/dev 和公开保留元数据，构造与旧路径相同的 `AudioAnswer`，调用同一个 `train_step`；它不打开保留答案、盐或媒体，不自动发布候选。检查点位于 `state/number-audio-v3/audio-conditioned-v1/`，不复用旧路径的状态；两条路径共用父目录的训练租约。恢复必须显式加 `--resume`，并重新匹配模型、codec、数据和实现身份。`dataset_hash` 绑定实际 train/dev 清单、媒体、规则答案、目标帧和来源、公开保留承诺，以及 v3 加载和训练数据接线实现；完整 codec 与模型配置还由目标身份及底座身份绑定。开发集只参与身份和隔离检查，不用于训练更新。
+入口只加载 train/dev 和公开保留元数据，构造与旧路径相同的 `AudioAnswer`，调用同一个 `train_step`；它不打开保留答案、盐或媒体，不自动发布候选。检查点位于 `state/number-audio-v3/audio-conditioned-v1/`，不复用旧路径的状态；两条路径既共用父目录租约，也按实际检查点根目录取得租约，避免嵌套 state 别名竞争。恢复必须显式加 `--resume`，并重新匹配模型、codec、数据和实现身份，重新执行全部目标重编码。`dataset_hash` 绑定实际 train/dev 清单、媒体、规则答案、目标帧和来源、公开保留承诺，以及 v3 加载和训练数据接线实现；完整 codec 与模型配置还由目标身份及底座身份绑定。开发集只参与身份、隔离与重编码检查，不用于训练更新。
 
-此次修改了共享的音频训练入口、检查点和示例构造源码，因此 `audio_implementation_hash` 会变化。旧 v1/v2 清单仍可使用，但旧实现生成的检查点不会自动迁移或恢复；显式恢复时会报告实现摘要已变，保留原检查点和指针，可用原二进制与备份继续。训练完成或本地 mock 测试均不表示质量改善、真实来源已核验或许可已确定。
+目标的 `runtime_backend` 是被数据身份绑定的历史声明，不要求与本次训练后端相同，也不作为制备过程的证明；现场使用训练后端的 FP32 codec 重编码，编码帧必须完全一致，不使用数值容差。每个目标在构造编码器前先检查 4–199 个内容帧及不超过 16,777,216 个 FP32 STFT 特征，WAV 继续受上文的单文件和累计预算限制。重编码器每次处理一个目标；取消在文件读取及目标之间检查，单次解码、编码器构造和编码期间不保证立即中止。模型主体仍按路径加载，前后哈希与树预检适用于受控、稳定的本地工件，不防同账号并发替换或 ABA。重编码只验证当前帧与这份 WAV 和 codec 的一致性，不证明历史生成过程、授权、语音内容是否读对答案或真人参考质量。
+
+旧 v1/v2 训练入口保留原有行为，包括语音目标；它没有目标 WAV 现场重编码，只能用于探索，不能据此声称满足 v3 的语音目标核验。旧清单若没有 `codec_fingerprint_sha256` 扩展仍可使用；该字段若存在必须是合法哈希且对应语音帧，显式 `null` 或无效值会被拒绝。需要清理无意义的旧 `null` 时，应另存清单副本；改变数据不会迁移旧状态。预注册目前可以记录任意候选文件的哈希，但始终标记资格不足，并不验证其训练来源或授予晋级许可；正式开发验收及保留许可仍未接通，legacy 检查点或探索报告不能作为正式通过证据。
+
+此次修改了权重加载、codec 与训练验证等实现身份，因此 `audio_implementation_hash` 会变化；旧实现生成的 v1/v2 和 v3 检查点不会自动迁移或恢复。显式恢复时会拒绝不匹配，保留原检查点和指针；可用原二进制及备份继续旧实验。训练完成或本地测试均不表示质量改善、真实来源已核验或许可已确定。
 
 共享检查点源码也纳入数字开发评分的实现摘要，新增只读接口则改变预注册实现源码摘要。旧评分报告和旧冻结协议仍绑定各自生成时的源码；新版本不会把它们自动升级成新版本证据，旧冻结协议的重验会拒绝当前源码摘要不匹配。保留旧文件及其原二进制，后续按新协议重新冻结并取得所需的真实证据。
 

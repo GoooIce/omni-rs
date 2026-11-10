@@ -125,6 +125,7 @@ fn fixture() -> tempfile::TempDir {
     root
 }
 
+#[cfg(unix)]
 #[test]
 fn v3_training_examples_preserve_real_pcm_chinese_answer_and_eos() {
     let root = fixture();
@@ -165,6 +166,7 @@ fn v3_training_snapshot_does_not_open_holdout_files() {
     assert_eq!(protocol.train_records, 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn v3_training_protocol_binds_model_and_refuses_stale_target_codec() {
     use omni_rsi::speech_audio_checkpoint::AudioProtocol;
@@ -185,6 +187,7 @@ fn v3_training_protocol_binds_model_and_refuses_stale_target_codec() {
     fs::write(path, original).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn v3_training_digest_binds_train_dev_frames_sources_and_public_commitment() {
     let root = fixture();
@@ -280,7 +283,7 @@ fn v3_training_digest_binds_train_dev_frames_sources_and_public_commitment() {
     assert_eq!(identity(), baseline);
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn legacy_checkpoint_from_previous_implementation_is_rejected_without_overwrite() {
     use burn::{
@@ -348,7 +351,7 @@ fn legacy_checkpoint_from_previous_implementation_is_rejected_without_overwrite(
     assert_eq!(fs::read(checkpoint_file).unwrap(), bytes);
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 fn v3_checkpoint_resumes_optimizer_and_rejects_changed_frames_in_separate_state() {
     use burn::{
@@ -406,6 +409,15 @@ fn v3_checkpoint_resumes_optimizer_and_rejects_changed_frames_in_separate_state(
     let mut manifest: Value = serde_json::from_slice(&fs::read(&train).unwrap()).unwrap();
     manifest["records"][0]["speech_target"]["frames"][0][0] = 5.into();
     write_json(&train, &manifest);
+    let changed_data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
+    let changed_protocol =
+        AudioProtocol::for_v3(&model, &changed_data, Cpu::name(&device), &stop).unwrap();
+    assert!(
+        AudioCheckpoint::load(&v3_state, &changed_protocol)
+            .err()
+            .unwrap()
+            .contains("does not match")
+    );
     let options = AudioRoundOptions {
         model: &model,
         data: root.path(),
@@ -417,12 +429,45 @@ fn v3_checkpoint_resumes_optimizer_and_rejects_changed_frames_in_separate_state(
     let error = train_v3_audio_round::<Cpu>(&options, &device, &stop)
         .err()
         .unwrap();
-    assert!(error.contains("does not match"), "{error}");
+    assert!(error.contains("unverified"), "{error}");
     assert_eq!(fs::read(pointer).unwrap(), before);
     assert_eq!(
         fs::read(legacy.join("marker")).unwrap(),
         b"legacy is unchanged"
     );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn v3_loading_fails_closed_when_safe_directory_handles_are_unsupported() {
+    let root = tempfile::tempdir().unwrap();
+    let error = NumberAudioV3::load(root.path(), root.path(), &AtomicBool::new(false))
+        .err()
+        .unwrap();
+    assert!(error.contains("unsupported"), "{error}");
+}
+
+#[cfg(all(not(unix), feature = "cpu"))]
+#[test]
+fn v3_training_fails_closed_without_cooperative_leases() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::speech_audio_round::{AudioRoundOptions, train_v3_audio_round};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let options = AudioRoundOptions {
+        model: root.path(),
+        data: root.path(),
+        state: &state,
+        epochs: 1,
+        max_updates: 1,
+        resume: false,
+    };
+    let error = train_v3_audio_round::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+        .err()
+        .unwrap();
+    assert!(error.contains("not supported"), "{error}");
+    assert!(!state.join("number-audio-v3/audio-conditioned-v1").exists());
 }
 
 #[cfg(all(unix, feature = "cpu"))]
@@ -1154,4 +1199,218 @@ fn v3_registration_and_mock_run_do_not_open_holdout_files() {
     })
     .unwrap();
     assert_eq!(report["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_trainer_locks_the_actual_checkpoint_namespace() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        lease::Lease,
+        speech_audio_round::{AudioRoundOptions, train_v3_audio_round},
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let nested = state.join("number-audio-v3");
+    fs::create_dir_all(&nested).unwrap();
+    let _lease = Lease::try_acquire(&nested.join("audio-training.lock"))
+        .unwrap()
+        .unwrap();
+    let options = AudioRoundOptions {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        epochs: 1,
+        max_updates: 1,
+        resume: false,
+    };
+    let error = train_v3_audio_round::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("another audio trainer owns this state"),
+        "{error}"
+    );
+    assert!(!nested.join("audio-conditioned-v1").exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn v3_rejects_unverified_speech_targets_before_creating_a_checkpoint() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::speech_audio_round::{AudioRoundOptions, train_v3_audio_round};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let options = AudioRoundOptions {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        epochs: 1,
+        max_updates: 1,
+        resume: false,
+    };
+    let manifest_path = root.path().join("train.v3.json");
+    let original: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    for encoding in ["caller_supplied_unverified", "local_liquidcodec_f32"] {
+        let mut manifest = original.clone();
+        manifest["records"][0]["speech_target"]["encoding"] = encoding.into();
+        manifest["records"][0]["speech_target"]["runtime_backend"] =
+            "caller_supplied_unverified".into();
+        write_json(&manifest_path, &manifest);
+        let error =
+            train_v3_audio_round::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                .err()
+                .unwrap();
+        assert!(error.contains("unverified"), "{error}");
+        assert!(!state.join("number-audio-v3/audio-conditioned-v1").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn text_only_v3_preflights_the_model_tree_before_fingerprinting() {
+    use omni_rsi::speech_audio_checkpoint::AudioProtocol;
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+    let root = fixture();
+    let model = root.path().join("model");
+    let train_path = root.path().join("train.v3.json");
+    let group_path = root.path().join("train.groups.v3.json");
+    let mut train: Value = serde_json::from_slice(&fs::read(&train_path).unwrap()).unwrap();
+    let mut groups: Value = serde_json::from_slice(&fs::read(&group_path).unwrap()).unwrap();
+    train["records"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("speech_target");
+    groups["records"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("target_source");
+    write_json(&train_path, &train);
+    write_json(&group_path, &groups);
+    let stop = AtomicBool::new(false);
+    let data = NumberAudioV3::load(root.path(), &model, &stop).unwrap();
+    let weight = model.join("model.safetensors");
+    fs::remove_file(&weight).unwrap();
+    symlink(root.path().join("layout.v3"), &weight).unwrap();
+    let error = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop)
+        .err()
+        .unwrap();
+    assert!(error.contains("symlink or special file"), "{error}");
+    fs::remove_file(&weight).unwrap();
+    let name = CString::new(weight.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let error = AudioProtocol::for_v3(&model, &data, "cpu-fixture".into(), &stop)
+        .err()
+        .unwrap();
+    assert!(error.contains("symlink or special file"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+#[ignore = "requires an official local codec and an isolated non-holdout v3 fixture"]
+fn v3_real_codec_rejects_forged_frames_before_new_and_resumed_checkpoints() {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::{
+        speech_audio_checkpoint::{AudioCheckpoint, AudioProgress, AudioProtocol},
+        speech_audio_round::{AudioRoundOptions, train_v3_audio_round},
+        speech_training::SpeechOptimizer,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let model = std::path::PathBuf::from(std::env::var_os("LFM3_MODEL").expect("LFM3_MODEL"));
+    let source = std::path::PathBuf::from(
+        std::env::var_os("LFM3_NUMBER_V3_DATA").expect("LFM3_NUMBER_V3_DATA"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("v3-data");
+    fs::create_dir(&data).unwrap();
+    for name in [
+        "layout.v3",
+        "holdout-public.json",
+        "train.groups.v3.json",
+        "dev.groups.v3.json",
+        "train.v3.json",
+        "dev.v3.json",
+    ] {
+        fs::copy(source.join(name), data.join(name)).unwrap();
+    }
+    for name in [
+        "train-media",
+        "dev-media",
+        "train-target-media",
+        "dev-target-media",
+    ] {
+        let from = source.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = data.join(name);
+        fs::create_dir(&to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    let original = NumberAudioV3::load(&data, &model, &stop).unwrap();
+    assert!(original.example(0).unwrap().frames().is_some());
+    let protocol = AudioProtocol::for_v3(&model, &original, Cpu::name(&device), &stop).unwrap();
+    let state = root.path().join("resume-state");
+    let nested = state.join("number-audio-v3");
+    let optimizer = SpeechOptimizer::<Cpu>::new(protocol.width, 4, 761, &device).unwrap();
+    AudioCheckpoint::new(protocol, AudioProgress::default(), &optimizer)
+        .unwrap()
+        .save(&nested)
+        .unwrap();
+    let pointer = nested.join("audio-conditioned-v1/latest.json");
+    let pointer_before = fs::read(&pointer).unwrap();
+
+    let codec: Value =
+        serde_json::from_slice(&fs::read(model.join("audio_tokenizer/config.json")).unwrap())
+            .unwrap();
+    let count: u64 = codec["fsq_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .product();
+    let train_path = data.join("train.v3.json");
+    let mut train: Value = serde_json::from_slice(&fs::read(&train_path).unwrap()).unwrap();
+    let target = &mut train["records"][0]["speech_target"];
+    assert_eq!(target["encoding"], "local_liquidcodec_f32");
+    // A historical declaration cannot substitute for the current re-encoding,
+    // and a different declaration must not hide the actual frame mismatch.
+    target["runtime_backend"] = "different-historical-backend".into();
+    let code = target["frames"][0][0].as_u64().unwrap();
+    target["frames"][0][0] = ((code + 1) % count).into();
+    write_json(&train_path, &train);
+
+    let fresh = root.path().join("fresh-state");
+    for (state, resume) in [(&fresh, false), (&state, true)] {
+        let options = AudioRoundOptions {
+            model: &model,
+            data: &data,
+            state,
+            epochs: 1,
+            max_updates: 1,
+            resume,
+        };
+        let error = train_v3_audio_round::<Cpu>(&options, &device, &stop)
+            .err()
+            .unwrap();
+        assert!(error.contains("frames do not match"), "{error}");
+    }
+    assert!(!fresh.join("number-audio-v3/audio-conditioned-v1").exists());
+    assert_eq!(fs::read(pointer).unwrap(), pointer_before);
 }

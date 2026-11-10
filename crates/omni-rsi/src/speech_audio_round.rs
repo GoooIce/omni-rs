@@ -106,6 +106,15 @@ fn train_round<B: AutodiffBackend>(
     std::fs::create_dir_all(&state).map_err(|error| error.to_string())?;
     let _lease = Lease::try_acquire(&options.state.join("audio-training.lock"))?
         .ok_or("another audio trainer owns this state")?;
+    // v3 and a legacy caller using the nested state share this checkpoint root.
+    let _namespace_lease = if v3 {
+        Some(
+            Lease::try_acquire(&state.join("audio-training.lock"))?
+                .ok_or("another audio trainer owns this state")?,
+        )
+    } else {
+        None
+    };
     let directory = state.join("audio-conditioned-v1");
     let exists = match std::fs::symlink_metadata(&directory) {
         Ok(_) => true,
@@ -132,6 +141,17 @@ fn train_round<B: AutodiffBackend>(
     for index in 0..dataset.len() {
         dataset.example(index)?;
     }
+    let verified_codec = match &dataset {
+        TrainingData::NumberV3(data) => crate::number_v3_target::verify::<B>(
+            data,
+            options.data,
+            options.model,
+            &protocol,
+            device,
+            stop,
+        )?,
+        TrainingData::Legacy(_) => None,
+    };
     cancelled(stop)?;
     let saved = if options.resume {
         Some(
@@ -142,8 +162,17 @@ fn train_round<B: AutodiffBackend>(
         None
     };
     cancelled(stop)?;
-    let mut model = OmniModel::<B>::load(options.model, Precision::F32, device)
-        .map_err(|error| error.to_string())?;
+    let mut model = match verified_codec {
+        Some(codec) => OmniModel::<B>::load_with_codec_weights(
+            options.model,
+            Precision::F32,
+            device,
+            &codec.weights,
+            codec.config,
+        ),
+        None => OmniModel::<B>::load(options.model, Precision::F32, device),
+    }
+    .map_err(|error| error.to_string())?;
     cancelled(stop)?;
     protocol.verify_model(options.model, stop)?;
     if model.text.hidden_size() != protocol.width {

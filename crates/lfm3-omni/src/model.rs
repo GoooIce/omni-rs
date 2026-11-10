@@ -219,6 +219,26 @@ impl<B: Backend> OmniModel<B> {
         Ok(sampling)
     }
     pub fn load(directory: &Path, precision: Precision, device: &B::Device) -> Result<Self> {
+        Self::load_inner(directory, precision, device, None)
+    }
+
+    /// Load the decoder from the exact codec bytes already used by the caller.
+    pub fn load_with_codec_weights(
+        directory: &Path,
+        precision: Precision,
+        device: &B::Device,
+        weights: &Weights,
+        config: CodecConfig,
+    ) -> Result<Self> {
+        Self::load_inner(directory, precision, device, Some((weights, config)))
+    }
+
+    fn load_inner(
+        directory: &Path,
+        precision: Precision,
+        device: &B::Device,
+        codec_snapshot: Option<(&Weights, CodecConfig)>,
+    ) -> Result<Self> {
         precision.validate_device::<B>(device)?;
         let settings: ModelSettings =
             serde_json::from_slice(&std::fs::read(directory.join("config.json"))?)?;
@@ -314,10 +334,15 @@ impl<B: Backend> OmniModel<B> {
             precision,
             device,
         )?;
-        let codec_dir = directory.join("audio_tokenizer");
-        let codec_config = CodecConfig::load(&codec_dir)?;
-        let codec_weights = Weights::open(&codec_dir)?;
-        let codec = Codec::from_weights(&codec_weights, codec_config, precision, device)?;
+        let codec = match codec_snapshot {
+            Some((weights, config)) => Codec::from_weights(weights, config, precision, device)?,
+            None => {
+                let codec_dir = directory.join("audio_tokenizer");
+                let config = CodecConfig::load(&codec_dir)?;
+                let weights = Weights::open(&codec_dir)?;
+                Codec::from_weights(&weights, config, precision, device)?
+            }
+        };
         Ok(Self {
             text,
             audio,

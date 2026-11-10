@@ -26,7 +26,10 @@ impl NumberAudioV3 {
         let answers = data
             .train()
             .iter()
-            .map(|record| chinese_number(record.answer()))
+            .map(|record| {
+                crate::speech_audio_data::number_text(record.answer())
+                    .ok_or_else(|| "v3 rule answer outside 0..=100".to_owned())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let digest = data_identity(&data, stop)?;
         Ok(Self {
@@ -66,24 +69,6 @@ impl NumberAudioV3 {
             }
             None => AudioAnswer::new_text_only(row.samples(), 16_000, INSTRUCTION, answer),
         }
-    }
-}
-
-fn chinese_number(value: u32) -> Result<String, String> {
-    const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
-    match value {
-        0..=9 => Ok(DIGITS[value as usize].into()),
-        10..=99 => {
-            let tens = value / 10;
-            let ones = value % 10;
-            Ok(format!(
-                "{}十{}",
-                if tens == 1 { "" } else { DIGITS[tens as usize] },
-                if ones == 0 { "" } else { DIGITS[ones as usize] }
-            ))
-        }
-        100 => Ok("一百".into()),
-        _ => Err("v3 rule answer outside 0..=100".into()),
     }
 }
 

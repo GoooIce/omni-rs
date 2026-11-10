@@ -173,7 +173,7 @@ fn preparation_fingerprint() -> String {
     hash_preparation_sources(&preparation_sources())
 }
 
-fn target_pcm(bytes: &[u8]) -> Result<Vec<f32>, String> {
+pub(crate) fn target_pcm(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let samples = crate::speech_pcm::decode_mono_pcm(Cursor::new(bytes), SAMPLE_RATE)?;
     if samples.is_empty()
         || samples.len() > MAX_SAMPLES

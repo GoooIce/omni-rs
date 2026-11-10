@@ -99,6 +99,39 @@ impl CodecConfig {
         self.validate()?;
         Ok(self)
     }
+
+    /// Return the output frame count and STFT feature count before allocating them.
+    pub fn encoder_workload(&self, samples: usize) -> Result<(usize, usize)> {
+        let (_, frames, features) = self.encoder_shape(samples)?;
+        Ok((frames, features))
+    }
+
+    fn encoder_shape(&self, samples: usize) -> Result<(usize, usize, usize)> {
+        let p = &self.params;
+        if samples == 0 {
+            return Err(Error::Audio("LiquidCodec input is empty".into()));
+        }
+        let frame_size = p
+            .stft_hop_length
+            .checked_mul(p.stft_frame_stack)
+            .filter(|size| *size > 0)
+            .ok_or_else(|| Error::Audio("LiquidCodec frame size overflow".into()))?;
+        let padded_len = samples
+            .checked_add(frame_size - 1)
+            .and_then(|length| (length / frame_size).checked_mul(frame_size))
+            .ok_or_else(|| Error::Audio("LiquidCodec input is too long".into()))?;
+        let side = (p.stft_win_length - p.stft_hop_length) / 2;
+        if padded_len <= side || padded_len.checked_add(side.saturating_mul(2)).is_none() {
+            return Err(Error::Audio(
+                "LiquidCodec input is too short or too long for reflect padding".into(),
+            ));
+        }
+        let features = (p.stft_n_fft / 2 + 1)
+            .checked_mul(3)
+            .and_then(|bins| bins.checked_mul(padded_len / p.stft_hop_length))
+            .ok_or_else(|| Error::Audio("LiquidCodec STFT size overflow".into()))?;
+        Ok((padded_len, padded_len / frame_size, features))
+    }
     fn validate(&self) -> Result<()> {
         let p = &self.params;
         let mut checked_backbone = self.backbone.clone();
@@ -349,18 +382,8 @@ impl<B: Backend> CodecEncoder<B> {
                 "LiquidCodec input must be nonempty and finite".into(),
             ));
         }
-        let frame_size = p.stft_hop_length * p.stft_frame_stack;
-        let padded_len = samples
-            .len()
-            .checked_add(frame_size - 1)
-            .and_then(|length| (length / frame_size).checked_mul(frame_size))
-            .ok_or_else(|| Error::Audio("LiquidCodec input is too long".into()))?;
+        let (padded_len, count, feature_count) = self.config.encoder_shape(samples.len())?;
         let side = (p.stft_win_length - p.stft_hop_length) / 2;
-        if padded_len <= side {
-            return Err(Error::Audio(
-                "LiquidCodec input is too short for reflect padding".into(),
-            ));
-        }
         let mut padded = vec![0.0; padded_len];
         padded[..samples.len()].copy_from_slice(samples);
         let mut reflected = Vec::with_capacity(padded_len + side * 2);
@@ -369,7 +392,7 @@ impl<B: Backend> CodecEncoder<B> {
         reflected.extend((1..=side).map(|i| padded[padded_len - 1 - i]));
         let frames = padded_len / p.stft_hop_length;
         let bins = p.stft_n_fft / 2 + 1;
-        let mut features = vec![0.0_f32; 3 * bins * frames];
+        let mut features = vec![0.0_f32; feature_count];
         let mut buffer = vec![Complex32::new(0.0, 0.0); p.stft_n_fft];
         for frame in 0..frames {
             let offset = frame * p.stft_hop_length;
@@ -418,7 +441,6 @@ impl<B: Backend> CodecEncoder<B> {
                 "LiquidCodec encoder produced non-finite latents".into(),
             ));
         }
-        let count = padded_len / frame_size;
         let dims = p.fsq_levels.len();
         let mut result = Vec::with_capacity(count);
         for frame in 0..count {
