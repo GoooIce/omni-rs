@@ -8,6 +8,8 @@ pub mod humming_audio;
 pub mod idle;
 pub mod lease;
 pub mod model;
+pub mod number_gate;
+pub mod number_holdout_ledger;
 pub mod platform;
 pub mod reader;
 pub mod speech_asr;
