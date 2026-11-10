@@ -619,6 +619,99 @@ fn losing_the_media_turn_keeps_explicit_stop_and_barrier_control() {
 }
 
 #[test]
+fn observed_async_cancellation_prevents_backdated_stop() {
+    use omni_lfm3::causal_audio::{ControlEvent, Error};
+    use omni_lfm3::interruptible::State;
+
+    let encoder = synthetic_encoder();
+    let mut session = AudioSession::new(
+        SessionId(133),
+        &encoder,
+        &Default::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    session
+        .push(
+            Duration::from_millis(1),
+            &synthetic_pcm(3200),
+            16_000,
+            false,
+        )
+        .unwrap();
+    let turn = session
+        .start_generation(
+            Duration::from_millis(2),
+            session.snapshot().unwrap().unwrap(),
+            24_000,
+        )
+        .unwrap();
+    let control = session.current_control().unwrap();
+    session.cancellation().cancel();
+    let before = session.conversation().timeline().len();
+    assert!(matches!(
+        session.push(Duration::from_millis(1), &[0.1], 16_000, false),
+        Err(Error::StreamUnavailable)
+    ));
+    assert_eq!(session.conversation().timeline().len(), before);
+    assert!(matches!(
+        session.push(Duration::from_millis(10), &[0.1], 16_000, false),
+        Err(Error::StreamUnavailable)
+    ));
+    assert!(session.conversation().timeline().iter().any(|entry| {
+        entry.at == Duration::from_millis(10) && matches!(entry.event, TimelineEvent::InputFailed)
+    }));
+    assert!(turn.media().is_err());
+    assert!(
+        session
+            .apply_control(
+                Duration::from_millis(3),
+                &control,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled
+                },
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        session.conversation().state(),
+        State::Responding { .. }
+    ));
+    assert!(matches!(
+        session.push(Duration::from_millis(12), &[0.1], 16_000, false),
+        Err(Error::StreamUnavailable)
+    ));
+    assert!(
+        session
+            .apply_control(
+                Duration::from_millis(11),
+                &control,
+                ControlEvent::Stop {
+                    reason: StopReason::Cancelled,
+                },
+            )
+            .is_err()
+    );
+    session
+        .apply_control(
+            Duration::from_millis(12),
+            &control,
+            ControlEvent::Stop {
+                reason: StopReason::Cancelled,
+            },
+        )
+        .unwrap();
+    session
+        .apply_control(
+            Duration::from_millis(13),
+            &control,
+            ControlEvent::Stopped { played_end: 0 },
+        )
+        .unwrap();
+    assert!(matches!(session.conversation().state(), State::Listening));
+}
+
+#[test]
 fn failed_input_cannot_be_stopped_before_the_failure_time() {
     use omni_lfm3::causal_audio::ControlEvent;
     use omni_lfm3::interruptible::State;

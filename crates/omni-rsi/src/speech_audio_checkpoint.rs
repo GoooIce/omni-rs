@@ -478,6 +478,7 @@ mod tests {
         }
 
         for name in [
+            "Cargo.toml",
             "src/config.rs",
             "src/weights.rs",
             "src/weights/layout.rs",

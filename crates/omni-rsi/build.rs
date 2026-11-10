@@ -279,7 +279,7 @@ pub fn graph_identity(
 
 // These files describe the CPU dependency graph whose local packages were
 // inspected. Any graph change falls back to including every local patch.
-fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
+pub fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
     let inputs = [
         (
             "Cargo.toml",
@@ -322,10 +322,41 @@ fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
     for (name, expected) in inputs {
         let path = repo.join(name);
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        known &= format!("{:x}", Sha256::digest(bytes)) == expected;
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        // The scanner manifest adds only a gated binary target; its dependency
+        // graph and every other anchor are identical to the original manifest.
+        known &= actual == expected
+            || (name == "crates/omni-rsi/Cargo.toml"
+                && actual == "f1502a1d91d591305f1675d2f382b902aa80e6bc05e07031716129205d1c22e2");
         println!("cargo:rerun-if-changed={}", path.display());
     }
     Ok(known)
+}
+
+/// Derive both backend root sets from the actual manifest and graph anchors.
+pub fn backend_roots(repo: &Path, manifest: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let patches = build_backend::patch_paths(
+        &fs::read_to_string(manifest.join("Cargo.toml")).map_err(|e| e.to_string())?,
+    )?;
+    let known_cpu_graph = known_cpu_graph(repo)?;
+    let gpu_only = [
+        "burn-cubecl",
+        "burn-fusion",
+        "burn-router",
+        "cubecl-cpp",
+        "cubecl-runtime",
+        "cubecl-wgpu",
+    ];
+    let mut cpu = Vec::new();
+    let mut gpu = vec![repo.join("crates/omni-kernel")];
+    for (name, path) in patches {
+        let path = manifest.join(path);
+        if !known_cpu_graph || !gpu_only.contains(&name.as_str()) {
+            cpu.push(path.clone());
+        }
+        gpu.push(path);
+    }
+    Ok((cpu, gpu))
 }
 
 pub fn backend_digests(
@@ -356,34 +387,14 @@ fn run() -> Result<(), String> {
         println!("cargo:rustc-env=OMNI_RSI_BACKEND_GPU=backend-unverified-context");
         Ok(())
     };
-    let Some(cwd) = build_invocation::cargo_invocation_cwd(&repo) else {
+    let Some(cwd) = build_invocation::cargo_invocation_cwd() else {
         return unverified("Cannot verify Cargo's invocation directory");
     };
     if build_environment::cargo_home_from_env().is_none() {
         return unverified("Cannot determine Cargo home");
     }
     let manifest_file = manifest.join("Cargo.toml");
-    let patches = build_backend::patch_paths(
-        &fs::read_to_string(&manifest_file).map_err(|e| e.to_string())?,
-    )?;
-    let known_cpu_graph = known_cpu_graph(&repo)?;
-    let gpu_only = [
-        "burn-cubecl",
-        "burn-fusion",
-        "burn-router",
-        "cubecl-cpp",
-        "cubecl-runtime",
-        "cubecl-wgpu",
-    ];
-    let mut cpu = Vec::new();
-    let mut gpu = vec![repo.join("crates/omni-kernel")];
-    for (name, path) in patches {
-        let path = manifest.join(path);
-        if !known_cpu_graph || !gpu_only.contains(&name.as_str()) {
-            cpu.push(path.clone());
-        }
-        gpu.push(path);
-    }
+    let (cpu, gpu) = backend_roots(&repo, &manifest)?;
     let mut common = Sha256::new();
     field(&mut common, b"omni-backend-build-config-v1");
     config_identity(&mut common, &cwd, &manifest)?;

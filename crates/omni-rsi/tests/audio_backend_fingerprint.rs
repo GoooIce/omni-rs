@@ -1,22 +1,43 @@
 #![cfg(feature = "cpu")]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use burn::{
     backend::{Autodiff, NdArray},
     tensor::backend::Backend,
 };
+use omni_rsi::speech_audio_checkpoint::audio_implementation_hash;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use omni_rsi::{
-    speech_audio_checkpoint::{
-        AudioCheckpoint, AudioProgress, AudioProtocol, audio_implementation_hash,
-    },
+    speech_audio_checkpoint::{AudioCheckpoint, AudioProgress, AudioProtocol},
     speech_training::SpeechOptimizer,
 };
 
+#[test]
+fn audio_identity_matches_the_build_context_availability() {
+    let identity = audio_implementation_hash();
+    if env!("OMNI_RSI_BACKEND_CPU") == "backend-unverified-context" {
+        let error = identity.expect_err("unverified build context must fail closed");
+        assert!(error.contains("cannot verify Cargo invocation"), "{error}");
+    } else {
+        assert!(identity.is_ok(), "{:?}", identity.err());
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn prior_audio_checkpoints_without_patched_backend_identity_are_rejected() {
     type Cpu = Autodiff<NdArray<f32>>;
     // Captured from the unchanged 856b313 source identity before this test.
     const OLD: &str = "bcf40480cfd095d8534a49e161c029cccbab3241c21d7498bb6e7de1c6f55eb4";
-    assert_ne!(audio_implementation_hash().unwrap(), OLD);
+    let current = match audio_implementation_hash() {
+        Ok(identity) => identity,
+        Err(error) => {
+            assert!(error.contains("cannot verify Cargo invocation"), "{error}");
+            eprintln!("audio identity unavailable in this build context: {error}");
+            return;
+        }
+    };
+    assert_ne!(current, OLD);
     let device = Default::default();
     let optimizer = SpeechOptimizer::<Cpu>::new(16, 4, 761, &device).unwrap();
     let protocol = AudioProtocol {
@@ -34,4 +55,11 @@ fn prior_audio_checkpoints_without_patched_backend_identity_are_rejected() {
         .err()
         .unwrap();
     assert!(error.contains("implementation changed"), "{error}");
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn unsupported_platform_cannot_issue_audio_identity() {
+    let error = audio_implementation_hash().expect_err("unsupported platform must fail closed");
+    assert!(error.contains("cannot verify Cargo invocation"), "{error}");
 }

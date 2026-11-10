@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// The build script runs in the manifest directory, not Cargo's launch directory.
 /// Trust only an inspectable direct Cargo parent; PWD can be absent or stale.
-pub fn cargo_invocation_cwd(_repo: &Path) -> Option<PathBuf> {
+pub fn cargo_invocation_cwd() -> Option<PathBuf> {
     let expected = PathBuf::from(std::env::var_os("CARGO")?);
     if !expected.is_absolute() {
         return None;

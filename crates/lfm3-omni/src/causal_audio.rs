@@ -475,6 +475,19 @@ impl<'a, B: Backend> AudioSession<'a, B> {
         is_final: bool,
     ) -> Result<usize, Error> {
         if !self.scope.available() {
+            // An asynchronous cancellation has no timestamp of its own. A
+            // valid timed call does establish when it was observed, so later
+            // events cannot be backdated before that observation.
+            if self.conversation.check_time(at).is_ok() {
+                self.conversation
+                    .apply(
+                        at,
+                        Event::InputFailed {
+                            session: self.session,
+                        },
+                    )
+                    .expect("preflighted unavailable input must fit the timeline");
+            }
             return Err(Error::StreamUnavailable);
         }
         self.conversation.check_time(at).map_err(Error::Protocol)?;

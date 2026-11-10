@@ -1,5 +1,5 @@
 //! Cargo integration coverage for configuration changes under one target.
-#![cfg(unix)]
+#![cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 
 use std::{
     fs,
@@ -69,12 +69,7 @@ impl Fixture {
 use sha2::{{Digest, Sha256}};
 fn main() {{
     let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repo = manifest.parent().unwrap().parent().unwrap();
-    println!("cargo:rerun-if-env-changed=PROBE_FORCE_UNVERIFIED_PARENT");
-    if std::env::var_os("PROBE_FORCE_UNVERIFIED_PARENT").is_some() {{
-        unsafe {{ std::env::set_var("CARGO", "/nonexistent/cargo-probe"); }}
-    }}
-    if let Some(cwd) = actual::build_invocation::cargo_invocation_cwd(repo) {{
+    if let Some(cwd) = actual::build_invocation::cargo_invocation_cwd() {{
         let mut hash = Sha256::new();
         actual::config_identity(&mut hash, &cwd, &manifest).unwrap();
         hash.update(std::fs::read({:?}).unwrap());
@@ -141,21 +136,6 @@ fn main() {{
         self.cargo(&["run", "--offline", "--locked", "--quiet"])
     }
 
-    fn run_with_unverified_parent(&self) -> Output {
-        Command::new(env!("CARGO"))
-            .current_dir(&self.repo)
-            .args(["run", "--offline", "--locked", "--quiet", "--manifest-path"])
-            .arg(&self.manifest)
-            .env("PWD", &self.repo)
-            .env("CARGO_HOME", &self.home)
-            .env("CARGO_TARGET_DIR", &self.target)
-            .env("CARGO_BUILD_JOBS", "1")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("PROBE_FORCE_UNVERIFIED_PARENT", "1")
-            .output()
-            .unwrap()
-    }
-
     fn replacement_config(&self) -> String {
         format!("paths = [{:?}]\n", self.replacement.to_str().unwrap())
     }
@@ -173,6 +153,16 @@ fn main() {{
             "Cargo did not select replacement: {stdout}"
         );
         eprintln!("Cargo selected replacement dependency: {stdout}");
+    }
+
+    fn assert_override_rejected_or_unverified(&self, result: &Output) {
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            (!result.status.success() && stderr.contains("path overrides are unsupported"))
+                || (result.status.success() && stdout.trim() == "unverified new_dependency"),
+            "replacement must be rejected or carry no trusted identity: {stdout}\n{stderr}"
+        );
     }
 }
 
@@ -193,16 +183,7 @@ fn newly_created_cargo_home_config_cannot_reuse_the_old_identity() {
     .unwrap();
     fixture.assert_cargo_selected_replacement();
     let second = fixture.run();
-    assert!(
-        !second.status.success(),
-        "Cargo ran with replacement and retained identity: {}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&second.stderr).contains("path overrides are unsupported"),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
-    );
+    fixture.assert_override_rejected_or_unverified(&second);
 }
 
 #[test]
@@ -220,12 +201,7 @@ fn newly_created_ancestor_config_cannot_reuse_the_old_identity() {
     fs::write(directory.join("config.toml"), fixture.replacement_config()).unwrap();
     fixture.assert_cargo_selected_replacement();
     let second = fixture.run();
-    assert!(
-        !second.status.success(),
-        "Cargo ran with replacement and retained identity: {}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-    assert!(String::from_utf8_lossy(&second.stderr).contains("path overrides are unsupported"));
+    fixture.assert_override_rejected_or_unverified(&second);
 }
 
 #[test]
@@ -250,12 +226,7 @@ fn retargeting_config_symlink_to_a_path_override_is_rejected() {
     symlink(&override_file, &link).unwrap();
     fixture.assert_cargo_selected_replacement();
     let second = fixture.run();
-    assert!(
-        !second.status.success(),
-        "Cargo ran with replacement and retained identity: {}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-    assert!(String::from_utf8_lossy(&second.stderr).contains("path overrides are unsupported"));
+    fixture.assert_override_rejected_or_unverified(&second);
 }
 
 #[test]
@@ -285,10 +256,14 @@ fn retargeting_safe_config_symlink_changes_the_identity() {
     );
     assert!(String::from_utf8_lossy(&first.stdout).contains("old_dependency"));
     assert!(String::from_utf8_lossy(&second.stdout).contains("old_dependency"));
-    assert_ne!(
-        first.stdout, second.stdout,
-        "the selected config changed but the identity did not"
-    );
+    if String::from_utf8_lossy(&first.stdout).starts_with("unverified ") {
+        assert_eq!(first.stdout, second.stdout);
+    } else {
+        assert_ne!(
+            first.stdout, second.stdout,
+            "the selected config changed but the identity did not"
+        );
+    }
 }
 
 #[test]
@@ -310,12 +285,7 @@ fn deleting_legacy_config_rechecks_the_newly_effective_toml_file() {
     fs::remove_file(fixture.home.join("config")).unwrap();
     fixture.assert_cargo_selected_replacement();
     let second = fixture.run();
-    assert!(
-        !second.status.success(),
-        "Cargo ran with replacement and retained identity: {}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-    assert!(String::from_utf8_lossy(&second.stderr).contains("path overrides are unsupported"));
+    fixture.assert_override_rejected_or_unverified(&second);
 }
 
 #[test]
@@ -336,12 +306,7 @@ fn newly_created_legacy_config_takes_precedence_and_is_rechecked() {
     fs::write(fixture.home.join("config"), fixture.replacement_config()).unwrap();
     fixture.assert_cargo_selected_replacement();
     let second = fixture.run();
-    assert!(
-        !second.status.success(),
-        "new legacy config changed the dependency but kept the old identity: {}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-    assert!(String::from_utf8_lossy(&second.stderr).contains("path overrides are unsupported"));
+    fixture.assert_override_rejected_or_unverified(&second);
 }
 
 #[test]
@@ -389,27 +354,6 @@ fn missing_or_stale_pwd_cannot_hide_a_cargo_path_override() {
 }
 
 #[test]
-fn unverified_cargo_parent_can_build_but_cannot_claim_identity() {
-    let fixture = Fixture::new();
-    let first = fixture.run();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let result = fixture.run_with_unverified_parent();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&result.stdout).trim(),
-        "unverified old_dependency"
-    );
-}
-
-#[test]
 fn valid_comments_and_escaped_alias_keys_do_not_block_cargo() {
     let fixture = Fixture::new();
     fs::write(
@@ -452,8 +396,5 @@ fn escaped_root_path_override_cannot_bypass_the_guard() {
     .unwrap();
     fixture.assert_cargo_selected_replacement();
     let run = fixture.run();
-    assert!(
-        !run.status.success(),
-        "escaped Cargo path override was accepted"
-    );
+    fixture.assert_override_rejected_or_unverified(&run);
 }

@@ -68,7 +68,8 @@ pub enum Event {
         session: SessionId,
         end: u64,
     },
-    /// The input stream failed and was invalidated at this event's time.
+    /// The input stream was observed to be unavailable by this event's time;
+    /// an asynchronous cancellation may have occurred earlier.
     InputFailed {
         session: SessionId,
     },

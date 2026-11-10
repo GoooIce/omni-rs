@@ -1,35 +1,14 @@
 //! Cargo-home discovery and build-script change tracking.
-use std::{ffi::OsString, path::PathBuf};
-
-pub fn cargo_home(
-    cargo: Option<OsString>,
-    home: Option<OsString>,
-    profile: Option<OsString>,
-    windows: bool,
-) -> Option<PathBuf> {
-    cargo
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            let base = if windows { profile } else { home };
-            base.filter(|value| !value.is_empty())
-                .map(|value| PathBuf::from(value).join(".cargo"))
-        })
-}
+use std::path::PathBuf;
 
 pub fn cargo_home_from_env() -> Option<PathBuf> {
-    cargo_home(
-        std::env::var_os("CARGO_HOME"),
-        std::env::var_os("HOME"),
-        std::env::var_os("USERPROFILE"),
-        cfg!(windows),
-    )
-    .or_else(|| {
-        // Match Cargo's OS home-directory fallback when the usual environment
-        // variable is unset. On Windows HOME does not override USERPROFILE.
-        #[allow(deprecated)]
-        std::env::home_dir().map(|home| home.join(".cargo"))
-    })
+    // Cargo 1.69 and later reject CARGO_HOME in their [env] configuration;
+    // the project requires a newer Cargo for its 2024 edition. Unlike HOME,
+    // this value cannot be replaced by Cargo when it launches the script.
+    // A direct Cargo invocation may leave it unset; that context is unverified.
+    std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 pub fn watch_configuration_environment() {

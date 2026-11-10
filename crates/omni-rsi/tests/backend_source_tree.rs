@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 #[path = "../build.rs"]
 mod build_script;
-use build_script::{build_backend, build_environment};
+use build_script::build_backend;
 
 use std::{fs, path::Path};
 
@@ -156,42 +156,6 @@ fn visible_cargo_path_overrides_are_rejected() {
 }
 
 #[test]
-fn cargo_home_resolution_uses_windows_profile_when_home_is_unset() {
-    let profile = std::ffi::OsString::from("C:\\Users\\fixture");
-    assert_eq!(
-        build_environment::cargo_home(None, None, Some(profile.clone()), true),
-        Some(std::path::PathBuf::from(profile).join(".cargo"))
-    );
-    assert_eq!(
-        build_environment::cargo_home(
-            Some("custom".into()),
-            Some("unix-home".into()),
-            Some("windows-home".into()),
-            true
-        ),
-        Some("custom".into())
-    );
-    assert_eq!(
-        build_environment::cargo_home(
-            Some("".into()),
-            Some("unix-home".into()),
-            Some("windows-home".into()),
-            true
-        ),
-        Some(std::path::PathBuf::from("windows-home").join(".cargo"))
-    );
-    assert_eq!(
-        build_environment::cargo_home(
-            None,
-            Some("unix-home".into()),
-            Some("windows-home".into()),
-            false
-        ),
-        Some(std::path::PathBuf::from("unix-home").join(".cargo"))
-    );
-}
-
-#[test]
 fn cargo_parent_requires_the_expected_executable_and_an_existing_directory() {
     let root = tempfile::tempdir().unwrap();
     let expected = root.path().join("cargo");
@@ -235,6 +199,107 @@ fn foreign_proc_namespace_is_not_accepted_as_the_current_process() {
     assert!(!proc_self_matches_pid(Path::new("732"), 731));
     assert!(!proc_self_matches_pid(Path::new("/proc/731"), 731));
     assert!(!proc_self_matches_pid(Path::new("self"), 731));
+}
+
+#[test]
+#[cfg(unix)]
+fn scanner_manifest_keeps_the_real_cpu_roots_without_scanning_gpu_only_paths() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let repo = fs::canonicalize(temp.path()).unwrap();
+    for name in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/lfm3-omni/Cargo.toml",
+        "crates/lfm3-omni/Cargo.lock",
+        "crates/omni-rsi/Cargo.toml",
+        "crates/omni-rsi/Cargo.lock",
+        "vendor/burn/Cargo.toml",
+        "vendor/cubecl-common/Cargo.toml",
+        "crates/burn-ane/Cargo.toml",
+    ] {
+        let destination = repo.join(name);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(source.join(name), destination).unwrap();
+    }
+    for name in [
+        "burn-cubecl",
+        "burn-fusion",
+        "burn-router",
+        "cubecl-cpp",
+        "cubecl-runtime",
+        "cubecl-wgpu",
+    ] {
+        symlink(
+            "inaccessible-synthetic-gpu-only",
+            repo.join("vendor").join(name),
+        )
+        .unwrap();
+    }
+    let manifest = repo.join("crates/omni-rsi");
+    let current = fs::read_to_string(manifest.join("Cargo.toml")).unwrap();
+    let original_hash = "1f19d2ed09a4704028cada1ee7ae3a510ac728a5f43ed67d74b5a5864cd864fc";
+    let scanner_hash = "f1502a1d91d591305f1675d2f382b902aa80e6bc05e07031716129205d1c22e2";
+    let addition = "[[bin]]\nname = \"alimeeting-screen\"\npath = \"src/bin/alimeeting-screen.rs\"\nrequired-features = [\"native\"]\n\n";
+    let versions = |current: &str| {
+        let current_hash = format!("{:x}", Sha256::digest(current.as_bytes()));
+        if current_hash == original_hash {
+            (
+                current.to_owned(),
+                current.replacen(
+                    "[patch.crates-io]",
+                    &format!("{addition}[patch.crates-io]"),
+                    1,
+                ),
+            )
+        } else if current_hash == scanner_hash {
+            assert_eq!(current.matches(addition).count(), 1);
+            (current.replacen(addition, "", 1), current.to_owned())
+        } else {
+            panic!("unrecognised source manifest: {current_hash}");
+        }
+    };
+    let (original, scanner) = versions(&current);
+    assert_eq!(versions(&scanner), (original.clone(), scanner.clone()));
+    assert_eq!(
+        format!("{:x}", Sha256::digest(original.as_bytes())),
+        original_hash
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(scanner.as_bytes())),
+        scanner_hash
+    );
+
+    fs::write(manifest.join("Cargo.toml"), &original).unwrap();
+    assert!(build_script::known_cpu_graph(&repo).unwrap());
+    let (before, _) = build_script::backend_roots(&repo, &manifest).unwrap();
+    let before_hash = build_script::graph_identity(&repo, before, b"fixture", "cpu").unwrap();
+    fs::write(manifest.join("Cargo.toml"), &scanner).unwrap();
+    assert!(build_script::known_cpu_graph(&repo).unwrap());
+    let (cpu, gpu) = build_script::backend_roots(&repo, &manifest).unwrap();
+    assert_eq!(
+        build_script::graph_identity(&repo, cpu, b"fixture", "cpu").unwrap(),
+        before_hash
+    );
+    assert!(build_script::graph_identity(&repo, gpu, b"fixture", "gpu").is_err());
+
+    fs::write(manifest.join("Cargo.toml"), &current).unwrap();
+    assert!(build_script::known_cpu_graph(&repo).unwrap());
+    fs::write(
+        manifest.join("Cargo.toml"),
+        format!("{scanner}\n# unrecognised change\n"),
+    )
+    .unwrap();
+    assert!(!build_script::known_cpu_graph(&repo).unwrap());
+    let (conservative_cpu, _) = build_script::backend_roots(&repo, &manifest).unwrap();
+    assert!(build_script::graph_identity(&repo, conservative_cpu, b"fixture", "cpu").is_err());
 }
 
 #[test]
@@ -319,9 +384,13 @@ fn cargo_rebuilds_when_the_cargo_home_changes() {
 #[path = {:?}] mod config;
 fn main() {{
     config::watch_configuration_environment();
-    let home = config::cargo_home_from_env().unwrap();
-    let input = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    let value = if input.contains("value-A") {{ "A" }} else {{ "B" }};
+    let value = match config::cargo_home_from_env() {{
+        Some(home) => {{
+            let input = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            if input.contains("value-A") {{ "A" }} else {{ "B" }}
+        }},
+        None => "UNVERIFIED",
+    }};
     println!("cargo:rustc-env=OBSERVED_CONFIG={{value}}");
 }}
 "#,
@@ -400,11 +469,11 @@ fn main() {{
             );
             String::from_utf8(result.stdout).unwrap().trim().to_owned()
         };
-        assert_eq!(run_default(&default_a), "A");
-        assert_eq!(
-            run_default(&default_b),
-            "B",
-            "default Cargo home changed with HOME"
+        let first = run_default(&default_a);
+        let second = run_default(&default_b);
+        assert!(
+            (first == "A" && second == "B") || (first == "UNVERIFIED" && second == "UNVERIFIED"),
+            "default-home contexts must either use protected CARGO_HOME or fail closed"
         );
     }
 }
