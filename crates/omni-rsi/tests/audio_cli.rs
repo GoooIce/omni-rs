@@ -23,6 +23,87 @@ fn audio_training_has_an_explicit_native_entry_and_resume_flag() {
     assert!(!help.contains("--python"));
 }
 
+#[test]
+fn v3_training_is_an_explicit_cli_choice() {
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi-audio"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--number-v3"), "{help}");
+}
+
+#[test]
+fn v3_cli_resume_uses_its_own_checkpoint_namespace() {
+    use std::fs;
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let legacy = state.join("audio-conditioned-v1");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("marker"), b"unchanged").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi-audio"))
+        .env("DDUST_RUN_REGISTRY", root.path().join("registry.json"))
+        .arg("--model")
+        .arg(root.path())
+        .arg("--data")
+        .arg(root.path())
+        .arg("--state")
+        .arg(&state)
+        .args(["--number-v3", "--resume"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no audio training state to resume"));
+    assert_eq!(fs::read(legacy.join("marker")).unwrap(), b"unchanged");
+    assert!(state.join("number-audio-v3").is_dir());
+}
+
+#[test]
+#[ignore = "requires an explicit local LFM3 checkpoint and a v3 dataset with speech then text targets"]
+fn v3_real_cli_trains_speech_and_text_then_resumes() {
+    use omni_rsi::number_audio_v3::NumberAudioV3;
+    use std::{path::PathBuf, sync::atomic::AtomicBool};
+    let model = PathBuf::from(std::env::var_os("LFM3_MODEL").expect("LFM3_MODEL"));
+    let data = PathBuf::from(std::env::var_os("LFM3_NUMBER_V3_DATA").expect("LFM3_NUMBER_V3_DATA"));
+    let snapshot = NumberAudioV3::load(&data, &model, &AtomicBool::new(false)).unwrap();
+    assert!(snapshot.len() >= 2);
+    assert!(snapshot.example(0).unwrap().frames().is_some());
+    assert!(snapshot.example(1).unwrap().frames().is_none());
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let run = |resume: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omni-rsi-audio"));
+        command
+            .env("DDUST_RUN_REGISTRY", root.path().join("registry.json"))
+            .arg("--model")
+            .arg(&model)
+            .arg("--data")
+            .arg(&data)
+            .arg("--state")
+            .arg(&state)
+            .args(["--number-v3", "--epochs", "1", "--max-updates", "1"]);
+        if resume {
+            command.arg("--resume");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(run(false)["progress"]["updates"], 1);
+    assert_eq!(run(true)["progress"]["updates"], 2);
+    assert!(
+        state
+            .join("number-audio-v3/audio-conditioned-v1/latest.json")
+            .is_file()
+    );
+    assert!(!state.join("audio-conditioned-v1/latest.json").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn audio_training_respects_the_ddust_global_device_lease() {

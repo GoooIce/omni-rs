@@ -166,6 +166,7 @@ pub fn implementation_hash() -> String {
         include_bytes!("speech_data.rs").as_slice(),
         include_bytes!("speech_evaluation.rs").as_slice(),
         include_bytes!("speech_ingest.rs").as_slice(),
+        include_bytes!("speech_pcm.rs").as_slice(),
         include_bytes!("speech_asr.rs").as_slice(),
         include_bytes!("speech_round.rs").as_slice(),
         include_bytes!("speech_generate.rs").as_slice(),

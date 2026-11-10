@@ -2,7 +2,7 @@
 use clap::Parser;
 use omni_rsi::{
     lease::Lease,
-    speech_audio_round::{AudioRoundOptions, train_audio_round},
+    speech_audio_round::{AudioRoundOptions, train_audio_round, train_v3_audio_round},
 };
 use std::{
     path::{Path, PathBuf},
@@ -39,6 +39,9 @@ struct Args {
     /// Resume the existing, matching audio checkpoint.
     #[arg(long)]
     resume: bool,
+    /// Use isolated v3 number train/dev data and a separate checkpoint namespace.
+    #[arg(long)]
+    number_v3: bool,
 }
 
 fn device_lease(state: &Path, stop: &AtomicBool) -> Result<Lease, String> {
@@ -101,7 +104,11 @@ fn execute() -> Result<(), String> {
         max_updates: args.max_updates,
         resume: args.resume,
     };
-    let result = train_audio_round::<TrainingBackend>(&options, &Default::default(), &stop)?;
+    let result = if args.number_v3 {
+        train_v3_audio_round::<TrainingBackend>(&options, &Default::default(), &stop)?
+    } else {
+        train_audio_round::<TrainingBackend>(&options, &Default::default(), &stop)?
+    };
     println!(
         "{}",
         serde_json::to_string(&result).map_err(|error| error.to_string())?

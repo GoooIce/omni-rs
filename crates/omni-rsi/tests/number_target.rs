@@ -178,6 +178,38 @@ fn invalid_or_out_of_bounds_wav_is_rejected_before_encoding() {
     reject();
 }
 
+#[cfg(unix)]
+#[test]
+fn special_input_files_are_rejected_without_waiting_for_a_writer() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
+
+    for name in ["wav", "model_config", "codec_config", "codec_weights"] {
+        let (root, model, wav) = fixture();
+        let path = match name {
+            "wav" => wav.clone(),
+            "model_config" => model.join("config.json"),
+            "codec_config" => model.join("audio_tokenizer/config.json"),
+            _ => model.join("audio_tokenizer/model.safetensors"),
+        };
+        fs::remove_file(&path).unwrap();
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _root = root;
+            let result = encode_target_with(&model, &wav, &AtomicBool::new(false), |_, _| {
+                panic!("special input reached encoder")
+            });
+            let _ = tx.send(result.is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(3)),
+            Ok(true),
+            "special input {name} did not fail promptly"
+        );
+    }
+}
+
 #[test]
 fn source_wav_and_each_codec_binding_must_stay_unchanged() {
     for changed in ["wav", "codec_config", "codec_weights", "model_config"] {
@@ -222,6 +254,85 @@ fn changing_a_codec_shard_during_encoding_is_rejected() {
     })
     .unwrap_err();
     assert!(error.contains("changed"), "{error}");
+}
+
+fn padded_index(shard: &str, size: usize) -> Vec<u8> {
+    let mut bytes = format!(r#"{{"weight_map":{{"encoder.weight":"{shard}"}}}}"#).into_bytes();
+    assert!(bytes.len() <= size);
+    bytes.resize(size, b' ');
+    bytes
+}
+
+#[test]
+fn target_encoder_enforces_codec_index_limit_at_the_public_boundary() {
+    let (_root, model, wav) = fixture();
+    let codec = model.join("audio_tokenizer");
+    let index = codec.join("model.safetensors.index.json");
+    fs::write(codec.join("part.safetensors"), b"fixture shard").unwrap();
+    let stop = AtomicBool::new(false);
+    let limit = 8 * 1024 * 1024;
+    fs::write(&index, padded_index("part.safetensors", limit)).unwrap();
+    let target = encode_target_with(&model, &wav, &stop, |_, _| Ok(vec![vec![1; 12]; 4])).unwrap();
+    let legacy = omni_rsi::fingerprint::codec_fingerprint(&codec, &stop).unwrap();
+    // Independent SHA-256 of the v1 domain and the three ordered fixture files.
+    assert_eq!(
+        legacy,
+        "c9241fa45e776158bb9d62177a0e99fe7a0bcdf80a424edb3abb30de1a3e4f7a"
+    );
+    assert_eq!(target.codec_fingerprint_sha256(), legacy);
+    assert_eq!(target.target_codec_sha256(), legacy);
+
+    let bytes = padded_index("part.safetensors", limit + 1);
+    assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+    fs::write(&index, bytes).unwrap();
+    let error = encode_target_with(&model, &wav, &stop, |_, _| {
+        panic!("oversized codec index reached the encoder")
+    })
+    .unwrap_err();
+    assert!(error.contains("oversized"), "{error}");
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn native_target_rejects_oversized_index_before_reading_shards() {
+    use burn::backend::NdArray;
+    use omni_rsi::speech_audio_target::encode_target;
+
+    let (_root, model, wav) = fixture();
+    let index = model.join("audio_tokenizer/model.safetensors.index.json");
+    fs::write(
+        &index,
+        padded_index("missing.safetensors", 8 * 1024 * 1024 + 1),
+    )
+    .unwrap();
+    let error =
+        encode_target::<NdArray<f32>>(&model, &wav, &Default::default(), &AtomicBool::new(false))
+            .unwrap_err();
+    assert!(error.contains("oversized"), "{error}");
+}
+
+#[test]
+fn target_encoder_applies_index_limit_to_the_final_recheck() {
+    let (_root, model, wav) = fixture();
+    let codec = model.join("audio_tokenizer");
+    let index = codec.join("model.safetensors.index.json");
+    fs::write(codec.join("part.safetensors"), b"fixture shard").unwrap();
+    fs::write(&index, padded_index("part.safetensors", 128)).unwrap();
+    let mut calls = 0;
+    let error = encode_target_with(&model, &wav, &AtomicBool::new(false), |_, _| {
+        calls += 1;
+        if calls == 2 {
+            fs::write(
+                &index,
+                padded_index("part.safetensors", 8 * 1024 * 1024 + 1),
+            )
+            .unwrap();
+        }
+        Ok(vec![vec![1; 12]; 4])
+    })
+    .unwrap_err();
+    assert_eq!(calls, 2);
+    assert!(error.contains("oversized"), "{error}");
 }
 
 #[test]
@@ -285,6 +396,46 @@ fn incompatible_model_and_codec_formats_are_rejected_before_encoding() {
 }
 
 #[test]
+fn codec_codebook_and_total_output_limits_are_enforced() {
+    for books in [129_usize, 1_000_000] {
+        let (_root, model, wav) = fixture();
+        fs::write(
+            model.join("config.json"),
+            format!(r#"{{"num_codebooks":{books},"codebook_size":2017,"audio_eos_code":2016}}"#),
+        )
+        .unwrap();
+        fs::write(
+            model.join("audio_tokenizer/config.json"),
+            format!(r#"{{"n_q":{books},"fsq_levels":[8,7,6,6],"sampling_rate":24000}}"#),
+        )
+        .unwrap();
+        let error = encode_target_with(&model, &wav, &AtomicBool::new(false), |_, _| {
+            panic!("oversized codebook count reached encoder")
+        })
+        .unwrap_err();
+        assert!(error.contains("codec"), "{books}: {error}");
+    }
+
+    let (_root, model, wav) = fixture();
+    fs::write(
+        model.join("config.json"),
+        br#"{"num_codebooks":128,"codebook_size":2017,"audio_eos_code":2016}"#,
+    )
+    .unwrap();
+    fs::write(
+        model.join("audio_tokenizer/config.json"),
+        br#"{"n_q":128,"fsq_levels":[8,7,6,6],"sampling_rate":24000}"#,
+    )
+    .unwrap();
+    let result = encode_target_with(&model, &wav, &AtomicBool::new(false), |_, _| {
+        Ok(vec![vec![1; 128]; 199])
+    })
+    .unwrap();
+    assert_eq!(result.frames().len(), 200);
+    assert_eq!(result.frames().iter().map(Vec::len).sum::<usize>(), 25_600);
+}
+
+#[test]
 fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
     use omni_rsi::{
         speech_audio_checkpoint::AudioProtocol,
@@ -294,6 +445,11 @@ fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
 
     for sharded in [false, true] {
         let (root, model, wav) = fixture();
+        fs::write(
+            model.join("audio_tokenizer/config.json"),
+            br#"{"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":24000,"stft_hop_length":160}"#,
+        )
+        .unwrap();
         if sharded {
             let codec = model.join("audio_tokenizer");
             fs::write(codec.join("part.safetensors"), b"fixture-shard").unwrap();
@@ -353,6 +509,34 @@ fn target_fields_fit_rule_plans_and_the_training_codec_binding() {
         let protocol =
             AudioProtocol::for_dataset(&model, &dataset, "fixture".into(), &stop).unwrap();
         assert_eq!(protocol.codec_hash, expected_codec, "sharded={sharded}");
+
+        // A changed codec configuration must invalidate a freshly encoded target
+        // even when the legacy unsharded weights hash has not changed.
+        fs::write(
+            model.join("audio_tokenizer/config.json"),
+            br#"{"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":24000,"stft_hop_length":320}"#,
+        )
+        .unwrap();
+        let error =
+            AudioProtocol::for_dataset(&model, &dataset, "fixture".into(), &stop).unwrap_err();
+        assert!(error.contains("codec"), "sharded={sharded}: {error}");
+
+        // Older unsharded data without the optional full fingerprint retains
+        // its historical weights-only admission behavior.
+        if !sharded {
+            let mut legacy = manifest;
+            legacy["records"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("codec_fingerprint_sha256");
+            fs::write(
+                data.join("manifest.json"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+            let dataset = AudioDataset::load(&data, &stop).unwrap();
+            AudioProtocol::for_dataset(&model, &dataset, "fixture".into(), &stop).unwrap();
+        }
     }
 }
 
@@ -446,6 +630,121 @@ fn float_wav_reaches_the_independently_referenced_fixture_codec() {
     assert_eq!(&result.frames()[..result.frames().len() - 1], case.frames);
     assert_eq!(result.frames().last().unwrap(), &vec![12; 3]);
     assert_eq!(result.encoding(), "caller_supplied_unverified");
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn captured_codec_remains_the_loaded_codec_after_source_replacement() {
+    use burn::backend::NdArray;
+    use omni_lfm3::{
+        Precision,
+        codec::{CodecConfig, CodecEncoder},
+        config::TextConfig,
+    };
+    use omni_r2t2::weights::Weights;
+    use omni_rsi::fingerprint::{CodecSnapshot, codec_fingerprint};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Reference {
+        cases: Vec<Case>,
+    }
+    #[derive(Deserialize)]
+    struct Case {
+        samples: Vec<f32>,
+        frames: Vec<Vec<u32>>,
+    }
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lfm3-omni/tests/fixtures/codec");
+    let reference: Reference =
+        serde_json::from_slice(&fs::read(source.join("expected-encode.json")).unwrap()).unwrap();
+    let backbone: TextConfig =
+        serde_json::from_slice(&fs::read(source.join("backbone.json")).unwrap()).unwrap();
+    for sharded in [false, true] {
+        let (_root, model, _) = fixture();
+        let codec = model.join("audio_tokenizer");
+        let weights_path = codec.join(if sharded {
+            "part.safetensors"
+        } else {
+            "model.safetensors"
+        });
+        let config = fs::read(source.join("config.json")).unwrap();
+        let weights = fs::read(source.join("synthetic.bin")).unwrap();
+        fs::write(codec.join("config.json"), &config).unwrap();
+        fs::write(&weights_path, &weights).unwrap();
+        if sharded {
+            fs::write(
+                codec.join("model.safetensors.index.json"),
+                br#"{"weight_map":{"fixture":"part.safetensors"}}"#,
+            )
+            .unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let expected = codec_fingerprint(&codec, &stop).unwrap();
+        let snapshot = CodecSnapshot::capture(&codec, &stop).unwrap();
+        assert_eq!(snapshot.fingerprint(), expected);
+        let expected_target = if sharded {
+            expected.clone()
+        } else {
+            format!("{:x}", Sha256::digest(&weights))
+        };
+        assert_eq!(snapshot.target_codec_hash(), expected_target);
+
+        // The live source changes before loading and is then restored: the
+        // encoder must nevertheless consume the exact captured bytes.
+        fs::write(codec.join("config.json"), b"replacement config").unwrap();
+        fs::write(&weights_path, b"replacement weights").unwrap();
+        let index = codec.join("model.safetensors.index.json");
+        let original_index = sharded.then(|| fs::read(&index).unwrap());
+        if sharded {
+            fs::write(&index, b"replacement index").unwrap();
+        }
+        let (captured_config, captured_weights) = snapshot.into_parts();
+        let parsed = CodecConfig::from_bytes(&captured_config)
+            .unwrap()
+            .with_backbone(backbone.clone())
+            .unwrap();
+        let weights = Weights::from_bytes(captured_weights).unwrap();
+        let encoder = CodecEncoder::<NdArray<f32>>::from_weights(
+            &weights,
+            parsed,
+            Precision::F32,
+            &Default::default(),
+        )
+        .unwrap();
+        fs::write(codec.join("config.json"), &config).unwrap();
+        fs::write(
+            &weights_path,
+            fs::read(source.join("synthetic.bin")).unwrap(),
+        )
+        .unwrap();
+        if let Some(original_index) = original_index {
+            fs::write(&index, original_index).unwrap();
+        }
+        assert_eq!(codec_fingerprint(&codec, &stop).unwrap(), expected);
+        assert_eq!(
+            encoder.encode(&reference.cases[1].samples).unwrap(),
+            reference.cases[1].frames
+        );
+    }
+}
+
+#[test]
+fn codec_snapshot_rejects_oversized_files_and_cancellation() {
+    use omni_rsi::fingerprint::CodecSnapshot;
+
+    let (_root, model, _) = fixture();
+    let codec = model.join("audio_tokenizer");
+    fs::File::create(codec.join("model.safetensors"))
+        .unwrap()
+        .set_len(1024 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(CodecSnapshot::capture(&codec, &AtomicBool::new(false)).is_err());
+    assert!(CodecSnapshot::capture(&codec, &AtomicBool::new(true)).is_err());
+    fs::File::create(codec.join("model.safetensors.index.json"))
+        .unwrap()
+        .set_len(8 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(CodecSnapshot::capture(&codec, &AtomicBool::new(false)).is_err());
 }
 
 #[cfg(feature = "cpu")]

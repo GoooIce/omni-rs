@@ -36,6 +36,14 @@ impl<'a> AudioAnswer<'a> {
         self.samples
     }
 
+    pub fn answer(&self) -> &str {
+        self.answer
+    }
+
+    pub fn frames(&self) -> Option<&[Vec<u32>]> {
+        self.frames
+    }
+
     pub fn new(
         samples: &'a [f32],
         sample_rate: u32,

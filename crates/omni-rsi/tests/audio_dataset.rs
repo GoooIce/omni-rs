@@ -120,6 +120,26 @@ fn speech_targets_require_a_codec_binding_but_text_only_records_do_not() {
     manifest["records"][0]["frames"] = serde_json::json!(vec![vec![1; 12]; 5]);
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     assert!(AudioDataset::load(root.path(), &stop).is_err());
+    manifest["records"][0]["target_codec_sha256"] = serde_json::json!("1".repeat(64));
+    manifest["records"][0]["codec_fingerprint_sha256"] = serde_json::Value::Null;
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(AudioDataset::load(root.path(), &stop).is_err());
+    manifest["records"][0]["codec_fingerprint_sha256"] = serde_json::json!("not-a-sha256");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(AudioDataset::load(root.path(), &stop).is_err());
+    manifest["records"][0]["codec_fingerprint_sha256"] = serde_json::json!("2".repeat(64));
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(AudioDataset::load(root.path(), &stop).is_ok());
+    manifest["records"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("frames");
+    manifest["records"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("target_codec_sha256");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(AudioDataset::load(root.path(), &stop).is_err());
 }
 
 #[test]

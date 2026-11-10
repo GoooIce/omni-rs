@@ -1,9 +1,9 @@
 //! Checkpoints for audio-conditioned training, isolated from self-reading.
 use crate::{
-    fingerprint::codec_fingerprint,
+    fingerprint::{codec_fingerprint, target_codec_hash},
+    number_audio_v3::NumberAudioV3,
     speech_audio_data::AudioDataset,
     speech_checkpoint::{atomic_json, implementation_hash},
-    speech_data::file_hash,
     speech_training::{SpeechOptimizer, SpeechOptimizerSnapshot},
 };
 use burn::tensor::backend::AutodiffBackend;
@@ -52,6 +52,9 @@ fn hex_id(value: &str) -> bool {
 }
 
 fn validate(protocol: &AudioProtocol, progress: &AudioProgress) -> Result<(), String> {
+    if protocol.implementation_hash != audio_implementation_hash() {
+        return Err("audio checkpoint implementation changed; existing state is untouched; use its original binary".into());
+    }
     if protocol.version != 1
         || [
             &protocol.base_hash,
@@ -61,7 +64,6 @@ fn validate(protocol: &AudioProtocol, progress: &AudioProgress) -> Result<(), St
         ]
         .iter()
         .any(|value| !hex_id(value))
-        || protocol.implementation_hash != audio_implementation_hash()
         || protocol.backend.is_empty()
         || protocol.backend.len() > 256
         || !(4..=65_536).contains(&protocol.width)
@@ -104,6 +106,63 @@ pub fn audio_implementation_hash() -> String {
 }
 
 impl AudioProtocol {
+    /// Build a checkpoint protocol for the isolated v3 training snapshot.
+    pub fn for_v3(
+        model: &Path,
+        dataset: &NumberAudioV3,
+        backend: String,
+        stop: &AtomicBool,
+    ) -> Result<Self, String> {
+        if stop.load(Ordering::Acquire) {
+            return Err("interrupted".into());
+        }
+        let base_hash =
+            omni_lfm3::speech_adapter::source_fingerprint(model).map_err(|e| e.to_string())?;
+        let full_codec_hash = codec_fingerprint(&model.join("audio_tokenizer"), stop)?;
+        let codec_hash = audio_codec_hash(model, stop)?;
+        if dataset
+            .development()
+            .target_model_fingerprints()
+            .is_some_and(|(base, codec)| base != base_hash || codec != full_codec_hash)
+        {
+            return Err("v3 target model or codec changed after data loading".into());
+        }
+        for record in dataset
+            .development()
+            .train()
+            .iter()
+            .chain(dataset.development().dev())
+        {
+            if record
+                .speech_target()
+                .is_some_and(|target| target.target_codec_sha256() != codec_hash)
+            {
+                return Err("v3 target codec does not match the current model".into());
+            }
+        }
+        let config: serde_json::Value = serde_json::from_slice(
+            &fs::read(model.join("config.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let width = config
+            .pointer("/text_config/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|width| usize::try_from(width).ok())
+            .filter(|width| (4..=65_536).contains(width))
+            .ok_or("invalid audio model width")?;
+        Ok(Self {
+            version: 1,
+            base_hash,
+            codec_hash,
+            dataset_hash: dataset.digest().into(),
+            implementation_hash: audio_implementation_hash(),
+            backend,
+            width,
+            train_records: dataset.len(),
+            mask_seed: 159,
+        })
+    }
+
     /// Build the identical model/data binding for training and evaluation.
     pub fn for_dataset(
         model: &Path,
@@ -117,6 +176,7 @@ impl AudioProtocol {
         let base_hash = omni_lfm3::speech_adapter::source_fingerprint(model)
             .map_err(|error| error.to_string())?;
         let codec_hash = audio_codec_hash(model, stop)?;
+        let mut full_codec_hash = None;
         for index in 0..dataset.len() {
             let record = dataset.record(index).ok_or("missing audio record")?;
             if record
@@ -125,6 +185,17 @@ impl AudioProtocol {
                 .is_some_and(|hash| hash != &codec_hash)
             {
                 return Err("audio target codec does not match the current model".into());
+            }
+            if let Some(expected) = &record.codec_fingerprint_sha256 {
+                if full_codec_hash.is_none() {
+                    full_codec_hash =
+                        Some(codec_fingerprint(&model.join("audio_tokenizer"), stop)?);
+                }
+                if full_codec_hash.as_ref() != Some(expected) {
+                    return Err(
+                        "audio target codec fingerprint does not match the current model".into(),
+                    );
+                }
             }
         }
         let config: serde_json::Value = serde_json::from_slice(
@@ -171,12 +242,7 @@ impl AudioProtocol {
 
 // Preserve the established target and checkpoint digest for unsharded codecs.
 fn audio_codec_hash(model: &Path, stop: &AtomicBool) -> Result<String, String> {
-    let codec = model.join("audio_tokenizer");
-    if codec.join("model.safetensors.index.json").is_file() {
-        codec_fingerprint(&codec, stop)
-    } else {
-        file_hash(&codec.join("model.safetensors"))
-    }
+    target_codec_hash(&model.join("audio_tokenizer"), stop)
 }
 
 impl AudioCheckpoint {

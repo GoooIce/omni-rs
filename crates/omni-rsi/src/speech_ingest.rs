@@ -248,33 +248,8 @@ pub(crate) fn write_pcm(path: &Path, samples: &[f32], rate: u32) -> Result<(), S
 }
 
 pub(crate) fn read_pcm(path: &Path, expected_rate: u32) -> Result<Vec<f32>, String> {
-    let mut wav = hound::WavReader::open(path).map_err(|error| error.to_string())?;
-    let spec = wav.spec();
-    if spec.channels != 1
-        || spec.sample_rate != expected_rate
-        || wav.duration() > expected_rate.saturating_mul(20)
-    {
-        return Err("invalid mono PCM speech".into());
-    }
-    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Int, 16) => wav
-            .samples::<i16>()
-            .map(|sample| {
-                sample
-                    .map(|value| f32::from(value) / 32768.0)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Float, 32) => wav
-            .samples::<f32>()
-            .map(|sample| sample.map_err(|error| error.to_string()))
-            .collect::<Result<_, _>>()?,
-        _ => return Err("invalid mono PCM speech".into()),
-    };
-    if samples.iter().any(|sample| !sample.is_finite()) {
-        return Err("non-finite speech audio".into());
-    }
-    Ok(samples)
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    crate::speech_pcm::decode_mono_pcm(std::io::BufReader::new(file), expected_rate)
 }
 
 impl<B: Backend> SpeechVerifier for LocalVerifier<B> {
@@ -421,5 +396,60 @@ impl<B: Backend> SpeechVerifier for LocalVerifier<B> {
             return Err("interrupted".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pcm_tests {
+    use super::read_pcm;
+
+    #[test]
+    fn speech_pcm_decoding_preserves_existing_format_and_value_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("speech.wav");
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 24_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for value in [0_i16, 8192, i16::MIN] {
+            writer.write_sample(value).unwrap();
+        }
+        writer.finalize().unwrap();
+        assert_eq!(read_pcm(&path, 24_000).unwrap(), [0.0, 0.25, -1.0]);
+        assert!(read_pcm(&path, 16_000).is_err());
+
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 24_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        writer.write_sample(1.5_f32).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(read_pcm(&path, 24_000).unwrap(), [1.5]);
+
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 24_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        writer.write_sample(f32::NAN).unwrap();
+        writer.finalize().unwrap();
+        assert!(read_pcm(&path, 24_000).is_err());
     }
 }

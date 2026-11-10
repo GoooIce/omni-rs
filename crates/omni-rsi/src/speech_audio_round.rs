@@ -1,6 +1,7 @@
 //! Bounded audio-conditioned LoRA training and recovery.
 use crate::{
     lease::Lease,
+    number_audio_v3::NumberAudioV3,
     speech_audio::{AudioAnswer, train_step},
     speech_audio_checkpoint::{AudioCheckpoint, AudioProgress, AudioProtocol},
     speech_audio_data::AudioDataset,
@@ -44,14 +45,68 @@ pub fn train_audio_round<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<AudioRoundResult, String> {
+    train_round::<B>(options, device, stop, false)
+}
+
+/// Explicit isolated v3 number training. It never reads holdout contents.
+pub fn train_v3_audio_round<B: AutodiffBackend>(
+    options: &AudioRoundOptions<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+) -> Result<AudioRoundResult, String> {
+    train_round::<B>(options, device, stop, true)
+}
+
+enum TrainingData {
+    Legacy(AudioDataset),
+    NumberV3(Box<NumberAudioV3>),
+}
+
+impl TrainingData {
+    fn len(&self) -> usize {
+        match self {
+            Self::Legacy(data) => data.len(),
+            Self::NumberV3(data) => data.len(),
+        }
+    }
+    fn example(&self, index: usize) -> Result<AudioAnswer<'_>, String> {
+        match self {
+            Self::Legacy(data) => AudioAnswer::from_dataset(data, index),
+            Self::NumberV3(data) => data.example(index),
+        }
+    }
+    fn protocol(
+        &self,
+        model: &Path,
+        backend: String,
+        stop: &AtomicBool,
+    ) -> Result<AudioProtocol, String> {
+        match self {
+            Self::Legacy(data) => AudioProtocol::for_dataset(model, data, backend, stop),
+            Self::NumberV3(data) => AudioProtocol::for_v3(model, data, backend, stop),
+        }
+    }
+}
+
+fn train_round<B: AutodiffBackend>(
+    options: &AudioRoundOptions<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+    v3: bool,
+) -> Result<AudioRoundResult, String> {
     if !(1..=100).contains(&options.epochs) || !(1..=100).contains(&options.max_updates) {
         return Err("audio training epochs and update budget must be between 1 and 100".into());
     }
     cancelled(stop)?;
-    std::fs::create_dir_all(options.state).map_err(|error| error.to_string())?;
+    let state = if v3 {
+        options.state.join("number-audio-v3")
+    } else {
+        options.state.to_path_buf()
+    };
+    std::fs::create_dir_all(&state).map_err(|error| error.to_string())?;
     let _lease = Lease::try_acquire(&options.state.join("audio-training.lock"))?
         .ok_or("another audio trainer owns this state")?;
-    let directory = options.state.join("audio-conditioned-v1");
+    let directory = state.join("audio-conditioned-v1");
     let exists = match std::fs::symlink_metadata(&directory) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -64,15 +119,23 @@ pub fn train_audio_round<B: AutodiffBackend>(
         (true, false) => return Err("no audio training state to resume".into()),
         _ => {}
     }
-    let dataset = AudioDataset::load(options.data, stop)?;
-    let protocol = AudioProtocol::for_dataset(options.model, &dataset, B::name(device), stop)?;
+    let dataset = if v3 {
+        TrainingData::NumberV3(Box::new(NumberAudioV3::load(
+            options.data,
+            options.model,
+            stop,
+        )?))
+    } else {
+        TrainingData::Legacy(AudioDataset::load(options.data, stop)?)
+    };
+    let protocol = dataset.protocol(options.model, B::name(device), stop)?;
     for index in 0..dataset.len() {
-        AudioAnswer::from_dataset(&dataset, index)?;
+        dataset.example(index)?;
     }
     cancelled(stop)?;
     let saved = if options.resume {
         Some(
-            AudioCheckpoint::load(options.state, &protocol)?
+            AudioCheckpoint::load(&state, &protocol)?
                 .ok_or("no complete audio checkpoint to resume")?,
         )
     } else {
@@ -87,7 +150,7 @@ pub fn train_audio_round<B: AutodiffBackend>(
         return Err("audio training model changed while loading".into());
     }
     for index in 0..dataset.len() {
-        if let Some(frames) = &dataset.record(index).ok_or("missing audio record")?.frames {
+        if let Some(frames) = dataset.example(index)?.frames() {
             validate_speech_frames(&model, frames)?;
         }
     }
@@ -100,12 +163,12 @@ pub fn train_audio_round<B: AutodiffBackend>(
         None => SpeechOptimizer::<B>::new(protocol.width, 4, 761, device)?,
     };
     cancelled(stop)?;
-    let mut latest = AudioCheckpoint::new(protocol.clone(), progress.clone(), &optimizer)?
-        .save(options.state)?;
+    let mut latest =
+        AudioCheckpoint::new(protocol.clone(), progress.clone(), &optimizer)?.save(&state)?;
     let mut count = 0;
     while progress.epoch < options.epochs && count < options.max_updates {
         cancelled(stop)?;
-        let example = AudioAnswer::from_dataset(&dataset, progress.next_index)?;
+        let example = dataset.example(progress.next_index)?;
         let seed = protocol.seed_for_step(&progress)?;
         train_step(&mut model, &mut optimizer, &example, seed, stop)?;
         progress.updates += 1;
@@ -115,8 +178,8 @@ pub fn train_audio_round<B: AutodiffBackend>(
             progress.epoch += 1;
         }
         // A completed update is committed even if cancellation arrives during it.
-        latest = AudioCheckpoint::new(protocol.clone(), progress.clone(), &optimizer)?
-            .save(options.state)?;
+        latest =
+            AudioCheckpoint::new(protocol.clone(), progress.clone(), &optimizer)?.save(&state)?;
         count += 1;
     }
     cancelled(stop)?;

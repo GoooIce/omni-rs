@@ -1,6 +1,6 @@
 # 数字听答开发集：隔离入口和预注册基础
 
-`number_development` 提供独立的 train/dev 读取及协议冻结基础。它尚未接入实际训练或评估，不能构造 `VerifiedDevelopment`、打开保留集或启用候选；返回状态固定为 `insufficient_evidence`。以下文件格式和测试只约束输入与快照，不证明运行、数据真实性、授权或模型质量。旧版 v2 单清单会暴露 test 内容，只能用于已暴露的实验，不能用作盲验收输入。
+`number_development` 提供独立的 train/dev 读取及协议冻结基础。v3 可显式进入下述音频条件训练，但还没有接入正式开发集验收或保留集评估，不能构造 `VerifiedDevelopment`、打开保留集或启用候选。文件格式和测试只约束输入与快照，不证明运行、数据真实性、授权或模型质量。旧版 v2 单清单会暴露 test 内容，只能用于已暴露的实验，不能用作盲验收输入。
 
 ## v3 数据边界
 
@@ -28,7 +28,26 @@ regression-plan.json     regression-inputs/*.json
 
 含语音目标的数据必须使用 `DevelopmentData::load_with_model` 并指定实际本地模型目录；无模型的 `load` 会拒绝含目标的数据，而不是丢弃它。入口保留所有帧和目标字段，按实际模型 `num_codebooks`、`codebook_size`、`audio_eos_code` 及 codec `n_q`、`fsq_levels`、采样率检查：总帧数 5–200，码本数最多 128，每帧宽度匹配码本，内容码在 codec 和模型范围内，只有最后一帧是全码本 EOS。目标模型配置哈希、codec 配置和权重的完整指纹，以及 #82 使用的目标 codec 身份必须与实际文件一致；单文件和索引分片各按原有算法处理。
 
-冻结的每条目标身份是整个目标对象的规范 JSON 哈希，因而绑定实际帧值、目标 WAV 字节身份、文件名和完整来源声明；加载后的记录仍可取回全部 `frames`，而不是只保留哈希。哈希不能证明 frames 确由该 WAV 和 codec 生成，也不能证实来源、许可或真人标注。当前没有联合训练入口；后续必须显式传递 frames、EOS 及 codec 身份，且重新执行 #82 的数据准入和训练校验，不能静默丢弃语音目标或声称正式通过。
+冻结的每条目标身份是整个目标对象的规范 JSON 哈希，因而绑定实际帧值、目标 WAV 字节身份、文件名和完整来源声明；加载后的记录仍可取回全部 `frames`，而不是只保留哈希。哈希不能证明 frames 确由该 WAV 和 codec 生成，也不能证实来源、许可或真人标注。显式 v3 训练入口将经模型和 codec 校验的目标 frames、EOS 连同规则文本和实际输入 PCM 交给同一个训练步骤；文本目标缺少语音码时只计算文本损失。来源核查和正式验收仍须另行接线。
+
+## 显式 v3 训练
+
+使用 `omni-rsi-audio --number-v3` 才会选择 v3 入口，省略此参数保留 v1/v2 数据加载路径。`--model`、`--data` 和 `--state` 均须显式指定；例如在已准备好本地模型和隔离数据后：
+
+```sh
+CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 UV_CACHE_DIR="$PWD/artifacts/uv-cache" \
+  cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
+  --bin omni-rsi-audio -- --number-v3 --model /path/to/local/model --data /path/to/v3-data \
+  --state /path/to/state --epochs 1 --max-updates 1
+```
+
+入口只加载 train/dev 和公开保留元数据，构造与旧路径相同的 `AudioAnswer`，调用同一个 `train_step`；它不打开保留答案、盐或媒体，不自动发布候选。检查点位于 `state/number-audio-v3/audio-conditioned-v1/`，不复用旧路径的状态；两条路径共用父目录的训练租约。恢复必须显式加 `--resume`，并重新匹配模型、codec、数据和实现身份。`dataset_hash` 绑定实际 train/dev 清单、媒体、规则答案、目标帧和来源、公开保留承诺，以及 v3 加载和训练数据接线实现；完整 codec 与模型配置还由目标身份及底座身份绑定。开发集只参与身份和隔离检查，不用于训练更新。
+
+此次修改了共享的音频训练入口、检查点和示例构造源码，因此 `audio_implementation_hash` 会变化。旧 v1/v2 清单仍可使用，但旧实现生成的检查点不会自动迁移或恢复；显式恢复时会报告实现摘要已变，保留原检查点和指针，可用原二进制与备份继续。训练完成或本地 mock 测试均不表示质量改善、真实来源已核验或许可已确定。
+
+共享检查点源码也纳入数字开发评分的实现摘要，新增只读接口则改变预注册实现源码摘要。旧评分报告和旧冻结协议仍绑定各自生成时的源码；新版本不会把它们自动升级成新版本证据，旧冻结协议的重验会拒绝当前源码摘要不匹配。保留旧文件及其原二进制，后续按新协议重新冻结并取得所需的真实证据。
+
+可由有本地权重的操作者显式运行 `audio_cli` 测试中的 `v3_real_cli_trains_speech_and_text_then_resumes`：设置 `LFM3_MODEL` 和 `LFM3_NUMBER_V3_DATA`，数据至少两条训练记录，首条带目标帧、第二条为纯文本。测试各执行一次更新与恢复，不发布候选；命令需明确选定本机可用后端并传入 `-- --ignored --exact`。假盲集占位的探索样本只能作接线烟雾，不能作为正式保留或质量证据。
 
 当前盲格式 v2 不支持秘密目标音频：保留案例只有输入音频，公开来源组也只承诺现有输入来源。这里不会读取、比较或声称隔离任何秘密目标音频；若未来要把语音目标用于保留集，必须先设计新的盲封存格式和独立来源、媒体核验流程，正式目标语音验收在此之前仍不可用。
 

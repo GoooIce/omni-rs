@@ -52,8 +52,17 @@ fn audio_reference_dataset(reference: &AudioReference) -> (tempfile::TempDir, Au
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
     let mut records = Vec::new();
+    let decoy = (0..16_000)
+        .map(|index| {
+            if index % 160 < 80 {
+                16_384_i16
+            } else {
+                -16_384_i16
+            }
+        })
+        .collect();
     for (name, samples) in [
-        ("decoy.wav", vec![0_i16; reference.pcm16.len()]),
+        ("decoy.wav", decoy),
         ("target.wav", reference.pcm16.clone()),
     ] {
         let path = root.path().join(name);
@@ -88,12 +97,42 @@ fn audio_reference_dataset(reference: &AudioReference) -> (tempfile::TempDir, Au
     (root, data)
 }
 
-fn close(actual: Vec<f32>, expected: &[f32]) {
-    assert_eq!(actual.len(), expected.len());
-    assert!(
-        actual.iter().chain(expected).all(|value| value.is_finite()),
-        "non-finite numerical comparison"
-    );
+#[test]
+fn wrong_wav_fixture_is_an_independent_finite_record() {
+    let reference = AudioReference {
+        messages: vec![],
+        answer: "十三".into(),
+        target_ids: vec![],
+        frames: vec![vec![1; 12]; 5],
+        seed: 159,
+        pcm16: vec![0, 32, -32, 0],
+        prefix_ids: vec![],
+        a: vec![],
+        b: vec![],
+        text: 0.0,
+        speech: 0.0,
+        end: 0.0,
+        gradient_a: vec![],
+        gradient_b: vec![],
+        gradient_norm: 0.0,
+    };
+    let (_root, dataset) = audio_reference_dataset(&reference);
+    let wrong = AudioAnswer::from_dataset(&dataset, 0).unwrap();
+    let target = AudioAnswer::from_dataset(&dataset, 1).unwrap();
+    assert_eq!(wrong.samples().len(), 16_000);
+    assert_eq!(wrong.samples()[0], 0.5);
+    assert_eq!(wrong.samples()[80], -0.5);
+    assert!(wrong.samples().iter().all(|value| value.is_finite()));
+    assert_ne!(wrong.samples(), target.samples());
+}
+
+fn compare_gradient(actual: &[f32], expected: &[f32]) -> Result<(), String> {
+    if actual.len() != expected.len() || actual.is_empty() {
+        return Err("gradient length mismatch".into());
+    }
+    if !actual.iter().chain(expected).all(|value| value.is_finite()) {
+        return Err("non-finite numerical comparison".into());
+    }
     let error = actual
         .iter()
         .zip(expected)
@@ -103,10 +142,130 @@ fn close(actual: Vec<f32>, expected: &[f32]) {
         .iter()
         .map(|value| value.abs())
         .fold(0.0_f32, f32::max);
+    if error < 1e-5_f32.max(scale * 0.03) {
+        Ok(())
+    } else {
+        Err(format!("max error {error}, reference scale {scale}"))
+    }
+}
+
+fn close(actual: Vec<f32>, expected: &[f32]) {
+    compare_gradient(&actual, expected).unwrap();
+}
+
+#[derive(Clone)]
+struct TrainingMetrics {
+    text: f32,
+    speech: f32,
+    end: f32,
+    gradient_a: Vec<f32>,
+    gradient_b: Vec<f32>,
+}
+
+fn compare_audio_reference(
+    actual: &TrainingMetrics,
+    expected: &TrainingMetrics,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (name, actual, expected) in [
+        ("text", actual.text, expected.text),
+        ("speech", actual.speech, expected.speech),
+        ("end", actual.end, expected.end),
+    ] {
+        if !actual.is_finite() || !expected.is_finite() || (actual - expected).abs() >= 0.02 {
+            failures.push(format!(
+                "{name} loss does not match the reference: {actual} vs {expected}"
+            ));
+        }
+    }
+    if let Err(error) = compare_gradient(&actual.gradient_a, &expected.gradient_a) {
+        failures.push(format!("gradient_a: {error}"));
+    }
+    if let Err(error) = compare_gradient(&actual.gradient_b, &expected.gradient_b) {
+        failures.push(format!("gradient_b: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn production_training_metrics(
+    model: &mut OmniModel<CpuTraining>,
+    reference: &AudioReference,
+    samples: &[f32],
+    a: &[f32],
+    b: &[f32],
+) -> TrainingMetrics {
+    let optimizer = SpeechOptimizer::<CpuTraining>::from_values(
+        model.text.hidden_size(),
+        4,
+        a.to_vec(),
+        b.to_vec(),
+        &Default::default(),
+    )
+    .unwrap();
+    optimizer.adapter().install(&mut model.text, 23).unwrap();
+    let media = [model.prepare_audio(samples, 16_000).unwrap()];
+    let text =
+        text_loss_with_media(model, &reference.messages, &media, &reference.target_ids).unwrap();
+    let speech = speech_loss_with_media(
+        model,
+        &reference.messages,
+        &media,
+        &reference.frames,
+        reference.seed,
+    )
+    .unwrap();
+    let text_value = text.clone().into_scalar();
+    let speech_value = speech.content.clone().into_scalar();
+    let end_value = speech.end.clone().into_scalar();
+    let gradients = (text + speech.content + speech.end * 0.01).backward();
+    let (a, b) = optimizer.adapter().weights();
+    TrainingMetrics {
+        text: text_value,
+        speech: speech_value,
+        end: end_value,
+        gradient_a: a.grad(&gradients).unwrap().into_data().to_vec().unwrap(),
+        gradient_b: b.grad(&gradients).unwrap().into_data().to_vec().unwrap(),
+    }
+}
+
+fn assert_finite_candidate_rejected(
+    label: &str,
+    candidate: &TrainingMetrics,
+    expected: &TrainingMetrics,
+) {
     assert!(
-        error < 1e-5_f32.max(scale * 0.03),
-        "max error {error}, reference scale {scale}"
+        [candidate.text, candidate.speech, candidate.end]
+            .iter()
+            .all(|value| value.is_finite()),
+        "{label}"
     );
+    assert!(
+        candidate
+            .gradient_a
+            .iter()
+            .chain(&candidate.gradient_b)
+            .all(|value| value.is_finite()),
+        "{label}"
+    );
+    assert_eq!(
+        candidate.gradient_a.len(),
+        expected.gradient_a.len(),
+        "{label}"
+    );
+    assert_eq!(
+        candidate.gradient_b.len(),
+        expected.gradient_b.len(),
+        "{label}"
+    );
+    let rejection = match compare_audio_reference(candidate, expected) {
+        Err(error) => error,
+        Ok(()) => panic!("{label} passed the official acceptance tolerances"),
+    };
+    println!("{label} rejected: {rejection}");
 }
 
 #[test]
@@ -118,6 +277,33 @@ fn numerical_comparison_rejects_nonfinite_values() {
     ] {
         assert!(std::panic::catch_unwind(|| close(vec![actual], &[expected])).is_err());
     }
+}
+
+#[test]
+fn finite_candidates_use_the_same_loss_and_gradient_acceptance_tolerances() {
+    let expected = TrainingMetrics {
+        text: 2.0,
+        speech: 3.0,
+        end: 4.0,
+        gradient_a: vec![0.02, -0.01],
+        gradient_b: vec![0.001, -0.002],
+    };
+    let mut candidate = expected.clone();
+    candidate.text = 2.019;
+    assert!(compare_audio_reference(&candidate, &expected).is_ok());
+    candidate.text = 2.021;
+    assert!(compare_audio_reference(&candidate, &expected).is_err());
+    candidate.gradient_a[0] = 0.0207;
+    let error = compare_audio_reference(&candidate, &expected).unwrap_err();
+    assert!(
+        error.contains("text") && error.contains("gradient_a"),
+        "{error}"
+    );
+
+    candidate = expected.clone();
+    candidate.gradient_a[0] = 0.0207;
+    let error = compare_audio_reference(&candidate, &expected).unwrap_err();
+    assert!(error.contains("gradient_a"), "{error}");
 }
 
 #[test]
@@ -215,8 +401,10 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
     .unwrap();
     optimizer.adapter().install(&mut model.text, 23).unwrap();
     let (_dataset_root, dataset) = audio_reference_dataset(&reference);
-    let samples = dataset.record(1).unwrap().samples();
-    assert_ne!(dataset.record(0).unwrap().samples(), samples);
+    let example = AudioAnswer::from_dataset(&dataset, 1).unwrap();
+    let decoy = AudioAnswer::from_dataset(&dataset, 0).unwrap();
+    let samples = example.samples();
+    assert_ne!(decoy.samples(), samples);
     let base_embeddings = model
         .text
         .embed_tokens(&[1, 2, 3])
@@ -240,10 +428,38 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
             .prepare_prompt(&reference.messages, None, &[])
             .is_err()
     );
-    let text =
-        text_loss_with_media(&model, &reference.messages, &media, &reference.target_ids).unwrap();
-    let text_value = text.clone().into_scalar();
-    assert!((text_value - reference.text).abs() < 0.02);
+    let expected = TrainingMetrics {
+        text: reference.text,
+        speech: reference.speech,
+        end: reference.end,
+        gradient_a: reference.gradient_a.clone(),
+        gradient_b: reference.gradient_b.clone(),
+    };
+    let actual =
+        production_training_metrics(&mut model, &reference, samples, &reference.a, &reference.b);
+    compare_audio_reference(&actual, &expected).unwrap();
+    let text_value = actual.text;
+
+    // An actual finite LoRA candidate must fail the exact same independent
+    // loss-and-gradient acceptance used above, not just differ by a tiny amount.
+    let perturbed_a: Vec<_> = reference.a.iter().map(|value| value * 64.0).collect();
+    let perturbed_b: Vec<_> = reference.b.iter().map(|value| value * 64.0).collect();
+    let perturbed =
+        production_training_metrics(&mut model, &reference, samples, &perturbed_a, &perturbed_b);
+    assert_finite_candidate_rejected("finite perturbed LoRA candidate", &perturbed, &expected);
+
+    // The other AudioDataset record is assembled through the same training
+    // interface and evaluated with the original candidate and reference.
+    let wrong_audio = production_training_metrics(
+        &mut model,
+        &reference,
+        decoy.samples(),
+        &reference.a,
+        &reference.b,
+    );
+    assert_finite_candidate_rejected("finite wrong WAV input", &wrong_audio, &expected);
+
+    optimizer.adapter().install(&mut model.text, 23).unwrap();
     let silence = [model
         .prepare_audio(&vec![0.0; samples.len()], 16_000)
         .unwrap()];
@@ -251,29 +467,7 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
         text_loss_with_media(&model, &reference.messages, &silence, &reference.target_ids)
             .unwrap()
             .into_scalar();
-    assert!((text.clone().into_scalar() - silent_loss).abs() > 1e-5);
-    let speech = speech_loss_with_media(
-        &model,
-        &reference.messages,
-        &media,
-        &reference.frames,
-        reference.seed,
-    )
-    .unwrap();
-    let content = speech.content;
-    let end = speech.end;
-    assert!((content.clone().into_scalar() - reference.speech).abs() < 0.02);
-    assert!((end.clone().into_scalar() - reference.end).abs() < 0.02);
-    let gradients = (text + content + end * 0.01).backward();
-    let (a, b) = optimizer.adapter().weights();
-    close(
-        a.grad(&gradients).unwrap().into_data().to_vec().unwrap(),
-        &reference.gradient_a,
-    );
-    close(
-        b.grad(&gradients).unwrap().into_data().to_vec().unwrap(),
-        &reference.gradient_b,
-    );
+    assert!((text_value - silent_loss).abs() > 1e-5);
 
     // Backward consumes Burn's graph, so each independent objective starts
     // from fresh LoRA tensors with the exact same values and fresh audio media.
@@ -354,7 +548,6 @@ fn real_audio_conditioned_losses_gradients_and_burn_update() {
             .into_scalar();
     optimizer.adapter().install(&mut model.text, 23).unwrap();
 
-    let example = AudioAnswer::from_dataset(&dataset, 1).unwrap();
     let before = optimizer.export().unwrap();
     let stop = AtomicBool::new(true);
     assert!(train_step(&mut model, &mut optimizer, &example, reference.seed, &stop).is_err());
