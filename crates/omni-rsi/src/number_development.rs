@@ -28,6 +28,42 @@ struct ManifestRecord {
     answer: u32,
     source: BlindSource,
     declaration: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    speech_target: Option<SpeechTarget>,
+}
+
+/// A preserved target and its declared origin. Its metadata is not proof that
+/// the encoder ran, the source is authorized, or the speech matches the answer.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeechTarget {
+    frames: Vec<Vec<u32>>,
+    target_codec_sha256: String,
+    target_audio_sha256: String,
+    codec_fingerprint_sha256: String,
+    model_config_sha256: String,
+    sample_rate: u32,
+    encoding: String,
+    quality_evidence: String,
+    runtime_backend: String,
+    preparation_sha256: String,
+    audio_file: String,
+    source: serde_json::Map<String, serde_json::Value>,
+}
+
+impl SpeechTarget {
+    pub fn frames(&self) -> &[Vec<u32>] {
+        &self.frames
+    }
+    pub fn target_codec_sha256(&self) -> &str {
+        &self.target_codec_sha256
+    }
+    pub fn target_audio_sha256(&self) -> &str {
+        &self.target_audio_sha256
+    }
+    pub fn source(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.source
+    }
 }
 
 #[derive(Deserialize)]
@@ -79,6 +115,13 @@ impl DevelopmentRecord {
     pub fn declaration(&self) -> &serde_json::Map<String, serde_json::Value> {
         &self.record.declaration
     }
+    /// Published or caller-provided reference text has not been independently verified.
+    pub fn reference_status(&self) -> &'static str {
+        "unverified"
+    }
+    pub fn speech_target(&self) -> Option<&SpeechTarget> {
+        self.record.speech_target.as_ref()
+    }
 }
 
 pub struct DevelopmentData {
@@ -89,12 +132,27 @@ pub struct DevelopmentData {
     train_groups_sha256: String,
     dev_groups_sha256: String,
     blind: PublicMetadata,
+    target_binding: Option<TargetBinding>,
+}
+
+struct TargetBinding {
+    base_model_sha256: String,
+    codec_sha256: String,
 }
 
 impl DevelopmentData {
     /// Read only the fixed v3 train/dev files and the public holdout metadata.
     /// The old combined v2 manifest is never opened by this entry point.
     pub fn load(root: &Path, stop: &AtomicBool) -> Result<Self, String> {
+        Self::load_inner(root, None, stop)
+    }
+
+    /// Load targets only with the actual local model and codec checked.
+    pub fn load_with_model(root: &Path, model: &Path, stop: &AtomicBool) -> Result<Self, String> {
+        Self::load_inner(root, Some(model), stop)
+    }
+
+    fn load_inner(root: &Path, model: Option<&Path>, stop: &AtomicBool) -> Result<Self, String> {
         check_stop(stop)?;
         let root = open_root(root)?;
         let marker = read_child(&root, "layout.v3", 128, stop)
@@ -124,11 +182,40 @@ impl DevelopmentData {
         let dev = parse_split(&dev_bytes, "dev")?;
         check_group_manifest(&train, &train_groups)?;
         check_group_manifest(&dev, &dev_groups)?;
+        let has_targets = train
+            .iter()
+            .chain(&dev)
+            .any(|record| record.speech_target.is_some());
+        if has_targets && model.is_none() {
+            return Err("speech targets require the model-bound v3 loader".into());
+        }
+        let train_target_dir = if train.iter().any(|record| record.speech_target.is_some()) {
+            Some(open_child(&root, "train-target-media", true)?)
+        } else {
+            None
+        };
+        let dev_target_dir = if dev.iter().any(|record| record.speech_target.is_some()) {
+            Some(open_child(&root, "dev-target-media", true)?)
+        } else {
+            None
+        };
         let train_dir = open_child(&root, "train-media", true)?;
         let dev_dir = open_child(&root, "dev-media", true)?;
         let mut total_samples = 0;
-        let train = load_media(train, &train_dir, &mut total_samples, stop)?;
-        let dev = load_media(dev, &dev_dir, &mut total_samples, stop)?;
+        let train = load_media(
+            train,
+            &train_dir,
+            train_target_dir.as_ref(),
+            &mut total_samples,
+            stop,
+        )?;
+        let dev = load_media(
+            dev,
+            &dev_dir,
+            dev_target_dir.as_ref(),
+            &mut total_samples,
+            stop,
+        )?;
         let train_pcm: HashSet<_> = train.iter().map(|record| &record.pcm_sha256).collect();
         if dev
             .iter()
@@ -136,6 +223,16 @@ impl DevelopmentData {
         {
             return Err("decoded PCM crosses train/dev partitions".into());
         }
+        let target_binding = if has_targets {
+            Some(validate_target_model(
+                &train,
+                &dev,
+                model.ok_or("missing target model")?,
+                stop,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             train,
             dev,
@@ -144,6 +241,7 @@ impl DevelopmentData {
             train_groups_sha256: format!("{:x}", Sha256::digest(&train_group_bytes)),
             dev_groups_sha256: format!("{:x}", Sha256::digest(&dev_group_bytes)),
             blind,
+            target_binding,
         })
     }
 
@@ -292,6 +390,13 @@ fn parse_split(bytes: &[u8], partition: &str) -> Result<Vec<ManifestRecord>, Str
         if !valid_declaration(record) {
             return Err("invalid authorization or human reference declaration".into());
         }
+        if record
+            .speech_target
+            .as_ref()
+            .is_some_and(|target| !valid_target_metadata(target))
+        {
+            return Err("invalid target metadata or source declaration".into());
+        }
         if record.id.trim().is_empty()
             || record.id.trim() != record.id
             || record.id.len() > 128
@@ -317,6 +422,64 @@ fn parse_split(bytes: &[u8], partition: &str) -> Result<Vec<ManifestRecord>, Str
     Ok(manifest.records)
 }
 
+fn valid_target_metadata(target: &SpeechTarget) -> bool {
+    let text = |value: &str| {
+        !value.trim().is_empty()
+            && value.trim() == value
+            && value.len() <= 2048
+            && !value.chars().any(char::is_control)
+    };
+    let source_text = |key: &str| {
+        target
+            .source
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(text)
+    };
+    valid_file_name(&target.audio_file)
+        && [
+            &target.target_codec_sha256,
+            &target.target_audio_sha256,
+            &target.codec_fingerprint_sha256,
+            &target.model_config_sha256,
+            &target.preparation_sha256,
+        ]
+        .iter()
+        .all(|value| valid_hash(value))
+        && target.sample_rate == 24_000
+        && matches!(
+            target.encoding.as_str(),
+            "caller_supplied_unverified" | "local_liquidcodec_f32"
+        )
+        && target.quality_evidence == "not_assessed"
+        && text(&target.runtime_backend)
+        && (5..=200).contains(&target.frames.len())
+        && source_text("source")
+        && match target
+            .source
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("licensed-synthetic") => source_text("license"),
+            Some("licensed-human") => {
+                source_text("license") && unverified_reference(&target.source)
+            }
+            Some("user-provided") => source_text("consent"),
+            _ => false,
+        }
+}
+
+fn unverified_reference(value: &serde_json::Map<String, serde_json::Value>) -> bool {
+    value
+        .get("reference_status")
+        .is_none_or(|status| status.as_str() == Some("unverified"))
+        && value.get("published_prompt").is_none_or(|reference| {
+            reference
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty() && text.len() <= 2048)
+        })
+}
+
 fn valid_declaration(record: &ManifestRecord) -> bool {
     let value = &record.declaration;
     let valid_text = |key: &str| {
@@ -330,6 +493,7 @@ fn valid_declaration(record: &ManifestRecord) -> bool {
     }
     match value.get("kind").and_then(serde_json::Value::as_str) {
         Some("licensed-synthetic") => valid_text("license"),
+        Some("licensed-human") => valid_text("license") && unverified_reference(value),
         Some("user-provided") => {
             valid_text("consent")
                 && value.get("human_reference").is_some_and(|reference| {
@@ -352,12 +516,25 @@ fn valid_declaration(record: &ManifestRecord) -> bool {
 fn load_media(
     records: Vec<ManifestRecord>,
     directory: &File,
+    target_directory: Option<&File>,
     total_samples: &mut usize,
     stop: &AtomicBool,
 ) -> Result<Vec<DevelopmentRecord>, String> {
     let mut loaded = Vec::with_capacity(records.len());
     let mut labels = HashMap::new();
     for record in records {
+        if let Some(target) = &record.speech_target {
+            let bytes = read_child(
+                target_directory.ok_or("missing target media directory")?,
+                &target.audio_file,
+                MAX_MEDIA,
+                stop,
+            )?;
+            if format!("{:x}", Sha256::digest(&bytes)) != target.target_audio_sha256 {
+                return Err("target audio hash mismatch".into());
+            }
+            validate_target_wav(&bytes, stop)?;
+        }
         let bytes = read_child(directory, &record.audio_file, MAX_MEDIA, stop)?;
         if format!("{:x}", Sha256::digest(&bytes)) != record.audio_sha256 {
             return Err("v3 media hash mismatch".into());
@@ -395,6 +572,41 @@ fn load_media(
         });
     }
     Ok(loaded)
+}
+
+fn validate_target_wav(bytes: &[u8], stop: &AtomicBool) -> Result<(), String> {
+    let mut wav = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let spec = wav.spec();
+    if spec.channels != 1
+        || spec.sample_rate != 24_000
+        || wav.duration() == 0
+        || wav.duration() > 24_000 * 20
+    {
+        return Err("target WAV must be bounded mono 24 kHz PCM".into());
+    }
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => {
+            for (i, sample) in wav.samples::<i16>().enumerate() {
+                if i % 4096 == 0 {
+                    check_stop(stop)?;
+                }
+                sample.map_err(|e| e.to_string())?;
+            }
+        }
+        (hound::SampleFormat::Float, 32) => {
+            for (i, sample) in wav.samples::<f32>().enumerate() {
+                if i % 4096 == 0 {
+                    check_stop(stop)?;
+                }
+                let sample = sample.map_err(|e| e.to_string())?;
+                if !sample.is_finite() || sample.abs() > 1.0 {
+                    return Err("invalid target WAV sample".into());
+                }
+            }
+        }
+        _ => return Err("target WAV must be PCM16 or float32".into()),
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -518,6 +730,8 @@ struct CaseIdentity {
     answer: u32,
     source: BlindSource,
     declaration_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_target_sha256: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq)]
@@ -618,6 +832,16 @@ fn case_identities(records: &[DevelopmentRecord]) -> Result<Vec<CaseIdentity>, S
                 answer: row.record.answer,
                 source: row.record.source.clone(),
                 declaration_sha256: format!("{:x}", Sha256::digest(declaration)),
+                speech_target_sha256: row
+                    .record
+                    .speech_target
+                    .as_ref()
+                    .map(|target| {
+                        serde_json::to_vec(target)
+                            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                            .map_err(|e| e.to_string())
+                    })
+                    .transpose()?,
             })
         })
         .collect()
@@ -704,7 +928,11 @@ fn hash_regular_path(path: &Path, limit: u64, stop: &AtomicBool) -> Result<Strin
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path).map_err(|e| e.to_string())?;
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    hash_open_regular(file, limit, stop)
+}
+
+fn hash_open_regular(mut file: File, limit: u64, stop: &AtomicBool) -> Result<String, String> {
     let before = file.metadata().map_err(|e| e.to_string())?;
     if !before.is_file() || before.len() == 0 || before.len() > limit {
         return Err("invalid preregistration artifact".into());
@@ -903,6 +1131,100 @@ fn model_and_codec_fingerprints(
     Ok((model_hash, codec_hash))
 }
 
+fn validate_target_model(
+    train: &[DevelopmentRecord],
+    dev: &[DevelopmentRecord],
+    path: &Path,
+    stop: &AtomicBool,
+) -> Result<TargetBinding, String> {
+    #[derive(Deserialize)]
+    struct ModelFormat {
+        num_codebooks: usize,
+        codebook_size: usize,
+        audio_eos_code: u32,
+    }
+    #[derive(Deserialize)]
+    struct CodecFormat {
+        n_q: usize,
+        fsq_levels: Vec<u32>,
+        sampling_rate: u32,
+    }
+
+    let model = open_root(path)?;
+    let codec = open_child(&model, "audio_tokenizer", true)?;
+    let model_bytes = read_child(&model, "config.json", MAX_MANIFEST, stop)?;
+    let codec_bytes = read_child(&codec, "config.json", MAX_MANIFEST, stop)?;
+    let model_format: ModelFormat =
+        serde_json::from_slice(&model_bytes).map_err(|e| e.to_string())?;
+    let codec_format: CodecFormat =
+        serde_json::from_slice(&codec_bytes).map_err(|e| e.to_string())?;
+    let code_count = codec_format
+        .fsq_levels
+        .iter()
+        .try_fold(1_u32, |product, level| {
+            (*level >= 2).then(|| product.checked_mul(*level)).flatten()
+        })
+        .ok_or("invalid codec levels")?;
+    if codec_format.fsq_levels.is_empty()
+        || codec_format.sampling_rate != 24_000
+        || codec_format.n_q == 0
+        || codec_format.n_q != model_format.num_codebooks
+        || model_format.audio_eos_code < code_count
+        || model_format.audio_eos_code as usize >= model_format.codebook_size
+    {
+        return Err("model and codec codebook formats do not match".into());
+    }
+    let (base_model_sha256, codec_sha256) = model_and_codec_fingerprints(path, stop)?;
+    let target_codec_sha256 = match open_child_io(&codec, "model.safetensors.index.json", false) {
+        Ok(_) => codec_sha256.clone(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => hash_open_regular(
+            open_child(&codec, "model.safetensors", false)?,
+            u64::MAX,
+            stop,
+        )?,
+        Err(error) => return Err(error.to_string()),
+    };
+    if model_bytes != read_child(&model, "config.json", MAX_MANIFEST, stop)?
+        || codec_bytes != read_child(&codec, "config.json", MAX_MANIFEST, stop)?
+    {
+        return Err("model or codec configuration changed during target validation".into());
+    }
+    let model_config_sha256 = format!("{:x}", Sha256::digest(&model_bytes));
+    for target in train
+        .iter()
+        .chain(dev)
+        .filter_map(|record| record.speech_target())
+    {
+        check_stop(stop)?;
+        if target.target_codec_sha256 != target_codec_sha256
+            || target.codec_fingerprint_sha256 != codec_sha256
+            || target.model_config_sha256 != model_config_sha256
+        {
+            return Err("speech target model or codec identity mismatch".into());
+        }
+        if target
+            .frames
+            .iter()
+            .any(|frame| frame.len() != model_format.num_codebooks)
+            || target.frames.last().is_none_or(|frame| {
+                frame
+                    .iter()
+                    .any(|code| *code != model_format.audio_eos_code)
+            })
+            || target.frames[..target.frames.len() - 1]
+                .iter()
+                .flatten()
+                .any(|code| *code >= code_count)
+        {
+            return Err("invalid speech target frames or EOS".into());
+        }
+    }
+    Ok(TargetBinding {
+        base_model_sha256,
+        codec_sha256,
+    })
+}
+
 fn snapshot(
     options: &RegistrationOptions<'_>,
     data: &DevelopmentData,
@@ -919,6 +1241,11 @@ fn snapshot(
     let (regression_plan_sha256, regression_inputs) =
         regression_identities(options.data_root, stop)?;
     let (base_model_sha256, codec_sha256) = model_and_codec_fingerprints(&options.model_dir, stop)?;
+    if data.target_binding.as_ref().is_some_and(|binding| {
+        binding.base_model_sha256 != base_model_sha256 || binding.codec_sha256 != codec_sha256
+    }) {
+        return Err("target model or codec changed during loading".into());
+    }
     let candidate_sha256 = hash_regular_path(&options.candidate_file, 256 * 1024 * 1024, stop)?;
     let evaluator_sha256 =
         hash_regular_path(&options.evaluator_file, 2 * 1024 * 1024 * 1024, stop)?;
@@ -959,7 +1286,7 @@ fn snapshot(
             "input_sample_rate":16000, "context":"fresh_per_input", "speech_max_slots":180,
             "speech_seed":42, "speech_temperature_milli":400, "speech_repetition_penalty_milli":1200,
             "speech_repetition_window":64, "speech_top_k":"checkpoint_default", "speech_sample_rate":24000},
-        "regression_criterion":"no_degradation", "source_declarations":"unverified"
+        "regression_criterion":"no_degradation", "source_declarations":"unverified", "reference_verification":"unverified"
     });
     Ok(FrozenProtocol {
         version: 1,
@@ -1005,12 +1332,12 @@ pub fn preregister(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let first_data = DevelopmentData::load(options.data_root, stop)?;
+    let first_data = DevelopmentData::load_with_model(options.data_root, &options.model_dir, stop)?;
     let first = snapshot(options, &first_data, stop)?;
     drop(first_data);
     check_stop(stop)?;
     create_registration_directory(destination)?;
-    let data = DevelopmentData::load(options.data_root, stop)?;
+    let data = DevelopmentData::load_with_model(options.data_root, &options.model_dir, stop)?;
     let protocol = snapshot(options, &data, stop)?;
     if first != protocol {
         return Err("preregistration inputs changed during freezing".into());
@@ -1073,7 +1400,7 @@ pub fn verify_registration(
     {
         return Err("invalid preregistration checksum or status".into());
     }
-    let data = DevelopmentData::load(options.data_root, stop)?;
+    let data = DevelopmentData::load_with_model(options.data_root, &options.model_dir, stop)?;
     let current = snapshot(options, &data, stop)?;
     if current != envelope.protocol {
         return Err("preregistered inputs or parameters changed".into());

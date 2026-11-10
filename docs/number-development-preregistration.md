@@ -12,16 +12,23 @@ holdout-public.json
 train.groups.v3.json     dev.groups.v3.json
 train.v3.json            dev.v3.json
 train-media/*.wav        dev-media/*.wav
+train-target-media/*.wav dev-target-media/*.wav  # 有语音目标时才需要
 regression-plan.json     regression-inputs/*.json
 ```
 
 公开保留元数据必须是盲格式 v2 的 `PublicMetadata`，只包含承诺和不透明分组；读取方在解析时必须读入公开 JSON，故保管人须确保该文件本身没有秘密。入口先检查 train/dev 的纯分组清单与公开保留分组，比较说话人、会话、原录音和派生家族，只有分组互斥时才打开 train/dev 的案例清单和媒体。公开分组应使用可信跨划分登记中的高熵不透明身份；格式和哈希无法证明声明真实，也不能在不读取保留媒体时比较其 PCM。
 
-每个分组清单包含 `version: 3`、`partition: "train"` 或 `"dev"`，以及按案例顺序排列的 `records`。每条仅有 `id` 和 `source`；后者有 `speaker_sha256`、`session_sha256`、`recording_sha256`、`family_sha256` 四个小写 64 位十六进制字段。案例清单包含同样的 `version`、`partition`、`rule: "number-plus-one-v1"` 和 `records`；每条必须有与分组清单相同的 `id`、`source`，以及 `audio_file`、`audio_sha256`、`spoken_number`、`answer` 和 `declaration`。媒体文件名只能是对应划分目录内的简单 WAV 文件名，输入数字为 0–99，答案必须加一。声明需有 `source`，并根据 `kind` 为 `licensed-synthetic` 或 `user-provided` 分别提供 `license`，或 `consent` 与匹配数字的 `human_reference`（`method: "human-listening"`、`labeler`、`spoken_number`）。这些都是**未核实声明**。
+每个分组清单包含 `version: 3`、`partition: "train"` 或 `"dev"`，以及按案例顺序排列的 `records`。每条仅有 `id` 和 `source`；后者有 `speaker_sha256`、`session_sha256`、`recording_sha256`、`family_sha256` 四个小写 64 位十六进制字段。案例清单包含同样的 `version`、`partition`、`rule: "number-plus-one-v1"` 和 `records`；每条必须有与分组清单相同的 `id`、`source`，以及 `audio_file`、`audio_sha256`、`spoken_number`、`answer` 和 `declaration`。媒体文件名只能是对应划分目录内的简单 WAV 文件名，输入数字为 0–99，答案必须加一。声明需有非空 `source`；`kind` 为 `licensed-synthetic` 或 `licensed-human` 时另需非空 `license`，`user-provided` 时需 `consent` 与匹配数字的 `human_reference`（`method: "human-listening"`、`labeler`、`spoken_number`）。这些都是**未核实声明**。
+
+`licensed-human` 可记录非空 `published_prompt` 等来源参考，不需要虚构用户同意或人工听审；可选 `reference_status` 只能为 `"unverified"`。记录接口及冻结策略始终将参考标记为未验证：出版文本、数字提取、ASR 输出或授权声明本身都不构成独立人工听审，也不能授予门控通过。实际来源、许可和身份仍须在后续真实证据环节核实；归档或再分发时应遵循相应署名和许可要求。
 
 入口校验实际 WAV 字节哈希并解码成 16 kHz PCM；train/dev 不得出现相同 PCM，同一划分中相同 PCM 若数字或答案矛盾则拒绝，同答案重复可加载，但不因此成为独立案例。每条最多 20 秒，train 与 dev 共用 1,200 秒的解码样本上限；每条解码后、保存前递增检查，上限触发后不再打开后续媒体。Unix 下固定文件通过目录描述符及禁止跟随末级符号链接读取，非 Unix 当前失败关闭。
 
-当前 v3 案例**没有目标语音码字段**，解析器拒绝未声明字段，也没有联合训练入口。后续接线必须显式保留和验证 #82 的目标 frames、EOS 及其 codec 指纹，不能静默丢弃语音目标；目前不得把 v3 表述为已完成联合训练或正式通过。
+案例可选 `speech_target` 对象；缺失或 `null` 明确表示纯文本目标。对象包含 `frames`、`target_codec_sha256`、`target_audio_sha256`、`codec_fingerprint_sha256`、`model_config_sha256`、`sample_rate`、`encoding`、`quality_evidence`、`runtime_backend` 和 `preparation_sha256`，与本地 `speech_audio_target::EncodedTarget` 的序列化字段一致；另需提供目标 WAV 的简单文件名 `audio_file` 和 `source` 声明。目标文件只从本划分的 `train-target-media` 或 `dev-target-media` 目录读取；其实际字节 SHA-256 必须匹配 `target_audio_sha256`，WAV 须为最长 20 秒的单声道 24 kHz PCM16 或 float32。`source` 必须有 `kind`、`source`，授权的合成或真人语音还需 `license`，用户提供语音还需 `consent`；`licensed-human` 的参考同样只能标记为未验证。这些字段与编码方式、运行后端同样是**未核实声明**，当前只接受 `quality_evidence: "not_assessed"`。
+
+含语音目标的数据必须使用 `DevelopmentData::load_with_model` 并指定实际本地模型目录；无模型的 `load` 会拒绝含目标的数据，而不是丢弃它。入口保留所有帧和目标字段，按实际模型 `num_codebooks`、`codebook_size`、`audio_eos_code` 及 codec `n_q`、`fsq_levels`、采样率检查：总帧数 5–200，每帧宽度匹配码本，内容码在 codec 和模型范围内，只有最后一帧是全码本 EOS。目标模型配置哈希、codec 配置和权重的完整指纹，以及 #82 使用的目标 codec 身份必须与实际文件一致；单文件和索引分片各按原有算法处理。
+
+冻结的每条目标身份是整个目标对象的规范 JSON 哈希，因而绑定实际帧值、目标 WAV 字节身份、文件名和完整来源声明；加载后的记录仍可取回全部 `frames`，而不是只保留哈希。哈希不能证明 frames 确由该 WAV 和 codec 生成，也不能证实来源、许可或真人标注。当前没有联合训练入口；后续必须显式传递 frames、EOS 及 codec 身份，且重新执行 #82 的数据准入和训练校验，不能静默丢弃语音目标或声称正式通过。
 
 ## 冻结和重验
 

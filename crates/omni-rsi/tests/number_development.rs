@@ -144,6 +144,331 @@ fn options(root: &Path) -> RegistrationOptions<'_> {
     }
 }
 
+fn speech_target_fixture(root: &Path) -> Value {
+    artifacts(root);
+    let model = root.join("model");
+    let codec = model.join("audio_tokenizer");
+    fs::write(
+        model.join("config.json"),
+        br#"{"num_codebooks":12,"codebook_size":2017,"audio_eos_code":2016}"#,
+    )
+    .unwrap();
+    fs::write(
+        codec.join("config.json"),
+        br#"{"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":24000}"#,
+    )
+    .unwrap();
+    fs::create_dir(root.join("train-target-media")).unwrap();
+    let wav = root.join("train-target-media/answer.wav");
+    let mut writer = hound::WavWriter::create(
+        &wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for sample in [0_i16, 4096, -4096, 0] {
+        writer.write_sample(sample).unwrap();
+    }
+    writer.finalize().unwrap();
+    let encoded = omni_rsi::speech_audio_target::encode_target_with(
+        &model,
+        &wav,
+        &AtomicBool::new(false),
+        |_, _| Ok(vec![vec![1; 12], vec![2; 12], vec![3; 12], vec![4; 12]]),
+    )
+    .unwrap();
+    let mut target = serde_json::to_value(encoded).unwrap();
+    target["audio_file"] = "answer.wav".into();
+    target["source"] =
+        json!({"kind":"licensed-synthetic","source":"target fixture","license":"CC0-1.0"});
+    let path = root.join("train.v3.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["records"][0]["speech_target"] = target.clone();
+    write_json(&path, &manifest);
+    target
+}
+
+#[cfg(unix)]
+#[test]
+fn speech_targets_survive_model_bound_load_and_freeze_without_holdout_access() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let root = fixture();
+    let expected = speech_target_fixture(root.path());
+    let private = root.path().join("holdout");
+    fs::create_dir(&private).unwrap();
+    for name in ["manifest.json", "salt.bin", "holdout.wav"] {
+        let name = CString::new(private.join(name).as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+    let stop = AtomicBool::new(false);
+    assert!(DevelopmentData::load(root.path(), &stop).is_err());
+    let data =
+        DevelopmentData::load_with_model(root.path(), &root.path().join("model"), &stop).unwrap();
+    let target = data.train()[0].speech_target().unwrap();
+    assert_eq!(serde_json::to_value(target).unwrap(), expected);
+    assert_eq!(target.frames().last().unwrap(), &vec![2016; 12]);
+    assert!(data.dev()[0].speech_target().is_none());
+    let registration =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    assert_eq!(
+        serde_json::to_value(registration.data().train()[0].speech_target().unwrap()).unwrap(),
+        expected
+    );
+    assert!(!registration.candidate_eligible());
+}
+
+fn replace_train_target(root: &Path, target: Value) {
+    let path = root.join("train.v3.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["records"][0]["speech_target"] = target;
+    write_json(&path, &manifest);
+}
+
+#[test]
+fn speech_frames_require_model_shape_codec_codes_and_one_final_eos() {
+    let root = fixture();
+    let target = speech_target_fixture(root.path());
+    let stop = AtomicBool::new(false);
+    let model = root.path().join("model");
+    for invalid in [
+        json!([vec![1; 12], vec![2; 12], vec![3; 12], vec![2016; 12]]),
+        json!(vec![vec![1_u32; 12]; 201]),
+        json!([
+            vec![1; 11],
+            vec![2; 12],
+            vec![3; 12],
+            vec![4; 12],
+            vec![2016; 12]
+        ]),
+        json!([
+            vec![2016; 12],
+            vec![2; 12],
+            vec![3; 12],
+            vec![4; 12],
+            vec![2016; 12]
+        ]),
+        json!([
+            vec![1; 12],
+            vec![2; 12],
+            vec![3; 12],
+            vec![4; 12],
+            vec![1; 12]
+        ]),
+        json!([
+            vec![1; 12],
+            vec![2; 12],
+            vec![3; 12],
+            vec![4; 12],
+            vec![
+                2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 1
+            ]
+        ]),
+        json!([
+            vec![2017; 12],
+            vec![2; 12],
+            vec![3; 12],
+            vec![4; 12],
+            vec![2016; 12]
+        ]),
+    ] {
+        let mut bad = target.clone();
+        bad["frames"] = invalid;
+        replace_train_target(root.path(), bad);
+        assert!(DevelopmentData::load_with_model(root.path(), &model, &stop).is_err());
+    }
+    replace_train_target(root.path(), target);
+    assert!(DevelopmentData::load_with_model(root.path(), &model, &stop).is_ok());
+}
+
+#[test]
+fn incomplete_target_is_rejected_and_text_only_is_explicit() {
+    let root = fixture();
+    let target = speech_target_fixture(root.path());
+    let model = root.path().join("model");
+    let stop = AtomicBool::new(false);
+    for field in [
+        "frames",
+        "target_codec_sha256",
+        "target_audio_sha256",
+        "codec_fingerprint_sha256",
+        "model_config_sha256",
+        "audio_file",
+        "source",
+        "preparation_sha256",
+    ] {
+        let mut bad = target.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        replace_train_target(root.path(), bad);
+        assert!(
+            DevelopmentData::load_with_model(root.path(), &model, &stop).is_err(),
+            "{field}"
+        );
+    }
+    let mut bad = target;
+    bad["quality_evidence"] = "passed".into();
+    replace_train_target(root.path(), bad);
+    assert!(DevelopmentData::load_with_model(root.path(), &model, &stop).is_err());
+    replace_train_target(root.path(), Value::Null);
+    let data = DevelopmentData::load(root.path(), &stop).unwrap();
+    assert!(data.train()[0].speech_target().is_none());
+}
+
+#[test]
+fn registered_target_rechecks_frames_source_audio_and_codec_files() {
+    let root = fixture();
+    let target = speech_target_fixture(root.path());
+    let options = options(root.path());
+    let destination = root.path().join("frozen");
+    let stop = AtomicBool::new(false);
+    preregister(&options, &destination, &stop).unwrap();
+    let mut changed = target.clone();
+    changed["frames"][0][0] = 5.into();
+    replace_train_target(root.path(), changed);
+    assert!(DevelopmentData::load_with_model(root.path(), &options.model_dir, &stop).is_ok());
+    assert!(verify_registration(&options, &destination, &stop).is_err());
+    let mut changed = target.clone();
+    changed["source"]["source"] = "another source".into();
+    replace_train_target(root.path(), changed);
+    assert!(DevelopmentData::load_with_model(root.path(), &options.model_dir, &stop).is_ok());
+    assert!(verify_registration(&options, &destination, &stop).is_err());
+    replace_train_target(root.path(), target.clone());
+
+    let wav_path = root.path().join("train-target-media/answer.wav");
+    let original = fs::read(&wav_path).unwrap();
+    let mut changed_wav = original.clone();
+    *changed_wav.last_mut().unwrap() ^= 1;
+    fs::write(&wav_path, &changed_wav).unwrap();
+    let mut changed = target.clone();
+    changed["target_audio_sha256"] = format!("{:x}", Sha256::digest(&changed_wav)).into();
+    replace_train_target(root.path(), changed);
+    assert!(DevelopmentData::load_with_model(root.path(), &options.model_dir, &stop).is_ok());
+    assert!(verify_registration(&options, &destination, &stop).is_err());
+    fs::write(wav_path, original).unwrap();
+    replace_train_target(root.path(), target);
+
+    for name in [
+        "train-target-media/answer.wav",
+        "model/audio_tokenizer/config.json",
+        "model/audio_tokenizer/model.safetensors",
+    ] {
+        let path = root.path().join(name);
+        let original = fs::read(&path).unwrap();
+        let mut bytes = original.clone();
+        bytes.push(b' ');
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            verify_registration(&options, &destination, &stop).is_err(),
+            "{name}"
+        );
+        fs::write(path, original).unwrap();
+    }
+    verify_registration(&options, &destination, &stop).unwrap();
+}
+
+#[test]
+fn indexed_codec_target_uses_the_full_actual_codec_fingerprint() {
+    let root = fixture();
+    let mut target = speech_target_fixture(root.path());
+    let codec = root.path().join("model/audio_tokenizer");
+    fs::create_dir(codec.join("parts")).unwrap();
+    fs::write(
+        codec.join("parts/encoder.safetensors"),
+        b"synthetic indexed codec",
+    )
+    .unwrap();
+    write_json(
+        &codec.join("model.safetensors.index.json"),
+        &json!({"weight_map":{"encoder.weight":"parts/encoder.safetensors"}}),
+    );
+    let stop = AtomicBool::new(false);
+    let fingerprint = omni_rsi::fingerprint::codec_fingerprint(&codec, &stop).unwrap();
+    target["target_codec_sha256"] = fingerprint.clone().into();
+    target["codec_fingerprint_sha256"] = fingerprint.into();
+    replace_train_target(root.path(), target);
+    let options = options(root.path());
+    let destination = root.path().join("frozen");
+    preregister(&options, &destination, &stop).unwrap();
+    fs::write(codec.join("parts/encoder.safetensors"), b"changed shard").unwrap();
+    assert!(verify_registration(&options, &destination, &stop).is_err());
+}
+
+#[test]
+fn target_validation_checks_actual_model_and_codec_formats_not_only_claimed_hashes() {
+    let root = fixture();
+    let target = speech_target_fixture(root.path());
+    let model = root.path().join("model");
+    let codec = model.join("audio_tokenizer");
+    let stop = AtomicBool::new(false);
+    let model_path = model.join("config.json");
+    let codec_path = codec.join("config.json");
+    let model_original = fs::read(&model_path).unwrap();
+    let codec_original = fs::read(&codec_path).unwrap();
+    for (model_value, codec_value) in [
+        (
+            json!({"num_codebooks":11,"codebook_size":2017,"audio_eos_code":2016}),
+            json!({"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":24000}),
+        ),
+        (
+            json!({"num_codebooks":12,"codebook_size":2017,"audio_eos_code":2015}),
+            json!({"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":24000}),
+        ),
+        (
+            json!({"num_codebooks":12,"codebook_size":2017,"audio_eos_code":2016}),
+            json!({"n_q":12,"fsq_levels":[8,7,6,6],"sampling_rate":16000}),
+        ),
+        (
+            json!({"num_codebooks":12,"codebook_size":2017,"audio_eos_code":2016}),
+            json!({"n_q":12,"fsq_levels":[2,2],"sampling_rate":24000}),
+        ),
+    ] {
+        write_json(&model_path, &model_value);
+        write_json(&codec_path, &codec_value);
+        let mut updated = target.clone();
+        updated["model_config_sha256"] =
+            format!("{:x}", Sha256::digest(fs::read(&model_path).unwrap())).into();
+        updated["codec_fingerprint_sha256"] =
+            omni_rsi::fingerprint::codec_fingerprint(&codec, &stop)
+                .unwrap()
+                .into();
+        replace_train_target(root.path(), updated);
+        assert!(
+            DevelopmentData::load_with_model(root.path(), &model, &stop).is_err(),
+            "model {model_value} codec {codec_value}"
+        );
+    }
+    fs::write(model_path, model_original).unwrap();
+    fs::write(codec_path, codec_original).unwrap();
+    replace_train_target(root.path(), target);
+    assert!(DevelopmentData::load_with_model(root.path(), &model, &stop).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn target_audio_symlink_cannot_open_holdout_media() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let root = fixture();
+    speech_target_fixture(root.path());
+    fs::create_dir(root.path().join("holdout")).unwrap();
+    let secret = root.path().join("holdout/secret.wav");
+    let name = CString::new(secret.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let target = root.path().join("train-target-media/answer.wav");
+    fs::remove_file(&target).unwrap();
+    std::os::unix::fs::symlink(secret, target).unwrap();
+    assert!(
+        DevelopmentData::load_with_model(
+            root.path(),
+            &root.path().join("model"),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn legacy_combined_manifest_is_rejected_without_opening_it() {
@@ -404,6 +729,75 @@ fn missing_authorization_declaration_is_not_a_valid_training_record() {
         .err()
         .unwrap();
     assert!(error.contains("authorization"), "{error}");
+}
+
+#[test]
+fn licensed_human_reference_remains_unverified_without_fictitious_consent() {
+    let root = fixture();
+    artifacts(root.path());
+    let path = root.path().join("train.v3.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let declaration = json!({"kind":"licensed-human","source":"public corpus fixture",
+        "license":"CC-BY-4.0","published_prompt":"published reference text"});
+    manifest["records"][0]["declaration"] = declaration.clone();
+    write_json(&path, &manifest);
+    let stop = AtomicBool::new(false);
+    let data = DevelopmentData::load(root.path(), &stop).unwrap();
+    assert_eq!(
+        data.train()[0].declaration()["published_prompt"],
+        "published reference text"
+    );
+    assert_eq!(data.train()[0].reference_status(), "unverified");
+    assert!(!data.train()[0].declaration().contains_key("consent"));
+    assert!(
+        !data.train()[0]
+            .declaration()
+            .contains_key("human_reference")
+    );
+    let destination = root.path().join("frozen");
+    let registered = preregister(&options(root.path()), &destination, &stop).unwrap();
+    assert_eq!(registered.status(), "insufficient_evidence");
+    assert!(!registered.candidate_eligible());
+    let envelope: Value =
+        serde_json::from_slice(&fs::read(destination.join("protocol.json")).unwrap()).unwrap();
+    assert_eq!(
+        envelope["protocol"]["policy"]["reference_verification"],
+        "unverified"
+    );
+
+    for invalid in [
+        json!({"kind":"licensed-human","license":"CC-BY-4.0"}),
+        json!({"kind":"licensed-human","source":"   ","license":"CC-BY-4.0"}),
+        json!({"kind":"licensed-human","source":"corpus"}),
+        json!({"kind":"licensed-human","source":"corpus","license":"  "}),
+        json!({"kind":"licensed-human","source":"corpus","license":"CC-BY-4.0","reference_status":"verified"}),
+    ] {
+        manifest["records"][0]["declaration"] = invalid;
+        write_json(&path, &manifest);
+        assert!(DevelopmentData::load(root.path(), &stop).is_err());
+    }
+}
+
+#[test]
+fn licensed_human_target_source_is_a_declaration_not_a_pass() {
+    let root = fixture();
+    let mut target = speech_target_fixture(root.path());
+    target["source"] = json!({"kind":"licensed-human","source":"public corpus fixture",
+        "license":"CC-BY-4.0","published_prompt":"published reference text"});
+    replace_train_target(root.path(), target.clone());
+    let stop = AtomicBool::new(false);
+    let model = root.path().join("model");
+    let data = DevelopmentData::load_with_model(root.path(), &model, &stop).unwrap();
+    assert_eq!(
+        data.train()[0].speech_target().unwrap().source()["kind"],
+        "licensed-human"
+    );
+    let registered =
+        preregister(&options(root.path()), &root.path().join("frozen"), &stop).unwrap();
+    assert!(!registered.candidate_eligible());
+    target["source"]["reference_status"] = "verified".into();
+    replace_train_target(root.path(), target);
+    assert!(DevelopmentData::load_with_model(root.path(), &model, &stop).is_err());
 }
 
 #[test]
