@@ -281,7 +281,9 @@ pub(crate) fn verify_development_metadata(
     Ok(checked)
 }
 
-/// Requires an opaque verified-development permit before accessing any private files.
+/// Requires an opaque verified-development permit before accessing private files.
+/// Linux accepts only explicitly owner-only ACLs on verified tmpfs or btrfs;
+/// ambiguous or unsupported ACL/filesystem results fail before reservation.
 pub fn open_once(
     public: &PublicMetadata,
     verified: VerifiedDevelopment,
@@ -291,6 +293,12 @@ pub fn open_once(
     // An unverifiable platform must not consume a one-shot reservation.
     verify_development_metadata(public, &verified)?;
     crate::private_acl::ensure_supported()?;
+    #[cfg(all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    private_directory_metadata(private_directory)?;
     let reserved = reserve_holdout(public, verified, ledger_directory)?;
     open_reserved(reserved, private_directory, None)
 }
@@ -461,7 +469,7 @@ fn read_private_file(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(directory.join(name))
         .map_err(|error| error.to_string())?;
-    crate::private_acl::ensure_no_acl(&file)?;
+    crate::private_acl::ensure_safe_acl(&file)?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() > limit as u64 {
         return Err("invalid private holdout file".into());
@@ -522,6 +530,8 @@ impl CustodianSeal {
     }
 
     /// Custodian-only creation of a new private directory. No existing secret is read.
+    /// Linux requires verified tmpfs or btrfs and explicitly readable owner-only access
+    /// and default ACLs; ambiguous ACL results fail before creating secrets.
     #[cfg(unix)]
     pub fn persist_private(&self, directory: &std::path::Path) -> Result<(), String> {
         use std::{
@@ -559,7 +569,7 @@ impl CustodianSeal {
                 .mode(0o600)
                 .open(directory.join(name))
                 .map_err(|error| error.to_string())?;
-            crate::private_acl::ensure_no_acl(&output)?;
+            crate::private_acl::ensure_safe_acl(&output)?;
             let metadata = output.metadata().map_err(|error| error.to_string())?;
             crate::private_acl::ensure_current_owner(&metadata)?;
             if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {

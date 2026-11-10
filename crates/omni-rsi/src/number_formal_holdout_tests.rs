@@ -23,7 +23,7 @@ fn audit_rows(report: &Path) -> Vec<serde_json::Value> {
         0
     );
     let file = std::fs::File::open(&path).unwrap();
-    crate::private_acl::ensure_no_acl(&file).unwrap();
+    crate::private_acl::ensure_safe_acl(&file).unwrap();
     let text = std::fs::read_to_string(path).unwrap();
     text.lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -419,6 +419,131 @@ fn empty_stop_policy_is_rejected_before_reservation_or_private_read() {
 }
 
 #[test]
+fn public_source_lower_bound_rejects_over_capacity_before_private_paths() {
+    for (source_count, over_limit) in [(1000_usize, false), (1001, true)] {
+        let root = temporary_root();
+        let seal = seal(root.path());
+        let mut public: serde_json::Value =
+            serde_json::from_slice(&seal.public().to_json().unwrap()).unwrap();
+        public["sources"] = serde_json::Value::Array(
+            (0..source_count)
+                .map(|index| {
+                    serde_json::json!({
+                        "recording_sha256":format!("{index:064x}"),
+                        "family_sha256":"a".repeat(64),
+                        "speaker_sha256":"b".repeat(64),
+                        "session_sha256":"c".repeat(64)
+                    })
+                })
+                .collect(),
+        );
+        let public = PublicMetadata::from_json(&serde_json::to_vec(&public).unwrap()).unwrap();
+        let ledger = root.path().join("ledger");
+        let private = root.path().join("private-not-opened");
+        let report = root.path().join("report");
+        let paths = HoldoutPaths {
+            ledger: &ledger,
+            private: &private,
+            report: &report,
+        };
+        let mut session = Some(QualifiedSession::synthetic(&public, &paths));
+        let error = run_holdout_once(&mut session, &paths, &AtomicBool::new(false)).unwrap_err();
+        let HoldoutError::Preflight(message) = error else {
+            panic!("expected preflight: {error:?}")
+        };
+        assert_eq!(
+            message.contains("observation limit"),
+            over_limit,
+            "{source_count}: {message}"
+        );
+        assert!(session.is_some());
+        assert!(!ledger.exists());
+        assert!(!private.exists());
+        assert!(!report.exists());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unwritable_report_parent_preserves_qualification_before_reservation() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temporary_root();
+    let seal = seal_pcm_fixture(root.path(), &[(12, 1000, false), (3, -1200, false)]);
+    let ledger = root.path().join("ledger");
+    let private = root.path().join("private");
+    let parent = root.path().join("report-parent");
+    std::fs::create_dir(&parent).unwrap();
+    let report = parent.join("report");
+    let paths = HoldoutPaths {
+        ledger: &ledger,
+        private: &private,
+        report: &report,
+    };
+    let mut session = Some(QualifiedSession::synthetic(seal.public(), &paths));
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let error = run_holdout_once(&mut session, &paths, &AtomicBool::new(false)).unwrap_err();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        matches!(error, HoldoutError::Preflight(ref e) if e.contains("report parent")),
+        "{error:?}"
+    );
+    assert!(session.is_some());
+    assert!(!ledger.exists());
+    assert!(!report.exists());
+    run_holdout_once(&mut session, &paths, &AtomicBool::new(false)).unwrap();
+    assert!(session.is_none());
+    assert!(report.join("report.json").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn existing_report_can_be_preserved_and_preflight_session_rebound() {
+    let root = temporary_root();
+    let seal = seal_pcm_fixture(root.path(), &[(12, 1000, false), (3, -1200, false)]);
+    let ledger = root.path().join("ledger");
+    let private = root.path().join("private");
+    let existing = root.path().join("existing-report");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("marker"), b"preserve").unwrap();
+    let first = HoldoutPaths {
+        ledger: &ledger,
+        private: &private,
+        report: &existing,
+    };
+    let mut session = Some(QualifiedSession::synthetic(seal.public(), &first));
+    let error = run_holdout_once(&mut session, &first, &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        matches!(error, HoldoutError::Preflight(ref e) if e.contains("already exists")),
+        "{error:?}"
+    );
+    assert!(!ledger.exists());
+
+    let invalid = private.join("inside-private");
+    assert!(session.as_mut().unwrap().rebind_report(&invalid).is_err());
+    let error = run_holdout_once(&mut session, &first, &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        matches!(error, HoldoutError::Preflight(ref e) if e.contains("already exists")),
+        "{error:?}"
+    );
+    let new_report = root.path().join("new-report");
+    session
+        .as_mut()
+        .unwrap()
+        .rebind_report(&new_report)
+        .unwrap();
+    let retry = HoldoutPaths {
+        ledger: &ledger,
+        private: &private,
+        report: &new_report,
+    };
+    run_holdout_once(&mut session, &retry, &AtomicBool::new(false)).unwrap();
+    assert!(session.is_none());
+    assert_eq!(std::fs::read(existing.join("marker")).unwrap(), b"preserve");
+    assert!(new_report.join("report.json").exists());
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn preflight_cancellation_returns_the_same_nonclone_session_for_retry() {
     let root = temporary_root();
@@ -641,7 +766,7 @@ fn audit_existing_journal_is_never_overwritten() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn audit_oversized_result_is_labeled_as_truncated_and_cannot_be_a_report() {
+fn audit_oversized_result_is_fully_recorded_but_cannot_be_a_report() {
     let root = temporary_root();
     let seal = seal_pcm_fixture(root.path(), &[(12, 1000, false), (3, -1200, false)]);
     let ledger = root.path().join("ledger");
@@ -664,9 +789,9 @@ fn audit_oversized_result_is_labeled_as_truncated_and_cannot_be_a_report() {
         .iter()
         .find(|row| row["record"] == "observation")
         .unwrap();
-    assert_eq!(raw["text_complete"], false);
+    assert_eq!(raw["text_complete"], true);
     assert_eq!(raw["text_bytes"], 5000);
-    assert_eq!(raw["text"].as_str().unwrap().len(), 4096);
+    assert_eq!(raw["text"].as_str().unwrap().len(), 5000);
     assert!(!report.join("report.json").exists());
 }
 
@@ -711,6 +836,144 @@ fn audit_process_exit_after_first_result_keeps_durable_incomplete_observations()
     assert_eq!(audit.last().unwrap()["record"], "inference_started");
     assert!(root.path().join("ledger/ledger.json").exists());
     assert!(!report.join("report.json").exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn audit_crash_after_return_keeps_write_ahead_fragments_and_end() {
+    const CHILD: &str = "OMNI_RSI_SYNTHETIC_AFTER_RETURN_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let root = PathBuf::from(path);
+        let seal = seal_pcm_fixture(&root, &[(12, 1000, false), (3, -1200, false)]);
+        let ledger = root.join("ledger");
+        let private = root.join("private");
+        let report = root.join("report");
+        let paths = HoldoutPaths {
+            ledger: &ledger,
+            private: &private,
+            report: &report,
+        };
+        let session = QualifiedSession::synthetic(seal.public(), &paths);
+        let _ = run_holdout_once(&mut Some(session), &paths, &AtomicBool::new(false));
+        panic!("synthetic crash did not occur");
+    }
+    let root = temporary_root();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("number_formal_holdout::tests::audit_crash_after_return_keeps_write_ahead_fragments_and_end")
+        .env(CHILD, root.path())
+        .env("OMNI_RSI_TEST_CRASH_AFTER_RETURN", "yes")
+        .status().unwrap();
+    assert_eq!(status.code(), Some(75));
+    let report = root.path().join("report");
+    let audit = audit_rows(&report);
+    let fragments: String = audit
+        .iter()
+        .filter(|row| row["record"] == "stream_fragment")
+        .map(|row| row["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(fragments, "13");
+    let end = audit
+        .iter()
+        .find(|row| row["record"] == "stream_end")
+        .unwrap();
+    assert_eq!(end["end"]["stop_token"], 7);
+    assert!(audit.iter().all(|row| row["record"] != "observation"));
+    assert!(!report.join("report.json").exists());
+    assert!(root.path().join("ledger/ledger.json").exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn audit_crash_mid_stream_keeps_only_the_synchronized_prefix() {
+    const CHILD: &str = "OMNI_RSI_SYNTHETIC_MID_STREAM_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let root = PathBuf::from(path);
+        let seal = seal_pcm_fixture(&root, &[(12, 1000, false), (3, -1200, false)]);
+        let ledger = root.join("ledger");
+        let private = root.join("private");
+        let report = root.join("report");
+        let paths = HoldoutPaths {
+            ledger: &ledger,
+            private: &private,
+            report: &report,
+        };
+        let mut session = QualifiedSession::synthetic(seal.public(), &paths);
+        session.executor = Executor::SyntheticCrashMidStream;
+        let _ = run_holdout_once(&mut Some(session), &paths, &AtomicBool::new(false));
+        panic!("synthetic crash did not occur");
+    }
+    let root = temporary_root();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("number_formal_holdout::tests::audit_crash_mid_stream_keeps_only_the_synchronized_prefix")
+        .env(CHILD, root.path())
+        .status().unwrap();
+    assert_eq!(status.code(), Some(76));
+    let report = root.path().join("report");
+    let audit = audit_rows(&report);
+    assert_eq!(audit[0]["record"], "incomplete_attempt");
+    let fragment = audit
+        .iter()
+        .find(|row| row["record"] == "stream_fragment")
+        .unwrap();
+    assert_eq!(fragment["text"], "1");
+    assert_eq!(fragment["sequence"], 0);
+    assert_eq!(fragment["offset_bytes"], 0);
+    assert!(audit.iter().all(|row| row["record"] != "stream_end"));
+    assert!(audit.iter().all(|row| row["record"] != "observation"));
+    assert!(root.path().join("ledger/ledger.json").exists());
+    assert!(!report.join("report.json").exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn audit_capture_and_fragment_limits_remain_incomplete_if_ignored() {
+    for (executor, reason, expected_bytes) in [
+        (
+            Executor::SyntheticIgnoreCaptureLimit,
+            "capture_limit",
+            64 * 1024,
+        ),
+        (Executor::SyntheticFragmentLimit, "fragment_limit", 256),
+    ] {
+        let root = temporary_root();
+        let seal = seal_pcm_fixture(root.path(), &[(12, 1000, false), (3, -1200, false)]);
+        let ledger = root.path().join("ledger");
+        let private = root.path().join("private");
+        let report = root.path().join("report");
+        let paths = HoldoutPaths {
+            ledger: &ledger,
+            private: &private,
+            report: &report,
+        };
+        let mut session = QualifiedSession::synthetic(seal.public(), &paths);
+        session.executor = executor;
+        let mut session = Some(session);
+        let result = run_holdout_once(&mut session, &paths, &AtomicBool::new(false));
+        assert!(
+            matches!(result, Err(HoldoutError::ConsumedOrUncertain(_))),
+            "{result:?}"
+        );
+        assert!(session.is_none());
+        let audit = audit_rows(&report);
+        let prefix: String = audit
+            .iter()
+            .filter(|row| row["record"] == "stream_fragment")
+            .map(|row| row["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(prefix.len(), expected_bytes);
+        let incomplete = audit
+            .iter()
+            .find(|row| row["record"] == "stream_incomplete")
+            .unwrap();
+        assert_eq!(incomplete["reason"], reason);
+        assert_eq!(incomplete["captured_bytes"], expected_bytes);
+        assert!(audit.iter().all(|row| row["record"] != "stream_end"));
+        assert!(audit.iter().all(|row| row["record"] != "observation"));
+        assert!(ledger.join("ledger.json").exists());
+        assert!(!report.join("report.json").exists());
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -269,13 +269,13 @@ fn source_evidence_is_persisted_in_the_private_manifest() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn private_persistence_is_rejected_on_unsupported_platforms() {
+fn private_persistence_without_verifiable_acl_fails_closed() {
     let seal = seal_for_custodian(&manifest_with_source_evidence()).unwrap();
     let root = tempfile::tempdir().unwrap();
     let private = root.path().join("private");
     let error = seal.persist_private(&private).unwrap_err();
     assert!(
-        error.contains("not supported") || error.contains("unsupported"),
+        error.contains("not supported") || error.contains("unsupported") || error.contains("ACL"),
         "{error}"
     );
     assert!(!private.exists());
@@ -289,7 +289,7 @@ fn private_persistence_is_rejected_on_unsupported_platforms() {
     .unwrap();
     let error = seal.persist_private(&private).unwrap_err();
     assert!(
-        error.contains("not supported") || error.contains("unsupported"),
+        error.contains("not supported") || error.contains("unsupported") || error.contains("ACL"),
         "{error}"
     );
     assert!(!private.exists());

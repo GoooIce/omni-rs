@@ -3,7 +3,7 @@
 
 use super::{
     Executor,
-    journal::{Journal, bounded_text},
+    journal::{Journal, end_value},
 };
 use crate::{
     number_blind_holdout::{BlindCase, OpenedHoldout},
@@ -22,6 +22,18 @@ use std::{
 const MAX_SAMPLES: usize = 16_000 * 20;
 const MAX_TOTAL_SAMPLES: usize = 16_000 * 1_200;
 const MAX_OBSERVATIONS: usize = 6_000;
+const OBSERVATIONS_PER_CASE: usize = 6;
+
+pub(super) fn check_observation_capacity(case_lower_bound: usize) -> Result<(), String> {
+    if case_lower_bound
+        .checked_mul(OBSERVATIONS_PER_CASE)
+        .is_none_or(|n| n > MAX_OBSERVATIONS)
+    {
+        Err("holdout observation limit exceeded".into())
+    } else {
+        Ok(())
+    }
+}
 
 fn interrupted(stop: &AtomicBool) -> Result<(), String> {
     if stop.load(Ordering::Acquire) {
@@ -120,17 +132,13 @@ pub(super) fn compare(
     journal: &mut Journal,
 ) -> Result<serde_json::Value, String> {
     let cases = &opened.manifest().cases;
-    if cases
-        .len()
-        .checked_mul(6)
-        .is_none_or(|n| n > MAX_OBSERVATIONS)
-        || stop_tokens.is_empty()
-    {
-        return Err("holdout observation limit or stop policy is invalid".into());
+    check_observation_capacity(cases.len())?;
+    if stop_tokens.is_empty() {
+        return Err("holdout stop policy is invalid".into());
     }
     let swaps = swap_mapping(cases)?;
     let audio = load_audio(opened, stop)?;
-    let mut observations = Vec::with_capacity(cases.len() * 6);
+    let mut observations = Vec::with_capacity(cases.len() * OBSERVATIONS_PER_CASE);
     let mut counts = [[0_usize; 6]; 2];
     let mut pairs = Vec::with_capacity(cases.len());
     let mut text_bytes = 0_usize;
@@ -155,37 +163,42 @@ pub(super) fn compare(
                 interrupted(stop)?;
                 let samples = input.map_or(silence.as_slice(), |index| audio[index].as_slice());
                 let pcm = pcm_hash(samples);
-                journal.append(&serde_json::json!({"record":"inference_started",
+                // This identity is shared by both audit records and the
+                // eventual report so their input fields cannot drift apart.
+                let observation_id = observations.len();
+                let identity = serde_json::json!({"observation_id":observation_id,
                     "arm":arm, "case_id":case.case_id, "condition":condition,
                     "audio_case_id":input.map(|i| &cases[i].case_id),
                     "expected_answer":input.map(|i| cases[i].answer),
                     "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
                     "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
-                    "audio_pcm_sha256":pcm, "samples":samples.len()}))?;
-                let result = executor.infer(arm, samples, stop)?;
-                let raw_end = match &result.end {
-                    TextEnd::Stop(token) => serde_json::json!({"stop_token":token}),
-                    TextEnd::Limit => serde_json::json!({"kind":"limit"}),
-                    TextEnd::Cancelled => serde_json::json!({"kind":"cancelled"}),
-                };
-                let (raw_text, complete) = bounded_text(&result.text);
-                journal.append(&serde_json::json!({"record":"observation",
-                    "arm":arm,"case_id":case.case_id,"condition":condition,
-                    "audio_case_id":input.map(|i| &cases[i].case_id),
-                    "expected_answer":input.map(|i| cases[i].answer),
-                    "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
-                    "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
-                    "audio_pcm_sha256":pcm,"samples":samples.len(),
-                    "text":raw_text,"text_complete":complete,"text_bytes":result.text.len(),
-                    "end":raw_end}))?;
+                    "audio_pcm_sha256":pcm, "samples":samples.len()});
+                let mut started = identity.clone();
+                started["record"] = "inference_started".into();
+                journal.append(&started)?;
+                let result = executor.infer(arm, samples, stop, journal.stream(observation_id))?;
+                #[cfg(all(test, unix))]
+                if std::env::var_os("OMNI_RSI_TEST_CRASH_AFTER_RETURN").as_deref()
+                    == Some(std::ffi::OsStr::new("yes"))
+                {
+                    unsafe { libc::_exit(75) }
+                }
+                let (text, text_end) = result.into_parts();
+                let mut raw = identity.clone();
+                raw["record"] = "observation".into();
+                raw["text"] = serde_json::json!(text);
+                raw["text_complete"] = true.into();
+                raw["text_bytes"] = serde_json::json!(text.len());
+                raw["end"] = end_value(&text_end);
+                journal.append(&raw)?;
                 interrupted(stop)?;
                 text_bytes = text_bytes
-                    .checked_add(result.text.len())
+                    .checked_add(text.len())
                     .ok_or("output text overflow")?;
-                if result.text.len() > 4096 || text_bytes > 16 * 1024 * 1024 {
+                if text.len() > 4096 || text_bytes > 16 * 1024 * 1024 {
                     return Err("holdout output text exceeds limit".into());
                 }
-                let (normal_end, end) = match result.end {
+                let (normal_end, end) = match text_end {
                     TextEnd::Stop(token) if stop_tokens.contains(&token) => {
                         (true, serde_json::json!({"stop_token":token}))
                     }
@@ -193,13 +206,12 @@ pub(super) fn compare(
                     TextEnd::Limit => (false, serde_json::json!({"kind":"limit"})),
                     TextEnd::Cancelled => return Err("interrupted".into()),
                 };
-                let correct = input.map(|index| {
-                    normal_end && answer_number(&result.text) == Some(cases[index].answer)
-                });
+                let correct = input
+                    .map(|index| normal_end && answer_number(&text) == Some(cases[index].answer));
                 if condition_index < 2 {
                     counts[arm_index][condition_index] += usize::from(correct == Some(true));
                 } else {
-                    counts[arm_index][2] += usize::from(mentions_number(&result.text));
+                    counts[arm_index][2] += usize::from(mentions_number(&text));
                 }
                 counts[arm_index][3 + condition_index] += usize::from(normal_end);
                 if condition_index == 0 {
@@ -208,13 +220,12 @@ pub(super) fn compare(
                         normal_end,
                     };
                 }
-                observations.push(serde_json::json!({"arm":arm,"case_id":case.case_id,
-                    "condition":condition,"audio_case_id":input.map(|i| &cases[i].case_id),
-                    "expected_answer":input.map(|i| cases[i].answer),
-                    "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
-                    "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
-                    "audio_pcm_sha256":pcm,"samples":samples.len(),
-                    "text":result.text,"end":end,"normal_end":normal_end,"correct":correct}));
+                let mut observation = identity;
+                observation["text"] = serde_json::json!(text);
+                observation["end"] = end;
+                observation["normal_end"] = serde_json::json!(normal_end);
+                observation["correct"] = serde_json::json!(correct);
+                observations.push(observation);
             }
         }
         pairs.push(PairedCase {

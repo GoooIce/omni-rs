@@ -1,7 +1,8 @@
 //! Conservative privacy checks for local holdout files and directories.
 //!
 //! An empty POSIX mode is insufficient when an inherited ACL grants access.
-//! Reject every extended ACL rather than attempting to interpret its entries.
+//! macOS rejects extended ACLs; the narrowly supported Linux path accepts only
+//! explicit, positively readable owner-only POSIX ACLs on verified filesystems.
 
 use std::{fs::File, path::Path};
 
@@ -28,7 +29,14 @@ pub(crate) fn ensure_supported() -> Result<(), String> {
     if TEST_UNSUPPORTED.with(std::cell::Cell::get) {
         return Err("private holdout ACL verification is unsupported on this platform".into());
     }
-    if cfg!(target_os = "macos") {
+    if cfg!(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )) {
         Ok(())
     } else {
         Err("private holdout ACL verification is unsupported on this platform".into())
@@ -56,7 +64,7 @@ pub(crate) fn ensure_current_owner(_: &std::fs::Metadata) -> Result<(), String> 
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn ensure_no_acl(file: &File) -> Result<(), String> {
+pub(crate) fn ensure_safe_acl(file: &File) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
     unsafe extern "C" {
@@ -80,8 +88,112 @@ pub(crate) fn ensure_no_acl(file: &File) -> Result<(), String> {
     Err("private holdout object has an extended ACL".into())
 }
 
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn ensure_no_acl(_: &File) -> Result<(), String> {
+#[cfg(all(
+    target_os = "linux",
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn ensure_safe_acl(file: &File) -> Result<(), String> {
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) } != 0 {
+        return Err(format!(
+            "cannot verify Linux filesystem: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if !matches!(filesystem.f_type as u32, 0x0102_1994 | 0x9123_683e) {
+        return Err("Linux filesystem is not in the verified ACL set".into());
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect ACL object: {error}"))?;
+    ensure_current_owner(&metadata)?;
+    if !(metadata.is_dir() || metadata.is_file()) || metadata.permissions().mode() & 0o077 != 0 {
+        return Err("Linux ACL object is not owner-private".into());
+    }
+    let read_acl = |name: &std::ffi::CStr| -> Result<Vec<u8>, String> {
+        // ENODATA is ambiguous (missing or inaccessible), so it is rejected
+        // along with every other error; never infer absence from mode bits.
+        let size =
+            unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size <= 0 || size > 4096 {
+            return Err(format!(
+                "cannot verify explicit Linux ACL: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut bytes = vec![0_u8; size as usize];
+        let read = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if read != size {
+            return Err("Linux ACL changed or could not be read".into());
+        }
+        Ok(bytes)
+    };
+    let mode_owner = ((metadata.permissions().mode() >> 6) & 7) as u16;
+    validate_linux_acl(&read_acl(c"system.posix_acl_access")?, Some(mode_owner))?;
+    if metadata.is_dir() {
+        validate_linux_acl(&read_acl(c"system.posix_acl_default")?, None)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn validate_linux_acl(bytes: &[u8], mode_owner: Option<u16>) -> Result<(), String> {
+    if bytes.len() < 4
+        || (bytes.len() - 4) % 8 != 0
+        || u32::from_le_bytes(bytes[..4].try_into().map_err(|_| "invalid Linux ACL")?) != 2
+    {
+        return Err("invalid Linux ACL encoding".into());
+    }
+    let mut seen = 0_u8;
+    for entry in bytes[4..].chunks_exact(8) {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let perm = u16::from_le_bytes([entry[2], entry[3]]);
+        let id = u32::from_le_bytes(entry[4..8].try_into().map_err(|_| "invalid Linux ACL")?);
+        if perm > 7 {
+            return Err("invalid Linux ACL permission".into());
+        }
+        let bit = match tag {
+            1 if id == u32::MAX && mode_owner.is_none_or(|expected| expected == perm) => 1,
+            4 if id == u32::MAX && perm == 0 => 2,
+            16 if id == u32::MAX && perm == 0 => 4,
+            32 if id == u32::MAX && perm == 0 => 8,
+            2 | 8 if id != u32::MAX && perm == 0 => 0,
+            _ => return Err("Linux ACL may grant access to another principal".into()),
+        };
+        if bit != 0 && seen & bit != 0 {
+            return Err("duplicate Linux ACL entry".into());
+        }
+        seen |= bit;
+    }
+    if seen != 15 {
+        return Err("incomplete Linux ACL".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn ensure_safe_acl(_: &File) -> Result<(), String> {
     ensure_supported()
 }
 
@@ -95,7 +207,7 @@ pub(crate) fn checked_directory(path: &Path) -> Result<File, String> {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)
             .map_err(|error| format!("open private directory: {error}"))?;
-        ensure_no_acl(&file)?;
+        ensure_safe_acl(&file)?;
         Ok(file)
     }
     #[cfg(not(unix))]
@@ -105,7 +217,17 @@ pub(crate) fn checked_directory(path: &Path) -> Result<File, String> {
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))
+))]
 mod tests {
     #[test]
     fn unsupported_platform_cannot_claim_private_acl_verification() {

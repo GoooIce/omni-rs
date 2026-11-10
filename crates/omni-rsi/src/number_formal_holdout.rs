@@ -49,6 +49,21 @@ pub struct QualifiedSession {
     formal_comparison_sha256: String,
 }
 
+impl QualifiedSession {
+    /// Change only the output location of a still-unconsumed session. This
+    /// performs the same path checks as execution without opening private data.
+    pub fn rebind_report(&mut self, report: &Path) -> Result<(), HoldoutError> {
+        let paths = HoldoutPaths {
+            ledger: &self.ledger,
+            private: &self.private,
+            report,
+        };
+        preflight_paths(&paths).map_err(HoldoutError::Preflight)?;
+        self.report = report.to_owned();
+        Ok(())
+    }
+}
+
 #[cfg_attr(test, allow(dead_code))]
 enum Executor {
     #[allow(dead_code)]
@@ -73,6 +88,12 @@ enum Executor {
     SyntheticCrashAfterFirst { emitted: bool },
     #[cfg(test)]
     SyntheticOversized,
+    #[cfg(test)]
+    SyntheticCrashMidStream,
+    #[cfg(test)]
+    SyntheticIgnoreCaptureLimit,
+    #[cfg(test)]
+    SyntheticFragmentLimit,
 }
 
 impl Executor {
@@ -89,7 +110,10 @@ impl Executor {
             | Self::SyntheticJournalCollision(_)
             | Self::SyntheticCancelAfterFirst { .. }
             | Self::SyntheticCrashAfterFirst { .. }
-            | Self::SyntheticOversized => true,
+            | Self::SyntheticOversized
+            | Self::SyntheticCrashMidStream
+            | Self::SyntheticIgnoreCaptureLimit
+            | Self::SyntheticFragmentLimit => true,
         }
     }
 
@@ -106,7 +130,10 @@ impl Executor {
             | Self::SyntheticJournalCollision(_)
             | Self::SyntheticCancelAfterFirst { .. }
             | Self::SyntheticCrashAfterFirst { .. }
-            | Self::SyntheticOversized => "synthetic_test_only",
+            | Self::SyntheticOversized
+            | Self::SyntheticCrashMidStream
+            | Self::SyntheticIgnoreCaptureLimit
+            | Self::SyntheticFragmentLimit => "synthetic_test_only",
         }
     }
 
@@ -115,20 +142,21 @@ impl Executor {
         _arm: &str,
         _samples: &[f32],
         stop: &AtomicBool,
-    ) -> Result<crate::number_v3_evaluation::DecodedText, String> {
-        let _ = stop;
+        mut stream: journal::ObservationStream<'_>,
+    ) -> Result<journal::CommittedText, String> {
+        let _ = (stop, &mut stream);
         match self {
             Self::Unavailable => Err("frozen holdout executor is not connected".into()),
             #[cfg(test)]
-            Self::Synthetic => Ok(crate::number_v3_evaluation::DecodedText {
-                text: "13".into(),
-                end: crate::number_v3_evaluation::TextEnd::Stop(7),
-            }),
+            Self::Synthetic => {
+                stream.push("13")?;
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
+            }
             #[cfg(test)]
-            Self::SyntheticInvalidStop => Ok(crate::number_v3_evaluation::DecodedText {
-                text: "13".into(),
-                end: crate::number_v3_evaluation::TextEnd::Stop(99),
-            }),
+            Self::SyntheticInvalidStop => {
+                stream.push("13")?;
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(99))
+            }
             #[cfg(test)]
             Self::SyntheticCollision { path, inserted } => {
                 if !*inserted {
@@ -141,10 +169,8 @@ impl Executor {
                         .map_err(|error| error.to_string())?;
                     *inserted = true;
                 }
-                Ok(crate::number_v3_evaluation::DecodedText {
-                    text: "13".into(),
-                    end: crate::number_v3_evaluation::TextEnd::Stop(7),
-                })
+                stream.push("13")?;
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
             }
             #[cfg(test)]
             Self::SyntheticCancel => {
@@ -170,10 +196,8 @@ impl Executor {
                     Err("interrupted".into())
                 } else {
                     *emitted = true;
-                    Ok(crate::number_v3_evaluation::DecodedText {
-                        text: "13".into(),
-                        end: crate::number_v3_evaluation::TextEnd::Stop(7),
-                    })
+                    stream.push("13")?;
+                    stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
                 }
             }
             #[cfg(test)]
@@ -187,16 +211,36 @@ impl Executor {
                     std::process::exit(74)
                 }
                 *emitted = true;
-                Ok(crate::number_v3_evaluation::DecodedText {
-                    text: "13".into(),
-                    end: crate::number_v3_evaluation::TextEnd::Stop(7),
-                })
+                stream.push("13")?;
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
             }
             #[cfg(test)]
-            Self::SyntheticOversized => Ok(crate::number_v3_evaluation::DecodedText {
-                text: "x".repeat(5000),
-                end: crate::number_v3_evaluation::TextEnd::Stop(7),
-            }),
+            Self::SyntheticOversized => {
+                stream.push(&"x".repeat(5000))?;
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
+            }
+            #[cfg(test)]
+            Self::SyntheticCrashMidStream => {
+                stream.push("1")?;
+                #[cfg(unix)]
+                unsafe {
+                    libc::_exit(76)
+                }
+                #[cfg(not(unix))]
+                std::process::exit(76)
+            }
+            #[cfg(test)]
+            Self::SyntheticIgnoreCaptureLimit => {
+                let _ = stream.push(&"x".repeat(64 * 1024 + 1));
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
+            }
+            #[cfg(test)]
+            Self::SyntheticFragmentLimit => {
+                for _ in 0..257 {
+                    let _ = stream.push("x");
+                }
+                stream.finish(crate::number_v3_evaluation::TextEnd::Stop(7))
+            }
         }
     }
 }
@@ -351,6 +395,34 @@ fn simple_sibling_name(path: &Path) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
+fn check_report_parent_access(directory: &fs::File) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    // Query the already-open directory using effective credentials. This is
+    // side-effect free; later filesystem or permission changes may still fail.
+    let result = unsafe {
+        libc::faccessat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "report parent is not writable/searchable: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn check_report_parent_access(_: &fs::File) -> Result<(), String> {
+    Err("report parent access verification is unsupported".into())
+}
+
 fn preflight_paths(paths: &HoldoutPaths<'_>) -> Result<PathPreflight, String> {
     // These checks are lexical and happen before any filesystem operation.
     for path in [paths.ledger, paths.private, paths.report] {
@@ -370,7 +442,8 @@ fn preflight_paths(paths: &HoldoutPaths<'_>) -> Result<PathPreflight, String> {
     let ledger_parents = check_direct_parent(paths.ledger, Some(private))?;
     let report_parents = check_direct_parent(paths.report, Some(private))?;
     let report_parent = paths.report.parent().ok_or("report path has no parent")?;
-    crate::private_acl::checked_directory(report_parent)?;
+    let report_parent = crate::private_acl::checked_directory(report_parent)?;
+    check_report_parent_access(&report_parent)?;
     let ledger = match fs::symlink_metadata(paths.ledger) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             Some(directory_identity(&metadata)?)
@@ -454,7 +527,7 @@ fn publish_report(directory: &Path, bytes: &[u8], stop: &AtomicBool) -> Result<(
         .prefix(".holdout-report-")
         .tempfile_in(directory)
         .map_err(|error| error.to_string())?;
-    crate::private_acl::ensure_no_acl(temporary.as_file())?;
+    crate::private_acl::ensure_safe_acl(temporary.as_file())?;
     let metadata = temporary
         .as_file()
         .metadata()
@@ -511,6 +584,10 @@ pub fn run_holdout_once(
         return Err(HoldoutError::Preflight("interrupted".into()));
     }
     verify_development_metadata(&pending.public, &pending.verified)
+        .map_err(HoldoutError::Preflight)?;
+    // Each distinct public recording represents at least one private case.
+    // The public lower bound is usable without exposing the exact case count.
+    scoring::check_observation_capacity(pending.public.sources().len())
         .map_err(HoldoutError::Preflight)?;
     let formal = identity::compute(pending.verified.identities().1, &pending.stop_tokens)
         .map_err(HoldoutError::Preflight)?;
