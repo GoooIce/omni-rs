@@ -1394,6 +1394,94 @@ fn v3_comparison_routes_each_frozen_audio_and_scores_its_answer() {
 
 #[cfg(all(unix, feature = "cpu"))]
 #[test]
+fn v3_recheck_rejects_stop_token_outside_the_frozen_policy() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_v3_with, preregister_v3,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3::<Cpu>(&options, &device, &stop).unwrap();
+
+    let bad = evaluate_v3_with::<Cpu>(&options, &device, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "不确定".into(),
+            end: TextEnd::Stop(99),
+        })
+    });
+    assert!(bad.is_err());
+    assert!(!output.exists());
+
+    let report = evaluate_v3_with::<Cpu>(&options, &device, &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "不确定".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        report["observation_recheck"]["termination_token_policy"],
+        "matched_registered_tokens"
+    );
+    assert_eq!(
+        report["observation_recheck"]["numeric_thresholds_on_reported_stops"]["text_normal_end_no_degradation"],
+        true
+    );
+    assert_eq!(report["observation_recheck"]["candidate_eligible"], false);
+    assert_eq!(report["execution"], "injected_unverified");
+    assert_eq!(report["candidate_eligible"], false);
+
+    let second_output = root.path().join("stop-regression.json");
+    let second_options = V3Options {
+        output: &second_output,
+        ..options
+    };
+    let mut observation_index = 0;
+    let regressed = evaluate_v3_with::<Cpu>(&second_options, &device, &stop, |_, _, _| {
+        let candidate_swapped = observation_index % 6 == 4;
+        observation_index += 1;
+        Ok(DecodedText {
+            text: "不确定".into(),
+            end: if candidate_swapped {
+                TextEnd::Limit
+            } else {
+                TextEnd::Stop(7)
+            },
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        regressed["observation_recheck"]["numeric_thresholds_on_reported_stops"]["text_normal_end_no_degradation"],
+        false
+    );
+    assert_eq!(
+        regressed["observation_recheck"]["baseline"]["normal_end"]["swapped"],
+        2
+    );
+    assert_eq!(
+        regressed["observation_recheck"]["candidate"]["normal_end"]["swapped"],
+        0
+    );
+    assert_eq!(regressed["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
 fn v3_report_pcm_identity_matches_frozen_signed_zero_audio() {
     use burn::backend::{Autodiff, NdArray};
     use omni_rsi::number_v3_evaluation::{
