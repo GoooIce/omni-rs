@@ -1419,6 +1419,11 @@ fn v3_report_pcm_identity_matches_frozen_signed_zero_audio() {
         report["observations"][0]["audio_pcm_sha256"],
         protocol["protocol"]["dev_cases"][0]["pcm_sha256"]
     );
+    // Independent SHA-256 of 16 LE bytes for [0.0, 0.375, -0.375, 0.0].
+    assert_eq!(
+        report["observations"][0]["audio_pcm_sha256"],
+        "90a6cd8fc460002e4cb732813a7a78f0678c3b603e73e1d668b06764f329aea6"
+    );
 }
 
 #[cfg(all(unix, feature = "cpu"))]

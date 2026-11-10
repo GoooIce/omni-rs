@@ -1,9 +1,13 @@
 //! Recompute control scores from the actual opened cases and executor outputs.
 //! This module cannot issue a qualification or prove who supplied the data.
 
-use super::Executor;
+use super::{
+    Executor,
+    journal::{Journal, bounded_text},
+};
 use crate::{
     number_blind_holdout::{BlindCase, OpenedHoldout},
+    number_development::update_pcm_digest,
     number_gate::{PairedCase, PairedOutcome, paired_statistics},
     number_v3_evaluation::TextEnd,
     speech_number_evaluation::{answer_number, mentions_number},
@@ -29,10 +33,7 @@ fn interrupted(stop: &AtomicBool) -> Result<(), String> {
 
 fn pcm_hash(samples: &[f32]) -> String {
     let mut hash = Sha256::new();
-    for sample in samples {
-        let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-        hash.update(bits.to_le_bytes());
-    }
+    update_pcm_digest(&mut hash, samples);
     format!("{:x}", hash.finalize())
 }
 
@@ -66,11 +67,14 @@ fn load_audio(opened: &OpenedHoldout, stop: &AtomicBool) -> Result<Vec<Vec<f32>>
         {
             return Err("invalid decoded holdout audio".into());
         }
-        if labels
-            .insert(pcm_hash(&samples), case.answer)
-            .is_some_and(|old| old != case.answer)
-        {
-            return Err("identical holdout PCM has contradictory answers".into());
+        if !samples.iter().any(|sample| *sample != 0.0) {
+            return Err("silent holdout original cannot be contrasted with silence".into());
+        }
+        if let Some(old) = labels.insert(pcm_hash(&samples), case.answer) {
+            if old != case.answer {
+                return Err("identical holdout PCM has contradictory answers".into());
+            }
+            return Err("duplicate holdout PCM cannot be counted as independent".into());
         }
         audio.push(samples);
     }
@@ -113,6 +117,7 @@ pub(super) fn compare(
     executor: &mut Executor,
     stop_tokens: &[u32],
     stop: &AtomicBool,
+    journal: &mut Journal,
 ) -> Result<serde_json::Value, String> {
     let cases = &opened.manifest().cases;
     if cases
@@ -149,7 +154,30 @@ pub(super) fn compare(
             ] {
                 interrupted(stop)?;
                 let samples = input.map_or(silence.as_slice(), |index| audio[index].as_slice());
+                let pcm = pcm_hash(samples);
+                journal.append(&serde_json::json!({"record":"inference_started",
+                    "arm":arm, "case_id":case.case_id, "condition":condition,
+                    "audio_case_id":input.map(|i| &cases[i].case_id),
+                    "expected_answer":input.map(|i| cases[i].answer),
+                    "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
+                    "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
+                    "audio_pcm_sha256":pcm, "samples":samples.len()}))?;
                 let result = executor.infer(arm, samples, stop)?;
+                let raw_end = match &result.end {
+                    TextEnd::Stop(token) => serde_json::json!({"stop_token":token}),
+                    TextEnd::Limit => serde_json::json!({"kind":"limit"}),
+                    TextEnd::Cancelled => serde_json::json!({"kind":"cancelled"}),
+                };
+                let (raw_text, complete) = bounded_text(&result.text);
+                journal.append(&serde_json::json!({"record":"observation",
+                    "arm":arm,"case_id":case.case_id,"condition":condition,
+                    "audio_case_id":input.map(|i| &cases[i].case_id),
+                    "expected_answer":input.map(|i| cases[i].answer),
+                    "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
+                    "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
+                    "audio_pcm_sha256":pcm,"samples":samples.len(),
+                    "text":raw_text,"text_complete":complete,"text_bytes":result.text.len(),
+                    "end":raw_end}))?;
                 interrupted(stop)?;
                 text_bytes = text_bytes
                     .checked_add(result.text.len())
@@ -185,7 +213,7 @@ pub(super) fn compare(
                     "expected_answer":input.map(|i| cases[i].answer),
                     "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
                     "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
-                    "audio_pcm_sha256":pcm_hash(samples),"samples":samples.len(),
+                    "audio_pcm_sha256":pcm,"samples":samples.len(),
                     "text":result.text,"end":end,"normal_end":normal_end,"correct":correct}));
             }
         }
@@ -210,6 +238,7 @@ pub(super) fn compare(
         "status":"insufficient_evidence", "candidate_eligible":false,
         "execution":executor.execution(), "baseline":metrics(counts[0]), "candidate":metrics(counts[1]),
         "observations":observations, "paired_statistics":{"n":stats.n,
+            "independence":"conditional_on_unverified_source_declarations",
             "baseline_correct":stats.baseline_correct,"candidate_correct":stats.candidate_correct,
             "candidate_only":stats.candidate_only,"baseline_only":stats.baseline_only,
             "improvement":stats.improvement,"interval_95":stats.interval_95},

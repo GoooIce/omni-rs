@@ -763,12 +763,16 @@ fn check_sample_budget(total: usize, additional: usize) -> Result<usize, String>
         .ok_or_else(|| "v3 dataset exceeds decoded sample limit".into())
 }
 
-fn pcm_sha256(samples: &[f32]) -> String {
-    let mut hash = Sha256::new();
+pub(crate) fn update_pcm_digest(hash: &mut Sha256, samples: &[f32]) {
     for sample in samples {
         let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
         hash.update(bits.to_le_bytes());
     }
+}
+
+fn pcm_sha256(samples: &[f32]) -> String {
+    let mut hash = Sha256::new();
+    update_pcm_digest(&mut hash, samples);
     format!("{:x}", hash.finalize())
 }
 

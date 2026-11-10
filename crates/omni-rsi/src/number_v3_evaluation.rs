@@ -3,7 +3,8 @@ use crate::{
     lease::Lease,
     number_audio_v3::NumberAudioV3,
     number_development::{
-        RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, verify_registration,
+        RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, update_pcm_digest,
+        verify_registration,
     },
     number_gate::{PairedCase, PairedOutcome, PairedStatistics, paired_statistics},
     speech_asr::AsrEvent,
@@ -1015,10 +1016,7 @@ fn recheck_with_stop_tokens(
         let mut hash = Sha256::new();
         for chunk in case.samples().chunks(4096) {
             interrupted(stop)?;
-            for sample in chunk {
-                let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-                hash.update(bits.to_le_bytes());
-            }
+            update_pcm_digest(&mut hash, chunk);
         }
         pcm.insert(case.id(), format!("{:x}", hash.finalize()));
         let count = case.samples().len();
@@ -1275,11 +1273,9 @@ pub fn compare_registered_with(
                     };
                 }
                 let mut digest = Sha256::new();
-                for sample in samples {
-                    // Match the preregistration identity, which treats both
-                    // IEEE-754 zero encodings as the same PCM value.
-                    let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
-                    digest.update(bits.to_le_bytes());
+                for chunk in samples.chunks(4096) {
+                    interrupted(stop)?;
+                    update_pcm_digest(&mut digest, chunk);
                 }
                 observations.push(Observation {
                     arm,

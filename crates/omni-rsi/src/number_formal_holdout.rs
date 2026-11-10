@@ -14,6 +14,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[path = "number_formal_holdout_identity.rs"]
+mod identity;
+#[path = "number_formal_holdout_journal.rs"]
+mod journal;
 #[path = "number_formal_holdout_scoring.rs"]
 mod scoring;
 
@@ -42,8 +46,10 @@ pub struct QualifiedSession {
     report: PathBuf,
     executor: Executor,
     stop_tokens: Vec<u32>,
+    formal_comparison_sha256: String,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 enum Executor {
     #[allow(dead_code)]
     Unavailable,
@@ -59,6 +65,14 @@ enum Executor {
     SyntheticCancelBeforeRead,
     #[cfg(test)]
     SyntheticDirectoryCollision(PathBuf),
+    #[cfg(test)]
+    SyntheticJournalCollision(PathBuf),
+    #[cfg(test)]
+    SyntheticCancelAfterFirst { emitted: bool },
+    #[cfg(test)]
+    SyntheticCrashAfterFirst { emitted: bool },
+    #[cfg(test)]
+    SyntheticOversized,
 }
 
 impl Executor {
@@ -71,7 +85,11 @@ impl Executor {
             | Self::SyntheticCollision { .. }
             | Self::SyntheticCancel
             | Self::SyntheticCancelBeforeRead
-            | Self::SyntheticDirectoryCollision(_) => true,
+            | Self::SyntheticDirectoryCollision(_)
+            | Self::SyntheticJournalCollision(_)
+            | Self::SyntheticCancelAfterFirst { .. }
+            | Self::SyntheticCrashAfterFirst { .. }
+            | Self::SyntheticOversized => true,
         }
     }
 
@@ -84,7 +102,11 @@ impl Executor {
             | Self::SyntheticCollision { .. }
             | Self::SyntheticCancel
             | Self::SyntheticCancelBeforeRead
-            | Self::SyntheticDirectoryCollision(_) => "synthetic_test_only",
+            | Self::SyntheticDirectoryCollision(_)
+            | Self::SyntheticJournalCollision(_)
+            | Self::SyntheticCancelAfterFirst { .. }
+            | Self::SyntheticCrashAfterFirst { .. }
+            | Self::SyntheticOversized => "synthetic_test_only",
         }
     }
 
@@ -137,6 +159,44 @@ impl Executor {
             Self::SyntheticDirectoryCollision(_) => {
                 Err("synthetic collision should precede inference".into())
             }
+            #[cfg(test)]
+            Self::SyntheticJournalCollision(_) => {
+                Err("synthetic journal collision should precede inference".into())
+            }
+            #[cfg(test)]
+            Self::SyntheticCancelAfterFirst { emitted } => {
+                if *emitted {
+                    stop.store(true, Ordering::Release);
+                    Err("interrupted".into())
+                } else {
+                    *emitted = true;
+                    Ok(crate::number_v3_evaluation::DecodedText {
+                        text: "13".into(),
+                        end: crate::number_v3_evaluation::TextEnd::Stop(7),
+                    })
+                }
+            }
+            #[cfg(test)]
+            Self::SyntheticCrashAfterFirst { emitted } => {
+                if *emitted {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::_exit(74)
+                    }
+                    #[cfg(not(unix))]
+                    std::process::exit(74)
+                }
+                *emitted = true;
+                Ok(crate::number_v3_evaluation::DecodedText {
+                    text: "13".into(),
+                    end: crate::number_v3_evaluation::TextEnd::Stop(7),
+                })
+            }
+            #[cfg(test)]
+            Self::SyntheticOversized => Ok(crate::number_v3_evaluation::DecodedText {
+                text: "x".repeat(5000),
+                end: crate::number_v3_evaluation::TextEnd::Stop(7),
+            }),
         }
     }
 }
@@ -144,15 +204,28 @@ impl Executor {
 #[cfg(test)]
 impl QualifiedSession {
     fn synthetic(public: &PublicMetadata, paths: &HoldoutPaths<'_>) -> Self {
+        Self::synthetic_with_stops(public, paths, vec![7])
+    }
+
+    fn synthetic_with_stops(
+        public: &PublicMetadata,
+        paths: &HoldoutPaths<'_>,
+        stop_tokens: Vec<u32>,
+    ) -> Self {
+        let verified = crate::number_blind_holdout::synthetic_verified_development(public);
+        let formal_comparison_sha256 = identity::compute(verified.identities().1, &stop_tokens)
+            .expect("synthetic frozen policy")
+            .comparison_sha256;
         Self {
             public: public.clone(),
-            verified: crate::number_blind_holdout::synthetic_verified_development(public),
+            verified,
             ledger: paths.ledger.to_owned(),
             ledger_target: paths.ledger.to_owned(),
             private: paths.private.to_owned(),
             report: paths.report.to_owned(),
             executor: Executor::Synthetic,
-            stop_tokens: vec![7],
+            stop_tokens,
+            formal_comparison_sha256,
         }
     }
 }
@@ -172,6 +245,20 @@ pub enum HoldoutError {
     /// The ledger may already be durable. Do not retry this holdout.
     ConsumedOrUncertain(String),
 }
+
+impl std::fmt::Display for HoldoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientEvidence => formatter.write_str("insufficient holdout evidence"),
+            Self::Preflight(message) => write!(formatter, "holdout preflight: {message}"),
+            Self::ConsumedOrUncertain(message) => {
+                write!(formatter, "holdout consumed or uncertain: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HoldoutError {}
 
 // Paths are accepted only in a lexical, absolute form. In particular `..`
 // cannot disguise either a secret ancestor or overlap between public paths.
@@ -282,6 +369,8 @@ fn preflight_paths(paths: &HoldoutPaths<'_>) -> Result<PathPreflight, String> {
     let private = directory_identity(&private_directory_metadata(paths.private)?)?;
     let ledger_parents = check_direct_parent(paths.ledger, Some(private))?;
     let report_parents = check_direct_parent(paths.report, Some(private))?;
+    let report_parent = paths.report.parent().ok_or("report path has no parent")?;
+    crate::private_acl::checked_directory(report_parent)?;
     let ledger = match fs::symlink_metadata(paths.ledger) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             Some(directory_identity(&metadata)?)
@@ -343,8 +432,9 @@ fn reserve_report_directory(path: &Path) -> Result<(), String> {
         .mode(0o700)
         .create(path)
         .map_err(|error| format!("reserve report directory: {error}"))?;
-    fs::File::open(path)
-        .and_then(|file| file.sync_all())
+    let report_directory = crate::private_acl::checked_directory(path)?;
+    report_directory
+        .sync_all()
         .and_then(|_| fs::File::open(parent))
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("sync report directory: {error}"))
@@ -359,10 +449,24 @@ fn publish_report(directory: &Path, bytes: &[u8], stop: &AtomicBool) -> Result<(
     if stop.load(Ordering::Acquire) {
         return Err("interrupted before report publication".into());
     }
+    crate::private_acl::checked_directory(directory)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".holdout-report-")
         .tempfile_in(directory)
         .map_err(|error| error.to_string())?;
+    crate::private_acl::ensure_no_acl(temporary.as_file())?;
+    let metadata = temporary
+        .as_file()
+        .metadata()
+        .map_err(|error| error.to_string())?;
+    crate::private_acl::ensure_current_owner(&metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err("private report file lacks owner read/write permissions".into());
+        }
+    }
     temporary
         .write_all(bytes)
         .and_then(|_| temporary.as_file().sync_all())
@@ -380,19 +484,24 @@ fn publish_report(directory: &Path, bytes: &[u8], stop: &AtomicBool) -> Result<(
 
 /// No production path can issue a session until real execution, provenance,
 /// human review and the registered regressions have been verified.
+/// A preflight refusal leaves the session in `session` for a retry. The session
+/// is taken before attempting the durable reservation, including on errors.
 pub fn run_holdout_once(
-    session: Option<QualifiedSession>,
+    session: &mut Option<QualifiedSession>,
     paths: &HoldoutPaths<'_>,
     stop: &AtomicBool,
 ) -> Result<(), HoldoutError> {
-    let mut session = session.ok_or(HoldoutError::InsufficientEvidence)?;
-    if !session.executor.available() {
+    let pending = session.as_ref().ok_or(HoldoutError::InsufficientEvidence)?;
+    if !pending.executor.available() {
         return Err(HoldoutError::InsufficientEvidence);
     }
-    if paths.ledger != session.ledger
-        || paths.private != session.private
-        || paths.report != session.report
-        || paths.ledger != session.ledger_target
+    if pending.stop_tokens.is_empty() {
+        return Err(HoldoutError::Preflight("empty stop policy".into()));
+    }
+    if paths.ledger != pending.ledger
+        || paths.private != pending.private
+        || paths.report != pending.report
+        || paths.ledger != pending.ledger_target
     {
         return Err(HoldoutError::Preflight(
             "custody paths differ or overlap".into(),
@@ -401,15 +510,26 @@ pub fn run_holdout_once(
     if stop.load(Ordering::Acquire) {
         return Err(HoldoutError::Preflight("interrupted".into()));
     }
-    verify_development_metadata(&session.public, &session.verified)
+    verify_development_metadata(&pending.public, &pending.verified)
         .map_err(HoldoutError::Preflight)?;
+    let formal = identity::compute(pending.verified.identities().1, &pending.stop_tokens)
+        .map_err(HoldoutError::Preflight)?;
+    if formal.comparison_sha256 != pending.formal_comparison_sha256 {
+        return Err(HoldoutError::Preflight(
+            "frozen formal policy or implementation changed".into(),
+        ));
+    }
     let custody = preflight_paths(paths).map_err(HoldoutError::Preflight)?;
     if stop.load(Ordering::Acquire) {
         return Err(HoldoutError::Preflight("interrupted".into()));
     }
-    let (metadata, protocol, candidate) = session.verified.identities();
+    let (metadata, protocol, candidate) = pending.verified.identities();
     let identities = serde_json::json!({"public_holdout_sha256":metadata,
-        "protocol_sha256":protocol,"candidate_sha256":candidate});
+        "protocol_sha256":protocol,"candidate_sha256":candidate,
+        "stop_tokens":formal.stop_tokens, "stop_policy_sha256":formal.stop_policy_sha256,
+        "formal_implementation_sha256":formal.implementation_sha256,
+        "formal_comparison_sha256":formal.comparison_sha256});
+    let mut session = session.take().expect("preflight retained the session");
     let reserved = reserve_holdout(&session.public, session.verified, &session.ledger_target)
         .map_err(HoldoutError::ConsumedOrUncertain)?;
     if stop.load(Ordering::Acquire) {
@@ -427,15 +547,41 @@ pub fn run_holdout_once(
     }
     reserve_report_directory(paths.report).map_err(HoldoutError::ConsumedOrUncertain)?;
     #[cfg(test)]
+    if let Executor::SyntheticJournalCollision(path) = &session.executor {
+        fs::write(path, b"competing journal")
+            .map_err(|error| HoldoutError::ConsumedOrUncertain(error.to_string()))?;
+    }
+    let mut journal = journal::Journal::create(paths.report, &identities)
+        .map_err(HoldoutError::ConsumedOrUncertain)?;
+    #[cfg(test)]
     if matches!(session.executor, Executor::SyntheticCancelBeforeRead) {
         stop.store(true, Ordering::Release);
     }
-    let opened = open_reserved(reserved, paths.private, Some(stop))
-        .map_err(HoldoutError::ConsumedOrUncertain)?;
-    let mut report = scoring::compare(&opened, &mut session.executor, &session.stop_tokens, stop)
-        .map_err(HoldoutError::ConsumedOrUncertain)?;
-    report["binding"] = identities;
-    let bytes = serde_json::to_vec_pretty(&report)
-        .map_err(|error| HoldoutError::ConsumedOrUncertain(error.to_string()))?;
-    publish_report(paths.report, &bytes, stop).map_err(HoldoutError::ConsumedOrUncertain)
+    let outcome = (|| -> Result<(), String> {
+        let opened = open_reserved(reserved, paths.private, Some(stop))?;
+        let mut report = scoring::compare(
+            &opened,
+            &mut session.executor,
+            &session.stop_tokens,
+            stop,
+            &mut journal,
+        )?;
+        report["binding"] = identities;
+        report["raw_observations"] = serde_json::json!({
+            "file":"raw-observations.jsonl", "sha256":journal.sha256(),
+            "status":"private_attempt_log_not_a_success_report"
+        });
+        let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+        publish_report(paths.report, &bytes, stop)
+    })();
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = match journal.failure(&error) {
+                Ok(()) => error,
+                Err(audit) => format!("{error}; attempt journal persistence failed: {audit}"),
+            };
+            Err(HoldoutError::ConsumedOrUncertain(message))
+        }
+    }
 }

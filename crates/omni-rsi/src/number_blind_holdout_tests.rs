@@ -49,6 +49,7 @@ fn unknown_media_capacity_is_rejected_before_reservation_or_private_access() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn private_media_total_is_committed_and_tampering_cannot_be_retried() {
     for declared in [14_u64, 16] {
         let root = tempfile::tempdir().unwrap();
@@ -76,6 +77,7 @@ fn private_media_total_is_committed_and_tampering_cannot_be_retried() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn metadata_checked_seal_opens_the_same_media_after_reservation() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("custodian-media");
@@ -106,6 +108,7 @@ fn metadata_checked_seal_opens_the_same_media_after_reservation() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn media_size_changed_after_sealing_fails_and_stays_consumed() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("custodian-media");
@@ -173,13 +176,20 @@ fn occupied_ledger_fails_before_opening_the_private_directory() {
     )
     .unwrap();
     let missing_private = root.path().join("must-not-open");
+    #[cfg(target_os = "macos")]
     let error = open_once(public, test_permit(public), &ledger, &missing_private)
         .err()
         .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let error = reserve_holdout(public, test_permit(public), &ledger)
+        .err()
+        .unwrap();
     assert!(error.contains("already consumed"), "{error}");
+    assert!(!missing_private.exists());
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn reserved_holdout_opens_only_after_salt_manifest_and_media_match() {
     let root = tempfile::tempdir().unwrap();
     let seal = fixture_seal();
@@ -195,6 +205,7 @@ fn reserved_holdout_opens_only_after_salt_manifest_and_media_match() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn tampered_salt_manifest_sizes_or_audio_never_releases_a_holdout_and_remains_consumed() {
     for name in ["salt.bin", "manifest.json", "media-sizes.bin", "secret.wav"] {
         let root = tempfile::tempdir().unwrap();
@@ -254,12 +265,15 @@ fn process_exit_immediately_after_reservation_blocks_later_reading() {
         let root = std::path::Path::new(&directory);
         let public =
             PublicMetadata::from_json(&std::fs::read(root.join("public.json")).unwrap()).unwrap();
+        #[cfg(target_os = "macos")]
         let _ = open_once(
             &public,
             test_permit(&public),
             &root.join("ledger"),
             &root.join("no-private-files"),
         );
+        #[cfg(not(target_os = "macos"))]
+        let _ = reserve_holdout(&public, test_permit(&public), &root.join("ledger"));
         std::process::exit(0);
     }
     let root = tempfile::tempdir().unwrap();
@@ -277,6 +291,7 @@ fn process_exit_immediately_after_reservation_blocks_later_reading() {
         .status().unwrap();
     assert_eq!(status.code(), Some(73));
     let public = seal.public();
+    #[cfg(target_os = "macos")]
     let error = open_once(
         public,
         test_permit(public),
@@ -285,10 +300,15 @@ fn process_exit_immediately_after_reservation_blocks_later_reading() {
     )
     .err()
     .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let error = reserve_holdout(public, test_permit(public), &root.path().join("ledger"))
+        .err()
+        .unwrap();
     assert!(error.contains("already consumed"), "{error}");
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn concurrent_callers_can_release_at_most_one_holdout() {
     use std::sync::Barrier;
     let root = tempfile::tempdir().unwrap();
@@ -323,14 +343,20 @@ fn resealing_same_source_cannot_reopen_with_a_new_commitment() {
     let root = tempfile::tempdir().unwrap();
     let first = fixture_seal();
     let second = fixture_seal();
-    let private = root.path().join("private");
-    first.persist_private(&private).unwrap();
-    std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
     let ledger = root.path().join("ledger");
     let one = first.public();
-    open_once(one, test_permit(one), &ledger, &private).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let private = root.path().join("private");
+        first.persist_private(&private).unwrap();
+        std::fs::write(private.join("secret.wav"), b"synthetic-audio").unwrap();
+        open_once(one, test_permit(one), &ledger, &private).unwrap();
+    }
+    #[cfg(not(target_os = "macos"))]
+    reserve_holdout(one, test_permit(one), &ledger).unwrap();
     let two = second.public();
     assert_ne!(one.to_json().unwrap(), two.to_json().unwrap());
+    #[cfg(target_os = "macos")]
     let error = open_once(
         two,
         test_permit(two),
@@ -339,6 +365,10 @@ fn resealing_same_source_cannot_reopen_with_a_new_commitment() {
     )
     .err()
     .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let error = reserve_holdout(two, test_permit(two), &ledger)
+        .err()
+        .unwrap();
     assert!(error.contains("already consumed"), "{error}");
 }
 
@@ -371,6 +401,7 @@ fn previously_consumed_v1_source_cannot_be_reopened_by_resealing_v2() {
     let before = std::fs::read(ledger.join("ledger.json")).unwrap();
     let new = fixture_seal();
     let public = new.public();
+    #[cfg(target_os = "macos")]
     let error = open_once(
         public,
         test_permit(public),
@@ -379,12 +410,17 @@ fn previously_consumed_v1_source_cannot_be_reopened_by_resealing_v2() {
     )
     .err()
     .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let error = reserve_holdout(public, test_permit(public), &ledger)
+        .err()
+        .unwrap();
     assert!(error.contains("already consumed"), "{error}");
     assert_eq!(std::fs::read(ledger.join("ledger.json")).unwrap(), before);
 }
 
 #[cfg(unix)]
 #[test]
+#[cfg(target_os = "macos")]
 fn private_media_symlink_is_rejected_after_reservation() {
     let root = tempfile::tempdir().unwrap();
     let seal = fixture_seal();
@@ -404,6 +440,7 @@ fn private_media_symlink_is_rejected_after_reservation() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(target_os = "macos")]
 fn separate_processes_cannot_both_open_the_same_holdout() {
     use std::{
         process::{Command, Stdio},
@@ -472,6 +509,7 @@ fn held_ledger_lock_is_reported_before_any_private_access() {
         .unwrap()
         .unwrap();
     let public = seal.public();
+    #[cfg(target_os = "macos")]
     let error = open_once(
         public,
         test_permit(public),
@@ -480,6 +518,10 @@ fn held_ledger_lock_is_reported_before_any_private_access() {
     )
     .err()
     .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let error = reserve_holdout(public, test_permit(public), &ledger)
+        .err()
+        .unwrap();
     assert!(error.contains("locked"), "{error}");
     assert!(!ledger.join("ledger.json").exists());
     drop(lease);
@@ -487,6 +529,7 @@ fn held_ledger_lock_is_reported_before_any_private_access() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(target_os = "macos")]
 fn exposed_secret_salt_is_rejected_and_the_holdout_remains_consumed() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -518,6 +561,7 @@ fn exposed_secret_salt_is_rejected_and_the_holdout_remains_consumed() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(target_os = "macos")]
 fn public_private_directory_is_rejected_after_reservation() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -539,6 +583,7 @@ fn public_private_directory_is_rejected_after_reservation() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn committed_manifest_must_match_public_sources_before_audio_is_opened() {
     let root = tempfile::tempdir().unwrap();
     let seal = fixture_seal();
@@ -585,7 +630,16 @@ fn fixed_domain_separated_commitment_matches_independent_sha256_reference() {
     };
     let bytes = serde_json::to_vec(&data).unwrap();
     assert_eq!(bytes.len(), 516);
-    std::fs::write(private.join("manifest.json"), bytes).unwrap();
+    let sizes = [3_u64.to_be_bytes(), 3_u64.to_be_bytes()].concat();
+    assert_eq!(
+        manifest_commitment(&[17_u8; 32], &bytes),
+        "6192465ecb1bcfcbbbee7be94a110eff24cbf69bd559224ce77326aeb96f9429"
+    );
+    assert_eq!(
+        manifest_commitment_v2(&[17_u8; 32], &bytes, &sizes),
+        "b6ac9193ca2b5c9a4cb3aca95b4019795da18b88bdba43abcc572ae3922be823"
+    );
+    std::fs::write(private.join("manifest.json"), &bytes).unwrap();
     std::fs::write(private.join("salt.bin"), [17_u8; 32]).unwrap();
     std::fs::set_permissions(
         private.join("salt.bin"),
@@ -604,23 +658,23 @@ fn fixed_domain_separated_commitment_matches_independent_sha256_reference() {
         legacy.fingerprint().unwrap(),
         "4e59f59392994b32624cb44ac012e062caba36f8b97e06d97ec24276b25a56da"
     );
-    std::fs::write(
-        private.join("media-sizes.bin"),
-        [3_u64.to_be_bytes(), 3_u64.to_be_bytes()].concat(),
-    )
-    .unwrap();
+    std::fs::write(private.join("media-sizes.bin"), sizes).unwrap();
     // Independently computed with Python's hashlib over the specified v2 bytes.
     let mut public_json = legacy_json;
     public_json["version"] = 2.into();
     public_json["content_sha256"] =
         "b6ac9193ca2b5c9a4cb3aca95b4019795da18b88bdba43abcc572ae3922be823".into();
     let public = PublicMetadata::from_json(&serde_json::to_vec(&public_json).unwrap()).unwrap();
-    let opened = open_once(
-        &public,
-        test_permit(&public),
-        &root.path().join("ledger"),
-        &private,
-    )
-    .unwrap();
-    assert_eq!(opened.audio(0).unwrap(), b"abc");
+    assert_eq!(public.version, 2);
+    #[cfg(target_os = "macos")]
+    {
+        let opened = open_once(
+            &public,
+            test_permit(&public),
+            &root.path().join("ledger"),
+            &private,
+        )
+        .unwrap();
+        assert_eq!(opened.audio(0).unwrap(), b"abc");
+    }
 }

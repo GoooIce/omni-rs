@@ -17,6 +17,57 @@ const MAX_TOTAL_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 #[path = "number_blind_holdout_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+mod unsupported_acl_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_acl_platform_does_not_reserve_or_open_a_holdout() {
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        std::fs::write(media.join("synthetic.wav"), b"synthetic").unwrap();
+        let manifest = BlindManifest {
+            cases: vec![BlindCase {
+                case_id: "synthetic".into(),
+                spoken_number: 1,
+                answer: 2,
+                audio_file: "synthetic.wav".into(),
+                audio_sha256: format!("{:x}", Sha256::digest(b"synthetic")),
+                recording_sha256: "1".repeat(64),
+                family_sha256: "2".repeat(64),
+                speaker_sha256: "3".repeat(64),
+                session_sha256: "4".repeat(64),
+                private_source: serde_json::Map::new(),
+            }],
+        };
+        let seal = seal_for_custodian_with_media_metadata(&manifest, &media).unwrap();
+        let ledger = root.path().join("ledger");
+        let private = root.path().join("not-opened");
+        crate::private_acl::simulate_unsupported(|| {
+            let error = seal
+                .persist_private(&private)
+                .err()
+                .expect("private persistence accepted");
+            assert!(
+                error.contains("ACL") || error.contains("not supported"),
+                "{error}"
+            );
+            let error = open_once(
+                seal.public(),
+                synthetic_verified_development(seal.public()),
+                &ledger,
+                &private,
+            )
+            .err()
+            .expect("unsupported ACL platform accepted");
+            assert!(error.contains("ACL"), "{error}");
+            assert!(!ledger.exists());
+            assert!(!private.exists());
+        });
+    }
+}
+
 // One identity schema drives both flat wire formats, the conversion and its
 // validation, while preserving existing public Rust fields and JSON bytes.
 macro_rules! blind_identity_types {
@@ -237,6 +288,9 @@ pub fn open_once(
     ledger_directory: &std::path::Path,
     private_directory: &std::path::Path,
 ) -> Result<OpenedHoldout, String> {
+    // An unverifiable platform must not consume a one-shot reservation.
+    verify_development_metadata(public, &verified)?;
+    crate::private_acl::ensure_supported()?;
     let reserved = reserve_holdout(public, verified, ledger_directory)?;
     open_reserved(reserved, private_directory, None)
 }
@@ -290,14 +344,20 @@ pub(crate) fn private_directory_metadata(
     if !directory.is_dir() || directory.file_type().is_symlink() {
         return Err("invalid private holdout directory".into());
     }
+    let file = crate::private_acl::checked_directory(private_directory)?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    crate::private_acl::ensure_current_owner(&opened)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if directory.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if directory.dev() != opened.dev() || directory.ino() != opened.ino() {
+            return Err("private holdout directory changed during verification".into());
+        }
+        if opened.permissions().mode() & 0o077 != 0 {
             return Err("private holdout directory lacks private permissions".into());
         }
     }
-    Ok(directory)
+    Ok(opened)
 }
 
 pub(crate) fn open_reserved(
@@ -401,6 +461,7 @@ fn read_private_file(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(directory.join(name))
         .map_err(|error| error.to_string())?;
+    crate::private_acl::ensure_no_acl(&file)?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() > limit as u64 {
         return Err("invalid private holdout file".into());
@@ -466,13 +527,24 @@ impl CustodianSeal {
         use std::{
             fs::{DirBuilder, File, OpenOptions},
             io::Write,
-            os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+            os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         };
 
+        let parent = directory
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        crate::private_acl::checked_directory(parent)?;
         DirBuilder::new()
             .mode(0o700)
             .create(directory)
             .map_err(|error| error.to_string())?;
+        let private_directory = crate::private_acl::checked_directory(directory)?;
+        crate::private_acl::ensure_current_owner(
+            &private_directory
+                .metadata()
+                .map_err(|error| error.to_string())?,
+        )?;
         let mut files = vec![
             ("salt.bin", self.secret_salt.as_slice()),
             ("manifest.json", self.manifest_bytes.as_slice()),
@@ -487,18 +559,20 @@ impl CustodianSeal {
                 .mode(0o600)
                 .open(directory.join(name))
                 .map_err(|error| error.to_string())?;
+            crate::private_acl::ensure_no_acl(&output)?;
+            let metadata = output.metadata().map_err(|error| error.to_string())?;
+            crate::private_acl::ensure_current_owner(&metadata)?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+                return Err("private holdout file lacks owner read/write permissions".into());
+            }
             output
                 .write_all(contents)
                 .and_then(|_| output.sync_all())
                 .map_err(|error| error.to_string())?;
         }
-        File::open(directory)
-            .and_then(|file| file.sync_all())
+        private_directory
+            .sync_all()
             .map_err(|error| error.to_string())?;
-        let parent = directory
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
         File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;

@@ -13,7 +13,7 @@ fn missing_qualification_does_not_touch_holdout_or_publish_anything() {
         report: &report,
     };
 
-    let result = run_holdout_once(None, &paths, &AtomicBool::new(false));
+    let result = run_holdout_once(&mut None, &paths, &AtomicBool::new(false));
 
     assert!(matches!(result, Err(HoldoutError::InsufficientEvidence)));
     assert!(!ledger.exists());
