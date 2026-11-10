@@ -332,6 +332,11 @@ impl<B: Backend> CodecEncoder<B> {
         })
     }
 
+    /// Sampling rate required by the encoder's PCM input.
+    pub fn sample_rate(&self) -> u32 {
+        self.config.params.sampling_rate
+    }
+
     pub fn encode(&self, samples: &[f32]) -> Result<Vec<Vec<u32>>> {
         let p = &self.config.params;
         if samples.is_empty() || samples.iter().any(|value| !value.is_finite()) {

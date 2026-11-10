@@ -4,6 +4,7 @@ pub mod child;
 pub mod evolution;
 pub mod fingerprint;
 pub mod humming;
+pub mod humming_audio;
 pub mod idle;
 pub mod lease;
 pub mod model;

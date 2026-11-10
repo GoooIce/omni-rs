@@ -6,14 +6,14 @@
 ///
 /// The origin must be calibrated against the other clock. It does not by itself
 /// account for a hardware buffer or prove when sound reached a listener.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Clock {
     pub sample_rate_hz: u32,
     pub origin_ns: i64,
 }
 
 /// A reference note on the input clock, with an exclusive end.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Note {
     pub start: u64,
     pub end: u64,
@@ -24,7 +24,7 @@ pub struct Note {
 ///
 /// `None` denotes unvoiced audio. `note_onset` denotes a new articulation, not
 /// every pitch change. Split spans whenever pitch or the consumed prefix changes.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct OutputSpan {
     pub start: u64,
     pub end: u64,
@@ -34,7 +34,7 @@ pub struct OutputSpan {
 }
 
 /// Whether an evaluation uses only arrived input or permits future input offline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum InputMode {
     Causal,
     Offline,
@@ -56,7 +56,7 @@ pub struct Evaluation<'a> {
 }
 
 /// Metrics over the input interval; undefined denominators are `None`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Report {
     pub input_clock: Clock,
     pub input_samples: u64,
@@ -91,7 +91,7 @@ pub struct Report {
 }
 
 /// One association, preserving both original clocks and the recorded prefix.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct OnsetMatch {
     pub reference_note: usize,
     pub output_sample: u64,
