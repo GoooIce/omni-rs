@@ -562,6 +562,11 @@ fn evaluation_fixture() -> tempfile::TempDir {
 
 #[cfg(all(unix, feature = "cpu"))]
 fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
+    evaluation_fixture_with_options(signed_zero, false)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn evaluation_fixture_with_options(signed_zero: bool, fractional_cer: bool) -> tempfile::TempDir {
     use burn::{
         backend::{Autodiff, NdArray},
         tensor::backend::Backend,
@@ -603,6 +608,10 @@ fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
     let group_path = path.join("dev.groups.v3.json");
     let mut dev: Value = serde_json::from_slice(&fs::read(&dev_path).unwrap()).unwrap();
     let mut groups: Value = serde_json::from_slice(&fs::read(&group_path).unwrap()).unwrap();
+    if fractional_cer {
+        dev["records"][0]["spoken_number"] = 25.into();
+        dev["records"][0]["answer"] = 26.into();
+    }
     if signed_zero {
         let file = path.join("dev-media/dev-a.wav");
         let mut writer = hound::WavWriter::create(
@@ -2287,4 +2296,702 @@ fn v3_real_codec_rejects_forged_frames_before_new_and_resumed_checkpoints() {
     }
     assert!(!fresh.join("number-audio-v3/audio-conditioned-v1").exists());
     assert_eq!(fs::read(pointer).unwrap(), pointer_before);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+struct VoiceRecheckFixture {
+    _root: tempfile::TempDir,
+    registered: omni_rsi::number_development::RegisteredDevelopment,
+    registration_dir: std::path::PathBuf,
+    report: Value,
+    voice_dir: std::path::PathBuf,
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture() -> VoiceRecheckFixture {
+    voice_recheck_fixture_with_failures(false)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture_with_failures(failures: bool) -> VoiceRecheckFixture {
+    voice_recheck_fixture_variant(failures, false)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture_fractional_cer() -> VoiceRecheckFixture {
+    voice_recheck_fixture_variant(false, true)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture_variant(failures: bool, fractional_cer: bool) -> VoiceRecheckFixture {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::{
+        number_development::{RegistrationOptions, ToolPaths, verify_registration},
+        number_v3_evaluation::{
+            DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+            preregister_v3_with_asr,
+        },
+        speech_asr::AsrEvent,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture_with_options(false, fractional_cer);
+    let root_path = fs::canonicalize(root.path()).unwrap();
+    let model = root_path.join("model");
+    let state = root_path.join("state");
+    let registration = root_path.join("registration");
+    let output = root_path.join("report.json");
+    let voice_dir = root_path.join("voice-output");
+    let (r2t2, binary) = fake_r2t2(&root_path);
+    let options = V3Options {
+        model: &model,
+        data: &root_path,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let mut index = 0;
+    let report = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, samples| {
+            let current = index;
+            index += 1;
+            let value = if samples.iter().all(|v| *v == 0.0) {
+                0.125
+            } else if samples[1] < 0.4 {
+                0.5
+            } else {
+                0.25
+            };
+            Ok((
+                DecodedText {
+                    text: "fixture".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![7],
+                    frames: vec![
+                        vec![if failures && current == 1 { 2017 } else { 1 }; 12],
+                        vec![2016; 12],
+                    ],
+                    samples: if failures && current == 2 {
+                        Vec::new()
+                    } else if failures && current == 3 {
+                        vec![f32::NAN, 0.0]
+                    } else {
+                        vec![value, -value]
+                    },
+                    end: if failures && current == 0 {
+                        TextEnd::Limit
+                    } else {
+                        TextEnd::Stop(7)
+                    },
+                },
+            ))
+        },
+        |wav| {
+            let sample = hound::WavReader::open(wav)
+                .unwrap()
+                .samples::<f32>()
+                .next()
+                .unwrap()
+                .unwrap();
+            Ok(AsrEvent {
+                text: if sample == 0.5 {
+                    "十六"
+                } else if sample == 0.25 {
+                    "13"
+                } else {
+                    "一"
+                }
+                .into(),
+                language: "zh".into(),
+            })
+        },
+    )
+    .unwrap();
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(state.join("number-audio-v3/audio-conditioned-v1/latest.json")).unwrap(),
+    )
+    .unwrap();
+    let candidate = state
+        .join("number-audio-v3/audio-conditioned-v1/checkpoints")
+        .join(format!("{}.json", pointer["sha256"].as_str().unwrap()));
+    let registered = verify_registration(
+        &RegistrationOptions {
+            data_root: &root_path,
+            model_dir: model,
+            candidate_file: candidate,
+            evaluator_file: std::env::current_exe().unwrap(),
+            backend: Cpu::name(&device),
+            r2t2: Some(ToolPaths {
+                model: r2t2,
+                binary,
+            }),
+            breeze: None,
+        },
+        &registration,
+        &stop,
+    )
+    .unwrap();
+    VoiceRecheckFixture {
+        _root: root,
+        registered,
+        registration_dir: registration,
+        report,
+        voice_dir,
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_recomputes_swapped_cer_without_granting_eligibility() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["status"], "insufficient_evidence");
+    assert_eq!(checked["candidate_eligible"], false);
+    assert_eq!(checked["execution_verified"], false);
+    assert_eq!(checked["policy_authenticity"], "cannot_recompute");
+    assert_eq!(checked["termination_verified"], false);
+    assert_eq!(checked["observations"][0]["cer"], 0.0);
+    assert_eq!(checked["observations"][1]["audio_case_id"], "dev-b");
+    assert_eq!(checked["observations"][1]["cer"], 1.0);
+    assert_eq!(checked["observations"][2]["silence_numeric"], true);
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["original"]["mean_case_cer"],
+        0.5
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_text_stop_token_outside_frozen_policy() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    fixture.report["observations"][0]["end"] = json!({"stop_token": 999});
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(
+        result.is_err(),
+        "an unregistered text stop cannot be accepted"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_missing_silence_score_instead_of_assuming_null() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    fixture.report["observations"][2]["speech"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cer");
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "an omitted score is not an explicit null");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_duplicate_fields_in_the_frozen_protocol() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let path = fixture.registration_dir.join("protocol.json");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen("\"version\": 1,", "\"version\": 999,\n  \"version\": 1,", 1);
+    assert_ne!(changed, original);
+    fs::write(&path, changed).unwrap();
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "duplicate frozen fields must be rejected");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_file_entry_reads_saved_report_and_rejects_duplicate_keys() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    let fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("report.json");
+    let run = || {
+        recheck_registered_voice_file(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &path,
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+    };
+    let checked = run().unwrap();
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["original"]["mean_case_cer"],
+        0.5
+    );
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen(
+        "\"status\": \"insufficient_evidence\",",
+        "\"status\": \"passed\",\n  \"status\": \"insufficient_evidence\",",
+        1,
+    );
+    assert_ne!(changed, original);
+    fs::write(&path, changed).unwrap();
+    assert!(run().is_err(), "duplicate report fields must be rejected");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_unrecognized_fields_in_the_frozen_envelope() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let path = fixture.registration_dir.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    envelope["approved"] = true.into();
+    write_json(&path, &envelope);
+    assert!(
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &fixture.report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .is_err()
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_keeps_invalid_and_abnormally_ended_observations() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture_with_failures(true);
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["observations"].as_array().unwrap().len(), 12);
+    assert_eq!(checked["observations"][0]["valid"], true);
+    assert_eq!(checked["observations"][0]["normal_end"], false);
+    assert_eq!(checked["observations"][0]["cer"], 0.0);
+    assert_eq!(checked["observations"][1]["valid"], false);
+    assert!(checked["observations"][1]["cer"].is_null());
+    assert_eq!(checked["observations"][2]["valid"], false);
+    assert!(checked["observations"][2]["cer"].is_null());
+    assert_eq!(checked["observations"][3]["valid"], false);
+    assert!(checked["observations"][3]["cer"].is_null());
+    assert_eq!(checked["speech_summary"]["status"], "partial_unverified");
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["swapped"]["observations"],
+        2
+    );
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["swapped"]["cer_cases"],
+        1
+    );
+    assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_incomplete_wrongly_mapped_or_forged_reports() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let mut variants = Vec::new();
+    let mut report = fixture.report.clone();
+    report["observations"].as_array_mut().unwrap().pop();
+    variants.push(("missing observation", report));
+    let mut report = fixture.report.clone();
+    report["observations"][1] = report["observations"][0].clone();
+    variants.push(("duplicate observation", report));
+    let mut report = fixture.report.clone();
+    report["observations"][1]["audio_case_id"] = "dev-a".into();
+    variants.push(("wrong swapped audio", report));
+    let mut report = fixture.report.clone();
+    report["candidate_checkpoint_sha256"] = "0".repeat(64).into();
+    variants.push(("different candidate", report));
+    let mut report = fixture.report.clone();
+    report["parameters"]["output_speech"]["codebooks"] = 11.into();
+    variants.push(("different policy", report));
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["cer"] = 0.25.into();
+    variants.push(("forged case CER", report));
+    let mut report = fixture.report.clone();
+    report["output_speech_r2t2_cer"]["by_arm"]["baseline"]["original"]["cer_cases"] = 1.into();
+    variants.push(("forged aggregate", report));
+    let mut report = fixture.report.clone();
+    report["candidate_eligible"] = true.into();
+    variants.push(("self-reported eligibility", report));
+    for (name, report) in variants {
+        assert!(
+            recheck_registered_voice(
+                &fixture.registered,
+                &fixture.registration_dir,
+                &report,
+                &fixture.voice_dir,
+                &AtomicBool::new(false),
+            )
+            .is_err(),
+            "{name} was accepted"
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_changed_or_malformed_saved_artifacts() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let frame_path = fixture.voice_dir.join("000000.frames.json");
+    let original_frames = fs::read(&frame_path).unwrap();
+    let wav_path = fixture.voice_dir.join("000000.wav");
+    let original_wav = fs::read(&wav_path).unwrap();
+    let run = |report: &Value| {
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+    };
+    fs::write(&frame_path, b"different").unwrap();
+    assert!(run(&fixture.report).is_err());
+    let mut frames: Value = serde_json::from_slice(&original_frames).unwrap();
+    frames["frames"][0][0] = 2017.into();
+    let bytes = serde_json::to_vec(&frames).unwrap();
+    fs::write(&frame_path, &bytes).unwrap();
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["frames_sha256"] =
+        format!("{:x}", Sha256::digest(&bytes)).into();
+    assert!(
+        run(&report).is_err(),
+        "a matching hash cannot make invalid codes valid"
+    );
+    fs::write(&frame_path, &original_frames).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&frame_path)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(
+        run(&fixture.report).is_err(),
+        "an oversized frame file must be rejected before reading"
+    );
+    fs::write(&frame_path, &original_frames).unwrap();
+    let mut writer = hound::WavWriter::create(
+        &wav_path,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    writer.write_sample(0.5_f32).unwrap();
+    writer.write_sample(-0.5_f32).unwrap();
+    writer.finalize().unwrap();
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["audio_sha256"] =
+        format!("{:x}", Sha256::digest(fs::read(&wav_path).unwrap())).into();
+    assert!(
+        run(&report).is_err(),
+        "a matching hash cannot change the WAV rate"
+    );
+    fs::write(&wav_path, original_wav).unwrap();
+    fs::remove_file(&frame_path).unwrap();
+    assert!(
+        run(&fixture.report).is_err(),
+        "a missing artifact cannot be skipped"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_links_and_traversal_but_accepts_chinese_paths() {
+    use omni_rsi::number_v3_voice_recheck::{
+        recheck_registered_voice, recheck_registered_voice_file,
+    };
+    use std::os::unix::fs::symlink;
+    let fixture = voice_recheck_fixture();
+    let run = |report: &Value, directory: &Path| {
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            report,
+            directory,
+            &AtomicBool::new(false),
+        )
+    };
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["frames_file"] = "../000000.frames.json".into();
+    assert!(run(&report, &fixture.voice_dir).is_err());
+    let parent = fixture.voice_dir.parent().unwrap();
+    let alias = parent.join("voice-link");
+    symlink(&fixture.voice_dir, &alias).unwrap();
+    assert!(run(&fixture.report, &alias).is_err());
+    assert!(run(&fixture.report, &fixture.voice_dir.join("../voice-output")).is_err());
+    let frame = fixture.voice_dir.join("000000.frames.json");
+    let saved = parent.join("saved-frames");
+    fs::rename(&frame, &saved).unwrap();
+    symlink(&saved, &frame).unwrap();
+    assert!(run(&fixture.report, &fixture.voice_dir).is_err());
+    fs::remove_file(&frame).unwrap();
+    fs::hard_link(&saved, &frame).unwrap();
+    assert!(run(&fixture.report, &fixture.voice_dir).is_err());
+    fs::remove_file(&frame).unwrap();
+    fs::rename(&saved, &frame).unwrap();
+    let report_link = parent.join("report-link.json");
+    symlink(parent.join("report.json"), &report_link).unwrap();
+    assert!(
+        recheck_registered_voice_file(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &report_link,
+            &fixture.voice_dir,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let chinese = parent.join("中文语音");
+    fs::rename(&fixture.voice_dir, &chinese).unwrap();
+    assert!(run(&fixture.report, &chinese).is_ok());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_cancellation_and_resource_limits() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        Path::new("/not-an-input"),
+        &AtomicBool::new(true),
+    );
+    assert!(matches!(result, Err(ref error) if error == "interrupted"));
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["sample_count"] = 720_001.into();
+    assert!(
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let path = fixture.registration_dir.join("v3-evaluation-policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    policy["parameters"]["output_speech"]["max_total_output_samples"] = 1.into();
+    write_json(&path, &policy);
+    let mut report = fixture.report.clone();
+    report["parameters"] = policy["parameters"].clone();
+    assert!(
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_never_opens_synthetic_private_holdout_entries() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let fixture = voice_recheck_fixture();
+    let private = fixture.registration_dir.parent().unwrap().join("holdout");
+    fs::create_dir(&private).unwrap();
+    for name in ["manifest.json", "salt.bin", "holdout.wav"] {
+        let path = private.join(name);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_accepts_reordered_fields_in_the_valid_registered_protocol() {
+    use omni_rsi::{
+        number_development::{RegistrationOptions, ToolPaths, verify_registration},
+        number_v3_voice_recheck::recheck_registered_voice,
+    };
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let protocol_path = fixture.registration_dir.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&protocol_path).unwrap()).unwrap();
+    let object = envelope["protocol"].as_object_mut().unwrap();
+    let case = object.get_mut("train_cases").unwrap()[0]
+        .as_object_mut()
+        .unwrap();
+    let id = case.shift_remove("id").unwrap();
+    case.insert("id".into(), id);
+    let source = case.get_mut("source").unwrap().as_object_mut().unwrap();
+    let recording = source.shift_remove("recording_sha256").unwrap();
+    source.insert("recording_sha256".into(), recording);
+    let provenance = case
+        .get_mut("source_provenance")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    let status = provenance.shift_remove("status").unwrap();
+    provenance.insert("status".into(), status);
+    let swap = object.get_mut("swaps").unwrap()[0].as_object_mut().unwrap();
+    let case_id = swap.shift_remove("case_id").unwrap();
+    swap.insert("case_id".into(), case_id);
+    let regression = object.get_mut("regression_inputs").unwrap()[0]
+        .as_object_mut()
+        .unwrap();
+    let name = regression.shift_remove("name").unwrap();
+    regression.insert("name".into(), name);
+    let version = object.shift_remove("version").unwrap();
+    object.insert("version".into(), version);
+    write_json(&protocol_path, &envelope);
+    let candidate = root
+        .join("state/number-audio-v3/audio-conditioned-v1/checkpoints")
+        .join(format!(
+            "{}.json",
+            fixture.report["candidate_checkpoint_sha256"]
+                .as_str()
+                .unwrap()
+        ));
+    let stop = AtomicBool::new(false);
+    let verified = verify_registration(
+        &RegistrationOptions {
+            data_root: root,
+            model_dir: root.join("model"),
+            candidate_file: candidate,
+            evaluator_file: std::env::current_exe().unwrap(),
+            backend: "autodiff<ndarray>".into(),
+            r2t2: Some(ToolPaths {
+                model: root.join("r2t2"),
+                binary: root.join("r2t2-binary"),
+            }),
+            breeze: None,
+        },
+        &fixture.registration_dir,
+        &stop,
+    )
+    .unwrap();
+    assert!(
+        recheck_registered_voice(
+            &verified,
+            &fixture.registration_dir,
+            &fixture.report,
+            &fixture.voice_dir,
+            &stop
+        )
+        .is_ok(),
+        "JSON field order must not change a registered protocol"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_marks_jointly_changed_policy_as_not_recomputable() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    let policy_path = fixture.registration_dir.join("v3-evaluation-policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["parameters"]["stop_tokens"] = json!([999]);
+    policy["parameters"]["output_speech"]["text_stop_tokens"] = json!([999]);
+    write_json(&policy_path, &policy);
+    fixture.report["parameters"] = policy["parameters"].clone();
+    for row in fixture.report["observations"].as_array_mut().unwrap() {
+        row["end"] = json!({"stop_token":999});
+        row["speech"]["end"] = json!({"stop_token":999});
+    }
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["policy_authenticity"], "cannot_recompute");
+    assert_eq!(checked["termination_verified"], false);
+    assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_recomputes_fractional_cer_after_report_json_roundtrip() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    let fixture = voice_recheck_fixture_fractional_cer();
+    let report = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("report.json");
+    let checked = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["observations"][0]["cer"], 1.0 / 3.0);
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["original"]["mean_case_cer"],
+        (1.0 / 3.0 + 1.0) / 2.0
+    );
 }
