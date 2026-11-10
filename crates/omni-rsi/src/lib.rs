@@ -19,6 +19,7 @@ pub mod speech_audio;
 pub mod speech_audio_checkpoint;
 pub mod speech_audio_data;
 pub mod speech_audio_round;
+pub mod speech_audio_target;
 pub mod speech_checkpoint;
 pub mod speech_data;
 pub mod speech_evaluation;
