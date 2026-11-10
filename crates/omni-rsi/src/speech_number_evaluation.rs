@@ -436,7 +436,7 @@ fn trim_answer_wrappers(mut text: &str) -> &str {
 
 // Only one integer, optionally with a fixed answer label, is accepted. Free
 // explanations, decimals and conflicting answers are not inferred as correct.
-fn answer_number(text: &str) -> Option<u16> {
+pub(crate) fn answer_number(text: &str) -> Option<u16> {
     // Only map full-width digits and presentation punctuation. General NFKC
     // would turn `1³` or `①③` into `13` and falsely award a different value.
     let normalized: String = text
@@ -503,7 +503,7 @@ fn answer_number(text: &str) -> Option<u16> {
 
 // Deliberately conservative: this is a literal numeral mention, not a semantic
 // judgment about whether a sentence asserts or denies an unsupported number.
-fn mentions_number(text: &str) -> bool {
+pub(crate) fn mentions_number(text: &str) -> bool {
     if text.chars().any(|ch| {
         ch.is_numeric()
             || "零〇一二两兩三四五六七八九十百千万亿萬億兆壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌幺"

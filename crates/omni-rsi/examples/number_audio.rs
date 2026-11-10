@@ -1,6 +1,7 @@
 //! Explicit local rule-data construction and development comparison.
 use omni_rsi::{
     lease::Lease,
+    number_v3_evaluation::{V3Options, evaluate_v3, preregister_v3},
     speech_asr,
     speech_audio_data::generate_rule_manifest,
     speech_audio_target::encode_target,
@@ -24,7 +25,40 @@ type ModelBackend = burn::backend::NdArray<f32>;
 compile_error!("select the cpu or metal feature");
 type TrainingBackend = burn::backend::Autodiff<ModelBackend>;
 
-const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n\nBuild consumes existing authorized local WAV files and a source plan; it does not run Breeze or R2T2 on inputs. Encode-target loads the local codec and does not validate the WAV's meaning or provenance. Dev compares a local LFM3 base and its audio-conditioned checkpoint. With both R2T2 arguments it also transcribes generated output speech. Reports never activate a candidate.";
+const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n  number_audio preregister-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR [TOOL OPTIONS]\n  number_audio dev-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON [TOOL OPTIONS]\n\nTOOL OPTIONS: --r2t2-model PATH --r2t2-binary PATH --breeze-model PATH --breeze-binary PATH (each model/binary pair is optional). V3 output speech is not_run. Reports never activate a candidate.";
+
+#[derive(Default)]
+struct LocalTools {
+    r2t2_model: Option<PathBuf>,
+    r2t2_binary: Option<PathBuf>,
+    breeze_model: Option<PathBuf>,
+    breeze_binary: Option<PathBuf>,
+}
+
+fn local_tools(args: &[std::ffi::OsString]) -> Result<LocalTools, String> {
+    let mut result = LocalTools::default();
+    if !args.len().is_multiple_of(2) {
+        return Err("local tool options require paths".into());
+    }
+    for pair in args.as_chunks::<2>().0 {
+        let slot = match pair[0].to_str() {
+            Some("--r2t2-model") => &mut result.r2t2_model,
+            Some("--r2t2-binary") => &mut result.r2t2_binary,
+            Some("--breeze-model") => &mut result.breeze_model,
+            Some("--breeze-binary") => &mut result.breeze_binary,
+            _ => return Err("unknown local tool option".into()),
+        };
+        if slot.replace(PathBuf::from(&pair[1])).is_some() {
+            return Err("duplicate local tool option".into());
+        }
+    }
+    if result.r2t2_model.is_some() != result.r2t2_binary.is_some()
+        || result.breeze_model.is_some() != result.breeze_binary.is_some()
+    {
+        return Err("local tools require both model and binary".into());
+    }
+    Ok(result)
+}
 
 fn execute() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -122,6 +156,48 @@ fn execute() -> Result<(), String> {
                 serde_json::to_string(&result).map_err(|error| error.to_string())?
             );
         }
+        Some(command @ ("preregister-v3" | "dev-v3")) => {
+            let is_registration = command == "preregister-v3";
+            let positional = if is_registration { 5 } else { 6 };
+            if args.len() < positional {
+                return Err(USAGE.into());
+            }
+            let tools = local_tools(&args[positional..])?;
+            let model = Path::new(&args[1]);
+            let data = Path::new(&args[2]);
+            let state = Path::new(&args[3]);
+            let registration = Path::new(&args[4]);
+            let unused_output = registration.join(".unused-report");
+            let output = if is_registration {
+                unused_output.as_path()
+            } else {
+                Path::new(&args[5])
+            };
+            let options = V3Options {
+                model,
+                data,
+                state,
+                registration,
+                output,
+                r2t2: tools
+                    .r2t2_model
+                    .as_deref()
+                    .zip(tools.r2t2_binary.as_deref()),
+                breeze: tools
+                    .breeze_model
+                    .as_deref()
+                    .zip(tools.breeze_binary.as_deref()),
+            };
+            let result = if is_registration {
+                preregister_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
+            } else {
+                evaluate_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|e| e.to_string())?
+            );
+        }
         _ => return Err(USAGE.into()),
     }
     Ok(())
@@ -131,5 +207,29 @@ fn main() {
     if let Err(error) = execute() {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn help_lists_explicit_v3_registration_and_development_commands() {
+        assert!(USAGE.contains("preregister-v3"));
+        assert!(USAGE.contains("dev-v3"));
+    }
+    #[test]
+    fn local_tool_options_require_complete_unique_pairs() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(local_tools(&args(&["--r2t2-model", "m"])).is_err());
+        assert!(local_tools(&args(&["--r2t2-model", "m", "--r2t2-model", "n"])).is_err());
+        assert!(local_tools(&args(&["--cloud", "m"])).is_err());
+        assert!(local_tools(&args(&["--r2t2-model", "m", "--r2t2-binary", "b"])).is_ok());
+        assert!(local_tools(&args(&["--breeze-model", "m", "--breeze-binary", "b"])).is_ok());
     }
 }

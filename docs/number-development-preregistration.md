@@ -55,9 +55,9 @@ CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 UV_CACHE_DIR
 
 `preregister` 接受数据目录、实际模型目录、候选文件、评估程序、后端名称及可选 R2T2/Breeze 位置。它冻结规则、评分和统计实现身份、解码及统计参数、train/dev 分组与案例清单和逐条媒体/PCM 身份、规则答案、声明哈希、确定性交换映射、公开保留元数据指纹，以及回归计划和输入身份。评分源码与评估器文件哈希只标识文件，不证明它们被执行；后端、来源、许可和真人标注仍是声明。
 
-交换音频必须是答案不同的一对一映射：每条开发案例恰好使用一条不同答案的开发音频，每个音频恰好使用一次；若某答案超过案例总数的一半，或开发集有重复规范 PCM，则拒绝冻结。协议记录不同交换 PCM 的数量，逐条交换通过 `audio_case_id` 关联到 `dev_cases` 的 PCM 摘要和来源组；这些身份仍须独立核实，不能作为通过证据。
+交换音频必须是答案不同的一对一映射：每条开发案例恰好使用一条不同答案的开发音频，每个音频恰好使用一次，但不要求双向配对；若某答案超过案例总数的一半，或开发集有重复规范 PCM，则拒绝冻结。协议记录不同交换 PCM 的数量，逐条交换通过 `audio_case_id` 关联到 `dev_cases` 的 PCM 摘要和来源组；这些身份仍须独立核实，不能作为通过证据。
 
-成功 `preregister` 或 `verify_registration` 后，`RegisteredDevelopment::swaps()` 返回只读视图；`entries()` 的 `case_id()` 和 `audio_case_id()` 指向同一注册对象的开发案例，视图的 `protocol_sha256()` 是绑定该映射的协议哈希。后续真实评估必须消费此冻结映射，不能重新挑选交换音频，并应在执行前后重验注册。该视图不提供保留集许可，也不证明评估已执行。
+成功 `preregister` 或 `verify_registration` 后，`RegisteredDevelopment::swaps()` 返回只读视图；`entries()` 的 `case_id()` 和 `audio_case_id()` 指向同一注册对象的开发案例，视图的 `protocol_sha256()` 是绑定该映射的协议哈希。真实评估必须消费此冻结映射，不能重新挑选交换音频，并应在执行前后重验注册。该视图不提供保留集许可，也不证明评估已执行。开发比较及未完成的证据要求见 [开发证据文档](number-development-evidence.md)。
 
 每条输入及可选目标分别记录 `source_provenance` / `target_provenance`：`created_at`、`teacher_sha256` 和 `verifier_sha256` 缺失或格式无效时为 `null`，并在 `missing` 中列出，状态为 `incomplete`。时间要求带 `T` 和时区的时间戳，教师及验证器身份要求小写 SHA-256；三项齐全时状态仅为 `declared_unverified`，不表示来源、时间或工具已核实。可选工具未提供时对应的冻结身份仍为 `null`，不得用占位值伪造完整性或许可。
 

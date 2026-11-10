@@ -13,6 +13,7 @@ pub mod number_blind_holdout;
 pub mod number_development;
 pub mod number_gate;
 pub mod number_holdout_ledger;
+pub mod number_v3_evaluation;
 pub mod platform;
 pub mod reader;
 pub mod speech_asr;
