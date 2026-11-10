@@ -68,7 +68,7 @@ where
             .all(|frame| !frame.is_empty() && frame.iter().all(|code| *code < eos))
         && !samples.is_empty()
         && samples.iter().all(|sample| sample.is_finite())
-        && samples.iter().any(|sample| sample.abs() >= 0.001);
+        && samples.iter().any(|sample| *sample != 0.0);
     let (transcript, language) = if valid {
         transcribe(samples)?
     } else {
@@ -606,11 +606,7 @@ pub fn summarize_speech(
                 .get(source)
                 .ok_or("unknown output speech source")?
                 .answer();
-            let text = if output.valid && output.normal_end {
-                &output.transcript
-            } else {
-                ""
-            };
+            let text = if output.valid { &output.transcript } else { "" };
             let (errors, length) = character_errors(answer, text)?;
             totals[arm][0] += errors;
             totals[arm][1] += length;
