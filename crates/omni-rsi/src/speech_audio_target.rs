@@ -4,7 +4,8 @@
 //! module does not infer a transcript, meaning, or training eligibility.
 
 use crate::fingerprint::{
-    CodecSnapshot, codec_fingerprint, read_regular_bounded, target_codec_hash,
+    CodecSnapshot, codec_fingerprint_for_encoding, read_regular_bounded,
+    target_codec_hash_for_encoding,
 };
 use burn::tensor::backend::Backend;
 use omni_lfm3::{
@@ -215,7 +216,7 @@ fn encode_target_impl(
     let model_hash = sha256(&model_bytes);
     let model_format: ModelCodeFormat =
         serde_json::from_slice(&model_bytes).map_err(|error| error.to_string())?;
-    let codec_hash = codec_fingerprint(&codec, stop)?;
+    let codec_hash = codec_fingerprint_for_encoding(&codec, stop)?;
     let codec_bytes = bounded_read(&codec.join("config.json"), MAX_CONFIG_BYTES, stop)?;
     let codec_format: CodecCodeFormat =
         serde_json::from_slice(&codec_bytes).map_err(|error| error.to_string())?;
@@ -235,7 +236,7 @@ fn encode_target_impl(
     {
         return Err("model and codec codebook formats do not match".into());
     }
-    let target_codec_sha256 = target_codec_hash(&codec, stop)?;
+    let target_codec_sha256 = target_codec_hash_for_encoding(&codec, stop)?;
     interrupted(stop)?;
     let mut frames = encode(
         &codec,
@@ -276,7 +277,7 @@ fn encode_target_impl(
     ]);
     if sha256(&bounded_read(wav, MAX_WAV_BYTES, stop)?) != wav_before
         || sha256(&bounded_read(&model_config, MAX_CONFIG_BYTES, stop)?) != model_hash
-        || codec_fingerprint(&codec, stop)? != codec_hash
+        || codec_fingerprint_for_encoding(&codec, stop)? != codec_hash
     {
         return Err("target WAV or codec changed during encoding".into());
     }

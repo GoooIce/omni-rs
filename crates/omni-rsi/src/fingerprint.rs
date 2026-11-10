@@ -130,7 +130,23 @@ fn codec_hash_header(hash: &mut Sha256, name: &str, size: u64) {
 /// Hash the config, index (if present), and shards selected by Codec's index
 /// precedence. A path-based observation alone does not prove later execution.
 pub fn codec_fingerprint(directory: &Path, stop: &AtomicBool) -> Result<String, String> {
-    let files = codec_files(directory, u64::MAX, stop)?;
+    codec_fingerprint_with_index_limit(directory, u64::MAX, stop)
+}
+
+/// Target encoding applies the snapshot's index limit at every fingerprint read.
+pub(crate) fn codec_fingerprint_for_encoding(
+    directory: &Path,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    codec_fingerprint_with_index_limit(directory, MAX_CODEC_INDEX_BYTES, stop)
+}
+
+fn codec_fingerprint_with_index_limit(
+    directory: &Path,
+    index_limit: u64,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    let files = codec_files(directory, index_limit, stop)?;
     let mut hash = Sha256::new();
     hash.update(b"omni-rsi-liquidcodec-fingerprint-v1\0");
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -249,11 +265,26 @@ impl CodecSnapshot {
 /// Preserve the legacy single-file target identity, and bind indexed shards
 /// to the same composite identity used for their configuration and weights.
 pub(crate) fn target_codec_hash(directory: &Path, stop: &AtomicBool) -> Result<String, String> {
+    target_codec_hash_with_index_limit(directory, u64::MAX, stop)
+}
+
+pub(crate) fn target_codec_hash_for_encoding(
+    directory: &Path,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    target_codec_hash_with_index_limit(directory, MAX_CODEC_INDEX_BYTES, stop)
+}
+
+fn target_codec_hash_with_index_limit(
+    directory: &Path,
+    index_limit: u64,
+    stop: &AtomicBool,
+) -> Result<String, String> {
     if stop.load(Ordering::Acquire) {
         return Err("interrupted".into());
     }
     if directory.join("model.safetensors.index.json").is_file() {
-        return codec_fingerprint(directory, stop);
+        return codec_fingerprint_with_index_limit(directory, index_limit, stop);
     }
     let mut file = open_regular(&directory.join("model.safetensors"))?;
     let size = file.metadata().map_err(|error| error.to_string())?.len();

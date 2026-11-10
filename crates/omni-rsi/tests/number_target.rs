@@ -256,6 +256,85 @@ fn changing_a_codec_shard_during_encoding_is_rejected() {
     assert!(error.contains("changed"), "{error}");
 }
 
+fn padded_index(shard: &str, size: usize) -> Vec<u8> {
+    let mut bytes = format!(r#"{{"weight_map":{{"encoder.weight":"{shard}"}}}}"#).into_bytes();
+    assert!(bytes.len() <= size);
+    bytes.resize(size, b' ');
+    bytes
+}
+
+#[test]
+fn target_encoder_enforces_codec_index_limit_at_the_public_boundary() {
+    let (_root, model, wav) = fixture();
+    let codec = model.join("audio_tokenizer");
+    let index = codec.join("model.safetensors.index.json");
+    fs::write(codec.join("part.safetensors"), b"fixture shard").unwrap();
+    let stop = AtomicBool::new(false);
+    let limit = 8 * 1024 * 1024;
+    fs::write(&index, padded_index("part.safetensors", limit)).unwrap();
+    let target = encode_target_with(&model, &wav, &stop, |_, _| Ok(vec![vec![1; 12]; 4])).unwrap();
+    let legacy = omni_rsi::fingerprint::codec_fingerprint(&codec, &stop).unwrap();
+    // Independent SHA-256 of the v1 domain and the three ordered fixture files.
+    assert_eq!(
+        legacy,
+        "c9241fa45e776158bb9d62177a0e99fe7a0bcdf80a424edb3abb30de1a3e4f7a"
+    );
+    assert_eq!(target.codec_fingerprint_sha256(), legacy);
+    assert_eq!(target.target_codec_sha256(), legacy);
+
+    let bytes = padded_index("part.safetensors", limit + 1);
+    assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+    fs::write(&index, bytes).unwrap();
+    let error = encode_target_with(&model, &wav, &stop, |_, _| {
+        panic!("oversized codec index reached the encoder")
+    })
+    .unwrap_err();
+    assert!(error.contains("oversized"), "{error}");
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn native_target_rejects_oversized_index_before_reading_shards() {
+    use burn::backend::NdArray;
+    use omni_rsi::speech_audio_target::encode_target;
+
+    let (_root, model, wav) = fixture();
+    let index = model.join("audio_tokenizer/model.safetensors.index.json");
+    fs::write(
+        &index,
+        padded_index("missing.safetensors", 8 * 1024 * 1024 + 1),
+    )
+    .unwrap();
+    let error =
+        encode_target::<NdArray<f32>>(&model, &wav, &Default::default(), &AtomicBool::new(false))
+            .unwrap_err();
+    assert!(error.contains("oversized"), "{error}");
+}
+
+#[test]
+fn target_encoder_applies_index_limit_to_the_final_recheck() {
+    let (_root, model, wav) = fixture();
+    let codec = model.join("audio_tokenizer");
+    let index = codec.join("model.safetensors.index.json");
+    fs::write(codec.join("part.safetensors"), b"fixture shard").unwrap();
+    fs::write(&index, padded_index("part.safetensors", 128)).unwrap();
+    let mut calls = 0;
+    let error = encode_target_with(&model, &wav, &AtomicBool::new(false), |_, _| {
+        calls += 1;
+        if calls == 2 {
+            fs::write(
+                &index,
+                padded_index("part.safetensors", 8 * 1024 * 1024 + 1),
+            )
+            .unwrap();
+        }
+        Ok(vec![vec![1; 12]; 4])
+    })
+    .unwrap_err();
+    assert_eq!(calls, 2);
+    assert!(error.contains("oversized"), "{error}");
+}
+
 #[test]
 fn malformed_codec_frames_or_embedded_end_markers_are_rejected() {
     let (_root, model, wav) = fixture();
