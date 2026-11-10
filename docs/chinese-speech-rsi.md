@@ -14,11 +14,43 @@
 
 2026-11-10 的隔离 Rust／Burn 实验以本机 6 条种子完成一轮 Metal 训练，并用固定 10 题与 R2T2 比较：底座 CER 为 60.3%，候选为 87.2%，正常结束分别为 10/10 和 8/10。候选未通过门槛，没有发布；该开发集结果不能代表最终保留集表现。闲时调度的 mock 验证独立进行。
 
-音频条件听答路线已开始实现：训练前向通过推理所用的媒体绑定路径接收 16 kHz 输入音频，以答案文字、语音码和结束帧共同更新独立 LoRA；答案文字不放进输入提示。[训练步骤](../crates/omni-rsi/src/speech_audio.rs)和[独立检查点](../crates/omni-rsi/src/speech_audio_checkpoint.rs)已实现，检查点校验模型、codec、数据、后端、源码与进度，并保存在 `audio-conditioned-v1` 子目录。该路线**尚未接入闲时调度**：规则真值数据的生成与准入、训练入口及独立生成验收仍待完成（见 [#81](https://github.com/GoooIce/omni-rs/issues/81)、[#82](https://github.com/GoooIce/omni-rs/issues/82)）。现有 `speech-watch` 仍执行自朗读路线；音频条件前向的数值对照和参数更新不代表听答能力已提高。
+音频条件听答有独立的 Rust／Burn 前台训练入口：真实输入音频经推理使用的 WAV 解码、降混、重采样及媒体绑定进入上下文；答案文字必需，语音码和结束帧可选，答案不放进输入提示。[训练步骤](../crates/omni-rsi/src/speech_audio.rs)和[独立检查点](../crates/omni-rsi/src/speech_audio_checkpoint.rs)分别处理更新和恢复，检查点保存在 `audio-conditioned-v1` 子目录。该路线尚未接入闲时调度、生成验收或候选发布；规则真值数据与独立评估仍由 [#82](https://github.com/GoooIce/omni-rs/issues/82) 处理。现有 `speech-watch` 仍执行自朗读路线；数值对照和参数更新不代表听答能力已提高。
 
 [语气数据与反事实评估合同](speech-tone-contract.md)是独立的 Rust 准入与已有预测汇总基础设施，保留多人分歧、弃判及逐题来源；它尚未接入训练或模型推理，也不证明真实语气识别能力。
 
 检查点绑定训练源码。更新相关实现后，旧源码生成的检查点会拒绝续训；历史状态不被删除或自动迁移。开发用官方模型对照脚本只生成测试参考，实际训练和优化仍使用 Rust／Burn。
+
+## 音频条件前台训练
+
+训练数据目录须含 `manifest.json`，引用目录内的 WAV。每条记录显式声明 `split: "train"`；开发集、测试集、缺少分集或其他分集会被拒绝。一个最小文本目标清单如下（哈希为示意，需替换成实际文件的 SHA-256）：
+
+```json
+{
+  "version": 1,
+  "records": [{
+    "id": "example-1", "split": "train",
+    "input_audio": "example.wav", "input_sha256": "<WAV 的 SHA-256>",
+    "authorization": {"kind": "licensed-synthetic", "source": "合成来源", "license": "许可标识"},
+    "instruction": "把听到的数字加一，用中文回答。", "answer": "十三"
+  }]
+}
+```
+
+主动提供的录音可声明 `kind: "user-provided"`、`source` 和 `consent`。这些字段是调用方的来源和授权声明，加载器无法独立证实授权或答案真值；使用前须由数据提供者确认。语音监督记录还须提供 `frames`（含最后一帧所有码本的 EOS）及 `target_codec_sha256`（生成码的 `audio_tokenizer/model.safetensors` SHA-256）。省略两者即只训练文本。清单原文和每个实际 WAV 字节共同构成数据指纹；数据、媒体、目标、模型、codec、后端或训练实现变化时拒绝恢复。WAV 解码后每条最多 20 秒，整个快照最多 600 秒。
+
+每个记录代表**完整输入已经结束之后**的一个回答目标，全部 WAV 位于答案之前。它不表达输入进行中不同时间的目标；要训练某个前缀，只能提供该时刻已可用的音频，不能把后续录音放入 WAV。实时分段和带时间戳的因果训练不在此入口内。
+
+显式使用本地已授权数据运行，首次运行要求 `audio-conditioned-v1` 不存在；恢复必须带 `--resume`。`--epochs` 是希望达到的总 epoch，`--max-updates` 是本次调用最多更新数，可在恢复时调整；固定学习率、损失权重、掩码规则和初始化由实现指纹绑定。每次完整更新后保存参数、AdamW 状态和下一条记录的位置；中断时保留最后一个完整检查点。损坏、旧版或不匹配的音频检查点会报错，必须另选状态目录，不自动迁移或覆盖；原有自朗读检查点保持隔离。
+
+```sh
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
+  --bin omni-rsi-audio -- --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
+  --data /path/to/authorized-training-data --state /path/to/rsi-state \
+  --epochs 2 --max-updates 1
+# 继续：使用相同参数，末尾加 --resume
+```
+
+该命令不启动麦克风、下载数据、发布候选或更改已运行的会话。它持有同一 `--state` 下的 `foreground.lock` 和 `device.lock`，也遵守现有 ddust 全局锁：优先使用 `DDUST_RUN_REGISTRY` 所在目录的 `mps.lock`，否则使用已有的 `~/code/ddust/.ddust/mps.lock`。不同 state 目录的 RSI 设备锁彼此独立；未接入这些协作锁的其他应用也不受协调。直接调用 Rust 训练接口的程序须自行持有设备租约。
 
 ## 流程与边界
 

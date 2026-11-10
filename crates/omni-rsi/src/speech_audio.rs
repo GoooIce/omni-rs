@@ -12,7 +12,7 @@ pub struct AudioAnswer<'a> {
     samples: &'a [f32],
     instruction: &'a str,
     answer: &'a str,
-    frames: &'a [Vec<u32>],
+    frames: Option<&'a [Vec<u32>]>,
 }
 
 impl<'a> AudioAnswer<'a> {
@@ -22,6 +22,26 @@ impl<'a> AudioAnswer<'a> {
         instruction: &'a str,
         answer: &'a str,
         frames: &'a [Vec<u32>],
+    ) -> Result<Self, String> {
+        Self::with_frames(samples, sample_rate, instruction, answer, Some(frames))
+    }
+
+    /// Train the answer text without requiring a synthesized speech target.
+    pub fn new_text_only(
+        samples: &'a [f32],
+        sample_rate: u32,
+        instruction: &'a str,
+        answer: &'a str,
+    ) -> Result<Self, String> {
+        Self::with_frames(samples, sample_rate, instruction, answer, None)
+    }
+
+    fn with_frames(
+        samples: &'a [f32],
+        sample_rate: u32,
+        instruction: &'a str,
+        answer: &'a str,
+        frames: Option<&'a [Vec<u32>]>,
     ) -> Result<Self, String> {
         if sample_rate != 16_000
             || samples.is_empty()
@@ -56,8 +76,10 @@ impl<'a> AudioAnswer<'a> {
 #[derive(Debug, Serialize)]
 pub struct AudioTrainingStep {
     pub text_loss: f64,
+    /// Zero when `speech_supervised` is false.
     pub speech_loss: f64,
     pub speech_end_loss: f64,
+    pub speech_supervised: bool,
     pub gradient_norm: f64,
 }
 
@@ -87,7 +109,9 @@ pub fn train_step<B: AutodiffBackend>(
     if stop.load(Ordering::Acquire) {
         return Err("interrupted".into());
     }
-    validate_speech_frames(model, example.frames)?;
+    if let Some(frames) = example.frames {
+        validate_speech_frames(model, frames)?;
+    }
     let mut targets = model
         .tokenizer
         .encode(example.answer)
@@ -106,18 +130,28 @@ pub fn train_step<B: AutodiffBackend>(
         .map_err(|error| error.to_string())?];
     optimizer.adapter().install(&mut model.text, 23)?;
     let text = text_loss_with_media(model, &messages, &media, &targets)?;
-    let speech = speech_loss_with_media(model, &messages, &media, example.frames, seed)?;
     let text_loss = scalar(text.clone())?;
-    let speech_loss = scalar(speech.content.clone())?;
-    let speech_end_loss = scalar(speech.end.clone())?;
+    let (loss, speech_loss, speech_end_loss) = if let Some(frames) = example.frames {
+        let speech = speech_loss_with_media(model, &messages, &media, frames, seed)?;
+        let speech_loss = scalar(speech.content.clone())?;
+        let speech_end_loss = scalar(speech.end.clone())?;
+        (
+            text + speech.content + speech.end * 0.01,
+            speech_loss,
+            speech_end_loss,
+        )
+    } else {
+        (text, 0.0, 0.0)
+    };
     if stop.load(Ordering::Acquire) {
         return Err("interrupted".into());
     }
-    let gradient_norm = optimizer.update(text + speech.content + speech.end * 0.01, 0.0001)?;
+    let gradient_norm = optimizer.update(loss, 0.0001)?;
     Ok(AudioTrainingStep {
         text_loss,
         speech_loss,
         speech_end_loss,
+        speech_supervised: example.frames.is_some(),
         gradient_norm,
     })
 }

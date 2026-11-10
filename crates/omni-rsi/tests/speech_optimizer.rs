@@ -133,6 +133,40 @@ fn burn_adamw_updates_the_production_lfm_backbone_adapter() {
 }
 
 #[test]
+fn independent_backward_passes_keep_lora_gradients_available() {
+    let (_temporary, mut model, reference) = fixture();
+    let optimizer = SpeechOptimizer::<CpuTraining>::from_values(
+        model.hidden_size(),
+        reference.rank,
+        reference.a.clone(),
+        reference.b.clone(),
+        &Default::default(),
+    )
+    .unwrap();
+    let first = objective(&mut model, &optimizer, &reference).backward();
+    let (_, b) = optimizer.adapter().weights();
+    let first_gradient = b.grad(&first).unwrap().into_data().to_vec::<f32>().unwrap();
+    let independent = SpeechOptimizer::<CpuTraining>::from_values(
+        model.hidden_size(),
+        reference.rank,
+        reference.a.clone(),
+        reference.b.clone(),
+        &Default::default(),
+    )
+    .unwrap();
+    let second = objective(&mut model, &independent, &reference).backward();
+    let (_, b) = independent.adapter().weights();
+    let second_gradient = b
+        .grad(&second)
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    assert!(first_gradient.iter().any(|value| value.abs() > 1e-10));
+    assert_eq!(first_gradient, second_gradient);
+}
+
+#[test]
 fn invalid_loss_or_zero_gradient_does_not_change_adapter() {
     let (_temporary, mut model, reference) = fixture();
     let mut optimizer = SpeechOptimizer::<CpuTraining>::from_values(

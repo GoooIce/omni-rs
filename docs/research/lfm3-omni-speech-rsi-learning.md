@@ -58,6 +58,8 @@
 
 ### P3：跟音乐哼唱
 
+独立的音符、采样时钟和客观指标接口及其合成测试边界见 [哼唱评估](../humming-evaluation.md)；它不提供声学音高检测或真实哼唱证据。
+
 - **样本/目标：** 先限定有明确主旋律的单声部任务：伴奏、主旋律音符或干净哼唱、节拍与起止时间同轴配对；许可允许时使用真实人声与乐谱，记录演唱者和曲目。多声部伴奏本身不能唯一确定应唱旋律；纯正弦信号只验证管线，不证明会哼唱。[M4Singer](https://m4singer.github.io/)、[OpenCPOP](https://github.com/wenet-e2e/opencpop)
 - **教师：** 已授权的人类哼唱及其音符标注优先；经许可的合成教师可用于启动，但要记录合成器和来源。先测试 LFM3 codec 重建哼唱时的音高与清晰度上限，再尝试以已观察到的伴奏前缀预测后续声码；不能假定现有 YuE 接受 MERT 表征或直接提供同步人声。[音乐模块](../../crates/omni-music/README.md)、[codec](../../crates/lfm3-omni/src/codec.rs)
 - **评估：** 曲目、演唱者和伴奏版本隔离；在独立人声音轨上报告有声召回/误报、音高准确率、八度无关的 chroma 指标、音符起始误差和实际播放相对拍点的偏差；同时报告静音、漏唱和人工听感，不能靠时间扭曲掩盖延迟。[mir_eval 旋律指标](https://github.com/mir-evaluation/mir_eval/blob/main/mir_eval/melody.py)
