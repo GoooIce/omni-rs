@@ -37,7 +37,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
-burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
 
 [[bin]]
 name = "lfm3-omni"

@@ -8,7 +8,60 @@ fn speech_watch_exposes_explicit_online_opt_in() {
         .output()
         .unwrap();
     assert!(result.status.success());
-    assert!(String::from_utf8_lossy(&result.stdout).contains("--online"));
+    let help = String::from_utf8_lossy(&result.stdout);
+    assert!(help.contains("--online"));
+    assert!(!help.contains("--python"));
+}
+
+#[test]
+fn heldout_speech_evaluation_is_a_native_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi"))
+        .args(["speech-evaluate", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--candidate") && help.contains("--output"));
+    assert!(!help.contains("--python"));
+}
+
+#[test]
+fn speech_seed_uses_native_model_arguments() {
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi"))
+        .args(["speech-seed", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("--data") && help.contains("--tts-model") && help.contains("--asr-binary")
+    );
+    assert!(!help.contains("--python"));
+}
+
+#[test]
+fn empty_native_worker_waits_without_python_on_path() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omni-rsi"))
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--model",
+            root.path().to_str().unwrap(),
+            "--state",
+            root.path().to_str().unwrap(),
+            "speech-work",
+            "--online",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["pending"], true);
+    assert_eq!(result["online"]["state"], "empty");
 }
 
 #[test]

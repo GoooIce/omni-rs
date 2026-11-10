@@ -678,6 +678,48 @@ impl<B: Backend> OmniModel<B> {
             on_token,
         )
     }
+    /// Teacher-force speech frames and return the preceding hidden state for
+    /// each frame, ready for the speech depth decoder's training loss.
+    pub fn teacher_forced_speech_states(
+        &self,
+        messages: &[serde_json::Value],
+        frames: &[Vec<u32>],
+    ) -> Result<Tensor<B, 3>> {
+        if frames.is_empty() {
+            return Err(Error::Audio(
+                "speech training needs at least one frame".into(),
+            ));
+        }
+        let prompt = self.prepare_prompt(messages, None, &[])?;
+        if prompt.ids.is_empty() {
+            return Err(Error::Inference("speech training prompt is empty".into()));
+        }
+        let first = prompt.ids.len();
+        let mut embeddings = Vec::with_capacity(frames.len() + 2);
+        embeddings.push(prompt.embeddings);
+        embeddings.push(
+            self.text
+                .embed_tokens(&[self.settings.audio_start_token_id])?,
+        );
+        for frame in frames {
+            embeddings.push(self.speech_frame_embedding(frame)?);
+        }
+        let hidden = self
+            .text
+            .forward_embeddings(Tensor::cat(embeddings, 1), &mut self.new_text_cache())?;
+        let width = hidden.dims()[2];
+        Ok(hidden.slice([0..1, first..first + frames.len(), 0..width]))
+    }
+
+    /// Number of codebooks, vocabulary size, and all-codebook end marker.
+    pub fn speech_code_format(&self) -> (usize, usize, u32) {
+        (
+            self.settings.num_codebooks,
+            self.settings.codebook_size,
+            self.settings.audio_eos_code,
+        )
+    }
+
     pub fn speech_frame_embedding(&self, codes: &[u32]) -> Result<Tensor<B, 3>> {
         if codes.len() != self.settings.num_codebooks
             || codes

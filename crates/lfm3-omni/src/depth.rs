@@ -4,7 +4,7 @@ use crate::{
     sampling::AudioSampling,
     text::{Layer, norm},
 };
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{Int, Tensor, TensorData, activation::log_softmax, backend::Backend};
 use omni_r2t2::{
     Error, Precision, Result,
     tensor::{self, Embedding, Linear, Norm},
@@ -173,6 +173,43 @@ impl<B: Backend> DepthDecoder<B> {
             logits.push(book.embedding.logits(book.norm.forward(value, dtype)));
         }
         Ok(Tensor::cat(logits, 0))
+    }
+
+    /// Sum masked codebook cross-entropies for one teacher-forced frame.
+    ///
+    /// The returned count lets callers combine multiple frames before dividing,
+    /// matching the official loss when frames mask different numbers of books.
+    pub fn masked_loss(
+        &self,
+        hidden: Tensor<B, 2>,
+        codes: &[u32],
+        masked: &[bool],
+    ) -> Result<(Tensor<B, 1>, usize)> {
+        let count = masked.iter().filter(|value| **value).count();
+        if count == 0 {
+            return Err(Error::Inference(
+                "speech loss has no masked codebooks".into(),
+            ));
+        }
+        let logits = self.logits(hidden, codes, masked)?;
+        let device = logits.device();
+        let n = codes.len();
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(codes.iter().map(|code| i64::from(*code)).collect(), [n, 1]),
+            &device,
+        );
+        let mask = Tensor::<B, 1>::from_data(
+            TensorData::new(
+                masked
+                    .iter()
+                    .map(|value| if *value { 1.0_f32 } else { 0.0 })
+                    .collect(),
+                [n],
+            ),
+            &device,
+        );
+        let selected = log_softmax(logits, 1).gather(1, targets).reshape([n]);
+        Ok((-(selected * mask).sum(), count))
     }
 
     /// Reveal codebooks in the supplied order, using greedy selection on each pass.

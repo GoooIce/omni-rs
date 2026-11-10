@@ -2117,3 +2117,13 @@ WebGPU 提供原生 WGSL 后端和浏览器 Wasm/module worker。权重分成最
 默认 M5 路径使用 Metal GPU；通用 ANE 实验路径的范围与限制见上文。Windows/Linux 显卡未实测。
 麦克风路径已编译，没有录制用户麦克风；设备权限和实际采集链路仍需在目标环境确认。
 没有测量完整语料集 WER/CER、峰值 GPU 内存、麦克风到首字的端到端延迟或多路并发容量。
+
+## Rust／Burn 中文语音训练迁移（2026-11-10）
+
+`speech-watch` 的在线录音处理和训练已改为 Rust／Burn：原生 LiquidCodec 编解码、R2T2 核验、自动求导、AdamW、检查点及开发集生成门槛不调用 Python。`speech-seed` 使用项目的 Rust Breeze-TTS 和 R2T2 准备新数据；独立的 `speech-evaluate` 生成保留集报告，不参与晋级。历史数据准备及官方对照脚本仍保留为开发工具。
+
+- 本机官方 LFM3 检查点的教师强制语音损失及 LoRA 梯度与官方参考相符；真实 LiquidCodec 对 7200 个 PCM 采样点的编码逐码本一致且可重复。日志在 `artifacts/rust-burn-speech/speech-full-test.log` 和 `codec-real-test.log`。
+- 屏蔽 `uv`、`python` 和 `python3` 命令后，真实 LFM3 权重在 CPU 上完成两次 Burn 更新，中间从完整检查点恢复；这是隔离状态下的功能测试，不是语音质量结论。见 `artifacts/rust-burn-speech/real-cpu-round.log`。
+- 真实 LiquidCodec 配合确定性 R2T2 测试替身完成了录音认领、编码、核验和原子发布；原生队列、历史和新 R2T2 指纹、数据隔离、优化器恢复及候选加载器均有独立回归。15 条保留真人录音的源文件与采集指纹也已核对。
+- 新种子入口使用已有 Breeze 浮点波形和真实 LiquidCodec，在确定性 Breeze／R2T2 测试替身下完成转码、核验、原子发布和续跑；篡改语音码后拒绝复用。见 `artifacts/rust-burn-speech/seed-real-codec-test.log`。这不等于实际运行 Breeze 或 R2T2 的 GPU 质量验证。
+- 真实 R2T2／Metal 录音入训测试在检测到前台操作时主动让出；最终 Metal 训练和真实 R2T2 入训验证尚待空闲时完成。无合格候选，未建立中文语音质量改善；旧 PyTorch 检查点不会自动迁移。

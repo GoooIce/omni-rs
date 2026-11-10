@@ -3839,14 +3839,17 @@ dependencies = [
  "burn",
  "clap",
  "ctrlc",
+ "hound",
  "image",
  "libc",
  "omni-lfm3",
+ "omni-r2t2",
  "rand 0.9.5",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "unicode-normalization",
 ]
 
 [[package]]

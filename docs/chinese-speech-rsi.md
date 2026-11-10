@@ -10,12 +10,14 @@
 
 同日又使用一段不在保留集中的 AISHELL 真人录音及 6 条 Breeze 回放，完成 7 次影子更新。10 条开发题的底座 CER 为 33.3%，候选为 43.6%，正常结束分别为 8 / 10 和 9 / 10；候选同样未通过。R2T2 对这段真人原声的伪标签与参考文字一致，但一条录音不足以代表不同说话人。
 
+上述结果来自历史 PyTorch 实验。现在种子数据准备、`speech-watch` 的录音入队、LiquidCodec 编解码、语音损失、LoRA 更新、开发集生成验收与候选发布均走 Rust／Burn；Breeze-TTS 和 R2T2 使用本仓库的 Rust 可执行文件。模型对照脚本保留为开发测试工具。新的 Burn 检查点与历史 PyTorch 检查点分开保存，不自动互相续训。
+
 ## 流程与边界
 
-1. `training/prepare_chinese_speech.py` 按训练、开发、测试预先分组的问题生成简短中文回答，再使用本仓库 Breeze-TTS-2 合成普通话。24 kHz 源波形经 LFM3 的 LiquidCodec 编码，再重解码为训练目标；保留源音频、目标音频、语音码、种子和模型／可执行文件指纹。也可以通过 `--answers-from` 复用同一 LFM3 检查点先前生成的文字回答。
-2. `training/verify_chinese_speech.py` 再次编码 Breeze 源音频并逐帧对照语音码，重解码后逐样本核对目标波形，再用本仓库 R2T2 在自动语言模式下转写。要求完整终止、至少两个汉字、汉字占转写字母数字的比例至少 0.8，且与回答的汉字相似度至少 0.75。R2T2 不提供这里可用的语言置信度；语言标签可能有误，所以不虚构或依赖该概率。转写仍可能误判，不能等同人工真值。
+1. 已有种子集按训练、开发、测试预先分组，由冻结的 LFM3 和本仓库 Breeze-TTS-2 生成中文文字与语音。24 kHz 源波形经 LFM3 的 LiquidCodec 编码，再重解码为训练目标；记录源音频、目标音频、语音码及模型／可执行文件指纹。
+2. 种子集保留此前的核验证据。新的用户录音由 Rust 处理器编码和重解码，再用本仓库 R2T2 自动语言模式转写。要求完整终止、至少两个汉字、汉字占转写字母数字的比例至少 0.8，且与参考的汉字相似度至少 0.75。R2T2 的语言标签可能有误，不把它当作置信度；转写也不能等同人工真值。
 3. 用户语音只在 `lfm3-omni --live-pcm --learn-state ...` 显式开启时采集。完整输入必须是 16 kHz 单声道、0.4–15 秒；取消、过长、损坏和重复输入不会成为新样本。样本及来源指纹保存在本地状态目录。处理器先对原声做 R2T2 转写，再对 LiquidCodec 重解码音频做第二次转写并检查一致性。这两个结果来自同一识别器，标签只是伪标签，不是独立真值；样本只能学习朗读自身转写，不会把用户问题当作助手回答。
-4. 闲时训练使用官方 PyTorch 模型的语音码损失，冻结底座并训练最后一层的秩 4 LoRA；结束帧以 0.01 的权重参与损失，这是待生成验收验证的实验设置。每次更新后保存 LoRA、优化器和数据游标。一个 epoch 的样本清单固定，新录音只能在下一 epoch 加入；已使用样本丢失或改变、模型／codec／R2T2／代码协议变化时拒绝续训。旧检查点不会被覆盖或自动迁移。
+4. 闲时训练使用 Burn 自动求导和 AdamW 实现语音码损失，冻结底座并训练最后一层的秩 4 LoRA；结束帧以 0.01 的权重参与损失，这是待生成验收验证的实验设置。每次更新后保存 LoRA、优化器和数据游标。一个 epoch 的样本清单固定，新录音只能在下一 epoch 加入；已使用样本丢失或改变、模型／codec／R2T2／代码协议变化时拒绝续训。新旧检查点不会互相覆盖或自动迁移。
 5. 每个完整 epoch 用相同生成参数分别评估原模型与候选。固定开发集至少各有 5 条朗读和对话题，候选全部正常结束且有声音，整体字符错误率须相对降低至少 10%，两个分组都不得退步，基线错误率为零时不能声称相对改善。参考文本及独立保留的 45 条最终测试题见 [chinese-speech-generation-v1.json](eval/chinese-speech-generation-v1.json)，其中 15 条绑定现有 AISHELL 真人录音清单；最终测试不参与候选选择。通过后会生成带模型、权重及开发证据的候选包，原生加载器重新计算门槛并校验指纹。
 
 种子数据合同仍要求至少 3 条训练、2 条损失监测及 1 条保留样本；另有上述固定生成验收题。当前尚无真实候选通过完整开发门槛，最终测试、英语及其他 Omni 回归尚未形成候选报告，因此不能声称效果改善。小规模伪标签和同一 ASR 的复核也不能保证真人语音标签正确。Breeze 权重及其输出遵循其[研究／非商业许可](breeze-tts.md)。
@@ -45,20 +47,19 @@ target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" stop
 
 候选经过开发门槛后，可在启动新的 CLI 会话时追加 `--speech-adapter 路径`。加载器核对冻结底座指纹、权重哈希、目标层和固定开发题的逐条结果；不匹配时明确报告并继续使用底座。去掉该参数即在新会话回退。Rust API 的缓存会在适配器切换时失效，不能把旧缓存用于新权重。`omni-rsi rollback` 管理的是图表阅读实验，不会切换语音 LoRA。
 
-开发集合格的候选可以另行运行一次保留集报告；命令会再次验证候选、R2T2、底座、数据划分及 AISHELL 源音频哈希，只把结果写入新目录，不改变候选或训练状态。报告不会自动运行英语及其他 Omni 回归，也不能用于反复调参。
+开发集合格的候选可以另行运行一次 Rust 保留集报告；命令会再次验证候选、R2T2、底座、数据划分及 AISHELL 源音频哈希，只把结果写入新目录，不改变候选或训练状态。报告不会自动运行英语及其他 Omni 回归，也不能用于反复调参。
 
 ```sh
-uv run --offline --no-project --python "$HOME/code/ddust/.venv/bin/python" \
-  --with opencc-python-reimplemented python crates/omni-rsi/training/evaluate_speech_candidate.py \
-  --model "$SPEECH_MODEL" --data artifacts/chinese-speech/synthetic-breeze-r2t2-v1 \
-  --online "$SPEECH_STATE/online-data" --candidate "$SPEECH_STATE/speech/candidates/候选ID" \
+target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STATE" \
+  speech-evaluate --data artifacts/chinese-speech/synthetic-breeze-r2t2-v1 \
+  --online "$SPEECH_STATE/online-data" --candidate "$SPEECH_STATE/speech-native/candidates/候选ID" \
   --asr models/Confucius4-R2T2 --asr-binary target/release/r2t2 \
   --output "$SPEECH_STATE/held-out/候选ID"
 ```
 
 ## 本机启动
 
-命令从项目根目录运行，使用已有的 `models/Confucius4-R2T2`、`models/Breeze-TTS-2` 和 LFM3 官方检查点。默认语音数据目录为 `artifacts/chinese-speech/synthetic-breeze-r2t2-v1/`；训练使用 Python／PyTorch，R2T2 和 Breeze 的推理使用本项目 Rust 可执行文件，产品推理仍用 Rust／Burn。需要时可用 `--model`、`--python`、`--data`、`--asr` 和 `--asr-binary` 覆盖路径。
+命令从项目根目录运行，使用已有的 `models/Confucius4-R2T2` 和 LFM3 官方检查点。默认语音数据目录为 `artifacts/chinese-speech/synthetic-breeze-r2t2-v1/`；训练与在线核验使用 Rust／Burn，本项目 R2T2 可执行文件负责识别。需要时可用 `--model`、`--data`、`--asr` 和 `--asr-binary` 覆盖路径。
 
 ```sh
 CARGO_TARGET_DIR=target cargo build --release --bin r2t2
@@ -73,26 +74,25 @@ target/minicpm-v-cpu/debug/omni-rsi \
 
 R2T2 子进程设置 `CUBECL_AUTOTUNE_LEVEL=full`，以精确形状调优键避免已知的注意力缓存分桶冲突；首次遇到形状可能较慢。进程异常、输出不完整、终止被取消、token 触顶或 GPU 线程 panic 时，验收直接失败，不会将样本或候选判为通过。
 
-启动后默认等待 5 分钟无键鼠输入，且要求交流电、热状态和内存正常、足够磁盘空间以及无已知模型进程；信号不可用时不准入。每轮最多 5 次更新、默认 4 轮；再次运行会从完整检查点续训。Ctrl-C 是显式停止，不自动重启。状态、训练日志、哈希寻址的检查点和评估音频在 `--state` 目录下的 `speech/`。
+启动后默认等待 5 分钟无键鼠输入，且要求交流电、热状态和内存正常、足够磁盘空间以及无已知模型进程；信号不可用时不准入。每轮最多 5 次更新、默认 4 轮；再次运行会从完整检查点续训。Ctrl-C 是显式停止，不自动重启。Rust 状态、训练日志、哈希寻址的检查点和评估音频在 `--state` 目录下的 `speech-native/`；历史 `speech/` 保持独立。
 
 用户返回或同目录的前台任务请求设备时，调度器通知整个训练进程组退出，只恢复上次完整更新。现有 Makepad、API 和所有其他 GPU 应用尚未接入共同设备租约，进程扫描不能覆盖全部程序，因此没有全系统前台延迟保证。模块不会安装登录启动项，也不会自动常驻。
 
-## 准备种子集
+## 原生种子集准备
 
-以下使用本机 ddust Python 环境，只作离线训练与核验。`target/release/breeze-tts` 需是启用 Metal 的本项目构建；其他位置可通过 `--tts-binary` 指定。首次安装 OpenCC 依赖可能联网，已有缓存时可给 `uv run` 加 `--offline`。
+本机已有上述核验后的种子集，可直接供 Rust 训练使用。需要重新准备时，`speech-seed` 使用 LFM3 生成中文回答、Breeze-TTS 合成、LiquidCodec 转码并通过 R2T2 核验；每条样本在独立临时目录完成后原子发布。两个语音可执行文件需是本项目启用 Metal 的构建。
 
 ```sh
-SPEECH_MODEL_DIR="$HOME/models/LiquidAI/LFM3-Omni-2B"
-SPEECH_PYTHON="$HOME/code/ddust/.venv/bin/python"
-SPEECH_DATA_DIR=artifacts/chinese-speech/synthetic-breeze-r2t2-v1
-SPEECH_ASR_DIR=models/Confucius4-R2T2
+SPEECH_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B"
+SPEECH_STATE=artifacts/chinese-speech/native-seed-state
+SPEECH_DATA=artifacts/chinese-speech/native-seeds-v1
 
-uv run --no-project --python "$SPEECH_PYTHON" python \
-  crates/omni-rsi/training/prepare_chinese_speech.py --model "$SPEECH_MODEL_DIR" --data "$SPEECH_DATA_DIR"
-uv run --no-project --python "$SPEECH_PYTHON" --with opencc-python-reimplemented python \
-  crates/omni-rsi/training/verify_chinese_speech.py --model "$SPEECH_MODEL_DIR" --data "$SPEECH_DATA_DIR" --asr "$SPEECH_ASR_DIR"
+target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STATE" \
+  speech-seed --data "$SPEECH_DATA" \
+  --tts-model models/Breeze-TTS-2 --tts-binary target/release/breeze-tts \
+  --asr models/Confucius4-R2T2 --asr-binary target/release/r2t2
 ```
 
-这台机器以前准备过 LFM3 的文字回答；可在第一条命令后加 `--answers-from artifacts/chinese-speech/synthetic-v1` 复用同一检查点的回答，再重新合成和核验语音。历史测试题一旦用于调参，必须排除并另建未接触的测试集。旧 Whisper 标记的数据和旧训练检查点不能作为新协议的结果直接续用；请使用新数据与新状态目录，保留旧记录以供审计。
+这台机器以前准备过 LFM3 的文字回答；可追加 `--answers-from artifacts/chinese-speech/synthetic-breeze-r2t2-v1` 复用同一检查点的回答，再重新合成和核验语音。`--only greeting` 可只处理一条；已完成且指纹一致的样本会保留。新教师使用新数据目录，避免与历史教师指纹混合；用训练命令的 `--data "$SPEECH_DATA"` 选择它。历史测试题一旦用于调参，必须排除并另建未接触的测试集。旧 Whisper 标记的数据和旧训练检查点不能作为新协议的结果直接续用；保留旧记录以供审计。
 
-`training/check_chinese_voice.py --model "$SPEECH_MODEL_DIR" --asr "$SPEECH_ASR_DIR"` 可用同一个 R2T2 检查一条真实的中文文字／语音交错回答；运行时需要上述 OpenCC 依赖。它只检查一个固定示例，不能代表完整回归。
+历史 Python 脚本和模型对照脚本仅供复现或独立比对，不参与原生数据准备或训练。`training/check_chinese_voice.py` 可用于历史单例对照，不能代表完整回归。

@@ -10,6 +10,11 @@ use omni_rsi::{
     model::FrozenReader,
     platform,
     reader::ReaderHead,
+    speech_generate,
+    speech_holdout::{self, HoldoutOptions},
+    speech_ingest::{self, LocalVerifier},
+    speech_round::{SpeechRoundOptions, train_round},
+    speech_seed::{self, SeedOptions},
     storage::{Store, atomic_write},
     watchdog::Watchdog,
 };
@@ -29,6 +34,7 @@ use std::{
 type ModelBackend = omni_lfm3::NativeGpu;
 #[cfg(all(not(feature = "metal"), feature = "cpu"))]
 type ModelBackend = burn::backend::NdArray<f32>;
+type TrainingBackend = burn::backend::Autodiff<ModelBackend>;
 
 #[derive(Parser)]
 #[command(about = "Idle-time verified local LFM3 evolution experiments")]
@@ -64,24 +70,49 @@ enum Command {
         rounds: usize,
         #[arg(long, default_value_t = 300)]
         idle_seconds: u64,
+        #[command(flatten)]
+        job: SpeechJob,
+    },
+    /// Internal supervised worker, launched by the idle scheduler.
+    #[command(hide = true)]
+    SpeechWork {
+        #[command(flatten)]
+        job: SpeechJob,
+    },
+    /// Evaluate a qualified speech adapter on the separate held-out set.
+    SpeechEvaluate {
         #[arg(
             long,
             default_value = "artifacts/chinese-speech/synthetic-breeze-r2t2-v1"
         )]
         data: PathBuf,
+        #[arg(long)]
+        online: Option<PathBuf>,
+        #[arg(long)]
+        candidate: PathBuf,
         #[arg(long, default_value = "models/Confucius4-R2T2")]
         asr: PathBuf,
         #[arg(long, default_value = "target/release/r2t2")]
         asr_binary: PathBuf,
         #[arg(long)]
-        python: Option<PathBuf>,
-        #[arg(long, default_value_t = 5)]
-        epochs: usize,
-        #[arg(long, default_value_t = 5)]
-        updates_per_round: usize,
-        /// Process explicitly queued speech and include verified samples at epoch boundaries.
+        output: PathBuf,
+    },
+    /// Prepare a new Chinese speech seed dataset with native models.
+    SpeechSeed {
         #[arg(long)]
-        online: bool,
+        data: PathBuf,
+        #[arg(long)]
+        answers_from: Option<PathBuf>,
+        #[arg(long)]
+        only: Option<String>,
+        #[arg(long, default_value = "models/Breeze-TTS-2")]
+        tts_model: PathBuf,
+        #[arg(long, default_value = "target/release/breeze-tts")]
+        tts_binary: PathBuf,
+        #[arg(long, default_value = "models/Confucius4-R2T2")]
+        asr: PathBuf,
+        #[arg(long, default_value = "target/release/r2t2")]
+        asr_binary: PathBuf,
     },
     /// Read the latest scheduler state and active candidate identifier.
     Status,
@@ -96,6 +127,26 @@ enum Command {
         #[arg(long, value_enum, default_value = "taller")]
         question: QuestionArg,
     },
+}
+
+#[derive(Clone, ClapArgs)]
+struct SpeechJob {
+    #[arg(
+        long,
+        default_value = "artifacts/chinese-speech/synthetic-breeze-r2t2-v1"
+    )]
+    data: PathBuf,
+    #[arg(long, default_value = "models/Confucius4-R2T2")]
+    asr: PathBuf,
+    #[arg(long, default_value = "target/release/r2t2")]
+    asr_binary: PathBuf,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value_t = 5)]
+    updates_per_round: usize,
+    /// Process explicitly queued speech and include verified samples at epoch boundaries.
+    #[arg(long)]
+    online: bool,
 }
 #[derive(Clone, ClapArgs)]
 struct Tuning {
@@ -156,6 +207,18 @@ fn model_directory(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("model directory not provided")?;
     Ok(PathBuf::from(home).join("models/LiquidAI/LFM3-Omni-2B"))
 }
+
+fn private_state_directory(path: &Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| error.to_string())
+}
+
 fn precision() -> Precision {
     if cfg!(feature = "metal") {
         Precision::F16
@@ -256,104 +319,41 @@ fn run_one(
     run_round(&reader, store, &fingerprint, options, stop)
 }
 
-fn speech_python(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
-    let path = match explicit {
-        Some(path) => path,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("Python path not provided")?)
-            .join("code/ddust/.venv/bin/python"),
-    };
-    if !path.is_file() {
-        return Err(format!("training Python not found: {}", path.display()));
-    }
-    Ok(path)
-}
-
-#[derive(Clone, Copy)]
-struct SpeechWorker<'a> {
-    root: &'a Path,
-    model: &'a Path,
-    data: &'a Path,
-    asr: &'a Path,
-    asr_binary: &'a Path,
-    python: &'a Path,
-    epochs: usize,
-    updates: usize,
-    online: bool,
-}
-
-fn run_online_ingest(
-    worker: &SpeechWorker<'_>,
-    state: &Path,
+fn native_speech_job(
+    model: &Path,
+    root: &Path,
+    job: &SpeechJob,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    let result_path = state.join("online-ingest.json");
-    let output = std::fs::File::create(&result_path).map_err(|e| e.to_string())?;
-    let log_path = state.join("worker.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| e.to_string())?;
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("training/online_speech.py");
-    let mut command = ProcessCommand::new("uv");
-    command
-        .args(["run", "--offline", "--no-project", "--python"])
-        .arg(worker.python)
-        .args(["--with", "opencc-python-reimplemented", "python"])
-        .arg(script)
-        .arg("--state")
-        .arg(worker.root)
-        .arg("--data")
-        .arg(worker.data)
-        .arg("--model")
-        .arg(worker.model)
-        .arg("--asr")
-        .arg(worker.asr)
-        .arg("--asr-binary")
-        .arg(worker.asr_binary)
-        .env("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        .env("PYTHONUNBUFFERED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::from(log));
-    let status = child::run(command, stop, Duration::from_secs(10))?;
-    if !status.success() {
-        return Err(format!(
-            "online speech ingestion exited {status}; see {}",
-            log_path.display()
-        ));
-    }
-    let bytes = std::fs::read(result_path).map_err(|e| e.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("invalid online speech result: {e}"))
-}
-
-fn run_speech_worker(
-    worker: &SpeechWorker<'_>,
-    stop: &AtomicBool,
-) -> Result<serde_json::Value, String> {
-    let SpeechWorker {
-        root,
-        model,
-        data,
-        asr,
-        asr_binary,
-        python,
-        epochs,
-        updates,
-        online,
-    } = *worker;
-    let state = root.join("speech");
-    std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-    let ingestion = if online {
-        let directory = root.join("online-data");
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let state = root.join("speech-native");
+    private_state_directory(&state)?;
+    let online = root.join("online-data");
+    let ingestion = if job.online {
         let queued =
             speech_directory_count(root, "inbox")? + speech_directory_count(root, "processing")?;
         let result = if queued == 0 {
             json!({"state":"empty"})
         } else {
-            run_online_ingest(worker, &state, stop)?
+            let result = speech_ingest::ingest_one(
+                root,
+                &job.data,
+                || {
+                    LocalVerifier::<ModelBackend>::new(
+                        model,
+                        &job.asr,
+                        &job.asr_binary,
+                        Precision::F32,
+                        &Default::default(),
+                    )
+                },
+                stop,
+            )?;
+            serde_json::to_value(result).map_err(|error| error.to_string())?
         };
+        atomic_write(
+            &state.join("online-ingest.json"),
+            &serde_json::to_vec(&result).map_err(|error| error.to_string())?,
+        )?;
         if speech_directory_count(root, "online-data")? == 0 {
             return Ok(json!({"pending":true,"online":result}));
         }
@@ -361,55 +361,91 @@ fn run_speech_worker(
     } else {
         None
     };
+    let options = SpeechRoundOptions {
+        model,
+        data: &job.data,
+        online: job.online.then_some(online.as_path()),
+        state: &state,
+        asr: &job.asr,
+        asr_binary: &job.asr_binary,
+        epochs: job.epochs,
+        max_updates: job.updates_per_round,
+    };
+    let round = train_round::<TrainingBackend, _>(
+        &options,
+        &Default::default(),
+        stop,
+        |model, optimizer, evaluation, epoch, stop| {
+            speech_generate::development(
+                model,
+                optimizer,
+                evaluation,
+                epoch,
+                &speech_generate::GenerationContext {
+                    asr: &job.asr,
+                    binary: &job.asr_binary,
+                    state: &state,
+                    stop,
+                },
+            )
+        },
+    )?;
+    Ok(
+        json!({"complete":round.status == "complete","speech":round.progress,"checkpoint":round.checkpoint,
+             "candidate":round.candidate,"online":ingestion}),
+    )
+}
+
+fn run_speech_worker(
+    model: &Path,
+    root: &Path,
+    job: &SpeechJob,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    let state = root.join("speech-native");
+    private_state_directory(&state)?;
+    let result_path = state.join("round-output.json");
+    let output = std::fs::File::create(&result_path).map_err(|error| error.to_string())?;
     let log_path = state.join("worker.log");
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
-        .map_err(|e| e.to_string())?;
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("training/chinese_speech.py");
-    let mut command = ProcessCommand::new("uv");
+        .map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = ProcessCommand::new(executable);
     command
-        .args(["run", "--offline", "--no-project", "--python"])
-        .arg(python)
-        .args(["--with", "opencc-python-reimplemented", "python"])
-        .arg(script)
         .arg("--model")
         .arg(model)
-        .arg("--data")
-        .arg(data)
         .arg("--state")
-        .arg(&state)
+        .arg(root)
+        .arg("speech-work")
+        .arg("--data")
+        .arg(&job.data)
         .arg("--asr")
-        .arg(asr)
+        .arg(&job.asr)
         .arg("--asr-binary")
-        .arg(asr_binary)
+        .arg(&job.asr_binary)
         .arg("--epochs")
-        .arg(epochs.to_string())
-        .arg("--max-updates")
-        .arg(updates.to_string())
-        .env("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        .env("PYTHONUNBUFFERED", "1")
+        .arg(job.epochs.to_string())
+        .arg("--updates-per-round")
+        .arg(job.updates_per_round.to_string())
+        .env("OMNI_RSI_SUPERVISED_WORKER", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+        .stdout(Stdio::from(output))
         .stderr(Stdio::from(log));
-    if online {
-        command.arg("--online").arg(root.join("online-data"));
+    if job.online {
+        command.arg("--online");
     }
     let status = child::run(command, stop, Duration::from_secs(10))?;
     if !status.success() {
         return Err(format!(
-            "Chinese speech trainer exited {status}; see {}",
+            "native Chinese speech worker exited {status}; see {}",
             log_path.display()
         ));
     }
-    let bytes = std::fs::read(state.join("progress.json")).map_err(|e| e.to_string())?;
-    let progress: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let complete = progress
-        .get("epoch")
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|epoch| epoch >= epochs as u64);
-    Ok(json!({"complete":complete,"speech":progress,"online":ingestion}))
+    let bytes = std::fs::read(result_path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid native speech result: {error}"))
 }
 
 fn watch<F, P>(
@@ -550,7 +586,7 @@ where
 
 fn execute() -> Result<(), String> {
     let args = Args::parse();
-    std::fs::create_dir_all(&args.state).map_err(|e| e.to_string())?;
+    private_state_directory(&args.state)?;
     let model = model_directory(args.model)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = shutdown.clone();
@@ -587,42 +623,25 @@ fn execute() -> Result<(), String> {
         Command::SpeechWatch {
             rounds,
             idle_seconds,
-            data,
-            asr,
-            asr_binary,
-            python,
-            epochs,
-            updates_per_round,
-            online,
+            job,
         } => {
             if !model.is_dir()
-                || !data.is_dir()
-                || !asr.join("model.safetensors").is_file()
-                || !asr_binary.is_file()
+                || !job.data.is_dir()
+                || !job.asr.join("model.safetensors").is_file()
+                || !job.asr_binary.is_file()
             {
                 return Err(
                     "model, verified speech data, R2T2 checkpoint or executable is missing".into(),
                 );
             }
-            if !(1..=100).contains(&epochs) || !(1..=100).contains(&updates_per_round) {
+            if !(1..=100).contains(&job.epochs) || !(1..=100).contains(&job.updates_per_round) {
                 return Err("epochs and update budget must be between 1 and 100".into());
             }
-            let python = speech_python(python)?;
             let policy = IdlePolicy {
                 min_idle_seconds: idle_seconds as f64,
                 ..Default::default()
             };
-            let worker = SpeechWorker {
-                root: &args.state,
-                model: &model,
-                data: &data,
-                asr: &asr,
-                asr_binary: &asr_binary,
-                python: &python,
-                epochs,
-                updates: updates_per_round,
-                online,
-            };
+            let online = job.online;
             watch(
                 &args.state,
                 rounds,
@@ -640,8 +659,72 @@ fn execute() -> Result<(), String> {
                         Ok(None)
                     }
                 },
-                |stop| run_speech_worker(&worker, stop),
+                |stop| run_speech_worker(&model, &args.state, &job, stop),
             )
+        }
+        Command::SpeechWork { job } => {
+            let result = native_speech_job(&model, &args.state, &job, &shutdown)?;
+            println!("{result}");
+            Ok(())
+        }
+        Command::SpeechEvaluate {
+            data,
+            online,
+            candidate,
+            asr,
+            asr_binary,
+            output,
+        } => {
+            let _foreground = Lease::try_acquire(&args.state.join("foreground.lock"))?
+                .ok_or("another RSI foreground request is active")?;
+            let _device = wait_for_device(&args.state, &shutdown)?;
+            let _ddust = ddust_lease()?;
+            let repository = std::env::current_dir().map_err(|error| error.to_string())?;
+            let options = HoldoutOptions {
+                repository: &repository,
+                model: &model,
+                data: &data,
+                online: online.as_deref(),
+                candidate: &candidate,
+                asr: &asr,
+                asr_binary: &asr_binary,
+                output: &output,
+            };
+            let report =
+                speech_holdout::evaluate::<ModelBackend>(&options, &Default::default(), &shutdown)?;
+            println!("{}", json!({"report":report,"selection_eligible":false}));
+            Ok(())
+        }
+        Command::SpeechSeed {
+            data,
+            answers_from,
+            only,
+            tts_model,
+            tts_binary,
+            asr,
+            asr_binary,
+        } => {
+            let _foreground = Lease::try_acquire(&args.state.join("foreground.lock"))?
+                .ok_or("another RSI foreground request is active")?;
+            let _device = wait_for_device(&args.state, &shutdown)?;
+            let _ddust = ddust_lease()?;
+            let options = SeedOptions {
+                model: &model,
+                data: &data,
+                answers_from: answers_from.as_deref(),
+                only: only.as_deref(),
+                tts_model: &tts_model,
+                tts_binary: &tts_binary,
+                asr: &asr,
+                asr_binary: &asr_binary,
+            };
+            let results =
+                speech_seed::prepare::<ModelBackend>(&options, &Default::default(), &shutdown)?;
+            println!(
+                "{}",
+                serde_json::to_string(&results).map_err(|error| error.to_string())?
+            );
+            Ok(())
         }
         Command::Once { options } => {
             let _runner = Lease::try_acquire(&args.state.join("runner.lock"))?
@@ -720,14 +803,22 @@ fn execute() -> Result<(), String> {
                         .ok_or("invalid evolution progress")?,
                 );
             }
-            let speech = args.state.join("speech/progress.json");
+            let speech = args.state.join("speech-native/progress.json");
             if speech.exists() {
                 let progress: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(speech).map_err(|e| e.to_string())?)
                         .map_err(|e| e.to_string())?;
                 fields.insert("speech_progress".into(), progress);
             }
-            let last_ingestion = std::fs::read(args.state.join("speech/online-ingest.json"))
+            let legacy_speech = args.state.join("speech/progress.json");
+            if legacy_speech.exists() {
+                let progress: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(legacy_speech).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                fields.insert("legacy_speech_progress".into(), progress);
+            }
+            let last_ingestion = std::fs::read(args.state.join("speech-native/online-ingest.json"))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
             fields.insert("online_speech".into(), json!({
@@ -735,7 +826,8 @@ fn execute() -> Result<(), String> {
                 "processing":speech_directory_count(&args.state, "processing")?,
                 "verified":speech_directory_count(&args.state, "online-data")?,
                 "rejected":speech_directory_count(&args.state, "rejected")?,
-                "candidate_packages":speech_directory_count(&args.state.join("speech"), "candidates")?,
+                "candidate_packages":speech_directory_count(&args.state.join("speech-native"), "candidates")?,
+                "legacy_candidate_packages":speech_directory_count(&args.state.join("speech"), "candidates")?,
                 "last_ingestion":last_ingestion,
             }));
             println!("{}", value);

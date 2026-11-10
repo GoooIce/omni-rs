@@ -54,6 +54,41 @@ pub struct SpeechInbox {
     directory: PathBuf,
 }
 
+/// One exclusively claimed learning utterance, or a corrupt entry already
+/// retained in the rejection archive.
+pub enum SpeechClaim {
+    Valid(PendingSpeech),
+    Rejected { id: String, reason: String },
+}
+
+#[derive(Clone, Copy)]
+pub enum SpeechOutcome {
+    Accepted,
+    Rejected,
+}
+
+impl SpeechOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Accepted => "processed",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// One consumer owns the processing directory until this lease is dropped.
+pub struct SpeechWorker {
+    root: PathBuf,
+    _lease: WorkerLease,
+}
+
 /// A bounded, in-memory copy of one explicitly enabled live utterance.
 #[derive(Default)]
 pub struct SpeechCapture {
@@ -175,11 +210,12 @@ struct QueueLock(File);
 #[cfg(unix)]
 impl QueueLock {
     fn try_acquire(directory: &Path) -> io::Result<Option<Self>> {
+        Self::try_acquire_file(&directory.join(".queue.lock"))
+    }
+
+    fn try_acquire_file(path: &Path) -> io::Result<Option<Self>> {
         use std::os::fd::AsRawFd;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(directory.join(".queue.lock"))?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(Some(Self(file)));
         }
@@ -208,6 +244,28 @@ impl QueueLock {
             io::ErrorKind::Unsupported,
             "speech inbox locking is unavailable",
         ))
+    }
+
+    fn try_acquire_file(_: &Path) -> io::Result<Option<Self>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "speech worker locking is unavailable",
+        ))
+    }
+}
+
+struct WorkerLease(#[allow(dead_code)] QueueLock);
+
+impl WorkerLease {
+    fn acquire(root: &Path) -> io::Result<Self> {
+        QueueLock::try_acquire_file(&root.join(".ingest.lock"))?
+            .map(Self)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "speech processor is already running",
+                )
+            })
     }
 }
 
@@ -347,12 +405,14 @@ impl SpeechInbox {
         }
         let manifest_path = directory.join("manifest.json");
         let audio = directory.join("audio.wav");
-        if fs::symlink_metadata(&manifest_path)?
-            .file_type()
-            .is_symlink()
-            || fs::symlink_metadata(&audio)?.file_type().is_symlink()
+        let manifest_metadata = fs::symlink_metadata(&manifest_path)?;
+        let audio_metadata = fs::symlink_metadata(&audio)?;
+        if !manifest_metadata.is_file()
+            || manifest_metadata.len() > 4096
+            || !audio_metadata.is_file()
+            || audio_metadata.len() > (MAX_SAMPLES * 2 + 4096) as u64
         {
-            return Err(invalid("speech entry contains a symbolic link"));
+            return Err(invalid("speech entry has an invalid file"));
         }
         let manifest: Manifest = serde_json::from_reader(File::open(manifest_path)?)
             .map_err(|e| invalid(e.to_string()))?;
@@ -366,7 +426,7 @@ impl SpeechInbox {
         {
             return Err(invalid("speech entry failed integrity validation"));
         }
-        let wav = hound::WavReader::open(&audio).map_err(|e| invalid(e.to_string()))?;
+        let mut wav = hound::WavReader::open(&audio).map_err(|e| invalid(e.to_string()))?;
         if wav.spec().channels != 1
             || wav.spec().sample_rate != RATE
             || wav.spec().bits_per_sample != 16
@@ -374,6 +434,14 @@ impl SpeechInbox {
             || wav.duration() as usize != manifest.samples
         {
             return Err(invalid("speech entry has an invalid WAV format"));
+        }
+        let mut decoded = 0;
+        for sample in wav.samples::<i16>() {
+            sample.map_err(|error| invalid(error.to_string()))?;
+            decoded += 1;
+        }
+        if decoded != manifest.samples {
+            return Err(invalid("speech entry has a truncated WAV"));
         }
         Ok(Some(PendingSpeech {
             id: manifest.id,
@@ -400,5 +468,154 @@ impl SpeechInbox {
                     .ok_or_else(|| invalid("speech entry disappeared"))
             })
             .collect()
+    }
+}
+
+fn speech_ids(directory: &Path) -> io::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let name = entry?.file_name();
+        if let Some(name) = name.to_str().filter(|name| valid_id(name)) {
+            ids.push(name.to_owned());
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+fn private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+impl SpeechWorker {
+    /// Acquire the existing cross-language worker lease without starting any model.
+    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        private_dir(root.as_ref())?;
+        let root = root.as_ref().canonicalize()?;
+        for name in ["inbox", "processing", "processed", "rejected", "duplicates"] {
+            private_dir(&root.join(name))?;
+        }
+        let lease = WorkerLease::acquire(&root)?;
+        Ok(Self {
+            root,
+            _lease: lease,
+        })
+    }
+
+    /// Resume interrupted work first; otherwise claim and validate one entry.
+    pub fn claim(&self) -> io::Result<Option<SpeechClaim>> {
+        let processing = self.root.join("processing");
+        if let Some(id) = speech_ids(&processing)?.into_iter().next() {
+            return self.validate_claim(id).map(Some);
+        }
+        let inbox = self.root.join("inbox");
+        let Some(lock) = QueueLock::try_acquire(&inbox)? else {
+            return Ok(None);
+        };
+        for id in speech_ids(&inbox)? {
+            let duplicate = ["processed", "rejected"]
+                .iter()
+                .any(|name| self.root.join(name).join(&id).exists());
+            let destination = if duplicate {
+                self.root
+                    .join("duplicates")
+                    .join(format!("{id}-{:032x}", rand::random::<u128>()))
+            } else {
+                processing.join(&id)
+            };
+            fs::rename(inbox.join(&id), &destination)?;
+            File::open(&inbox)?.sync_all()?;
+            File::open(destination.parent().expect("queue entry has a parent"))?.sync_all()?;
+            if !duplicate {
+                drop(lock);
+                return self.validate_claim(id).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn validate_claim(&self, id: String) -> io::Result<SpeechClaim> {
+        let processing = SpeechInbox {
+            directory: self.root.join("processing"),
+        };
+        match processing.get(&id) {
+            Ok(Some(entry)) => Ok(SpeechClaim::Valid(entry)),
+            Ok(None) => Err(invalid("claimed speech entry disappeared")),
+            Err(error) => {
+                self.finish_entry(&id, SpeechOutcome::Rejected, "integrity")?;
+                Ok(SpeechClaim::Rejected {
+                    id,
+                    reason: error.to_string(),
+                })
+            }
+        }
+    }
+
+    pub fn finish(
+        &self,
+        entry: &PendingSpeech,
+        outcome: SpeechOutcome,
+        reason: &str,
+    ) -> io::Result<()> {
+        if !valid_id(&entry.id)
+            || entry.audio
+                != self
+                    .root
+                    .join("processing")
+                    .join(&entry.id)
+                    .join("audio.wav")
+        {
+            return Err(invalid("speech claim belongs to a different queue"));
+        }
+        self.finish_entry(&entry.id, outcome, reason)
+    }
+
+    fn finish_entry(&self, id: &str, outcome: SpeechOutcome, reason: &str) -> io::Result<()> {
+        if !valid_id(id) {
+            return Err(invalid("invalid speech queue completion"));
+        }
+        let processing = self.root.join("processing");
+        let entry = processing.join(id);
+        let target_directory = self.root.join(outcome.directory());
+        let target = target_directory.join(id);
+        if target.exists() {
+            return Err(invalid("speech result already exists"));
+        }
+        let metadata = fs::symlink_metadata(&entry)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let result = entry.join("result.json");
+            if result.exists() {
+                let metadata = fs::symlink_metadata(&result)?;
+                if !metadata.is_file() || metadata.len() > 4096 {
+                    return Err(invalid("speech result has an invalid file"));
+                }
+                let value: serde_json::Value = serde_json::from_reader(File::open(&result)?)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if value.get("outcome").and_then(|value| value.as_str()) != Some(outcome.as_str()) {
+                    return Err(invalid("speech completion conflicts with previous outcome"));
+                }
+            } else {
+                let mut temporary = tempfile::Builder::new()
+                    .prefix(".result-")
+                    .tempfile_in(&entry)?;
+                let value = serde_json::json!({"outcome": outcome.as_str(), "reason": reason.chars().take(200).collect::<String>()});
+                serde_json::to_writer(&mut temporary, &value)
+                    .map_err(|error| invalid(error.to_string()))?;
+                temporary.as_file().sync_all()?;
+                temporary.persist(&result).map_err(|error| error.error)?;
+            }
+            File::open(&entry)?.sync_all()?;
+        }
+        fs::rename(&entry, &target)?;
+        File::open(&processing)?.sync_all()?;
+        File::open(&target_directory)?.sync_all()?;
+        Ok(())
     }
 }

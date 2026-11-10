@@ -492,6 +492,56 @@ impl<B: Backend> TextModel<B> {
         let device = conv.weight.device();
         let left = Tensor::<B, 2>::from_data(TensorData::new(a.to_vec(), [rank, width]), &device);
         let right = Tensor::<B, 2>::from_data(TensorData::new(b.to_vec(), [width, rank]), &device);
+        self.install_conv_lora_tensors(layer, left, right)
+    }
+
+    /// Install adapter tensors without severing their Burn autodiff graph.
+    ///
+    /// This accepts the same `[rank, width]` and `[width, rank]` layout as
+    /// `install_conv_lora`; callers retain the input tensors to read gradients.
+    /// A successful replacement invalidates all caches for the previous model.
+    pub fn install_conv_lora_tensors(
+        &mut self,
+        layer: usize,
+        left: Tensor<B, 2>,
+        right: Tensor<B, 2>,
+    ) -> Result<()> {
+        let [rank, width] = left.dims();
+        if width != self.config.hidden_size
+            || rank == 0
+            || rank > 64
+            || rank > width
+            || right.dims() != [width, rank]
+        {
+            return Err(Error::Config("invalid convolution LoRA dimensions".into()));
+        }
+        let Some(Layer {
+            operator: Operator::Conv(conv),
+            ..
+        }) = self.layers.get_mut(layer)
+        else {
+            return Err(Error::Config(
+                "LoRA target must be a convolution layer".into(),
+            ));
+        };
+        let device = conv.weight.device();
+        if left.device() != device || right.device() != device {
+            return Err(Error::Config(
+                "LoRA tensors must be on the model device".into(),
+            ));
+        }
+        let left = left.cast(FloatDType::F32);
+        let right = right.cast(FloatDType::F32);
+        for tensor in [&left, &right] {
+            let values = tensor
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .map_err(|error| Error::Inference(format!("LoRA tensor readback: {error}")))?;
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(Error::Config("non-finite convolution LoRA tensor".into()));
+            }
+        }
         conv.lora = Some(ConvLoRA {
             a: Linear::from_parts(left, None),
             b: Linear::from_parts(right, None),

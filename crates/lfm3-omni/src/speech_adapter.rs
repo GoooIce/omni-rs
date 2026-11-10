@@ -1,6 +1,6 @@
 //! Load a speech LoRA only after checking its model binding and development evidence.
 use omni_r2t2::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -39,14 +39,14 @@ struct Case {
 struct Evaluation {
     dev: Vec<Case>,
 }
-#[derive(Deserialize)]
-struct Observation {
-    sample: String,
-    category: String,
-    kind: String,
-    frames: usize,
-    stopped: bool,
-    transcript: String,
+#[derive(Clone, Deserialize, Serialize)]
+pub struct SpeechObservation {
+    pub sample: String,
+    pub category: String,
+    pub kind: String,
+    pub frames: usize,
+    pub stopped: bool,
+    pub transcript: String,
 }
 #[derive(Deserialize)]
 struct Manifest {
@@ -59,7 +59,7 @@ struct Manifest {
     evaluation_sha256: String,
     asr_sha256: String,
     data_sha256: String,
-    results: Vec<Observation>,
+    results: Vec<SpeechObservation>,
 }
 #[derive(Deserialize)]
 struct Weights {
@@ -151,7 +151,7 @@ fn errors(reference: &[char], observed: &[char]) -> usize {
     }
     previous[observed.len()]
 }
-fn passes(cases: &[Case], results: &[Observation]) -> bool {
+fn passes(cases: &[Case], results: &[SpeechObservation]) -> bool {
     if cases.len() < 10 || results.len() != 2 * cases.len() {
         return false;
     }
@@ -200,6 +200,12 @@ fn passes(cases: &[Case], results: &[Observation]) -> bool {
         && baseline > 0
         && candidate * 10 <= baseline * 9
         && totals.iter().all(|group| group[1] <= group[0])
+}
+
+/// Recompute the same fixed development gate used by the adapter loader.
+pub fn passes_development(results: &[SpeechObservation]) -> Result<bool> {
+    let evaluation: Evaluation = serde_json::from_slice(EVALUATION)?;
+    Ok(passes(&evaluation.dev, results))
 }
 
 fn codec_files(root: &Path, directory: &Path, names: &mut Vec<String>) -> Result<()> {

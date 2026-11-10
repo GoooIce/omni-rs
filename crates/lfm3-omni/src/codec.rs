@@ -3,7 +3,9 @@ use crate::{
     config::{Config, RopeConfig, TextConfig},
     text::{Layer, LayerState, norm},
 };
-use burn::tensor::{Tensor, TensorData, backend::Backend};
+use burn::tensor::{
+    Tensor, TensorData, activation::silu, backend::Backend, module, ops::ConvOptions,
+};
 use omni_r2t2::{
     Error, Precision, Result,
     tensor::{self, Linear, Norm},
@@ -25,6 +27,8 @@ static NEXT_CODEC: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Deserialize)]
 struct Parameters {
     encoder_dim: usize,
+    #[serde(default)]
+    encoder_conv_dim: usize,
     quantizer_dim: usize,
     stft_n_fft: usize,
     stft_hop_length: usize,
@@ -152,6 +156,283 @@ pub struct Codec<B: Backend> {
     spectrogram: Linear<B>,
     window: Vec<f32>,
     inverse_fft: Arc<dyn Fft<f32>>,
+}
+
+struct EncoderConv<B: Backend> {
+    weight: Tensor<B, 3>,
+    bias: Tensor<B, 1>,
+}
+
+impl<B: Backend> EncoderConv<B> {
+    fn load(
+        weights: &impl WeightSource<B>,
+        name: &str,
+        input: usize,
+        output: usize,
+        kernel: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: weights.tensor(
+                &format!("{name}.weight"),
+                [output, input, kernel],
+                precision,
+                device,
+            )?,
+            bias: weights.tensor(&format!("{name}.bias"), [output], precision, device)?,
+        })
+    }
+
+    fn forward(&self, input: Tensor<B, 3>, stride: usize, padding: usize) -> Tensor<B, 3> {
+        module::conv1d(
+            input,
+            self.weight.clone(),
+            Some(self.bias.clone()),
+            ConvOptions::new([stride], [padding], [1], 1),
+        )
+    }
+}
+
+/// Native LiquidCodec encoder. Input is finite 24 kHz mono PCM; output is
+/// frame-major quantizer indices, without the model's speech end marker.
+pub struct CodecEncoder<B: Backend> {
+    config: CodecConfig,
+    device: B::Device,
+    precision: Precision,
+    in_proj: EncoderConv<B>,
+    conv: EncoderConv<B>,
+    out: EncoderConv<B>,
+    layers: Vec<Layer<B>>,
+    final_norm: Norm<B>,
+    to_quantizer: Linear<B>,
+    project_in: Option<Linear<B>>,
+    window: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
+}
+
+impl<B: Backend> CodecEncoder<B> {
+    pub fn load(directory: &Path, precision: Precision, device: &B::Device) -> Result<Self> {
+        let config = CodecConfig::load(directory)?;
+        let weights = Weights::open(directory)?;
+        Self::from_weights(&weights, config, precision, device)
+    }
+
+    pub fn from_weights(
+        weights: &impl WeightSource<B>,
+        config: CodecConfig,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Result<Self> {
+        config.validate()?;
+        let p = &config.params;
+        if p.encoder_conv_dim == 0 || p.stft_hop_length.checked_mul(p.stft_frame_stack).is_none() {
+            return Err(Error::Config(
+                "invalid LiquidCodec encoder configuration".into(),
+            ));
+        }
+        let channels = 3 * (p.stft_n_fft / 2 + 1);
+        let in_proj = EncoderConv::load(
+            weights,
+            "frontend.in_proj",
+            channels,
+            p.encoder_conv_dim,
+            1,
+            precision,
+            device,
+        )?;
+        let conv = EncoderConv::load(
+            weights,
+            "frontend.conv",
+            p.encoder_conv_dim,
+            p.encoder_conv_dim,
+            3,
+            precision,
+            device,
+        )?;
+        let out = EncoderConv::load(
+            weights,
+            "frontend.out",
+            p.encoder_conv_dim,
+            p.encoder_dim,
+            p.stft_frame_stack,
+            precision,
+            device,
+        )?;
+        let mut backbone = config.backbone.clone();
+        for kind in &mut backbone.layer_types {
+            if kind == "sliding_attention" {
+                *kind = "full_attention".into();
+            }
+        }
+        if !backbone.rope_parameters.contains_key("full_attention") {
+            let rope = backbone
+                .rope_parameters
+                .get("sliding_attention")
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Config("missing codec encoder rotary configuration".into())
+                })?;
+            backbone
+                .rope_parameters
+                .insert("full_attention".into(), rope);
+        }
+        let layers = (0..backbone.num_hidden_layers)
+            .map(|i| Layer::load_named(weights, "encoder.lfm", &backbone, i, precision, device))
+            .collect::<Result<Vec<_>>>()?;
+        let final_norm = norm(
+            weights,
+            "encoder.lfm.embedding_norm",
+            p.encoder_dim,
+            backbone.norm_eps,
+            device,
+        )?;
+        let to_quantizer = Linear::load(
+            weights,
+            "to_quantizer",
+            p.encoder_dim,
+            p.quantizer_dim,
+            true,
+            precision,
+            device,
+        )?;
+        let effective = p.n_q * p.fsq_levels.len();
+        let project_in = if effective == p.quantizer_dim {
+            None
+        } else {
+            Some(Linear::load(
+                weights,
+                "quantizer.project_in",
+                p.quantizer_dim,
+                effective,
+                true,
+                precision,
+                device,
+            )?)
+        };
+        let window = (0..p.stft_win_length)
+            .map(|i| {
+                0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / p.stft_win_length as f32).cos()
+            })
+            .collect();
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(p.stft_n_fft);
+        Ok(Self {
+            config,
+            device: device.clone(),
+            precision,
+            in_proj,
+            conv,
+            out,
+            layers,
+            final_norm,
+            to_quantizer,
+            project_in,
+            window,
+            fft,
+        })
+    }
+
+    pub fn encode(&self, samples: &[f32]) -> Result<Vec<Vec<u32>>> {
+        let p = &self.config.params;
+        if samples.is_empty() || samples.iter().any(|value| !value.is_finite()) {
+            return Err(Error::Audio(
+                "LiquidCodec input must be nonempty and finite".into(),
+            ));
+        }
+        let frame_size = p.stft_hop_length * p.stft_frame_stack;
+        let padded_len = samples
+            .len()
+            .checked_add(frame_size - 1)
+            .and_then(|length| (length / frame_size).checked_mul(frame_size))
+            .ok_or_else(|| Error::Audio("LiquidCodec input is too long".into()))?;
+        let side = (p.stft_win_length - p.stft_hop_length) / 2;
+        if padded_len <= side {
+            return Err(Error::Audio(
+                "LiquidCodec input is too short for reflect padding".into(),
+            ));
+        }
+        let mut padded = vec![0.0; padded_len];
+        padded[..samples.len()].copy_from_slice(samples);
+        let mut reflected = Vec::with_capacity(padded_len + side * 2);
+        reflected.extend((1..=side).rev().map(|i| padded[i]));
+        reflected.extend_from_slice(&padded);
+        reflected.extend((1..=side).map(|i| padded[padded_len - 1 - i]));
+        let frames = padded_len / p.stft_hop_length;
+        let bins = p.stft_n_fft / 2 + 1;
+        let mut features = vec![0.0_f32; 3 * bins * frames];
+        let mut buffer = vec![Complex32::new(0.0, 0.0); p.stft_n_fft];
+        for frame in 0..frames {
+            let offset = frame * p.stft_hop_length;
+            for i in 0..p.stft_n_fft {
+                buffer[i] = Complex32::new(reflected[offset + i] * self.window[i], 0.0);
+            }
+            self.fft.process(&mut buffer);
+            for (bin, value) in buffer.iter().take(bins).enumerate() {
+                let magnitude = value.norm();
+                if !magnitude.is_finite() {
+                    return Err(Error::Audio("LiquidCodec input overflowed the STFT".into()));
+                }
+                let denominator = magnitude.max(1e-5);
+                features[bin * frames + frame] = magnitude.ln_1p();
+                features[(bins + bin) * frames + frame] = value.re / denominator;
+                features[(2 * bins + bin) * frames + frame] = value.im / denominator;
+            }
+        }
+        let mut x = Tensor::<B, 3>::from_data(
+            TensorData::new(features, [1, 3 * bins, frames]),
+            &self.device,
+        )
+        .cast(self.precision.dtype());
+        x = silu(self.in_proj.forward(x, 1, 0));
+        x = silu(
+            self.conv
+                .forward(x, 1, 2)
+                .slice([0..1, 0..p.encoder_conv_dim, 0..frames]),
+        );
+        x = self.out.forward(x, p.stft_frame_stack, 0).swap_dims(1, 2);
+        for layer in &self.layers {
+            x = layer.forward(x, &mut layer.new_state(), 0, true);
+        }
+        let dtype = tensor::dtype(&x);
+        x = self.to_quantizer.forward(self.final_norm.forward(x, dtype));
+        if let Some(project) = &self.project_in {
+            x = project.forward(x);
+        }
+        let values = x
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|error| Error::Inference(format!("codec encoder readback: {error}")))?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::Audio(
+                "LiquidCodec encoder produced non-finite latents".into(),
+            ));
+        }
+        let count = padded_len / frame_size;
+        let dims = p.fsq_levels.len();
+        let mut result = Vec::with_capacity(count);
+        for frame in 0..count {
+            let mut row = Vec::with_capacity(p.n_q);
+            for book in 0..p.n_q {
+                let mut index = 0_usize;
+                let mut basis = 1_usize;
+                for (dimension, &level) in p.fsq_levels.iter().enumerate() {
+                    let value = values[(frame * p.n_q + book) * dims + dimension];
+                    let half_levels = (level as f32 - 1.0) * 1.001 / 2.0;
+                    let offset = if level % 2 == 0 { 0.5 } else { 0.0 };
+                    let shift = (offset / half_levels).atanh();
+                    let bounded = (value + shift).tanh() * half_levels - offset;
+                    let digit =
+                        (bounded.round_ties_even() as isize + (level / 2) as isize) as usize;
+                    index += digit * basis;
+                    basis *= level;
+                }
+                row.push(index as u32);
+            }
+            result.push(row);
+        }
+        Ok(result)
+    }
 }
 impl<B: Backend> Codec<B> {
     pub fn load(directory: &Path, precision: Precision, device: &B::Device) -> Result<Self> {
