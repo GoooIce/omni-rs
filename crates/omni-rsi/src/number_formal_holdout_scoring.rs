@@ -1,0 +1,219 @@
+//! Recompute control scores from the actual opened cases and executor outputs.
+//! This module cannot issue a qualification or prove who supplied the data.
+
+use super::Executor;
+use crate::{
+    number_blind_holdout::{BlindCase, OpenedHoldout},
+    number_gate::{PairedCase, PairedOutcome, paired_statistics},
+    number_v3_evaluation::TextEnd,
+    speech_number_evaluation::{answer_number, mentions_number},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+const MAX_SAMPLES: usize = 16_000 * 20;
+const MAX_TOTAL_SAMPLES: usize = 16_000 * 1_200;
+const MAX_OBSERVATIONS: usize = 6_000;
+
+fn interrupted(stop: &AtomicBool) -> Result<(), String> {
+    if stop.load(Ordering::Acquire) {
+        Err("interrupted".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn pcm_hash(samples: &[f32]) -> String {
+    let mut hash = Sha256::new();
+    for sample in samples {
+        let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
+        hash.update(bits.to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn load_audio(opened: &OpenedHoldout, stop: &AtomicBool) -> Result<Vec<Vec<f32>>, String> {
+    let mut total = 0_usize;
+    let mut labels = HashMap::new();
+    let mut audio = Vec::with_capacity(opened.manifest().cases.len());
+    for (index, case) in opened.manifest().cases.iter().enumerate() {
+        interrupted(stop)?;
+        let bytes = opened.audio(index).ok_or("missing holdout audio")?;
+        let wav = hound::WavReader::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+        let rate = wav.spec().sample_rate;
+        if rate == 0 || u64::from(wav.duration()) > u64::from(rate) * 20 {
+            return Err("invalid or overlong holdout WAV".into());
+        }
+        let predicted =
+            usize::try_from((u64::from(wav.duration()) * 16_000).div_ceil(u64::from(rate)))
+                .map_err(|_| "holdout sample count overflow")?;
+        total = total
+            .checked_add(predicted)
+            .filter(|n| *n <= MAX_TOTAL_SAMPLES)
+            .ok_or("holdout decoded sample budget exceeded")?;
+        let samples =
+            omni_lfm3::media_io::decode_wav(bytes, stop).map_err(|error| error.to_string())?;
+        if samples.is_empty()
+            || samples.len() > MAX_SAMPLES
+            || samples.len() > predicted
+            || samples
+                .iter()
+                .any(|sample| !sample.is_finite() || sample.abs() > 1.0)
+        {
+            return Err("invalid decoded holdout audio".into());
+        }
+        if labels
+            .insert(pcm_hash(&samples), case.answer)
+            .is_some_and(|old| old != case.answer)
+        {
+            return Err("identical holdout PCM has contradictory answers".into());
+        }
+        audio.push(samples);
+    }
+    Ok(audio)
+}
+
+/// Sort by answer and case ID, then rotate by the largest answer group. The
+/// rotation is bijective and differs in answer exactly when feasible.
+fn swap_mapping(cases: &[BlindCase]) -> Result<Vec<usize>, String> {
+    let mut order: Vec<_> = (0..cases.len()).collect();
+    order.sort_by(|a, b| {
+        (cases[*a].answer, &cases[*a].case_id).cmp(&(cases[*b].answer, &cases[*b].case_id))
+    });
+    let mut largest = 0;
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && cases[order[end]].answer == cases[order[start]].answer {
+            end += 1;
+        }
+        largest = largest.max(end - start);
+        start = end;
+    }
+    if cases.len() < 2 || largest > cases.len() / 2 {
+        return Err("holdout has no one-to-one different-answer swap".into());
+    }
+    let mut mapping = vec![0; cases.len()];
+    for (position, &source) in order.iter().enumerate() {
+        let destination = order[(position + largest) % order.len()];
+        if cases[source].answer == cases[destination].answer {
+            return Err("invalid holdout swap mapping".into());
+        }
+        mapping[source] = destination;
+    }
+    Ok(mapping)
+}
+
+pub(super) fn compare(
+    opened: &OpenedHoldout,
+    executor: &mut Executor,
+    stop_tokens: &[u32],
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    let cases = &opened.manifest().cases;
+    if cases
+        .len()
+        .checked_mul(6)
+        .is_none_or(|n| n > MAX_OBSERVATIONS)
+        || stop_tokens.is_empty()
+    {
+        return Err("holdout observation limit or stop policy is invalid".into());
+    }
+    let swaps = swap_mapping(cases)?;
+    let audio = load_audio(opened, stop)?;
+    let mut observations = Vec::with_capacity(cases.len() * 6);
+    let mut counts = [[0_usize; 6]; 2];
+    let mut pairs = Vec::with_capacity(cases.len());
+    let mut text_bytes = 0_usize;
+    for (case_index, case) in cases.iter().enumerate() {
+        let silence = vec![0.0; audio[case_index].len()];
+        let mut originals = [
+            PairedOutcome {
+                correct: false,
+                normal_end: false,
+            },
+            PairedOutcome {
+                correct: false,
+                normal_end: false,
+            },
+        ];
+        for (arm_index, arm) in ["baseline", "candidate"].into_iter().enumerate() {
+            for (condition_index, condition, input) in [
+                (0, "original", Some(case_index)),
+                (1, "swapped", Some(swaps[case_index])),
+                (2, "silence", None),
+            ] {
+                interrupted(stop)?;
+                let samples = input.map_or(silence.as_slice(), |index| audio[index].as_slice());
+                let result = executor.infer(arm, samples, stop)?;
+                interrupted(stop)?;
+                text_bytes = text_bytes
+                    .checked_add(result.text.len())
+                    .ok_or("output text overflow")?;
+                if result.text.len() > 4096 || text_bytes > 16 * 1024 * 1024 {
+                    return Err("holdout output text exceeds limit".into());
+                }
+                let (normal_end, end) = match result.end {
+                    TextEnd::Stop(token) if stop_tokens.contains(&token) => {
+                        (true, serde_json::json!({"stop_token":token}))
+                    }
+                    TextEnd::Stop(_) => return Err("stop token is not in the frozen policy".into()),
+                    TextEnd::Limit => (false, serde_json::json!({"kind":"limit"})),
+                    TextEnd::Cancelled => return Err("interrupted".into()),
+                };
+                let correct = input.map(|index| {
+                    normal_end && answer_number(&result.text) == Some(cases[index].answer)
+                });
+                if condition_index < 2 {
+                    counts[arm_index][condition_index] += usize::from(correct == Some(true));
+                } else {
+                    counts[arm_index][2] += usize::from(mentions_number(&result.text));
+                }
+                counts[arm_index][3 + condition_index] += usize::from(normal_end);
+                if condition_index == 0 {
+                    originals[arm_index] = PairedOutcome {
+                        correct: correct == Some(true),
+                        normal_end,
+                    };
+                }
+                observations.push(serde_json::json!({"arm":arm,"case_id":case.case_id,
+                    "condition":condition,"audio_case_id":input.map(|i| &cases[i].case_id),
+                    "expected_answer":input.map(|i| cases[i].answer),
+                    "audio_file_sha256":input.map(|i| &cases[i].audio_sha256),
+                    "audio_recording_sha256":input.map(|i| &cases[i].recording_sha256),
+                    "audio_pcm_sha256":pcm_hash(samples),"samples":samples.len(),
+                    "text":result.text,"end":end,"normal_end":normal_end,"correct":correct}));
+            }
+        }
+        pairs.push(PairedCase {
+            case_id: case.case_id.clone(),
+            original_id: case.recording_sha256.clone(),
+            family_id: case.family_sha256.clone(),
+            speaker_id: case.speaker_sha256.clone(),
+            session_id: case.session_sha256.clone(),
+            baseline: originals[0].clone(),
+            candidate: originals[1].clone(),
+        });
+    }
+    let stats = paired_statistics(&pairs)?;
+    let metrics = |values: [usize; 6]| {
+        serde_json::json!({
+            "original_correct":values[0],"swapped_correct":values[1],"silence_numeric_responses":values[2],
+            "normal_end":{"original":values[3],"swapped":values[4],"silence":values[5]}
+        })
+    };
+    Ok(serde_json::json!({
+        "status":"insufficient_evidence", "candidate_eligible":false,
+        "execution":executor.execution(), "baseline":metrics(counts[0]), "candidate":metrics(counts[1]),
+        "observations":observations, "paired_statistics":{"n":stats.n,
+            "baseline_correct":stats.baseline_correct,"candidate_correct":stats.candidate_correct,
+            "candidate_only":stats.candidate_only,"baseline_only":stats.baseline_only,
+            "improvement":stats.improvement,"interval_95":stats.interval_95},
+        "output_speech_r2t2_cer":"not_run", "human_listening":"not_verified",
+        "source_authorization":"not_verified", "registered_regressions":"not_verified"
+    }))
+}

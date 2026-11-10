@@ -18,6 +18,7 @@ pub mod model;
 pub mod number_audio_v3;
 pub mod number_blind_holdout;
 pub mod number_development;
+pub mod number_formal_holdout;
 pub mod number_gate;
 pub mod number_holdout_ledger;
 pub mod number_v3_evaluation;

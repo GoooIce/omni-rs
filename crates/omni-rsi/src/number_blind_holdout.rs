@@ -179,6 +179,25 @@ pub struct VerifiedDevelopment {
     candidate_sha256: String,
 }
 
+impl VerifiedDevelopment {
+    pub(crate) fn identities(&self) -> (&str, &str, &str) {
+        (
+            &self.metadata_sha256,
+            &self.protocol_sha256,
+            &self.candidate_sha256,
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_verified_development(public: &PublicMetadata) -> VerifiedDevelopment {
+    VerifiedDevelopment {
+        metadata_sha256: public.fingerprint().expect("synthetic metadata"),
+        protocol_sha256: "1".repeat(64),
+        candidate_sha256: "2".repeat(64),
+    }
+}
+
 pub struct OpenedHoldout {
     manifest: BlindManifest,
     audio: Vec<Vec<u8>>,
@@ -193,13 +212,11 @@ impl OpenedHoldout {
     }
 }
 
-/// Requires an opaque verified-development permit before accessing any private files.
-pub fn open_once(
+/// Validate a permit without examining the ledger or private files.
+pub(crate) fn verify_development_metadata(
     public: &PublicMetadata,
-    verified: VerifiedDevelopment,
-    ledger_directory: &std::path::Path,
-    private_directory: &std::path::Path,
-) -> Result<OpenedHoldout, String> {
+    verified: &VerifiedDevelopment,
+) -> Result<PublicMetadata, String> {
     let checked = PublicMetadata::from_json(&public.to_json()?)?;
     if checked.fingerprint()? != verified.metadata_sha256
         || !valid_hash(&verified.protocol_sha256)
@@ -210,6 +227,31 @@ pub fn open_once(
     if checked.version != 2 {
         return Err("public holdout metadata lacks a committed media capacity".into());
     }
+    Ok(checked)
+}
+
+/// Requires an opaque verified-development permit before accessing any private files.
+pub fn open_once(
+    public: &PublicMetadata,
+    verified: VerifiedDevelopment,
+    ledger_directory: &std::path::Path,
+    private_directory: &std::path::Path,
+) -> Result<OpenedHoldout, String> {
+    let reserved = reserve_holdout(public, verified, ledger_directory)?;
+    open_reserved(reserved, private_directory, None)
+}
+
+/// An internal, single-use result of a durably recorded reservation.
+pub(crate) struct ReservedHoldout {
+    checked: PublicMetadata,
+}
+
+pub(crate) fn reserve_holdout(
+    public: &PublicMetadata,
+    verified: VerifiedDevelopment,
+    ledger_directory: &std::path::Path,
+) -> Result<ReservedHoldout, String> {
+    let checked = verify_development_metadata(public, &verified)?;
     crate::number_holdout_ledger::record_attempt(
         ledger_directory,
         &crate::number_holdout_ledger::Reservation {
@@ -236,6 +278,13 @@ pub fn open_once(
     {
         unsafe { libc::_exit(73) }
     }
+    Ok(ReservedHoldout { checked })
+}
+
+/// Inspect only the directory metadata. This never opens the private files.
+pub(crate) fn private_directory_metadata(
+    private_directory: &std::path::Path,
+) -> Result<std::fs::Metadata, String> {
     let directory =
         std::fs::symlink_metadata(private_directory).map_err(|error| error.to_string())?;
     if !directory.is_dir() || directory.file_type().is_symlink() {
@@ -248,10 +297,22 @@ pub fn open_once(
             return Err("private holdout directory lacks private permissions".into());
         }
     }
-    let salt = read_private_file(private_directory, "salt.bin", 32)?;
+    Ok(directory)
+}
+
+pub(crate) fn open_reserved(
+    reserved: ReservedHoldout,
+    private_directory: &std::path::Path,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<OpenedHoldout, String> {
+    let checked = reserved.checked;
+    check_open_cancel(stop)?;
+    private_directory_metadata(private_directory)?;
+    let salt = read_private_file(private_directory, "salt.bin", 32, stop)?;
     let salt: [u8; 32] = salt.try_into().map_err(|_| "invalid secret salt length")?;
-    let manifest_bytes = read_private_file(private_directory, "manifest.json", MAX_MANIFEST_BYTES)?;
-    let media_sizes = read_private_file(private_directory, "media-sizes.bin", 10_001 * 8)?;
+    let manifest_bytes =
+        read_private_file(private_directory, "manifest.json", MAX_MANIFEST_BYTES, stop)?;
+    let media_sizes = read_private_file(private_directory, "media-sizes.bin", 10_001 * 8, stop)?;
     if manifest_commitment_v2(&salt, &manifest_bytes, &media_sizes) != checked.content_sha256 {
         return Err("private holdout commitment mismatch".into());
     }
@@ -290,14 +351,19 @@ pub fn open_once(
     let mut total = 0_u64;
     let mut audio = Vec::with_capacity(manifest.cases.len());
     for (case, size) in manifest.cases.iter().zip(sizes) {
-        let bytes = read_private_file(private_directory, &case.audio_file, MAX_MEDIA_BYTES)?;
+        let bytes = read_private_file(private_directory, &case.audio_file, MAX_MEDIA_BYTES, stop)?;
         total = total
             .checked_add(bytes.len() as u64)
             .ok_or("private holdout audio too large")?;
+        let mut audio_hash = Sha256::new();
+        for chunk in bytes.chunks(64 * 1024) {
+            check_open_cancel(stop)?;
+            audio_hash.update(chunk);
+        }
         if bytes.len() as u64 != size
             || total > audio_total_bytes
             || bytes.is_empty()
-            || format!("{:x}", Sha256::digest(&bytes)) != case.audio_sha256
+            || format!("{:x}", audio_hash.finalize()) != case.audio_sha256
         {
             return Err("private holdout audio mismatch or size limit".into());
         }
@@ -309,17 +375,27 @@ pub fn open_once(
     Ok(OpenedHoldout { manifest, audio })
 }
 
+fn check_open_cancel(stop: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        Err("interrupted".into())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn read_private_file(
     directory: &std::path::Path,
     name: &str,
     limit: usize,
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>, String> {
     use std::{
         fs::OpenOptions,
         io::Read,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
+    check_open_cancel(stop)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -333,9 +409,16 @@ fn read_private_file(
         return Err("secret salt lacks private permissions".into());
     }
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+    let mut file = file.take(limit as u64 + 1);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_open_cancel(stop)?;
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
     if bytes.len() > limit || bytes.len() as u64 != metadata.len() {
         return Err("private holdout file changed or exceeded its limit".into());
     }
@@ -343,7 +426,12 @@ fn read_private_file(
 }
 
 #[cfg(not(unix))]
-fn read_private_file(_: &std::path::Path, _: &str, _: usize) -> Result<Vec<u8>, String> {
+fn read_private_file(
+    _: &std::path::Path,
+    _: &str,
+    _: usize,
+    _: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<u8>, String> {
     Err("private holdout reading is not supported on this platform".into())
 }
 
