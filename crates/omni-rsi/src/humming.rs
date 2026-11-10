@@ -1,6 +1,7 @@
 //! Monophonic note and playback-clock evaluation for music-conditioned humming.
-//!
 //! This module consumes annotations; it does not extract pitch or record audio.
+
+pub mod training;
 
 /// A sample clock whose origin is expressed in a shared monotonic time domain.
 ///

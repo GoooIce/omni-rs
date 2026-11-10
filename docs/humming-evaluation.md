@@ -1,6 +1,6 @@
 # 哼唱的音符、时钟与客观指标
 
-`omni_rsi::humming` 是独立的 Rust 标注评估接口。它不读取音频、不检测 F0、不做转谱，也不启动模型或设备。参考音符和输出的有声、音高、起音需由调用者提供；`pitch_midi_from_hz` 只把已知的基频换成连续 MIDI 音高，不能从波形推断音高。单独的 [`humming_audio` 接口](humming-codec-fidelity.md) 提供离线 PCM 估计和合成旋律 codec 评估。这里的合成示例和测试只能验证时间与指标计算，不能证明自然哼唱或 LiquidCodec 对真人声音的保真度。[#85](https://github.com/GoooIce/omni-rs/issues/85) 的真人数据、codec、听审和对 #82 的依赖仍须另行完成。
+`omni_rsi::humming` 的标注评估接口不读取音频、不检测 F0、不做转谱，也不启动模型或设备。参考音符和输出的有声、音高、起音需由调用者提供；`pitch_midi_from_hz` 只把已知的基频换成连续 MIDI 音高，不能从波形推断音高。单独的 [`humming_audio` 接口](humming-codec-fidelity.md) 提供离线 PCM 估计和合成旋律 codec 评估，[`humming::training`](humming-training.md) 是另行显式调用的固定前缀训练原语。这里的合成示例和测试只能验证时间与指标计算，不能证明自然哼唱或 LiquidCodec 对真人声音的保真度。[#85](https://github.com/GoooIce/omni-rs/issues/85) 的真人数据、codec、听审和对 #82 的依赖仍须另行完成。
 
 ## 输入与时间
 
