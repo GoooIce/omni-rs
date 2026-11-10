@@ -148,12 +148,15 @@ def run_steps(root, steps, output, profile, resume=None):
     source_hash = fingerprint(root)
     current_environment = environment()
     previous = json.loads(resume.read_text()) if resume else None
-    if previous and (previous["source_sha256"] != source_hash or previous["profile"] != profile or
-                     previous.get("environment") != current_environment):
+    if previous and (previous["profile"] != profile or
+                     (profile != "cpu" and (previous["source_sha256"] != source_hash or
+                                            previous.get("environment") != current_environment))):
         raise ValueError("Sources, profile or environment changed; start a fresh run instead of reusing checks.")
-    # Device state and model fixtures are external inputs; hardware checks always run anew.
+    # CPU builds have external Cargo, compiler and backend inputs that are not
+    # fully captured by this runner; repeat the whole CPU profile on resume.
+    # Device state and model fixtures likewise cannot be reused.
     reusable = {row["id"]: row for row in previous["steps"] if row["status"] == "passed"} \
-        if previous and profile in ("quick", "cpu") else {}
+        if previous and profile == "quick" else {}
     output.mkdir(parents=True, exist_ok=False)
     report_path = output / "report.json"
     report = {"profile": profile, "source_sha256": source_hash, "environment": current_environment, "status": "running",
@@ -163,6 +166,8 @@ def run_steps(root, steps, output, profile, resume=None):
                                             profile, "--resume", str(report_path)])}
     write_report(report_path, report)
     print(f"Report: {report_path}", flush=True)
+    if previous and profile == "cpu":
+        print("CPU resume reruns all steps because external build inputs are not fully tracked.", flush=True)
     try:
         for step in steps:
             row = dict(step, status="running", log=str(output / (step["id"] + ".log")))
@@ -229,7 +234,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=("quick", "cpu", "metal", "native", "status"))
     parser.add_argument("--list", action="store_true", help="show commands without running them")
-    parser.add_argument("--resume", type=Path, help="reuse passed CPU steps with unchanged sources and toolchain")
+    parser.add_argument("--resume", type=Path, help="link to a prior report; CPU reruns all steps, quick may reuse unchanged steps")
     parser.add_argument("--output", type=Path, help="new report directory")
     args = parser.parse_args()
     if args.profile == "status":

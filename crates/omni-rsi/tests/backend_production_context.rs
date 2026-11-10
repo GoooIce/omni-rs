@@ -293,11 +293,17 @@ fn rustup_locations() -> Option<(PathBuf, PathBuf)> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn report_unverified_rustup(reason: &str) {
-    use std::io::Write;
-    let _ = writeln!(
-        std::io::stderr(),
-        "{reason}; rustup-only probe not verified; direct Cargo tests still run"
+fn assert_verified_identity(stdout: &str, context: &str) {
+    let identity = stdout
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("identity="))
+        .expect("positive probe did not report an identity");
+    assert!(
+        identity.len() == 64
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{context} positive probe did not obtain a verified identity: {identity}"
     );
 }
 
@@ -314,9 +320,9 @@ fn missing_rustup_locations_are_reported_even_with_test_output_capture() {
         .env_remove("RUSTUP_HOME")
         .output()
         .unwrap();
-    assert!(result.status.success());
+    assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("rustup locations unavailable"),
+        String::from_utf8_lossy(&result.stdout).contains("rustup locations unavailable"),
         "an unavailable rustup-only probe must be visible under normal test capture"
     );
 }
@@ -324,14 +330,12 @@ fn missing_rustup_locations_are_reported_even_with_test_output_capture() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn rustup_probe_accepts_missing_home_when_locations_are_explicit() {
-    let Some((cargo_home, rustup_home)) = rustup_locations() else {
-        report_unverified_rustup("rustup locations unavailable");
-        return;
-    };
-    if !cargo_home.join("bin/cargo").is_file() || !rustup_home.is_dir() {
-        report_unverified_rustup("rustup proxy unavailable");
-        return;
-    }
+    let (cargo_home, rustup_home) = rustup_locations()
+        .expect("rustup locations unavailable; positive rustup probe is not verified");
+    assert!(
+        cargo_home.join("bin/cargo").is_file() && rustup_home.is_dir(),
+        "rustup proxy unavailable; positive rustup probe is not verified"
+    );
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -355,15 +359,13 @@ fn rustup_probe_accepts_missing_home_when_locations_are_explicit() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn rustup_injected_cargo_home_keeps_valid_identity_and_detects_override() {
-    let Some((cargo_home, rustup_home)) = rustup_locations() else {
-        report_unverified_rustup("rustup locations unavailable");
-        return;
-    };
+    let (cargo_home, rustup_home) = rustup_locations()
+        .expect("rustup locations unavailable; positive rustup probe is not verified");
     let proxy = cargo_home.join("bin/cargo");
-    if !proxy.is_file() || !rustup_home.is_dir() {
-        report_unverified_rustup("rustup proxy unavailable");
-        return;
-    }
+    assert!(
+        proxy.is_file() && rustup_home.is_dir(),
+        "rustup proxy unavailable; positive rustup probe is not verified"
+    );
     let fixture = Fixture::new();
     let before = fixture.rustup_run(&proxy, &rustup_home);
     assert!(
@@ -374,15 +376,7 @@ fn rustup_injected_cargo_home_keeps_valid_identity_and_detects_override() {
     let before = String::from_utf8_lossy(&before.stdout);
     eprintln!("rustup-before={before}");
     assert!(before.contains("dependency=old_dependency"));
-    let verified = !before.contains("identity=backend-unverified-context");
-    if verified {
-        let identity = before
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("identity="))
-            .unwrap();
-        assert_eq!(identity.len(), 64);
-        assert!(identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    }
+    assert_verified_identity(&before, "rustup");
     fixture.write_config(true);
     let after = fixture.rustup_run(&proxy, &rustup_home);
     let stdout = String::from_utf8_lossy(&after.stdout);
@@ -391,16 +385,8 @@ fn rustup_injected_cargo_home_keeps_valid_identity_and_detects_override() {
         "rustup-after status={} stdout={stdout} stderr={stderr}",
         after.status
     );
-    if verified {
-        assert!(!after.status.success());
-        assert!(stderr.contains("path overrides are unsupported"));
-    } else {
-        assert!(
-            (!after.status.success() && stderr.contains("path overrides are unsupported"))
-                || (after.status.success()
-                    && stdout.contains("identity=backend-unverified-context"))
-        );
-    }
+    assert!(!after.status.success());
+    assert!(stderr.contains("path overrides are unsupported"));
 }
 
 #[test]
@@ -433,10 +419,23 @@ fn direct_cargo_without_trusted_home_fails_closed_despite_dependency_override() 
         String::from_utf8_lossy(&empty.stderr)
     );
     assert!(String::from_utf8_lossy(&empty.stdout).contains("identity=backend-unverified-context"));
+}
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn direct_cargo_with_explicit_home_is_verified_and_rejects_override() {
+    let fixture = Fixture::new();
+    let unverified = fixture.run(false);
+    assert!(
+        unverified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unverified.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unverified.stdout).contains("identity=backend-unverified-context")
+    );
     // Reusing the same target with an explicitly supplied protected home must
     // recheck configuration rather than retaining the unverified result.
-    fixture.write_config(false);
     let explicit = fixture.run(true);
     assert!(
         explicit.status.success(),
@@ -446,21 +445,12 @@ fn direct_cargo_without_trusted_home_fails_closed_despite_dependency_override() 
     let stdout = String::from_utf8_lossy(&explicit.stdout);
     eprintln!("explicit-home={stdout}");
     assert!(stdout.contains("dependency=old_dependency"));
-    let verified = !stdout.contains("identity=backend-unverified-context");
+    assert_verified_identity(&stdout, "direct Cargo");
     fixture.write_config(true);
     let guarded = fixture.run(true);
-    let stdout = String::from_utf8_lossy(&guarded.stdout);
     let stderr = String::from_utf8_lossy(&guarded.stderr);
-    if verified {
-        assert!(!guarded.status.success());
-        assert!(stderr.contains("path overrides are unsupported"));
-    } else {
-        assert!(
-            (!guarded.status.success() && stderr.contains("path overrides are unsupported"))
-                || (guarded.status.success()
-                    && stdout.contains("identity=backend-unverified-context"))
-        );
-    }
+    assert!(!guarded.status.success());
+    assert!(stderr.contains("path overrides are unsupported"));
 }
 
 #[test]
