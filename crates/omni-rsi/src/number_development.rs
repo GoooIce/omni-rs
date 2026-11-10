@@ -256,6 +256,26 @@ impl DevelopmentData {
             .fingerprint()
             .expect("validated public metadata serializes")
     }
+
+    /// Identities of the already validated train/dev case and group manifests.
+    pub fn manifest_fingerprints(&self) -> [&str; 4] {
+        [
+            &self.train_manifest_sha256,
+            &self.dev_manifest_sha256,
+            &self.train_groups_sha256,
+            &self.dev_groups_sha256,
+        ]
+    }
+
+    /// The model and full codec identities checked for any loaded speech targets.
+    pub fn target_model_fingerprints(&self) -> Option<(&str, &str)> {
+        self.target_binding.as_ref().map(|binding| {
+            (
+                binding.base_model_sha256.as_str(),
+                binding.codec_sha256.as_str(),
+            )
+        })
+    }
 }
 
 fn validate_groups(
