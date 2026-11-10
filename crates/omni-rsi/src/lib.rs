@@ -28,6 +28,7 @@ pub mod speech_generate;
 pub mod speech_holdout;
 pub mod speech_ingest;
 pub mod speech_number_evaluation;
+mod speech_pcm;
 pub mod speech_publish;
 pub mod speech_round;
 pub mod speech_seed;

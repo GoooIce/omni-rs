@@ -47,7 +47,12 @@ pub struct CodecConfig {
 }
 impl CodecConfig {
     pub fn load(directory: &Path) -> Result<Self> {
-        let p: Parameters = serde_json::from_slice(&std::fs::read(directory.join("config.json"))?)?;
+        Self::from_bytes(&std::fs::read(directory.join("config.json"))?)
+    }
+
+    /// Parse the exact configuration bytes supplied to an encoder or decoder.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let p: Parameters = serde_json::from_slice(bytes)?;
         let backbone = TextConfig {
             vocab_size: 1,
             hidden_size: p.encoder_dim,

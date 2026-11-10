@@ -53,7 +53,7 @@ CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 cargo run --
 CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 cargo run --offline --release --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,metal --example number_audio -- dev "$HOME/models/LiquidAI/LFM3-Omni-2B" "$PWD/artifacts/number-audio/data" "$PWD/artifacts/number-audio/state" "$PWD/artifacts/number-audio/dev-report.json" models/Confucius4-R2T2 target/release/r2t2
 ```
 
-省略最后两个 R2T2 参数可只运行文本对照，报告的输出语音 CER 会标为 `not_run`。传入时，输出语音使用相同 seed 42、温度 0.4、重复惩罚 1.2、180 slots，由本机 R2T2 转写并以规则答案计算 CER；原始文本、转写、语言、正常结束和有效性逐题记录。静音没有规则答案，不计入 CER。临时输出 WAV 不保留。文本生成对两组统一使用 FP32、贪心、最多 32 token；每次均重新建立模型上下文，输入是完整音频，不推断流式前缀，也不复用不同录音的声学前缀。两个入口通过相同状态目录的协作锁避免与遵守该约定的 RSI 工作并发；不能保证其他应用不占用设备。
+省略最后两个 R2T2 参数可只运行文本对照，报告的输出语音 CER 会标为 `not_run`。传入时，输出语音使用相同 seed 42、温度 0.4、重复惩罚 1.2、180 slots，由本机 R2T2 转写并以规则答案计算 CER；原始文本、转写、语言、正常结束和有效性逐题记录。有效音频即使未正常结束也按实际转写计算 CER，结束状态另行统计；无效音频按空转写计错。有限的低幅度非零音频也送交 R2T2，能否识别由转写结果反映。静音没有规则答案，不计入 CER。临时输出 WAV 不保留。文本生成对两组统一使用 FP32、贪心、最多 32 token；每次均重新建立模型上下文，输入是完整音频，不推断流式前缀，也不复用不同录音的声学前缀。两个入口通过相同状态目录的协作锁避免与遵守该约定的 RSI 工作并发；不能保证其他应用不占用设备。
 
 报告记录数据、底座、codec、候选检查点的身份及运行参数，另记录评分实现和评估程序文件哈希；运行后重查模型、数据、候选和评估程序文件。这些记录尚未构成预先冻结的正式证据；文件哈希只能约束内容一致性，不证明报告一定来自真实执行。逐题保留原文和实际音频来源，原题与交换题按该来源的规则答案评分。
 

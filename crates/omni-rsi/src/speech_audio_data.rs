@@ -40,8 +40,17 @@ struct ManifestRecord {
     frames: Option<Vec<Vec<u32>>>,
     #[serde(default)]
     target_codec_sha256: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    codec_fingerprint_sha256: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn optional_nonnull_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -98,6 +107,7 @@ pub struct AudioRecord {
     pub(crate) answer: String,
     pub(crate) frames: Option<Vec<Vec<u32>>>,
     pub(crate) target_codec_sha256: Option<String>,
+    pub(crate) codec_fingerprint_sha256: Option<String>,
     samples: Vec<f32>,
 }
 
@@ -357,6 +367,10 @@ impl AudioDataset {
                     }
                     _ => true,
                 }
+                || record
+                    .codec_fingerprint_sha256
+                    .as_ref()
+                    .is_some_and(|hash| record.frames.is_none() || !hex_id(hash))
                 || auth.source.trim().is_empty()
                 || !match auth.kind.as_str() {
                     "licensed-synthetic" => !auth.license.trim().is_empty(),
@@ -416,6 +430,7 @@ impl AudioDataset {
                     answer: record.answer,
                     frames: record.frames,
                     target_codec_sha256: record.target_codec_sha256,
+                    codec_fingerprint_sha256: record.codec_fingerprint_sha256,
                     samples,
                 });
             }

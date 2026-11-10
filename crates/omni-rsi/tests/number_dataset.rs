@@ -197,13 +197,37 @@ fn short_nonempty_speech_is_transcribed_without_assuming_it_is_correct() {
     assert!(output.normal_end && output.valid);
     assert_eq!(output.transcript, "十七");
     assert_eq!(calls.get(), 1);
-    for samples in [&[0.0_f32, 0.0][..], &[f32::NAN][..], &[][..]] {
+    for samples in [
+        &[0.0_f32, 0.0][..],
+        &[-0.0_f32, 0.0][..],
+        &[f32::NAN][..],
+        &[f32::INFINITY][..],
+        &[][..],
+    ] {
         let output = inspect_speech_output(&frames, samples, 9, true, |_| {
             panic!("invalid audio must not reach ASR")
         })
         .unwrap();
         assert!(!output.valid);
     }
+}
+
+#[test]
+fn low_amplitude_nonzero_speech_reaches_the_transcriber() {
+    use omni_rsi::speech_number_evaluation::inspect_speech_output;
+    use std::cell::Cell;
+    let called = Cell::new(false);
+    let frames = vec![vec![1, 2], vec![9, 9]];
+    let samples = [0.0_f32, 0.0005, -0.0005];
+    let output = inspect_speech_output(&frames, &samples, 9, true, |actual| {
+        called.set(true);
+        assert_eq!(actual, samples);
+        Ok(("无法识别".into(), "Chinese".into()))
+    })
+    .unwrap();
+    assert!(called.get());
+    assert!(output.valid && output.normal_end);
+    assert_eq!(output.transcript, "无法识别");
 }
 
 #[test]
@@ -480,6 +504,21 @@ fn swapped_audio_is_scored_against_the_audio_not_the_prompt_case() {
     let speech_summary = summarize_speech(&dev, &observations, &speech).unwrap();
     assert_eq!(speech_summary["baseline"]["cer"], 0.0);
     assert_eq!(speech_summary["candidate"]["cer"], 0.125);
+
+    let mut unfinished = speech.clone();
+    unfinished[0].normal_end = false;
+    let actual_transcript = summarize_speech(&dev, &observations, &unfinished).unwrap();
+    assert_eq!(actual_transcript["baseline"]["cer"], 0.0);
+    assert_eq!(actual_transcript["baseline"]["normal_end"], 5);
+    assert_eq!(actual_transcript["baseline"]["valid"], 6);
+    assert_eq!(actual_transcript["observations"][0]["transcript"], "十六");
+    assert_eq!(actual_transcript["observations"][0]["normal_end"], false);
+
+    let mut invalid = speech.clone();
+    invalid[0].valid = false;
+    let invalid_summary = summarize_speech(&dev, &observations, &invalid).unwrap();
+    assert_eq!(invalid_summary["baseline"]["cer"], 0.25);
+    assert_eq!(invalid_summary["baseline"]["valid"], 5);
 }
 
 #[test]

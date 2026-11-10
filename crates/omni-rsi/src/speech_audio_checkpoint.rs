@@ -1,10 +1,9 @@
 //! Checkpoints for audio-conditioned training, isolated from self-reading.
 use crate::{
-    fingerprint::codec_fingerprint,
+    fingerprint::{codec_fingerprint, target_codec_hash},
     number_audio_v3::NumberAudioV3,
     speech_audio_data::AudioDataset,
     speech_checkpoint::{atomic_json, implementation_hash},
-    speech_data::file_hash,
     speech_training::{SpeechOptimizer, SpeechOptimizerSnapshot},
 };
 use burn::tensor::backend::AutodiffBackend;
@@ -177,6 +176,7 @@ impl AudioProtocol {
         let base_hash = omni_lfm3::speech_adapter::source_fingerprint(model)
             .map_err(|error| error.to_string())?;
         let codec_hash = audio_codec_hash(model, stop)?;
+        let mut full_codec_hash = None;
         for index in 0..dataset.len() {
             let record = dataset.record(index).ok_or("missing audio record")?;
             if record
@@ -185,6 +185,17 @@ impl AudioProtocol {
                 .is_some_and(|hash| hash != &codec_hash)
             {
                 return Err("audio target codec does not match the current model".into());
+            }
+            if let Some(expected) = &record.codec_fingerprint_sha256 {
+                if full_codec_hash.is_none() {
+                    full_codec_hash =
+                        Some(codec_fingerprint(&model.join("audio_tokenizer"), stop)?);
+                }
+                if full_codec_hash.as_ref() != Some(expected) {
+                    return Err(
+                        "audio target codec fingerprint does not match the current model".into(),
+                    );
+                }
             }
         }
         let config: serde_json::Value = serde_json::from_slice(
@@ -231,12 +242,7 @@ impl AudioProtocol {
 
 // Preserve the established target and checkpoint digest for unsharded codecs.
 fn audio_codec_hash(model: &Path, stop: &AtomicBool) -> Result<String, String> {
-    let codec = model.join("audio_tokenizer");
-    if codec.join("model.safetensors.index.json").is_file() {
-        codec_fingerprint(&codec, stop)
-    } else {
-        file_hash(&codec.join("model.safetensors"))
-    }
+    target_codec_hash(&model.join("audio_tokenizer"), stop)
 }
 
 impl AudioCheckpoint {
