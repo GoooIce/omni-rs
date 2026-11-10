@@ -2313,6 +2313,37 @@ fn voice_recheck_fixture() -> VoiceRecheckFixture {
 }
 
 #[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_options(
+    fixture: &VoiceRecheckFixture,
+) -> omni_rsi::number_development::RegistrationOptions<'_> {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::number_development::{RegistrationOptions, ToolPaths};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = fixture.registration_dir.parent().unwrap();
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(root.join("state/number-audio-v3/audio-conditioned-v1/latest.json")).unwrap(),
+    )
+    .unwrap();
+    RegistrationOptions {
+        data_root: root,
+        model_dir: root.join("model"),
+        candidate_file: root
+            .join("state/number-audio-v3/audio-conditioned-v1/checkpoints")
+            .join(format!("{}.json", pointer["sha256"].as_str().unwrap())),
+        evaluator_file: std::env::current_exe().unwrap(),
+        backend: Cpu::name(&Default::default()),
+        r2t2: Some(ToolPaths {
+            model: root.join("r2t2"),
+            binary: root.join("r2t2-binary"),
+        }),
+        breeze: None,
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
 fn voice_recheck_fixture_with_failures(failures: bool) -> VoiceRecheckFixture {
     voice_recheck_fixture_variant(failures, false)
 }
@@ -2577,6 +2608,442 @@ fn voice_recheck_file_entry_reads_saved_report_and_rejects_duplicate_keys() {
 
 #[cfg(all(unix, feature = "cpu"))]
 #[test]
+fn voice_recheck_rejects_excess_observations_during_parsing() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    let fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("oversized.json");
+    // The trailing malformed object must never be parsed: the 6001st entry
+    // already exceeds the unconditional safety limit.
+    let report = format!(
+        "{{\"observations\":[{},{{\"unfinished\"",
+        vec!["0"; 6001].join(",")
+    );
+    fs::write(&path, report).unwrap();
+    let error = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &path,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("too many speech observations"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_caps_unknown_report_and_frame_nodes_during_parsing() {
+    use omni_rsi::number_v3_voice_recheck::{
+        recheck_registered_voice, recheck_registered_voice_file,
+    };
+    let mut fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("nodes.json");
+    let report = format!(
+        "{{\"unknown\":[{},{{\"unfinished\"",
+        vec!["0"; 750_001].join(",")
+    );
+    fs::write(&path, report).unwrap();
+    let error = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &path,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("JSON node budget exceeded"), "{error}");
+
+    let frame_path = fixture.voice_dir.join("000000.frames.json");
+    let bytes = format!(
+        "{{\"tokens\":[],\"frames\":[[{}]]}}",
+        vec!["0"; 30_001].join(",")
+    );
+    fs::write(&frame_path, &bytes).unwrap();
+    fixture.report["observations"][0]["speech"]["frames_sha256"] =
+        format!("{:x}", Sha256::digest(bytes.as_bytes())).into();
+    let error = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("JSON node budget exceeded"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_caps_protocol_nodes_before_schema_parsing() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let document = format!(
+        "{{\"unknown\":[{},{{\"unfinished\"",
+        vec!["0"; 1_000_001].join(",")
+    );
+    fs::write(fixture.registration_dir.join("protocol.json"), document).unwrap();
+    let error = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("JSON node budget exceeded"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_can_be_cancelled_while_processing_a_large_report() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        thread,
+        time::Duration,
+    };
+    let fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("large.json");
+    let report = format!("{{\"unknown\":[{}]}}", vec!["0"; 700_000].join(","));
+    fs::write(&path, report).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        signal.store(true, Ordering::Release);
+    });
+    let error = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &path,
+        &fixture.voice_dir,
+        &stop,
+    )
+    .unwrap_err();
+    thread.join().unwrap();
+    assert!(error.contains("interrupted"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built number_voice_recheck example"]
+fn voice_recheck_cli_rejects_linked_registration_ancestor_before_reading() {
+    use std::{os::unix::fs::symlink, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    fs::create_dir_all(root.join("actual/registration")).unwrap();
+    fs::write(
+        root.join("actual/registration/protocol.json"),
+        b"{unfinished",
+    )
+    .unwrap();
+    symlink(root.join("actual"), root.join("alias")).unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let output = Command::new(example)
+        .args(["unused", "unused", "unused", "unused"])
+        .arg(root.join("alias/registration"))
+        .args(["unused", "unused", "cpu", "unused", "unused"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(error.contains("without following links"), "{error}");
+    assert!(!error.contains("invalid preregistration"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_keeps_registration_directory_pinned_across_verification() {
+    use omni_rsi::number_v3_voice_recheck::VoiceRecheckRegistration;
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let options = voice_recheck_options(&fixture);
+    let opened = VoiceRecheckRegistration::open(&fixture.registration_dir).unwrap();
+    fs::rename(&fixture.registration_dir, root.join("pinned-registration")).unwrap();
+    fs::create_dir(&fixture.registration_dir).unwrap();
+    fs::write(
+        fixture.registration_dir.join("protocol.json"),
+        b"{unfinished",
+    )
+    .unwrap();
+    let result = opened
+        .verify_and_recheck(
+            &options,
+            &root.join("report.json"),
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        result["protocol_sha256"],
+        fixture.registered.protocol_sha256()
+    );
+    assert_eq!(result["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_uses_development_inputs_without_opening_training_media() {
+    use omni_rsi::number_v3_voice_recheck::VoiceRecheckRegistration;
+    use std::os::unix::fs::symlink;
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let options = voice_recheck_options(&fixture);
+    for name in [
+        "train-media",
+        "train-target-media",
+        "train.v3.json",
+        "train.groups.v3.json",
+    ] {
+        let path = root.join(name);
+        fs::rename(&path, root.join(format!("unavailable-{name}"))).unwrap();
+        symlink(root.join("must-not-be-read"), path).unwrap();
+    }
+    fs::create_dir(root.join("holdout")).unwrap();
+    for name in ["manifest.json", "salt.bin", "holdout.wav"] {
+        symlink(
+            root.join("must-not-be-read"),
+            root.join("holdout").join(name),
+        )
+        .unwrap();
+    }
+    let registration = VoiceRecheckRegistration::open(&fixture.registration_dir).unwrap();
+    let result = registration
+        .verify_and_recheck(
+            &options,
+            &root.join("report.json"),
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        result["protocol_sha256"],
+        fixture.registered.protocol_sha256()
+    );
+    assert_eq!(result["training_identity"], "not_reverified");
+    assert_eq!(result["partition_isolation"], "not_reverified");
+    assert_eq!(result["protocol_authenticity"], "not_verified");
+    assert_eq!(result["candidate_eligible"], false);
+    let candidate = fs::read(&options.candidate_file).unwrap();
+    fs::write(&options.candidate_file, b"changed synthetic candidate").unwrap();
+    assert!(
+        registration
+            .verify_and_recheck(
+                &options,
+                &root.join("report.json"),
+                &fixture.voice_dir,
+                &AtomicBool::new(false),
+            )
+            .is_err(),
+        "candidate identity must still be rechecked"
+    );
+    fs::write(&options.candidate_file, candidate).unwrap();
+    fs::write(
+        root.join("dev-media/dev-a.wav"),
+        b"changed synthetic development audio",
+    )
+    .unwrap();
+    assert!(
+        registration
+            .verify_and_recheck(
+                &options,
+                &root.join("report.json"),
+                &fixture.voice_dir,
+                &AtomicBool::new(false),
+            )
+            .is_err(),
+        "actual development audio must still be rechecked"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_rehashed_protocol_with_forged_candidate_identity() {
+    use omni_rsi::number_v3_voice_recheck::VoiceRecheckRegistration;
+    let fixture = voice_recheck_fixture();
+    let options = voice_recheck_options(&fixture);
+    let path = fixture.registration_dir.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    envelope["protocol"]["candidate_sha256"] = "0".repeat(64).into();
+    let bytes = serde_json::to_vec(&envelope["protocol"]).unwrap();
+    let mut hash = Sha256::new();
+    hash.update(b"omni-rsi-number-development-preregistration-v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(&bytes);
+    envelope["protocol_sha256"] = format!("{:x}", hash.finalize()).into();
+    write_json(&path, &envelope);
+    let error = VoiceRecheckRegistration::open(&fixture.registration_dir)
+        .unwrap()
+        .verify_and_recheck(
+            &options,
+            &fixture
+                .registration_dir
+                .parent()
+                .unwrap()
+                .join("report.json"),
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("local identities or parameters changed"),
+        "{error}"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built number_voice_recheck example"]
+fn voice_recheck_cli_uses_only_development_material() {
+    use std::{os::unix::fs::symlink, process::Command};
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let options = voice_recheck_options(&fixture);
+    for name in [
+        "train-media",
+        "train-target-media",
+        "train.v3.json",
+        "train.groups.v3.json",
+    ] {
+        let path = root.join(name);
+        fs::rename(&path, root.join(format!("unavailable-{name}"))).unwrap();
+        symlink(root.join("must-not-be-read"), path).unwrap();
+    }
+    let tool = options.r2t2.as_ref().unwrap();
+    let output =
+        Command::new(std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE"))
+            .arg(&options.model_dir)
+            .arg(root)
+            .arg(&options.candidate_file)
+            .arg(&options.evaluator_file)
+            .arg(&fixture.registration_dir)
+            .arg(root.join("report.json"))
+            .arg(&fixture.voice_dir)
+            .arg(&options.backend)
+            .arg(&tool.model)
+            .arg(&tool.binary)
+            .output()
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["protocol_sha256"],
+        fixture.registered.protocol_sha256()
+    );
+    assert_eq!(result["training_identity"], "not_reverified");
+    assert_eq!(result["partition_isolation"], "not_reverified");
+    assert_eq!(result["candidate_eligible"], false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example and lsof"]
+fn voice_recheck_cli_interrupts_an_in_progress_legacy_identity_hash() {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(root.join("state/number-audio-v3/audio-conditioned-v1/latest.json")).unwrap(),
+    )
+    .unwrap();
+    let candidate = root
+        .join("state/number-audio-v3/audio-conditioned-v1/checkpoints")
+        .join(format!("{}.json", pointer["sha256"].as_str().unwrap()));
+    let weights = root.join("r2t2/model.safetensors");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&weights)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 * 1024)
+        .unwrap(); // sparse synthetic bytes
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut process = Command::new(example)
+        .arg(root.join("model"))
+        .arg(root)
+        .arg(candidate)
+        .arg(std::env::current_exe().unwrap())
+        .arg(&fixture.registration_dir)
+        .arg(root.join("report.json"))
+        .arg(&fixture.voice_dir)
+        .arg(Cpu::name(&Default::default()))
+        .arg(root.join("r2t2"))
+        .arg(root.join("r2t2-binary"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut hashing_pid = None;
+    while Instant::now() < deadline {
+        let output = Command::new("/usr/sbin/lsof")
+            .arg("-t")
+            .arg("--")
+            .arg(&weights)
+            .output()
+            .unwrap();
+        if let Ok(pid) = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<i32>()
+        {
+            hashing_pid = Some(pid);
+            break;
+        }
+        if process.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if hashing_pid.is_none() {
+        let _ = process.kill();
+        let _ = process.wait();
+        panic!("synthetic R2T2 hash was not observed");
+    }
+    assert_eq!(unsafe { libc::kill(process.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && process.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if process.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(hashing_pid.unwrap(), libc::SIGKILL);
+        }
+        let _ = process.kill();
+        let _ = process.wait();
+        panic!("CLI did not stop its in-progress identity hash");
+    }
+    let output = process.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted"));
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
 fn voice_recheck_rejects_unrecognized_fields_in_the_frozen_envelope() {
     use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
     let fixture = voice_recheck_fixture();
@@ -2629,6 +3096,32 @@ fn voice_recheck_keeps_invalid_and_abnormally_ended_observations() {
         1
     );
     assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_a_stop_token_missing_from_saved_tokens() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    let frame_path = fixture.voice_dir.join("000000.frames.json");
+    let mut frames: Value = serde_json::from_slice(&fs::read(&frame_path).unwrap()).unwrap();
+    frames["tokens"] = json!([8]);
+    let bytes = serde_json::to_vec(&frames).unwrap();
+    fs::write(frame_path, &bytes).unwrap();
+    fixture.report["observations"][0]["speech"]["frames_sha256"] =
+        format!("{:x}", Sha256::digest(&bytes)).into();
+    assert_eq!(
+        fixture.report["observations"][0]["speech"]["end"]["stop_token"],
+        7
+    );
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "contradictory stop token was accepted");
 }
 
 #[cfg(all(unix, feature = "cpu"))]
@@ -2957,6 +3450,14 @@ fn voice_recheck_marks_jointly_changed_policy_as_not_recomputable() {
     for row in fixture.report["observations"].as_array_mut().unwrap() {
         row["end"] = json!({"stop_token":999});
         row["speech"]["end"] = json!({"stop_token":999});
+        let path = fixture
+            .voice_dir
+            .join(row["speech"]["frames_file"].as_str().unwrap());
+        let mut frames: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        frames["tokens"] = json!([999]);
+        let bytes = serde_json::to_vec(&frames).unwrap();
+        fs::write(path, &bytes).unwrap();
+        row["speech"]["frames_sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
     }
     let checked = recheck_registered_voice(
         &fixture.registered,

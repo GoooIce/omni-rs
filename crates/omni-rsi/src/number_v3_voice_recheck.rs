@@ -5,21 +5,25 @@
 
 use crate::{
     number_blind_holdout::BlindSource,
-    number_development::{FrozenSwap, RegisteredDevelopment},
-    number_v3_evaluation::recheck_registered_observations,
+    number_development::{
+        DevelopmentView, FrozenSwap, RegisteredDevelopment, RegistrationOptions,
+        verify_open_development_recheck,
+    },
+    number_v3_evaluation::recheck_development_view,
     speech_audio_data::number_text,
     speech_number_evaluation::{
         answer_number, character_error_rate, inspect_speech_output, mentions_number,
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeSeed};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::File,
-    io::{Cursor, Read},
+    io::{BufReader, Cursor, Read},
     path::{Component, Path},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -32,6 +36,9 @@ const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_FRAME_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WAV_BYTES: u64 = (MAX_SAMPLES * 4 + 1024) as u64;
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REPORT_JSON_NODES: usize = 750_000;
+const MAX_PROTOCOL_JSON_NODES: usize = 1_000_000;
+const MAX_FRAME_JSON_NODES: usize = 30_000;
 
 fn cancelled(stop: &AtomicBool) -> Result<(), String> {
     if stop.load(Ordering::Acquire) {
@@ -71,23 +78,32 @@ fn open_child(_: &File, _: &OsStr, _: bool) -> Result<File, String> {
     Err("voice recheck requires no-follow Unix file access".into())
 }
 
-fn open_directory(path: &Path) -> Result<File, String> {
+fn open_directory_with_parent(path: &Path) -> Result<(File, File), String> {
     if path.as_os_str().is_empty() {
         return Err("empty artifact directory".into());
     }
     let mut directory =
         File::open(if path.is_absolute() { "/" } else { "." }).map_err(|e| e.to_string())?;
+    let mut parent = directory.try_clone().map_err(|e| e.to_string())?;
     for component in path.components() {
         match component {
             Component::RootDir | Component::CurDir => (),
-            Component::Normal(name) => directory = open_child(&directory, name, true)?,
+            Component::Normal(name) => {
+                let child = open_child(&directory, name, true)?;
+                parent = directory;
+                directory = child;
+            }
             _ => return Err("artifact directory traversal is unsupported".into()),
         }
     }
     if !directory.metadata().map_err(|e| e.to_string())?.is_dir() {
         return Err("artifact root is not a directory".into());
     }
-    Ok(directory)
+    Ok((directory, parent))
+}
+
+fn open_directory(path: &Path) -> Result<File, String> {
+    open_directory_with_parent(path).map(|(directory, _)| directory)
 }
 
 #[cfg(unix)]
@@ -156,51 +172,104 @@ fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-struct StrictValue(Value);
+struct JsonBudget<'a> {
+    remaining: Cell<usize>,
+    stop: &'a AtomicBool,
+}
 
-impl<'de> Deserialize<'de> for StrictValue {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = StrictValue;
+impl JsonBudget<'_> {
+    fn consume<E: serde::de::Error>(&self) -> Result<(), E> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(E::custom("interrupted"));
+        }
+        self.remaining.set(
+            self.remaining
+                .get()
+                .checked_sub(1)
+                .ok_or_else(|| E::custom("JSON node budget exceeded"))?,
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ValueSeed<'a> {
+    budget: &'a JsonBudget<'a>,
+    depth: usize,
+    observation_limit: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        self.budget.consume()?;
+        struct Visitor<'a>(ValueSeed<'a>);
+        impl<'de> serde::de::Visitor<'de> for Visitor<'_> {
+            type Value = Value;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("JSON without duplicate fields")
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
+                Ok(json!(v))
             }
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
+                Ok(json!(v))
             }
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(StrictValue(json!(v)))
+                Ok(json!(v))
             }
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
                 serde_json::Number::from_f64(v)
-                    .map(|v| StrictValue(Value::Number(v)))
+                    .map(Value::Number)
                     .ok_or_else(|| E::custom("nonfinite JSON number"))
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(StrictValue(Value::String(v.to_owned())))
+                Ok(Value::String(v.to_owned()))
             }
             fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(StrictValue(Value::String(v)))
+                Ok(Value::String(v))
             }
             fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(StrictValue(Value::Null))
+                Ok(Value::Null)
             }
             fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(StrictValue(Value::Null))
+                Ok(Value::Null)
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut values = Vec::new();
-                while let Some(StrictValue(value)) = seq.next_element()? {
+                loop {
+                    if self.0.observation_limit && values.len() == MAX_OBSERVATIONS {
+                        // Reject before allocating or traversing the excess value.
+                        struct Reject;
+                        impl<'de> DeserializeSeed<'de> for Reject {
+                            type Value = ();
+                            fn deserialize<D: serde::Deserializer<'de>>(
+                                self,
+                                _: D,
+                            ) -> Result<(), D::Error> {
+                                Err(serde::de::Error::custom("too many speech observations"))
+                            }
+                        }
+                        if seq.next_element_seed(Reject)?.is_none() {
+                            break;
+                        }
+                        unreachable!();
+                    }
+                    let Some(value) = seq.next_element_seed(ValueSeed {
+                        budget: self.0.budget,
+                        depth: self.0.depth + 1,
+                        observation_limit: false,
+                    })?
+                    else {
+                        break;
+                    };
                     values.push(value);
                 }
-                Ok(StrictValue(Value::Array(values)))
+                Ok(Value::Array(values))
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -208,23 +277,63 @@ impl<'de> Deserialize<'de> for StrictValue {
             ) -> Result<Self::Value, A::Error> {
                 let mut values = serde_json::Map::new();
                 while let Some(key) = input.next_key::<String>()? {
+                    self.0.budget.consume()?;
                     if values.contains_key(&key) {
                         return Err(serde::de::Error::custom("duplicate JSON field"));
                     }
-                    let StrictValue(value) = input.next_value()?;
+                    let observation_limit = self.0.depth == 0 && key == "observations";
+                    let value = input.next_value_seed(ValueSeed {
+                        budget: self.0.budget,
+                        depth: self.0.depth + 1,
+                        observation_limit,
+                    })?;
                     values.insert(key, value);
                 }
-                Ok(StrictValue(Value::Object(values)))
+                Ok(Value::Object(values))
             }
         }
-        deserializer.deserialize_any(Visitor)
+        deserializer.deserialize_any(Visitor(self))
     }
 }
 
-fn strict_json(bytes: &[u8]) -> Result<Value, String> {
-    serde_json::from_slice::<StrictValue>(bytes)
-        .map(|value| value.0)
-        .map_err(|e| format!("invalid JSON: {e}"))
+struct CancelReader<'a> {
+    bytes: Cursor<&'a [u8]>,
+    stop: &'a AtomicBool,
+}
+
+impl Read for CancelReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("interrupted"));
+        }
+        self.bytes.read(buffer)
+    }
+}
+
+fn strict_json(bytes: &[u8], node_limit: usize, stop: &AtomicBool) -> Result<Value, String> {
+    let reader = BufReader::with_capacity(
+        16 * 1024,
+        CancelReader {
+            bytes: Cursor::new(bytes),
+            stop,
+        },
+    );
+    let mut input = serde_json::Deserializer::from_reader(reader);
+    let budget = JsonBudget {
+        remaining: Cell::new(node_limit),
+        stop,
+    };
+    let result = ValueSeed {
+        budget: &budget,
+        depth: 0,
+        observation_limit: false,
+    }
+    .deserialize(&mut input)
+    .and_then(|value| {
+        input.end()?;
+        Ok(value)
+    });
+    result.map_err(|e| format!("invalid JSON: {e}"))
 }
 
 fn equal_json(a: &Value, b: &Value) -> bool {
@@ -325,7 +434,7 @@ struct ProtocolSnapshot {
 
 fn registered_documents(
     directory: &File,
-    registered: &RegisteredDevelopment,
+    view: DevelopmentView<'_>,
     report: &Value,
     stop: &AtomicBool,
 ) -> Result<(Value, String), String> {
@@ -337,7 +446,7 @@ fn registered_documents(
         &mut remaining,
         stop,
     )?;
-    let envelope = strict_json(&bytes)?;
+    let envelope = strict_json(&bytes, MAX_PROTOCOL_JSON_NODES, stop)?;
     let protocol_value = envelope
         .get("protocol")
         .filter(|v| v.is_object())
@@ -356,7 +465,7 @@ fn registered_documents(
         || envelope["status"] != "insufficient_evidence"
         || envelope["candidate_eligible"] != false
         || envelope["protocol_sha256"] != id
-        || id != registered.protocol_sha256()
+        || id != view.protocol_sha256
         || report["protocol_sha256"] != id
     {
         return Err("frozen protocol does not match the registered comparison".into());
@@ -381,7 +490,7 @@ fn registered_documents(
         &mut remaining,
         stop,
     )?;
-    let policy = strict_json(&bytes)?;
+    let policy = strict_json(&bytes, MAX_PROTOCOL_JSON_NODES, stop)?;
     if policy.as_object().is_none_or(|fields| fields.len() != 6)
         || policy["version"] != 1
         || policy["protocol_sha256"] != id
@@ -523,11 +632,80 @@ fn speech_end(value: &Value, stops: &[u32]) -> Result<bool, String> {
     }
 }
 
+/// A directory handle for a read-only voice recheck, not a registration or
+/// evidence credential. Every path component is opened without following links.
+pub struct VoiceRecheckRegistration {
+    directory: File,
+    parent: File,
+}
+
+impl VoiceRecheckRegistration {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let (directory, parent) = open_directory_with_parent(path)?;
+        Ok(Self { directory, parent })
+    }
+
+    /// Match the supplied protocol to actual development inputs, model, tools,
+    /// and saved artifacts using the same pinned directory. Training identities
+    /// and cross-partition isolation are not reverified. Legacy identity hashing
+    /// is synchronous; the CLI supervises it in a cancellable local worker.
+    pub fn verify_and_recheck(
+        &self,
+        options: &RegistrationOptions<'_>,
+        report_path: &Path,
+        voice_dir: &Path,
+        stop: &AtomicBool,
+    ) -> Result<Value, String> {
+        cancelled(stop)?;
+        let mut budget = 32 * 1024 * 1024;
+        let bytes = read_child(
+            &self.directory,
+            OsStr::new("protocol.json"),
+            32 * 1024 * 1024,
+            &mut budget,
+            stop,
+        )?;
+        // Bound allocations before the existing typed registration parser runs
+        // over these exact immutable bytes.
+        strict_json(&bytes, MAX_PROTOCOL_JSON_NODES, stop)?;
+        let development = verify_open_development_recheck(options, &self.directory, &bytes, stop)?;
+        self.parent.sync_all().map_err(|e| e.to_string())?;
+        let mut result = recheck_voice_file_in_directory(
+            development.view(),
+            &self.directory,
+            report_path,
+            voice_dir,
+            stop,
+        )?;
+        result["training_identity"] = "not_reverified".into();
+        result["partition_isolation"] = "not_reverified".into();
+        result["protocol_authenticity"] = "not_verified".into();
+        Ok(result)
+    }
+}
+
 /// Read a bounded saved report without following links, then recheck it.
 /// Duplicate JSON fields are rejected before the report is interpreted.
 pub fn recheck_registered_voice_file(
     registered: &RegisteredDevelopment,
     registration_dir: &Path,
+    report_path: &Path,
+    voice_dir: &Path,
+    stop: &AtomicBool,
+) -> Result<Value, String> {
+    let registration = open_directory(registration_dir)?;
+    recheck_voice_file_in_directory(
+        registered.recheck_view(),
+        &registration,
+        report_path,
+        voice_dir,
+        stop,
+    )
+}
+
+fn recheck_voice_file_in_directory(
+    view: DevelopmentView<'_>,
+    registration: &File,
     report_path: &Path,
     voice_dir: &Path,
     stop: &AtomicBool,
@@ -541,9 +719,8 @@ pub fn recheck_registered_voice_file(
     let directory = open_directory(parent)?;
     let mut budget = 64 * 1024 * 1024;
     let bytes = read_child(&directory, name, 64 * 1024 * 1024, &mut budget, stop)?;
-    let report = strict_json(&bytes)?;
-    let mut result =
-        recheck_registered_voice(registered, registration_dir, &report, voice_dir, stop)?;
+    let report = strict_json(&bytes, MAX_REPORT_JSON_NODES, stop)?;
+    let mut result = recheck_voice_in_directory(view, registration, &report, voice_dir, stop)?;
     result["report_file_sha256"] = hash(&bytes).into();
     cancelled(stop)?;
     Ok(result)
@@ -559,6 +736,23 @@ pub fn recheck_registered_voice(
     voice_dir: &Path,
     stop: &AtomicBool,
 ) -> Result<Value, String> {
+    let registration = open_directory(registration_dir)?;
+    recheck_voice_in_directory(
+        registered.recheck_view(),
+        &registration,
+        report,
+        voice_dir,
+        stop,
+    )
+}
+
+fn recheck_voice_in_directory(
+    view: DevelopmentView<'_>,
+    registration: &File,
+    report: &Value,
+    voice_dir: &Path,
+    stop: &AtomicBool,
+) -> Result<Value, String> {
     cancelled(stop)?;
     let rows = report["observations"]
         .as_array()
@@ -569,20 +763,14 @@ pub fn recheck_registered_voice(
     if report["status"] != "insufficient_evidence" || report["candidate_eligible"] != false {
         return Err("invalid comparison evidence status".into());
     }
-    let registration = open_directory(registration_dir)?;
-    let (policy, policy_hash) = registered_documents(&registration, registered, report, stop)?;
+    let (policy, policy_hash) = registered_documents(registration, view, report, stop)?;
     let format = format_from_policy(&policy)?;
     if rows.len() > format.max_observations {
         return Err("registered observation limit exceeded".into());
     }
-    let text_check = recheck_registered_observations(registered, report, stop)?;
+    let text_check = recheck_development_view(view, report, stop, None)?;
     let directory = open_directory(voice_dir)?;
-    let cases: HashMap<_, _> = registered
-        .data()
-        .dev()
-        .iter()
-        .map(|c| (c.id(), c))
-        .collect();
+    let cases: HashMap<_, _> = view.cases.iter().map(|c| (c.id(), c)).collect();
     let mut names = HashSet::new();
     let mut budget = MAX_ARTIFACT_BYTES;
     let mut total_samples = 0_usize;
@@ -653,8 +841,10 @@ pub fn recheck_registered_voice(
         if speech["frames_sha256"].as_str() != Some(hash(&bytes).as_str()) {
             return Err("speech frames identity changed".into());
         }
+        let value = strict_json(&bytes, MAX_FRAME_JSON_NODES, stop)?;
         let frames: Frames =
-            serde_json::from_slice(&bytes).map_err(|e| format!("invalid speech frames: {e}"))?;
+            serde_json::from_value(value).map_err(|e| format!("invalid speech frames: {e}"))?;
+        cancelled(stop)?;
         if frames.tokens.len() > format.max_slots
             || frames.frames.len() > format.max_slots
             || frames.frames.iter().any(|frame| frame.len() > 128)
@@ -739,6 +929,15 @@ pub fn recheck_registered_voice(
             frame.len() == format.codebooks && frame.iter().all(|code| *code == format.eos)
         });
         let stopped = speech_end(&speech["end"], &format.stops)?;
+        if stopped
+            && frames.tokens.last().copied()
+                != Some(
+                    u32::try_from(number(&speech["end"]["stop_token"], "speech stop token")?)
+                        .map_err(|_| "invalid speech stop token")?,
+                )
+        {
+            return Err("speech stop token differs from saved tokens".into());
+        }
         let (valid, normal_end) = if shape {
             let inspected = inspect_speech_output(
                 &frames.frames[..frames.frames.len() - usize::from(has_eos)],
@@ -861,7 +1060,7 @@ pub fn recheck_registered_voice(
         "frames_wav_correspondence":"not_verified","source_authorization":"not_verified",
         "independent_human_listening":"not_verified","regressions":"not_verified",
         "unrecomputed_report_fields":["dataset_sha256","training_implementation_sha256","codec_checkpoint_sha256","candidate_training_updates"],
-        "protocol_sha256":registered.protocol_sha256(),
+        "protocol_sha256":view.protocol_sha256,
         "v3_policy_sha256":policy_hash,"text_recheck":text_check,"observations":checked,"speech_summary":speech_summary}),
     )
 }

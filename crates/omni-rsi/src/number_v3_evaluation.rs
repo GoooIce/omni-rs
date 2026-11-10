@@ -3,8 +3,8 @@ use crate::{
     lease::Lease,
     number_audio_v3::NumberAudioV3,
     number_development::{
-        RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister, update_pcm_digest,
-        verify_registration,
+        DevelopmentView, RegisteredDevelopment, RegistrationOptions, ToolPaths, preregister,
+        update_pcm_digest, verify_registration,
     },
     number_gate::{
         PairedCase, PairedOutcome, PairedStatistics, gain_at_least_five_points, paired_statistics,
@@ -1076,18 +1076,18 @@ mod late_cancel_tests {
 fn validate_frozen_mapping(
     registered: &RegisteredDevelopment,
 ) -> Result<HashMap<String, String>, String> {
-    let cases = registered.data().dev();
-    let frozen = registered.swaps();
-    if frozen.protocol_sha256() != registered.protocol_sha256()
-        || cases.len() < 2
-        || frozen.entries().len() != cases.len()
-    {
+    validate_view_mapping(registered.recheck_view())
+}
+
+fn validate_view_mapping(view: DevelopmentView<'_>) -> Result<HashMap<String, String>, String> {
+    let cases = view.cases;
+    if cases.len() < 2 || view.swaps.len() != cases.len() {
         return Err("invalid frozen development mapping".into());
     }
     let by_id: HashMap<_, _> = cases.iter().map(|case| (case.id(), case)).collect();
     let mut mapping = HashMap::new();
     let mut destinations = HashSet::new();
-    for pair in frozen.entries() {
+    for pair in view.swaps {
         let prompt = by_id.get(pair.case_id()).ok_or("unknown frozen case")?;
         let audio = by_id
             .get(pair.audio_case_id())
@@ -1123,20 +1123,24 @@ fn recheck_with_stop_tokens(
     stop: &AtomicBool,
     stop_tokens: Option<&[u32]>,
 ) -> Result<serde_json::Value, String> {
+    recheck_development_view(registered.recheck_view(), report, stop, stop_tokens)
+}
+
+pub(crate) fn recheck_development_view(
+    view: DevelopmentView<'_>,
+    report: &serde_json::Value,
+    stop: &AtomicBool,
+    stop_tokens: Option<&[u32]>,
+) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
-    if report["protocol_sha256"].as_str() != Some(registered.protocol_sha256()) {
+    if report["protocol_sha256"].as_str() != Some(view.protocol_sha256) {
         return Err("observation protocol differs from registration".into());
     }
-    let mapping = validate_frozen_mapping(registered)?;
-    let cases: HashMap<_, _> = registered
-        .data()
-        .dev()
-        .iter()
-        .map(|case| (case.id(), case))
-        .collect();
+    let mapping = validate_view_mapping(view)?;
+    let cases: HashMap<_, _> = view.cases.iter().map(|case| (case.id(), case)).collect();
     let mut pcm = HashMap::with_capacity(cases.len());
     let mut silence = HashMap::new();
-    for case in registered.data().dev() {
+    for case in view.cases {
         let mut hash = Sha256::new();
         for chunk in case.samples().chunks(4096) {
             interrupted(stop)?;
@@ -1260,9 +1264,8 @@ fn recheck_with_stop_tokens(
     {
         return Err("comparison summary differs from raw observations".into());
     }
-    let pairs = registered
-        .data()
-        .dev()
+    let pairs = view
+        .cases
         .iter()
         .map(|case| {
             let ends = originals
@@ -1295,7 +1298,7 @@ fn recheck_with_stop_tokens(
     let checked = serde_json::json!({
         "status": "insufficient_evidence",
         "candidate_eligible": false,
-        "protocol_sha256": registered.protocol_sha256(),
+        "protocol_sha256": view.protocol_sha256,
         "termination_token_policy": if stop_tokens.is_some() { "matched_registered_tokens" } else { "not_checked" },
         "execution_verified": false,
         "source_authorization": "not_verified",
