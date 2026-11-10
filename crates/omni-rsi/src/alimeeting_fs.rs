@@ -264,6 +264,27 @@ mod platform {
         Ok(())
     }
 
+    fn ensure_output_absent(directory: &File, name: &CStr) -> Result<(), String> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status == 0 {
+            return Err("output already exists".into());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(format!("cannot inspect output destination: {error}"))
+        }
+    }
+
     pub(crate) fn output_parent(root: &File, output: &Path) -> Result<(File, CString), String> {
         let name = output.file_name().ok_or("output needs a filename")?;
         if name == OsStr::new(".") || name == OsStr::new("..") || name.as_bytes().is_empty() {
@@ -289,6 +310,7 @@ mod platform {
             let next = open_child(&ancestor, OsStr::new(".."), true)?;
             let above = next.metadata().map_err(|error| error.to_string())?;
             if here.dev() == above.dev() && here.ino() == above.ino() {
+                ensure_output_absent(&output_dir, &name)?;
                 return Ok((output_dir, name));
             }
             ancestor = next;

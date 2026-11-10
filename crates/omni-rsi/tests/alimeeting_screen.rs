@@ -1,4 +1,4 @@
-#![cfg(feature = "native")]
+#![cfg(all(feature = "native", any(target_os = "linux", target_os = "macos")))]
 
 use std::{fs, process::Command};
 
@@ -305,6 +305,37 @@ fn whole_number_rule_excludes_dates_digit_strings_and_context() {
 }
 
 #[test]
+fn leading_period_before_chinese_number_is_deferred() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("textgrid_dir");
+    fs::create_dir(&input).unwrap();
+    for (index, mark) in [".一", "．一", "...十", "．两", ".〇"].iter().enumerate() {
+        fs::write(
+            input.join(format!("R{index:04}.TextGrid")),
+            single_interval("c1", mark),
+        )
+        .unwrap();
+    }
+    let output = root.join("candidates.json");
+    let result = run_cli(&input, &output);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(report["summary"]["candidate_count"], 0);
+    assert_eq!(report["summary"]["deferred_ambiguous_notation_count"], 5);
+    let deferred = report["deferred"].as_array().unwrap();
+    assert_eq!(deferred.len(), 5);
+    for row in deferred {
+        assert_eq!(row["reason"], "ambiguous_numeric_notation");
+        assert!(row.get("candidate_number").is_none());
+    }
+}
+
+#[test]
 fn compatibility_digits_and_leading_decimal_are_deferred_for_review() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -331,6 +362,40 @@ fn compatibility_digits_and_leading_decimal_are_deferred_for_review() {
         assert_eq!(row["reason"], "ambiguous_numeric_notation");
         assert!(row.get("candidate_number").is_none());
     }
+}
+
+#[test]
+fn ambiguous_notation_and_neighbor_context_are_both_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("textgrid_dir");
+    fs::create_dir(&input).unwrap();
+    let grid = "File type = \"ooTextFile\"\nObject class = \"TextGrid\"\nxmin = 0\nxmax = 2\n\
+        tiers? <exists>\nsize = 1\nitem []:\nitem [1]:\nclass = \"IntervalTier\"\n\
+        name = \"c1\"\nxmin = 0\nxmax = 2\nintervals: size = 2\n\
+        intervals [1]:\nxmin = 0\nxmax = 1\ntext = \".一\"\n\
+        intervals [2]:\nxmin = 1\nxmax = 2\ntext = \"个\"\n";
+    fs::write(input.join("R0001.TextGrid"), grid).unwrap();
+    let output = root.join("candidates.json");
+    let result = run_cli(&input, &output);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(report["summary"]["candidate_count"], 0);
+    assert_eq!(report["summary"]["deferred_adjacent_count"], 1);
+    assert_eq!(report["summary"]["deferred_ambiguous_notation_count"], 1);
+    assert_eq!(
+        report["deferred"][0]["reason"],
+        "ambiguous_numeric_notation"
+    );
+    assert_eq!(
+        report["deferred"][0]["reasons"],
+        serde_json::json!(["ambiguous_numeric_notation", "adjacent_nonempty_interval"])
+    );
+    assert!(report["deferred"][0].get("candidate_number").is_none());
 }
 
 #[test]
@@ -363,6 +428,32 @@ fn a_digit_adjacent_to_other_text_is_deferred_instead_of_labeled() {
         "adjacent_nonempty_interval"
     );
     assert!(report["deferred"][0].get("candidate_number").is_none());
+}
+
+#[test]
+fn multiline_crlf_mark_is_preserved_in_the_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("textgrid_dir");
+    fs::create_dir(&input).unwrap();
+    let grid = single_interval("c1", "\n十二\n").replace('\n', "\r\n");
+    fs::write(input.join("R0001.TextGrid"), grid.as_bytes()).unwrap();
+    fs::write(input.join("R0002.TextGrid"), utf16(&grid, true)).unwrap();
+    fs::write(input.join("R0003.TextGrid"), utf16(&grid, false)).unwrap();
+    let output = root.join("candidates.json");
+    let result = run_cli(&input, &output);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    let candidates = report["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 3);
+    for candidate in candidates {
+        assert_eq!(candidate["mark"], "\r\n十二\r\n");
+        assert_eq!(candidate["candidate_number"], 12);
+    }
 }
 
 #[test]
@@ -492,6 +583,50 @@ fn rejects_symlinks_special_files_traversal_and_oversized_inputs() {
 }
 
 #[test]
+fn repeated_long_source_paths_hit_the_accumulation_budget_before_publication() {
+    use std::fmt::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("textgrid_dir");
+    fs::create_dir(&input).unwrap();
+    let mut nested = input.clone();
+    for index in 0..3 {
+        nested.push(format!("d{index}{}", "x".repeat(238)));
+        fs::create_dir(&nested).unwrap();
+    }
+    let count = 38_000;
+    let mut grid = format!(
+        "File type = \"ooTextFile\"\nObject class = \"TextGrid\"\nxmin = 0\nxmax = {count}\n\
+         tiers? <exists>\nsize = 1\nitem []:\nitem [1]:\nclass = \"IntervalTier\"\n\
+         name = \"c1\"\nxmin = 0\nxmax = {count}\nintervals: size = {count}\n"
+    );
+    for index in 0..count {
+        writeln!(
+            grid,
+            "intervals [{}]:\nxmin = {index}\nxmax = {}\ntext = \"1\"",
+            index + 1,
+            index + 1
+        )
+        .unwrap();
+    }
+    assert!(grid.len() < 8 * 1024 * 1024);
+    fs::write(nested.join("R0001.TextGrid"), grid).unwrap();
+    let output = root.join("candidates.json");
+    let result = run_cli(&input, &output);
+    assert!(
+        !result.status.success(),
+        "accumulated records must be bounded"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("accumulated report data exceeds limit"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+}
+
+#[test]
 fn input_depth_and_unexpected_regular_files_are_not_silently_skipped() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -561,6 +696,76 @@ fn malformed_or_unsupported_textgrids_fail_closed() {
         assert!(!result.status.success(), "malformed case {index} must fail");
         assert!(!output.exists(), "malformed case {index} published output");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_output_is_rejected_before_reading_input_files() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("textgrid_dir");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("R0001.TextGrid"), "invalid synthetic TextGrid").unwrap();
+    let output = root.join("existing.json");
+    fs::write(&output, "unchanged").unwrap();
+    let result = run_cli(&input, &output);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("output already exists"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"unchanged");
+    let missing_target = root.join("missing-target");
+    let dangling = root.join("dangling.json");
+    symlink(&missing_target, &dangling).unwrap();
+    let result = run_cli(&input, &dangling);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("output already exists"));
+    assert!(
+        fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!missing_target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_publishers_do_not_replace_the_winning_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    fs::write(left.join("R0001.TextGrid"), single_interval("c1", "十二")).unwrap();
+    fs::write(right.join("R0001.TextGrid"), single_interval("c1", "十五")).unwrap();
+    let output = root.join("race.json");
+    let spawn = |input: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_alimeeting-screen"))
+            .arg("--textgrid-dir")
+            .arg(input)
+            .arg("--output")
+            .arg(&output)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn(&left);
+    let second = spawn(&right);
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_ne!(first.status.success(), second.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(
+        report["candidates"][0]["candidate_number"],
+        if first.status.success() { 12 } else { 15 }
+    );
 }
 
 #[cfg(unix)]

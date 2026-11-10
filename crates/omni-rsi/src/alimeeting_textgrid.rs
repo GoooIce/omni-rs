@@ -49,22 +49,39 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<String, String> {
 }
 
 struct Parser<'a> {
-    lines: std::str::Lines<'a>,
+    lines: std::str::SplitInclusive<'a, char>,
+    line_ending: &'a str,
 }
 
 impl<'a> Parser<'a> {
     fn new(text: &'a str) -> Self {
         Self {
-            lines: text.lines(),
+            lines: text.split_inclusive('\n'),
+            line_ending: "",
+        }
+    }
+
+    fn read_line(&mut self) -> Option<&'a str> {
+        let line = self.lines.next()?;
+        if let Some(content) = line.strip_suffix("\r\n") {
+            self.line_ending = "\r\n";
+            Some(content)
+        } else if let Some(content) = line.strip_suffix('\n') {
+            self.line_ending = "\n";
+            Some(content)
+        } else {
+            self.line_ending = "";
+            Some(line)
         }
     }
 
     fn next(&mut self) -> Result<&'a str, String> {
-        self.lines
-            .by_ref()
-            .find(|line| !line.trim().is_empty())
-            .map(str::trim_start)
-            .ok_or_else(|| "truncated TextGrid".into())
+        while let Some(line) = self.read_line() {
+            if !line.trim().is_empty() {
+                return Ok(line.trim_start());
+            }
+        }
+        Err("truncated TextGrid".into())
     }
 
     fn expect(&mut self, expected: &str) -> Result<(), String> {
@@ -114,11 +131,14 @@ impl<'a> Parser<'a> {
                     return Err(format!("{key} exceeds string limit"));
                 }
             }
-            output.push('\n');
+            if self.line_ending.is_empty() {
+                return Err("unterminated quoted string".into());
+            }
+            output.push_str(self.line_ending);
             if output.len() > MAX_STRING_BYTES {
                 return Err(format!("{key} exceeds string limit"));
             }
-            rest = self.lines.next().ok_or("unterminated quoted string")?;
+            rest = self.read_line().ok_or("unterminated quoted string")?;
         }
     }
 

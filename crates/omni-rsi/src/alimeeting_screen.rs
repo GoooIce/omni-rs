@@ -13,6 +13,10 @@ use unicode_normalization::UnicodeNormalization;
 const MAX_INTERVALS: usize = 1_000_000;
 const MAX_ROWS: usize = 100_000;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ACCUMULATED_REPORT_BYTES: usize = 32 * 1024 * 1024;
+// Fixed charges keep the acceptance boundary the same across architectures.
+const SOURCE_BUDGET_OVERHEAD: usize = 320;
+const ROW_BUDGET_OVERHEAD: usize = 512;
 
 #[derive(Serialize)]
 struct SourceFile {
@@ -48,7 +52,12 @@ struct Deferred {
     end_seconds: f64,
     mark: String,
     reason: &'static str,
+    reasons: &'static [&'static str],
 }
+
+const _: () = assert!(2 * std::mem::size_of::<SourceFile>() + 128 <= SOURCE_BUDGET_OVERHEAD);
+const _: () = assert!(2 * std::mem::size_of::<Candidate>() + 128 <= ROW_BUDGET_OVERHEAD);
+const _: () = assert!(2 * std::mem::size_of::<Deferred>() + 128 <= ROW_BUDGET_OVERHEAD);
 
 #[derive(Serialize)]
 struct Summary {
@@ -149,7 +158,7 @@ fn ambiguous_notation(mark: &str) -> bool {
             .trim_start_matches(|ch: char| ch == '.' || ch.is_whitespace())
             .chars()
             .next()
-            .is_some_and(|ch| ch.is_ascii_digit())
+            .is_some_and(|ch| ch.is_ascii_digit() || chinese_digits.contains(ch))
 }
 
 fn recording_id(relative: &str) -> Result<String, String> {
@@ -188,6 +197,29 @@ fn spk_suffix(recording: &str) -> &str {
 
 struct LimitedWriter {
     bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct AccumulationBudget {
+    bytes: usize,
+}
+
+impl AccumulationBudget {
+    fn reserve(&mut self, fixed: usize, strings: &[&str]) -> Result<(), String> {
+        let added = strings
+            .iter()
+            .try_fold(fixed, |total, value| total.checked_add(value.len()))
+            .ok_or("accumulated report data exceeds limit")?;
+        let total = self
+            .bytes
+            .checked_add(added)
+            .ok_or("accumulated report data exceeds limit")?;
+        if total > MAX_ACCUMULATED_REPORT_BYTES {
+            return Err("accumulated report data exceeds limit".into());
+        }
+        self.bytes = total;
+        Ok(())
+    }
 }
 
 fn tool_fingerprint() -> String {
@@ -247,13 +279,21 @@ pub fn screen(input: &Path, output: &Path) -> Result<(), String> {
     let mut deferred = Vec::new();
     let mut seen_recordings = BTreeSet::new();
     let mut interval_count = 0_usize;
+    let mut report_budget = AccumulationBudget::default();
     alimeeting_fs::visit_inputs(&root, |relative, bytes| {
         let recording = recording_id(&relative)?;
         let spk_suffix = spk_suffix(&recording);
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        // Account for the source record, recording set and summary keys before
+        // retaining copies. The factor covers spare Vec capacity; the extra
+        // allowance covers allocation and map-node overhead conservatively.
+        report_budget.reserve(
+            SOURCE_BUDGET_OVERHEAD,
+            &[&relative, &recording, spk_suffix, spk_suffix, &sha256],
+        )?;
         if !seen_recordings.insert(recording.clone()) {
             return Err(format!("duplicate recording identifier: {recording}"));
         }
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let text = alimeeting_textgrid::decode(&bytes)?;
         let tiers =
             alimeeting_textgrid::parse(&text).map_err(|error| format!("{relative}: {error}"))?;
@@ -285,14 +325,32 @@ pub fn screen(input: &Path, output: &Path) -> Result<(), String> {
                 if candidates.len().saturating_add(deferred.len()) >= MAX_ROWS {
                     return Err("candidate row limit exceeded".into());
                 }
-                let reason = if ambiguous_notation(&interval.mark) {
-                    Some("ambiguous_numeric_notation")
-                } else if neighbor_has_text {
-                    Some("adjacent_nonempty_interval")
-                } else {
-                    None
-                };
-                if let Some(reason) = reason {
+                // Per-row copies and worst-case unique summary keys are
+                // budgeted before allocation, including spare Vec capacity.
+                report_budget.reserve(
+                    ROW_BUDGET_OVERHEAD,
+                    &[
+                        &relative,
+                        &recording,
+                        &recording,
+                        spk_suffix,
+                        spk_suffix,
+                        &tier.name,
+                        &tier.name,
+                        &tier.name,
+                        &interval.mark,
+                    ],
+                )?;
+                let reasons: &'static [&'static str] =
+                    match (ambiguous_notation(&interval.mark), neighbor_has_text) {
+                        (true, true) => {
+                            &["ambiguous_numeric_notation", "adjacent_nonempty_interval"]
+                        }
+                        (true, false) => &["ambiguous_numeric_notation"],
+                        (false, true) => &["adjacent_nonempty_interval"],
+                        (false, false) => &[],
+                    };
+                if let Some(&reason) = reasons.first() {
                     deferred.push(Deferred {
                         source_file: relative.clone(),
                         recording_id: recording.clone(),
@@ -304,6 +362,7 @@ pub fn screen(input: &Path, output: &Path) -> Result<(), String> {
                         end_seconds: interval.end,
                         mark: interval.mark.clone(),
                         reason,
+                        reasons,
                     });
                 } else {
                     candidates.push(Candidate {
@@ -442,11 +501,11 @@ pub fn screen(input: &Path, output: &Path) -> Result<(), String> {
             deferred_unknown_spk_count,
             deferred_adjacent_count: deferred
                 .iter()
-                .filter(|row| row.reason == "adjacent_nonempty_interval")
+                .filter(|row| row.reasons.contains(&"adjacent_nonempty_interval"))
                 .count(),
             deferred_ambiguous_notation_count: deferred
                 .iter()
-                .filter(|row| row.reason == "ambiguous_numeric_notation")
+                .filter(|row| row.reasons.contains(&"ambiguous_numeric_notation"))
                 .count(),
         },
         source_files,
