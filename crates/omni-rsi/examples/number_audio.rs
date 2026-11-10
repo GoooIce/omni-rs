@@ -3,6 +3,7 @@ use omni_rsi::{
     lease::Lease,
     speech_asr,
     speech_audio_data::generate_rule_manifest,
+    speech_audio_target::encode_target,
     speech_data::file_hash,
     speech_number_evaluation::{DevelopmentOptions, evaluate_development},
     speech_seed::teacher_fingerprint,
@@ -23,7 +24,7 @@ type ModelBackend = burn::backend::NdArray<f32>;
 compile_error!("select the cpu or metal feature");
 type TrainingBackend = burn::backend::Autodiff<ModelBackend>;
 
-const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n\nBuild consumes existing authorized local WAV files and a source plan; it does not run Breeze or R2T2 on inputs. Dev compares a local LFM3 base and its audio-conditioned checkpoint. With both R2T2 arguments it also transcribes generated output speech. Reports never activate a candidate.";
+const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n\nBuild consumes existing authorized local WAV files and a source plan; it does not run Breeze or R2T2 on inputs. Encode-target loads the local codec and does not validate the WAV's meaning or provenance. Dev compares a local LFM3 base and its audio-conditioned checkpoint. With both R2T2 arguments it also transcribes generated output speech. Reports never activate a candidate.";
 
 fn execute() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -63,6 +64,18 @@ fn execute() -> Result<(), String> {
                 "{}",
                 serde_json::json!({"source":"local_r2t2_run", "audio_sha256":before,
                 "verifier_sha256":ids.native, "text":event.text, "language":event.language})
+            );
+        }
+        Some("encode-target") if args.len() == 3 => {
+            let result = encode_target::<ModelBackend>(
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+                &Default::default(),
+                &stop,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|error| error.to_string())?
             );
         }
         Some("build") if args.len() == 3 => {
