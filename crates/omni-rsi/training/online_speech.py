@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -37,6 +38,22 @@ def _regular(path: Path, max_bytes: int) -> None:
         raise ValueError('speech entry has an invalid file')
 
 
+@dataclass(frozen=True)
+class ClaimedUtterance:
+    """A completed recording whose queue manifest and audio passed integrity checks."""
+    id: str
+    audio: Path
+    sample_rate: int
+    samples: int
+
+
+@dataclass(frozen=True)
+class RejectedUtterance:
+    """A corrupt queued recording that was retained in the rejection archive."""
+    id: str
+    reason: str
+
+
 class SpeechQueue:
     """One worker may claim records; interrupted work remains recoverable.
 
@@ -68,7 +85,19 @@ class SpeechQueue:
             self.worker.close()
             self.worker = None
 
-    def claim(self) -> Path | None:
+    def claim(self) -> ClaimedUtterance | RejectedUtterance | None:
+        """Claim and validate one utterance, or quarantine an invalid one."""
+        entry = self._claim_path()
+        if entry is None:
+            return None
+        try:
+            manifest = self._validate(entry)
+        except ValueError as error:
+            self._finish_path(entry, 'rejected', 'integrity')
+            return RejectedUtterance(entry.name, str(error))
+        return ClaimedUtterance(entry.name, entry / 'audio.wav', manifest['sample_rate'], manifest['samples'])
+
+    def _claim_path(self) -> Path | None:
         if self.worker is None:
             raise RuntimeError('speech queue is not locked')
         processing = self.root / 'processing'
@@ -96,7 +125,7 @@ class SpeechQueue:
                     return destination
         return None
 
-    def validate(self, entry: Path) -> dict:
+    def _validate(self, entry: Path) -> dict:
         if entry.parent != self.root / 'processing' or not ID.fullmatch(entry.name):
             raise ValueError('invalid speech entry')
         if not stat.S_ISDIR(entry.lstat().st_mode):
@@ -121,7 +150,15 @@ class SpeechQueue:
         except (OSError, UnicodeError, json.JSONDecodeError, wave.Error, EOFError) as error:
             raise ValueError('speech entry failed integrity validation') from error
 
-    def finish(self, entry: Path, outcome: str, reason: str = '') -> None:
+    def finish(self, utterance: ClaimedUtterance, outcome: str, reason: str = '') -> None:
+        if not isinstance(utterance, ClaimedUtterance) or not isinstance(utterance.id, str) or not ID.fullmatch(utterance.id):
+            raise ValueError('invalid claimed utterance')
+        entry = self.root / 'processing' / utterance.id
+        if utterance.audio != entry / 'audio.wav':
+            raise ValueError('claimed utterance belongs to a different speech queue')
+        self._finish_path(entry, outcome, reason)
+
+    def _finish_path(self, entry: Path, outcome: str, reason: str = '') -> None:
         if (self.worker is None or entry.parent != self.root / 'processing' or
                 not ID.fullmatch(entry.name) or outcome not in ('accepted', 'rejected')):
             raise ValueError('invalid speech queue completion')
@@ -197,9 +234,9 @@ class LocalVerifier:
         processor = AutoProcessor.from_pretrained(model, trust_remote_code=True, local_files_only=True)
         self.codec = processor.audio_tokenizer.to(device=self.device, dtype=torch.float32).eval()
 
-    def prepare(self, entry: Path, destination: Path) -> dict:
+    def prepare(self, entry: ClaimedUtterance, destination: Path) -> dict:
         np, sf, torch = self.np, self.sf, self.torch
-        original = entry / 'audio.wav'
+        original = entry.audio
         signal, rate = sf.read(original, dtype='float32')
         if (rate != 16000 or signal.ndim != 1 or not np.isfinite(signal).all() or
                 float(np.sqrt(np.mean(signal * signal))) < .001):
@@ -248,10 +285,10 @@ class LocalVerifier:
                 sha256_file(self.model / 'audio_tokenizer/model.safetensors') != self.codec_hash):
             raise RuntimeError('model or verifier changed while processing speech')
         return {
-            'id': entry.name, 'split': 'train', 'task': 'tts', 'question': transcript, 'answer': transcript,
+            'id': entry.id, 'split': 'train', 'task': 'tts', 'question': transcript, 'answer': transcript,
             'label_source': 'r2t2-pseudo-label', 'frames': frames, 'audio': 'audio.wav',
             'audio_sha256': sha256_file(audio), 'teacher_model_sha256': self.base_hash, 'verified': True,
-            'speech_teacher': {'method': USER_TEACHER, 'fingerprint': entry.name,
+            'speech_teacher': {'method': USER_TEACHER, 'fingerprint': entry.id,
                                'audio': 'source.wav', 'audio_sha256': sha256_file(source)},
             'verification': {'method': VERIFIER, 'kind': 'codec-roundtrip-self-consistency',
                              'asr_sha256': self.asr_hash, **comparison, 'codec_max_error': codec_error,
@@ -266,14 +303,11 @@ def ingest_one(root: Path, data: Path, make_verifier, evaluation: Path | None = 
         entry = queue.claim()
         if entry is None:
             return {'state': 'empty'}
-        ident = entry.name
-        try:
-            queue.validate(entry)
-        except ValueError as error:
-            queue.finish(entry, 'rejected', 'integrity')
-            return {'state': 'rejected', 'id': ident, 'reason': str(error)}
+        if isinstance(entry, RejectedUtterance):
+            return {'state': 'rejected', 'id': entry.id, 'reason': entry.reason}
+        ident = entry.id
         evaluation_plan = load_evaluation(evaluation) if evaluation is not None else None
-        if evaluation_plan is not None and matches_reserved_audio(entry / 'audio.wav', evaluation_plan):
+        if evaluation_plan is not None and matches_reserved_audio(entry.audio, evaluation_plan):
             queue.finish(entry, 'rejected', 'reserved evaluation audio')
             return {'state': 'rejected', 'id': ident, 'reason': 'reserved evaluation audio'}
         online = root / 'online-data'

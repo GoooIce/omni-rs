@@ -39,7 +39,7 @@ target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" status
 target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" stop
 ```
 
-`status` 展示排队、处理中、已核验、拒绝和候选包数量；`stop` 请求调度器及其子进程让出设备，随后用 `status` 确认停止。录音保存在该状态目录下的 `inbox`、`processing`、`processed` 或 `rejected`，核验样本保存在 `online-data`；不会上传。队列上限为 128 条。处理异常可恢复，不能确认的音频不会入训。
+`status` 展示排队、处理中、已核验、拒绝和候选包数量；`stop` 请求调度器及其子进程让出设备，随后用 `status` 确认停止。录音保存在该状态目录下的 `inbox`、`processing`、`processed` 或 `rejected`，核验样本保存在 `online-data`；不会上传。队列上限为 128 条。处理器认领时会检查清单和录音的完整性，损坏的录音直接移入拒绝目录，不会加载核验模型。处理异常可恢复，不能确认的音频不会入训。
 
 固定保留集的 15 条真人录音带有原始 PCM 指纹；录音入队后以及训练续跑前会排除完整匹配的保留录音，训练文字也不能与保留题相同。这不能识别裁剪、变速或其他变换后的相似录音，也不能保证按说话人隔离。原始录音需留在状态目录中供续训时复核；缺失或变化时会拒绝续训。
 

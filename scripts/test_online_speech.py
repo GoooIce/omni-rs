@@ -8,7 +8,8 @@ import unittest
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'crates/omni-rsi/training'))
-from online_speech import SpeechQueue, RejectSpeech, ingest_one, check_reserved_online  # noqa: E402
+from online_speech import (SpeechQueue, ClaimedUtterance, RejectedUtterance,
+                           RejectSpeech, ingest_one, check_reserved_online)  # noqa: E402
 from chinese_speech_data import checked_dataset  # noqa: E402
 from breeze_teacher import TEACHER  # noqa: E402
 from r2t2_asr import VERIFIER  # noqa: E402
@@ -43,12 +44,15 @@ class OnlineSpeechQueueTests(unittest.TestCase):
         ident = submit(self.root)
         with SpeechQueue(self.root) as queue:
             record = queue.claim()
-            self.assertEqual(record.name, ident)
-            self.assertEqual(queue.validate(record)['samples'], 16000)
+            self.assertIsInstance(record, ClaimedUtterance)
+            self.assertEqual(record.id, ident)
+            self.assertEqual((record.sample_rate, record.samples), (16000, 16000))
+            self.assertTrue(record.audio.is_file())
             self.assertFalse((self.root / 'inbox' / ident).exists())
         with SpeechQueue(self.root) as queue:
             record = queue.claim()
-            self.assertEqual(record.name, ident)
+            self.assertIsInstance(record, ClaimedUtterance)
+            self.assertEqual(record.id, ident)
             queue.finish(record, 'accepted')
             self.assertIsNone(queue.claim())
         self.assertTrue((self.root / 'processed' / ident / 'audio.wav').is_file())
@@ -58,9 +62,10 @@ class OnlineSpeechQueueTests(unittest.TestCase):
         (self.root / 'inbox' / ident / 'audio.wav').write_bytes(b'corrupt')
         with SpeechQueue(self.root) as queue:
             record = queue.claim()
-            with self.assertRaisesRegex(ValueError, 'integrity'):
-                queue.validate(record)
-            queue.finish(record, 'rejected', 'integrity')
+            self.assertIsInstance(record, RejectedUtterance)
+            self.assertEqual(record.id, ident)
+            self.assertIn('integrity', record.reason)
+            self.assertIsNone(queue.claim())
         self.assertTrue((self.root / 'rejected' / ident / 'audio.wav').exists())
         self.assertFalse((self.root / 'processed' / ident).exists())
 
@@ -68,7 +73,6 @@ class OnlineSpeechQueueTests(unittest.TestCase):
         ident = submit(self.root)
         with SpeechQueue(self.root) as queue:
             record = queue.claim()
-            queue.validate(record)
             queue.finish(record, 'accepted')
         self.assertEqual(submit(self.root), ident)
         with SpeechQueue(self.root) as queue:
@@ -83,11 +87,21 @@ class OnlineSpeechQueueTests(unittest.TestCase):
                 with SpeechQueue(self.root):
                     pass
 
+    def test_a_claim_cannot_be_completed_by_a_different_queue(self):
+        ident = submit(self.root)
+        other = self.root / 'other'
+        with SpeechQueue(self.root) as queue, SpeechQueue(other) as other_queue:
+            record = queue.claim()
+            with self.assertRaisesRegex(ValueError, 'different speech queue'):
+                other_queue.finish(record, 'accepted')
+            queue.finish(record, 'accepted')
+        self.assertTrue((self.root / 'processed' / ident / 'audio.wav').is_file())
+
     def test_interruption_after_writing_outcome_can_be_resumed(self):
         ident = submit(self.root)
         with SpeechQueue(self.root) as queue:
             record = queue.claim()
-            (record / 'result.json').write_text(json.dumps({'outcome': 'accepted', 'reason': ''}))
+            (record.audio.parent / 'result.json').write_text(json.dumps({'outcome': 'accepted', 'reason': ''}))
         with SpeechQueue(self.root) as queue:
             queue.finish(queue.claim(), 'accepted')
         self.assertTrue((self.root / 'processed' / ident).is_dir())
@@ -135,13 +149,13 @@ class IngestionTests(unittest.TestCase):
                     raise RejectSpeech('source ASR did not produce enough Chinese speech')
                 if behavior == 'transient':
                     raise RuntimeError('local tool unavailable')
-                row = test.write_record(destination, entry.name, 'train', 'user-speech-v1', 99)
-                (destination / f'{entry.name}.json').unlink()
-                (destination / f'{entry.name}.wav').rename(destination / 'audio.wav')
-                (destination / f'{entry.name}-source.wav').rename(destination / 'source.wav')
+                row = test.write_record(destination, entry.id, 'train', 'user-speech-v1', 99)
+                (destination / f'{entry.id}.json').unlink()
+                (destination / f'{entry.id}.wav').rename(destination / 'audio.wav')
+                (destination / f'{entry.id}-source.wav').rename(destination / 'source.wav')
                 row.update(task='tts', question='新的语音', answer='新的语音', label_source='r2t2-pseudo-label')
                 row['audio'] = 'audio.wav'
-                row['speech_teacher'].update(fingerprint=entry.name, audio='source.wav')
+                row['speech_teacher'].update(fingerprint=entry.id, audio='source.wav')
                 row['verification']['kind'] = 'codec-roundtrip-self-consistency'
                 return row
         return FakeLocalBoundary()
@@ -168,6 +182,18 @@ class IngestionTests(unittest.TestCase):
         self.assertTrue((self.state / 'rejected' / ident).is_dir())
         self.assertFalse((self.state / 'online-data' / ident).exists())
 
+    def test_corrupt_record_is_rejected_before_loading_a_verifier(self):
+        ident = submit(self.state)
+        (self.state / 'inbox' / ident / 'audio.wav').write_bytes(b'corrupt')
+        def must_not_load():
+            self.fail('corrupt audio must not invoke ASR or the codec')
+        result = ingest_one(self.state, self.data, must_not_load)
+        self.assertEqual(result['state'], 'rejected')
+        self.assertEqual(result['id'], ident)
+        self.assertIn('integrity', result['reason'])
+        self.assertTrue((self.state / 'rejected' / ident).is_dir())
+        self.assertFalse((self.state / 'online-data' / ident).exists())
+
     def test_reserved_recording_is_rejected_before_running_any_models(self):
         ident = submit(self.state)
         audio = self.state / 'inbox' / ident / 'audio.wav'
@@ -190,8 +216,7 @@ class IngestionTests(unittest.TestCase):
         ident = submit(self.state)
         with SpeechQueue(self.state) as queue:
             entry = queue.claim()
-            queue.validate(entry)
-            with wave.open(str(entry / 'audio.wav'), 'rb') as sound:
+            with wave.open(str(entry.audio), 'rb') as sound:
                 samples = sound.getnframes()
                 digest = hashlib.sha256(sound.readframes(samples)).hexdigest()
             queue.finish(entry, 'accepted')

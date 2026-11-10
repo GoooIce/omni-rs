@@ -52,6 +52,10 @@ The end of an audio source, after which remaining audio and the final decoding b
 A request to stop decoding and retain committed text, discarding audio that has not yet been processed.
 _Avoid_: normal end, pause
 
+**Learning utterance**:
+A completed user-provided speech segment considered for local speech training. It is not verified training data until its audio and provenance have passed admission.
+_Avoid_: transcription, ground truth
+
 **Real-time factor (RTF)**:
 Time spent in decoding divided by the duration of audio represented in the transcript events. Model loading and waiting for audio are excluded.
 
