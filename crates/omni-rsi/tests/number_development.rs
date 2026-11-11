@@ -1773,6 +1773,38 @@ fn older_preregistration_is_rejected_without_overwriting_its_protocol() {
 
 #[cfg(unix)]
 #[test]
+fn preregistration_binds_shared_input_wav_validation_source() {
+    let root = fixture();
+    artifacts(root.path());
+    let options = options(root.path());
+    let destination = root.path().join("frozen");
+    let stop = AtomicBool::new(false);
+    preregister(&options, &destination, &stop).unwrap();
+    let path = destination.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let actual = format!(
+        "{:x}",
+        Sha256::digest(include_bytes!("../src/speech_audio_data.rs"))
+    );
+    assert_eq!(
+        envelope["protocol"]["policy"]["input_wav_implementation_sha256"],
+        actual
+    );
+    envelope["protocol"]["policy"]["input_wav_implementation_sha256"] = "0".repeat(64).into();
+    let bytes = serde_json::to_vec(&envelope["protocol"]).unwrap();
+    let mut hash = Sha256::new();
+    hash.update(b"omni-rsi-number-development-preregistration-v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    envelope["protocol_sha256"] = format!("{:x}", hash.finalize()).into();
+    write_json(&path, &envelope);
+    let original = fs::read(&path).unwrap();
+    assert!(verify_registration(&options, &destination, &stop).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
 fn registration_rechecks_model_codec_candidate_evaluator_and_regression_inputs() {
     let root = fixture();
     artifacts(root.path());

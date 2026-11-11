@@ -2,6 +2,7 @@
 
 use crate::{
     number_blind_holdout::{BlindSource, PublicMetadata},
+    speech_audio_data::ValidatedWavPcm,
     speech_target_format::{TARGET_SAMPLE_RATE, TargetCodeFormat},
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,6 @@ const LAYOUT: &[u8] = b"omni-rsi-number-train-dev-v3\n";
 const MAX_MANIFEST: usize = 8 * 1024 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
 const MAX_TOTAL_MEDIA: usize = 128 * 1024 * 1024;
-const MAX_SAMPLES: usize = 16_000 * 20;
 const MAX_TOTAL_SAMPLES: usize = 16_000 * 1_200;
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -114,7 +114,7 @@ struct GroupCase {
 
 pub struct DevelopmentRecord {
     record: ManifestRecord,
-    samples: Vec<f32>,
+    samples: ValidatedWavPcm,
     pcm_sha256: String,
 }
 
@@ -129,6 +129,9 @@ impl DevelopmentRecord {
         self.record.answer
     }
     pub fn samples(&self) -> &[f32] {
+        self.samples.samples()
+    }
+    pub(crate) fn validated_wav(&self) -> &ValidatedWavPcm {
         &self.samples
     }
     pub fn source(&self) -> &BlindSource {
@@ -707,16 +710,12 @@ fn load_media(
         }
         let predicted = normalized_samples(wav.duration(), rate)?;
         check_sample_budget(*total_samples, predicted)?;
-        let samples = omni_lfm3::media_io::decode_wav(&bytes, stop).map_err(|e| e.to_string())?;
-        if samples.is_empty()
-            || samples.len() > MAX_SAMPLES
-            || samples.len() > predicted
-            || samples.iter().any(|v| !v.is_finite() || v.abs() > 1.0)
-        {
+        let samples = ValidatedWavPcm::decode(&bytes, stop)?;
+        if samples.samples().len() > predicted {
             return Err("invalid v3 audio samples".into());
         }
         *total_samples = check_sample_budget(*total_samples, predicted)?;
-        let pcm_sha256 = pcm_sha256(&samples);
+        let pcm_sha256 = pcm_sha256(samples.samples());
         let label = (record.spoken_number, record.answer);
         if labels
             .insert(pcm_sha256.clone(), label)
@@ -1796,6 +1795,7 @@ fn common_identities(
         "answer_scoring": "single-integer-or-answer-label-0-100-v1", "silence_scoring": "numeric-mention-v1",
         "scoring_source_sha256": format!("{:x}", Sha256::digest(include_bytes!("speech_number_evaluation.rs"))),
         "registration_implementation_sha256": format!("{:x}", Sha256::digest(include_bytes!("number_development.rs"))),
+        "input_wav_implementation_sha256": format!("{:x}", Sha256::digest(include_bytes!("speech_audio_data.rs"))),
         "statistics_implementation_sha256": format!("{:x}", Sha256::digest(include_bytes!("number_gate.rs"))),
         "statistics": {"method":"bonferroni-clopper-pearson-95-v1", "minimum_independent_cases":30,
             "minimum_gain_percentage_points":5, "lower_bound":"strictly_positive", "normal_end":"no_degradation"},

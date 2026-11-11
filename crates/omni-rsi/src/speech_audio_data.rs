@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -20,6 +20,43 @@ const MAX_SAMPLES: usize = 16_000 * 20;
 // At most 1,200 seconds across every split (76.8 MB of decoded f32 PCM).
 const MAX_DATASET_SAMPLES: usize = 16_000 * 1_200;
 const NUMBER_INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
+
+/// PCM produced from a WAV after validating its original floating-point
+/// samples. Only this module constructs it; it is not a general PCM permit
+/// or proof of authorization or media identity. Admission checks those separately.
+pub(crate) struct ValidatedWavPcm(Vec<f32>);
+
+impl ValidatedWavPcm {
+    pub(crate) fn decode(bytes: &[u8], stop: &AtomicBool) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() as u64 > MAX_WAV {
+            return Err("invalid or oversized WAV input".into());
+        }
+        let mut wav = hound::WavReader::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+        if wav.spec().sample_format == hound::SampleFormat::Float {
+            for (index, sample) in wav.samples::<f32>().enumerate() {
+                if index % 4096 == 0 && stop.load(Ordering::Acquire) {
+                    return Err("interrupted".into());
+                }
+                let sample = sample.map_err(|e| e.to_string())?;
+                if !sample.is_finite() || sample.abs() > 1.0 {
+                    return Err("invalid source WAV sample".into());
+                }
+            }
+        }
+        let samples = decode_wav(bytes, stop).map_err(|e| e.to_string())?;
+        if samples.is_empty()
+            || samples.len() > MAX_SAMPLES
+            || samples.iter().any(|sample| !sample.is_finite())
+        {
+            return Err("invalid decoded WAV samples".into());
+        }
+        Ok(Self(samples))
+    }
+
+    pub(crate) fn samples(&self) -> &[f32] {
+        &self.0
+    }
+}
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -108,7 +145,7 @@ pub struct AudioRecord {
     pub(crate) frames: Option<Vec<Vec<u32>>>,
     pub(crate) target_codec_sha256: Option<String>,
     pub(crate) codec_fingerprint_sha256: Option<String>,
-    samples: Vec<f32>,
+    samples: ValidatedWavPcm,
 }
 
 impl AudioRecord {
@@ -128,6 +165,9 @@ impl AudioRecord {
         self.speaker_id.as_deref()
     }
     pub fn samples(&self) -> &[f32] {
+        self.samples.samples()
+    }
+    pub(crate) fn validated_wav(&self) -> &ValidatedWavPcm {
         &self.samples
     }
 }
@@ -390,22 +430,16 @@ impl AudioDataset {
             }
             hash.update((bytes.len() as u64).to_le_bytes());
             hash.update(&bytes);
-            let samples = decode_wav(&bytes, stop).map_err(|error| error.to_string())?;
+            let samples = ValidatedWavPcm::decode(&bytes, stop)?;
             total_samples = total_samples
-                .checked_add(samples.len())
+                .checked_add(samples.samples().len())
                 .ok_or("dataset too large")?;
-            if samples.is_empty()
-                || samples.len() > MAX_SAMPLES
-                || total_samples > MAX_DATASET_SAMPLES
-                || samples
-                    .iter()
-                    .any(|sample| !sample.is_finite() || sample.abs() > 1.0)
-            {
+            if total_samples > MAX_DATASET_SAMPLES {
                 return Err(format!("invalid audio samples: {}", record.id));
             }
             if manifest.version == 2 {
                 let mut pcm = Sha256::new();
-                for sample in &samples {
+                for sample in samples.samples() {
                     let bits = if *sample == 0.0 { 0 } else { sample.to_bits() };
                     pcm.update(bits.to_le_bytes());
                 }
