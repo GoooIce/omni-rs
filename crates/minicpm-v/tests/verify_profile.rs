@@ -15,6 +15,7 @@
 //!
 //! `VERIFY_PROFILE_ITERS` (default 24) bounds the measured iterations. The
 //! per-launch lines land in `/tmp/cubecl.log` as `| duration | Kernel | ...`.
+#![cfg(feature = "metal")]
 
 use burn::backend::wgpu::{Metal, WgpuDevice};
 use burn::tensor::backend::Backend as _;
