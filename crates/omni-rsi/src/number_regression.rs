@@ -217,6 +217,9 @@ pub(crate) fn verify(
     let mut seen = HashSet::new();
     let (mut baseline, mut candidate) = (Counts::default(), Counts::default());
     for row in &report.observations {
+        if matches!(&row.end, End::Cancelled) {
+            return Err("cancelled observation cannot form a complete report".into());
+        }
         let case = cases.get(row.case_id.as_str()).ok_or("unknown case")?;
         if !seen.insert((row.arm, row.case_id.as_str()))
             || row.raw_text.len() > MAX_OUTPUT
@@ -320,13 +323,18 @@ where
                     ));
                 }
             };
+            let cancelled = matches!(&decoded.end, TextEnd::Cancelled);
             if decoded.text.len() > MAX_OUTPUT {
                 return Err(diagnostic(
                     manifest,
                     &rows,
                     (arm, case),
-                    "failed_unverified",
-                    Some("decoded text exceeds size limit"),
+                    if cancelled {
+                        "cancelled_unverified"
+                    } else {
+                        "failed_unverified"
+                    },
+                    Some("decoded text exceeds size limit; last output omitted"),
                 ));
             }
             let end = End::from(decoded.end);
@@ -353,12 +361,16 @@ where
                     manifest,
                     &rows,
                     (arm, case),
-                    "failed_unverified",
+                    if cancelled {
+                        "cancelled_unverified"
+                    } else {
+                        "failed_unverified"
+                    },
                     Some("observation budget exceeded; last output omitted"),
                 ));
             }
             rows.push(row);
-            if stop.load(Ordering::Acquire) {
+            if cancelled || stop.load(Ordering::Acquire) {
                 return Err(diagnostic(
                     manifest,
                     &rows,

@@ -5,7 +5,9 @@
 use crate::{
     number_development::RegisteredDevelopment,
     number_regression::ChineseManifest,
-    number_v3_voice_recheck::{open_child, open_directory, read_child, strict_registered_protocol},
+    number_v3_voice_recheck::{
+        open_child, open_directory, read_child, strict_json, strict_registered_protocol,
+    },
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -49,7 +51,7 @@ fn valid_name(name: &str) -> bool {
 
 fn load(data: &Path, stop: &AtomicBool) -> Result<Current, String> {
     let root = open_directory(data)?;
-    let mut remaining = 512 * 1024;
+    let mut remaining = 6 * 256 * 1024;
     let bytes = read_child(
         &root,
         OsStr::new("regression-plan.json"),
@@ -69,32 +71,62 @@ fn load(data: &Path, stop: &AtomicBool) -> Result<Current, String> {
     {
         return Err("invalid regression plan".into());
     }
-    let mut chinese = None;
-    for group in plan.groups {
+    for group in &plan.groups {
         if !required.contains(group.name.as_str())
             || !seen.insert(group.name.clone())
             || !valid_name(&group.manifest_file)
         {
             return Err("invalid regression group".into());
         }
+    }
+    let directory = open_child(&root, OsStr::new("regression-inputs"), true)?;
+    let mut chinese = None;
+    for group in plan.groups {
+        let manifest_bytes = read_child(
+            &directory,
+            OsStr::new(&group.manifest_file),
+            256 * 1024,
+            &mut remaining,
+            stop,
+        )?;
         if group.name == "chinese" {
-            chinese = Some(group.manifest_file);
+            chinese = Some((
+                group.manifest_file,
+                ChineseManifest::from_bytes(&manifest_bytes)?,
+            ));
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                .map_err(|e| format!("invalid regression manifest: {e}"))?;
+            if !value.is_object() {
+                return Err("regression manifest must be a JSON object".into());
+            }
         }
     }
-    let manifest_file = chinese.ok_or("missing Chinese regression")?;
-    let directory = open_child(&root, OsStr::new("regression-inputs"), true)?;
-    let manifest_bytes = read_child(
-        &directory,
-        OsStr::new(&manifest_file),
-        256 * 1024,
-        &mut remaining,
-        stop,
-    )?;
+    let (manifest_file, manifest) = chinese.ok_or("missing Chinese regression")?;
     Ok(Current {
         plan_sha256: format!("{:x}", Sha256::digest(&bytes)),
         manifest_file,
-        manifest: ChineseManifest::from_bytes(&manifest_bytes)?,
+        manifest,
     })
+}
+
+/// Check the whole protocol using safe descriptors before any legacy verifier runs.
+pub(super) fn preflight_protocol(registration: &Path, stop: &AtomicBool) -> Result<(), String> {
+    let directory = open_directory(registration)?;
+    let mut remaining = 32 * 1024 * 1024;
+    let bytes = read_child(
+        &directory,
+        OsStr::new("protocol.json"),
+        32 * 1024 * 1024,
+        &mut remaining,
+        stop,
+    )?;
+    let envelope = strict_json(&bytes, 1_000_000, stop)?;
+    let id = envelope["protocol_sha256"]
+        .as_str()
+        .ok_or("missing protocol identity")?;
+    strict_registered_protocol(&bytes, id, stop)?;
+    Ok(())
 }
 
 pub(super) fn current(data: &Path, stop: &AtomicBool) -> Result<ChineseManifest, String> {

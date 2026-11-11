@@ -141,7 +141,10 @@ pub(crate) fn read_child(
     cancelled(stop)?;
     let mut file = open_child(directory, name, false)?;
     let before = file.metadata().map_err(|e| e.to_string())?;
-    if !same_file(&before, &before) || before.len() == 0 || before.len() > limit {
+    if !same_file(&before, &before) {
+        return Err("artifact must be a single-link regular file".into());
+    }
+    if before.len() == 0 || before.len() > limit {
         return Err("invalid or oversized voice artifact".into());
     }
     *remaining = remaining
@@ -314,7 +317,11 @@ impl Read for CancelReader<'_> {
     }
 }
 
-fn strict_json(bytes: &[u8], node_limit: usize, stop: &AtomicBool) -> Result<Value, String> {
+pub(crate) fn strict_json(
+    bytes: &[u8],
+    node_limit: usize,
+    stop: &AtomicBool,
+) -> Result<Value, String> {
     let reader = BufReader::with_capacity(
         16 * 1024,
         CancelReader {

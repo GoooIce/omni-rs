@@ -34,6 +34,9 @@ const INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
 
 #[path = "number_chinese_registration.rs"]
 mod chinese_registration;
+#[path = "number_chinese_state.rs"]
+mod chinese_state;
+use chinese_state::ChineseState;
 #[path = "number_v3_voice.rs"]
 mod voice;
 
@@ -243,8 +246,12 @@ fn prepare<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
     asr_mode: V3AsrMode,
+    chinese_state: Option<&ChineseState>,
 ) -> Result<Prepared, String> {
     interrupted(stop)?;
+    if let Some(state) = chinese_state {
+        state.verify(stop)?;
+    }
     let dataset = NumberAudioV3::load(options.data, options.model, stop)?;
     if options.r2t2.is_some()
         && dataset
@@ -258,31 +265,36 @@ fn prepare<B: AutodiffBackend>(
     }
     let backend = B::name(device);
     let protocol = AudioProtocol::for_v3(options.model, &dataset, backend.clone(), stop)?;
-    let checkpoint_state = options.state.join("number-audio-v3");
-    let directory = checkpoint_state.join("audio-conditioned-v1");
-    let pointer: serde_json::Value =
-        serde_json::from_slice(&read_regular(&directory.join("latest.json"), 4096)?)
-            .map_err(|e| e.to_string())?;
-    let candidate = pointer
-        .get("sha256")
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| {
-            id.len() == 64
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-        .ok_or("invalid v3 candidate pointer")?
-        .to_owned();
-    let checkpoint = load_matching_checkpoint(&checkpoint_state, &protocol, &candidate)?;
+    let (candidate, checkpoint, candidate_file) = if let Some(state) = chinese_state {
+        state.checkpoint::<B>(&protocol, device, stop)?
+    } else {
+        let checkpoint_state = options.state.join("number-audio-v3");
+        let directory = checkpoint_state.join("audio-conditioned-v1");
+        let pointer: serde_json::Value =
+            serde_json::from_slice(&read_regular(&directory.join("latest.json"), 4096)?)
+                .map_err(|e| e.to_string())?;
+        let candidate = pointer
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| {
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or("invalid v3 candidate pointer")?
+            .to_owned();
+        let checkpoint = load_matching_checkpoint(&checkpoint_state, &protocol, &candidate)?;
+        let candidate_file = directory
+            .join("checkpoints")
+            .join(format!("{candidate}.json"));
+        if hash_regular(&candidate_file, 256 * 1024 * 1024, stop)? != candidate {
+            return Err("v3 candidate content mismatch".into());
+        }
+        (candidate, checkpoint, candidate_file)
+    };
     if checkpoint.progress().updates == 0 {
         return Err("v3 candidate has no training updates".into());
-    }
-    let candidate_file = directory
-        .join("checkpoints")
-        .join(format!("{candidate}.json"));
-    if hash_regular(&candidate_file, 256 * 1024 * 1024, stop)? != candidate {
-        return Err("v3 candidate content mismatch".into());
     }
     let evaluator = std::env::current_exe().map_err(|e| e.to_string())?;
     let (mut parameters, text_options) = text_parameters(options.model, &backend)?;
@@ -446,7 +458,16 @@ fn preregister_with_mode<B: AutodiffBackend>(
     chinese: bool,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
-    let _leases = leases(options.state)?;
+    let chinese_state = if chinese {
+        Some(ChineseState::acquire(options.state, stop)?)
+    } else {
+        None
+    };
+    let _leases = if chinese {
+        None
+    } else {
+        Some(leases(options.state)?)
+    };
     match fs::symlink_metadata(options.registration) {
         Ok(_) => return Err("v3 registration already exists".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -457,24 +478,41 @@ fn preregister_with_mode<B: AutodiffBackend>(
     } else {
         None
     };
-    let before = prepare::<B>(options, device, stop, mode)?;
+    let before = prepare::<B>(options, device, stop, mode, chinese_state.as_ref())?;
     if chinese {
         number_regression::check_stops(&before.text_options.stop_tokens)?;
     }
     // Validate the actual optimizer snapshot before a registration can be frozen.
     drop(before.checkpoint.restore::<B>(device)?);
+    if let Some(initial) = &initial_chinese {
+        if chinese_registration::current(options.data, stop)?.sha256() != initial.sha256() {
+            return Err("Chinese regression changed before registration".into());
+        }
+        chinese_state
+            .as_ref()
+            .ok_or("missing Chinese state guard")?
+            .verify(stop)?;
+    }
     let registration = preregister(
         &registration_options(options, &before),
         options.registration,
         stop,
     )?;
     ensure_same_data(&before, &registration)?;
-    let after = prepare::<B>(options, device, stop, mode)?;
+    if chinese {
+        chinese_registration::current(options.data, stop)?;
+        chinese_registration::preflight_protocol(options.registration, stop)?;
+    }
+    let after = prepare::<B>(options, device, stop, mode, chinese_state.as_ref())?;
     if before.candidate != after.candidate
         || before.protocol != after.protocol
         || before.parameters != after.parameters
     {
         return Err("v3 inputs changed during registration".into());
+    }
+    if chinese {
+        chinese_registration::current(options.data, stop)?;
+        chinese_registration::preflight_protocol(options.registration, stop)?;
     }
     let checked = verify_registration(
         &registration_options(options, &after),
@@ -494,6 +532,10 @@ fn preregister_with_mode<B: AutodiffBackend>(
         stop,
     )?;
     if let Some(initial) = initial_chinese {
+        chinese_state
+            .as_ref()
+            .ok_or("missing Chinese state guard")?
+            .verify(stop)?;
         let manifest =
             chinese_registration::frozen(options.data, options.registration, &checked, stop)?;
         if manifest.sha256() != initial.sha256() {
@@ -590,6 +632,8 @@ fn chinese_policy(
         "scoring_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_regression.rs"))),
         "evaluation_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_v3_evaluation.rs"))),
         "registration_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_chinese_registration.rs"))),
+        "state_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_chinese_state.rs"))),
+        "lease_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("lease.rs"))),
         "protocol_verifier_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_v3_voice_recheck.rs"))),
         "scoring":"exact-trim-v1", "normal_end":"registered-stop-token-v1",
         "parameters":{
@@ -691,13 +735,23 @@ fn run_chinese_v3<B: AutodiffBackend>(
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
     chinese_paths(options, true)?;
-    let _leases = leases(options.state)?;
+    let chinese_state = ChineseState::acquire(options.state, stop)?;
     match fs::symlink_metadata(options.output) {
         Ok(_) => return Err("Chinese regression report already exists".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let before = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+    chinese_registration::current(options.data, stop)?;
+    chinese_registration::preflight_protocol(options.registration, stop)?;
+    let before = prepare::<B>(
+        options,
+        device,
+        stop,
+        V3AsrMode::MetalF16,
+        Some(&chinese_state),
+    )?;
+    chinese_registration::current(options.data, stop)?;
+    chinese_registration::preflight_protocol(options.registration, stop)?;
     let registered = verify_registration(
         &registration_options(options, &before),
         options.registration,
@@ -725,13 +779,24 @@ fn run_chinese_v3<B: AutodiffBackend>(
     verify_chinese_report(&report, &before, &registered, &manifest, &policy_sha256)?;
     let postcheck = (|| -> Result<(), String> {
         interrupted(stop)?;
-        let after = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+        chinese_state.verify(stop)?;
+        chinese_registration::current(options.data, stop)?;
+        chinese_registration::preflight_protocol(options.registration, stop)?;
+        let after = prepare::<B>(
+            options,
+            device,
+            stop,
+            V3AsrMode::MetalF16,
+            Some(&chinese_state),
+        )?;
         if before.candidate != after.candidate
             || before.protocol != after.protocol
             || before.parameters != after.parameters
         {
             return Err("v3 inputs changed during Chinese evaluation".into());
         }
+        chinese_registration::current(options.data, stop)?;
+        chinese_registration::preflight_protocol(options.registration, stop)?;
         let verified = verify_registration(
             &registration_options(options, &after),
             options.registration,
@@ -741,6 +806,7 @@ fn run_chinese_v3<B: AutodiffBackend>(
         let after_manifest =
             chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
         let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
+        chinese_state.verify(stop)?;
         verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)
     })();
     if let Err(error) = postcheck {
@@ -791,8 +857,18 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
     chinese_paths(options, true)?;
-    let _leases = leases(options.state)?;
-    let prepared = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+    let chinese_state = ChineseState::acquire(options.state, stop)?;
+    chinese_registration::current(options.data, stop)?;
+    chinese_registration::preflight_protocol(options.registration, stop)?;
+    let prepared = prepare::<B>(
+        options,
+        device,
+        stop,
+        V3AsrMode::MetalF16,
+        Some(&chinese_state),
+    )?;
+    chinese_registration::current(options.data, stop)?;
+    chinese_registration::preflight_protocol(options.registration, stop)?;
     let registered = verify_registration(
         &registration_options(options, &prepared),
         options.registration,
@@ -822,13 +898,24 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
     )?;
     let report: ChineseRunReport = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     verify_chinese_report(&report, &prepared, &registered, &manifest, &policy_sha256)?;
-    let after = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+    chinese_state.verify(stop)?;
+    chinese_registration::current(options.data, stop)?;
+    chinese_registration::preflight_protocol(options.registration, stop)?;
+    let after = prepare::<B>(
+        options,
+        device,
+        stop,
+        V3AsrMode::MetalF16,
+        Some(&chinese_state),
+    )?;
     if prepared.candidate != after.candidate
         || prepared.protocol != after.protocol
         || prepared.parameters != after.parameters
     {
         return Err("v3 inputs changed during Chinese recheck".into());
     }
+    chinese_registration::current(options.data, stop)?;
+    chinese_registration::preflight_protocol(options.registration, stop)?;
     let verified = verify_registration(
         &registration_options(options, &after),
         options.registration,
@@ -838,6 +925,7 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
     let after_manifest =
         chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
     let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
+    chinese_state.verify(stop)?;
     verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)?;
     interrupted(stop)?;
     serde_json::to_value(report).map_err(|e| e.to_string())
@@ -915,7 +1003,7 @@ fn run_v3<B: AutodiffBackend>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let before = prepare::<B>(options, device, stop, mode)?;
+    let before = prepare::<B>(options, device, stop, mode, None)?;
     let registered = verify_registration(
         &registration_options(options, &before),
         options.registration,
@@ -926,7 +1014,7 @@ fn run_v3<B: AutodiffBackend>(
     validate_frozen_mapping(&registered)?;
     let mut report = run(&before, &registered)?;
     interrupted(stop)?;
-    let after = prepare::<B>(options, device, stop, mode)?;
+    let after = prepare::<B>(options, device, stop, mode, None)?;
     if before.candidate != after.candidate
         || before.protocol != after.protocol
         || before.parameters != after.parameters

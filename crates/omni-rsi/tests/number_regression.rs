@@ -162,3 +162,46 @@ fn output_and_serialized_report_budgets_fail_closed() {
     assert_eq!(diagnostic["current"]["arm"], "baseline");
     assert!(recheck(&manifest, &[7], &vec![b' '; 2 * 1024 * 1024 + 1]).is_err());
 }
+
+#[test]
+fn returned_cancel_without_flag_is_an_incomplete_diagnostic() {
+    let manifest = ChineseManifest::from_bytes(GOOD.as_bytes()).unwrap();
+    let stop = AtomicBool::new(false);
+    let mut calls = 0;
+    let result = compare_with(&manifest, &[7], &stop, |_, _, _| {
+        calls += 1;
+        Ok(DecodedText {
+            text: "partial".into(),
+            end: TextEnd::Cancelled,
+        })
+    });
+    let diagnostic: serde_json::Value = serde_json::from_str(&result.unwrap_err()).unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(diagnostic["outcome"], "cancelled_unverified");
+    assert_eq!(diagnostic["observations"][0]["raw_text"], "partial");
+    assert_eq!(diagnostic["observations"][0]["end"]["kind"], "cancelled");
+    assert!(!stop.load(std::sync::atomic::Ordering::Acquire));
+
+    let mut report = compare_with(&manifest, &[7], &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "partial".into(),
+            end: TextEnd::Limit,
+        })
+    })
+    .unwrap();
+    report["observations"][0]["end"] = serde_json::json!({"kind":"cancelled"});
+    assert!(recheck(&manifest, &[7], &serde_json::to_vec(&report).unwrap()).is_err());
+    let mut calls = 0;
+    let error = compare_with(&manifest, &[7], &stop, |_, _, _| {
+        calls += 1;
+        Ok(DecodedText {
+            text: "x".repeat(4097),
+            end: TextEnd::Cancelled,
+        })
+    })
+    .unwrap_err();
+    let diagnostic: serde_json::Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(diagnostic["outcome"], "cancelled_unverified");
+    assert!(diagnostic["failure"].as_str().unwrap().contains("omitted"));
+}

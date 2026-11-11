@@ -2348,6 +2348,712 @@ fn chinese_rejects_duplicate_fields_inside_the_frozen_protocol() {
 }
 
 #[cfg(all(unix, feature = "cpu"))]
+fn review_chinese_fixture() -> tempfile::TempDir {
+    let root = evaluation_fixture();
+    write_json(
+        &root.path().join("regression-inputs/chinese.json"),
+        &json!({
+            "version":1,"group":"chinese","scoring":"exact-trim-v1",
+            "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+            "cases":[{"id":"synthetic","prompt":"add five and six","reference":"11"}]
+        }),
+    );
+    root
+}
+
+#[cfg(unix)]
+fn review_set_old_access_time(path: &Path) {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [libc::timeval {
+        tv_sec: 946_684_800,
+        tv_usec: 0,
+    }; 2];
+    assert_eq!(unsafe { libc::utimes(path.as_ptr(), times.as_ptr()) }, 0);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_hardlinked_other_group_before_registration() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    for name in [
+        "plan",
+        "chinese",
+        "english",
+        "other_omni",
+        "reading",
+        "dialogue",
+    ] {
+        let root = review_chinese_fixture();
+        let private = root.path().join("synthetic-private.json");
+        let target = if name == "plan" {
+            root.path().join("regression-plan.json")
+        } else {
+            root.path()
+                .join("regression-inputs")
+                .join(format!("{name}.json"))
+        };
+        let synthetic = fs::read(&target).unwrap();
+        fs::write(&private, synthetic).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::hard_link(&private, &target).unwrap();
+        let model = root.path().join("model");
+        let state = root.path().join("state");
+        let registration = root.path().join("registration");
+        let output = root.path().join("report.json");
+        let options = V3Options {
+            model: &model,
+            data: root.path(),
+            state: &state,
+            registration: &registration,
+            output: &output,
+            r2t2: None,
+            breeze: None,
+        };
+        let error =
+            preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                .unwrap_err();
+        assert!(error.contains("single-link"), "{name}: {error}");
+        assert!(!registration.exists());
+        assert!(!output.exists());
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_hardlinked_protocol_before_parsing() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        V3Options, evaluate_chinese_v3_with, preregister_chinese_v3, recheck_chinese_v3,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let private = root.path().join("synthetic-private.json");
+    fs::write(&private, b"not-json-synthetic-private").unwrap();
+    let control = root.path().join("synthetic-atime-control");
+    fs::write(&control, b"control").unwrap();
+    review_set_old_access_time(&control);
+    let control_before = fs::metadata(&control).unwrap().accessed().unwrap();
+    fs::read(&control).unwrap();
+    let atime_reports_reads = fs::metadata(&control).unwrap().accessed().unwrap() != control_before;
+    review_set_old_access_time(&private);
+    let private_before = fs::metadata(&private).unwrap().accessed().unwrap();
+    let protocol = registration.join("protocol.json");
+    fs::remove_file(&protocol).unwrap();
+    fs::hard_link(&private, &protocol).unwrap();
+    let error = evaluate_chinese_v3_with::<Cpu>(
+        &options,
+        &Default::default(),
+        &stop,
+        |_, _, _| unreachable!(),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("single-link"),
+        "expected alias rejection before parsing: {error}"
+    );
+    let error = recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap_err();
+    assert!(
+        error.contains("single-link"),
+        "expected alias rejection before parsing: {error}"
+    );
+    assert!(!output.exists());
+    if atime_reports_reads {
+        assert_eq!(
+            fs::metadata(&private).unwrap().accessed().unwrap(),
+            private_before
+        );
+        eprintln!("synthetic atime control observed reads; linked protocol was not read");
+    } else {
+        eprintln!(
+            "synthetic atime control did not observe reads; ordering evidenced by error and reader checks"
+        );
+    }
+    fs::remove_file(&protocol).unwrap();
+    fs::write(&protocol, vec![b' '; 32 * 1024 * 1024 + 1]).unwrap();
+    let error = evaluate_chinese_v3_with::<Cpu>(
+        &options,
+        &Default::default(),
+        &stop,
+        |_, _, _| unreachable!(),
+    )
+    .unwrap_err();
+    assert!(error.contains("oversized"), "{error}");
+    assert!(!output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_does_not_follow_foreground_lock_symlink() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let outside = root.path().join("synthetic-outside-lock");
+    symlink(&outside, state.join("foreground.lock")).unwrap();
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(!outside.exists());
+    assert!(!registration.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_does_not_lock_or_modify_a_hardlinked_foreground_file() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let outside = root.path().join("synthetic-foreign-lock");
+    fs::write(&outside, b"sentinel").unwrap();
+    fs::hard_link(&outside, state.join("foreground.lock")).unwrap();
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .is_err()
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
+    assert!(!registration.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_every_derived_lock_symlink() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    for name in [
+        "device.lock",
+        "audio-training.lock",
+        "number-audio-v3/audio-training.lock",
+    ] {
+        let root = review_chinese_fixture();
+        let model = root.path().join("model");
+        let state = root.path().join("state");
+        let outside = root.path().join("synthetic-outside-lock");
+        symlink(&outside, state.join(name)).unwrap();
+        let registration = root.path().join("registration");
+        let output = root.path().join("report.json");
+        let options = V3Options {
+            model: &model,
+            data: root.path(),
+            state: &state,
+            registration: &registration,
+            output: &output,
+            r2t2: None,
+            breeze: None,
+        };
+        assert!(
+            preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                .is_err(),
+            "{name}"
+        );
+        assert!(!outside.exists());
+        assert!(!registration.exists());
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_linked_data_root_plan_and_manifest_directory() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    for scenario in ["data-root", "plan", "manifest-directory"] {
+        let root = review_chinese_fixture();
+        let model = root.path().join("model");
+        let state = root.path().join("state");
+        let alias = root.path().join("synthetic-alias");
+        let data = if scenario == "data-root" {
+            symlink(root.path(), &alias).unwrap();
+            alias.clone()
+        } else {
+            let target = root.path().join(if scenario == "plan" {
+                "regression-plan.json"
+            } else {
+                "regression-inputs"
+            });
+            fs::rename(&target, &alias).unwrap();
+            symlink(&alias, &target).unwrap();
+            root.path().to_path_buf()
+        };
+        let registration = root.path().join("registration");
+        let output = root.path().join("report.json");
+        let options = V3Options {
+            model: &model,
+            data: &data,
+            state: &state,
+            registration: &registration,
+            output: &output,
+            r2t2: None,
+            breeze: None,
+        };
+        assert!(
+            preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                .is_err(),
+            "{scenario}"
+        );
+        assert!(!registration.exists());
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_does_not_follow_nested_state_symlink() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let nested = state.join("number-audio-v3");
+    let outside = root.path().join("synthetic-outside-state");
+    fs::rename(&nested, &outside).unwrap();
+    symlink(&outside, &nested).unwrap();
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(!outside.join("audio-training.lock").exists());
+    assert!(!registration.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rechecks_all_groups_before_and_after_inference() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+        recheck_chinese_v3,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "11".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+    let original_report = fs::read(&output).unwrap();
+    let english = root.path().join("regression-inputs/english.json");
+    let outside = root.path().join("synthetic-outside-english.json");
+    fs::rename(&english, &outside).unwrap();
+    fs::hard_link(&outside, &english).unwrap();
+    assert!(recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).is_err());
+    assert_eq!(fs::read(&output).unwrap(), original_report);
+    fs::remove_file(&english).unwrap();
+    fs::rename(&outside, &english).unwrap();
+    let after_output = root.path().join("after-report.json");
+    let after = V3Options {
+        output: &after_output,
+        ..options
+    };
+    let mut changed = false;
+    let result = evaluate_chinese_v3_with::<Cpu>(&after, &Default::default(), &stop, |_, _, _| {
+        if !changed {
+            fs::rename(&english, &outside).unwrap();
+            fs::hard_link(&outside, &english).unwrap();
+            changed = true;
+        }
+        Ok(DecodedText {
+            text: "11".into(),
+            end: TextEnd::Stop(7),
+        })
+    });
+    assert!(result.is_err());
+    assert!(!after_output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_oversized_other_group_before_registration() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let mut manifest = b"{}".to_vec();
+    manifest.resize(256 * 1024 + 1, b' ');
+    fs::write(root.path().join("regression-inputs/english.json"), manifest).unwrap();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(!registration.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_oversized_plan_before_registration() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let plan_path = root.path().join("regression-plan.json");
+    let mut plan = fs::read(&plan_path).unwrap();
+    plan.resize(256 * 1024 + 1, b' ');
+    fs::write(&plan_path, plan).unwrap();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(!registration.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_lock_replacement_during_inference() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let lock = state.join("foreground.lock");
+    let retired = root.path().join("synthetic-retired-lock");
+    let outside = root.path().join("synthetic-outside-lock");
+    let mut changed = false;
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            if !changed {
+                fs::rename(&lock, &retired).unwrap();
+                symlink(&outside, &lock).unwrap();
+                changed = true;
+            }
+            Ok(DecodedText {
+                text: "11".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    assert!(result.is_err());
+    assert!(!outside.exists());
+    assert!(!output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_accepts_other_group_at_the_exact_byte_limit() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let mut manifest = b"{}".to_vec();
+    manifest.resize(256 * 1024, b' ');
+    fs::write(root.path().join("regression-inputs/english.json"), manifest).unwrap();
+    let plan_path = root.path().join("regression-plan.json");
+    let mut plan = fs::read(&plan_path).unwrap();
+    plan.resize(256 * 1024, b' ');
+    fs::write(&plan_path, plan).unwrap();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let result =
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .unwrap();
+    assert_eq!(result["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_linked_checkpoint_pointer_and_directory() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    for scenario in [
+        "pointer-symlink",
+        "pointer-hardlink",
+        "checkpoint-directory",
+        "candidate-symlink",
+        "candidate-hardlink",
+    ] {
+        let root = review_chinese_fixture();
+        let model = root.path().join("model");
+        let state = root.path().join("state");
+        let conditioned = state.join("number-audio-v3/audio-conditioned-v1");
+        let target = if scenario == "checkpoint-directory" {
+            conditioned.join("checkpoints")
+        } else if scenario.starts_with("candidate-") {
+            let pointer: Value =
+                serde_json::from_slice(&fs::read(conditioned.join("latest.json")).unwrap())
+                    .unwrap();
+            conditioned
+                .join("checkpoints")
+                .join(format!("{}.json", pointer["sha256"].as_str().unwrap()))
+        } else {
+            conditioned.join("latest.json")
+        };
+        let outside = root.path().join("synthetic-outside-checkpoint");
+        fs::rename(&target, &outside).unwrap();
+        if scenario.ends_with("hardlink") {
+            fs::hard_link(&outside, &target).unwrap();
+        } else {
+            symlink(&outside, &target).unwrap();
+        }
+        let registration = root.path().join("registration");
+        let output = root.path().join("report.json");
+        let options = V3Options {
+            model: &model,
+            data: root.path(),
+            state: &state,
+            registration: &registration,
+            output: &output,
+            r2t2: None,
+            breeze: None,
+        };
+        assert!(
+            preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+                .is_err(),
+            "{scenario}"
+        );
+        assert!(!registration.exists());
+        if scenario == "checkpoint-directory" {
+            assert!(!state.join("foreground.lock").exists());
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_keeps_existing_lease_semantics_and_stops_on_returned_cancel() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        lease::Lease,
+        number_v3_evaluation::{
+            DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+            recheck_chinese_v3,
+        },
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let mut calls = 0;
+    let error = evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+        calls += 1;
+        assert!(Lease::try_acquire(&state.join("foreground.lock"))?.is_none());
+        assert!(Lease::try_acquire(&state.join("number-audio-v3/audio-training.lock"))?.is_none());
+        Ok(DecodedText {
+            text: "partial".into(),
+            end: TextEnd::Cancelled,
+        })
+    })
+    .unwrap_err();
+    let diagnostic: Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(diagnostic["detail"]["outcome"], "cancelled_unverified");
+    assert_eq!(
+        diagnostic["detail"]["observations"][0]["raw_text"],
+        "partial"
+    );
+    assert!(!output.exists());
+    let mut report =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            Ok(DecodedText {
+                text: "partial".into(),
+                end: TextEnd::Limit,
+            })
+        })
+        .unwrap();
+    report["result"]["observations"][0]["end"] = json!({"kind":"cancelled"});
+    fs::write(&output, serde_json::to_vec(&report).unwrap()).unwrap();
+    assert!(recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).is_err());
+    let forged = fs::read(&output).unwrap();
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &options,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&output).unwrap(), forged);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn review_chinese_rejects_old_training_identity_without_mutating_checkpoint() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{V3Options, preregister_chinese_v3};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let conditioned = state.join("number-audio-v3/audio-conditioned-v1");
+    let pointer_path = conditioned.join("latest.json");
+    let pointer: Value = serde_json::from_slice(&fs::read(&pointer_path).unwrap()).unwrap();
+    let source = conditioned
+        .join("checkpoints")
+        .join(format!("{}.json", pointer["sha256"].as_str().unwrap()));
+    let mut checkpoint: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+    checkpoint["protocol"]["implementation_hash"] = "0".repeat(64).into();
+    let bytes = serde_json::to_vec(&checkpoint).unwrap();
+    let id = format!("{:x}", Sha256::digest(&bytes));
+    let old = conditioned.join("checkpoints").join(format!("{id}.json"));
+    fs::write(&old, &bytes).unwrap();
+    let pointer_bytes = serde_json::to_vec(&json!({"sha256":id})).unwrap();
+    fs::write(&pointer_path, &pointer_bytes).unwrap();
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false))
+            .is_err()
+    );
+    assert_eq!(fs::read(&old).unwrap(), bytes);
+    assert_eq!(fs::read(&pointer_path).unwrap(), pointer_bytes);
+    assert!(!registration.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 #[ignore = "explicit local real-weight run only; needs prepared public/development inputs and a new registration"]
 fn chinese_real_weights_explicit_opt_in() {
