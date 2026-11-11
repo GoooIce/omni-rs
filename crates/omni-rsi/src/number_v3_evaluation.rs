@@ -9,6 +9,7 @@ use crate::{
     number_gate::{
         PairedCase, PairedOutcome, PairedStatistics, gain_at_least_five_points, paired_statistics,
     },
+    number_regression::{self, Arm, ChineseManifest},
     speech_asr::AsrEvent,
     speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol},
     speech_number_evaluation::{answer_number, character_error_rate, mentions_number},
@@ -19,7 +20,7 @@ use omni_lfm3::{
     generate::{EndReason, GenerationOptions, OmniEvent, generate_greedy},
     model::OmniModel,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -31,6 +32,8 @@ use std::{
 
 const INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
 
+#[path = "number_chinese_registration.rs"]
+mod chinese_registration;
 #[path = "number_v3_voice.rs"]
 mod voice;
 
@@ -408,7 +411,7 @@ pub fn preregister_v3<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16)
+    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16, false)
 }
 
 /// Register an explicitly selected local R2T2 backend and precision.
@@ -421,7 +424,18 @@ pub fn preregister_v3_with_asr<B: AutodiffBackend>(
     if options.r2t2.is_none() {
         return Err("ASR mode requires a local R2T2 model and executable".into());
     }
-    preregister_with_mode::<B>(options, device, stop, mode)
+    preregister_with_mode::<B>(options, device, stop, mode, false)
+}
+
+/// Freeze a new, separately scoped Chinese text policy before any observations.
+pub fn preregister_chinese_v3<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    interrupted(stop)?;
+    chinese_paths(options, false)?;
+    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16, true)
 }
 
 fn preregister_with_mode<B: AutodiffBackend>(
@@ -429,6 +443,7 @@ fn preregister_with_mode<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
     mode: V3AsrMode,
+    chinese: bool,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
     let _leases = leases(options.state)?;
@@ -437,7 +452,15 @@ fn preregister_with_mode<B: AutodiffBackend>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
+    let initial_chinese = if chinese {
+        Some(chinese_registration::current(options.data, stop)?)
+    } else {
+        None
+    };
     let before = prepare::<B>(options, device, stop, mode)?;
+    if chinese {
+        number_regression::check_stops(&before.text_options.stop_tokens)?;
+    }
     // Validate the actual optimizer snapshot before a registration can be frozen.
     drop(before.checkpoint.restore::<B>(device)?);
     let registration = preregister(
@@ -470,6 +493,20 @@ fn preregister_with_mode<B: AutodiffBackend>(
         &bytes,
         stop,
     )?;
+    if let Some(initial) = initial_chinese {
+        let manifest =
+            chinese_registration::frozen(options.data, options.registration, &checked, stop)?;
+        if manifest.sha256() != initial.sha256() {
+            return Err("Chinese regression changed during registration".into());
+        }
+        let document = chinese_policy(&after, &checked, &manifest, stop)?;
+        let bytes = serde_json::to_vec_pretty(&document).map_err(|e| e.to_string())?;
+        write_noclobber(
+            &options.registration.join("chinese-regression-policy.json"),
+            &bytes,
+            stop,
+        )?;
+    }
     Ok(
         serde_json::json!({"status":"insufficient_evidence","candidate_eligible":false,
         "protocol_sha256":checked.protocol_sha256(),"candidate_sha256":after.candidate}),
@@ -490,6 +527,378 @@ fn check_policy(
         return Err("registered v3 evaluation parameters changed".into());
     }
     Ok(())
+}
+
+// These paths are caller-selected, but links and parent traversal must not redirect
+// the new registration or report. Concurrent replacement of ancestors is outside
+// this local, cooperatively leased interface's trust boundary.
+fn chinese_path(path: &Path, missing_final: bool) -> Result<(), String> {
+    use std::path::Component;
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty() {
+        return Err("empty Chinese regression path".into());
+    }
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        if matches!(component, Component::ParentDir) {
+            return Err("parent traversal is not allowed".into());
+        }
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || (index + 1 < components.len() && !metadata.is_dir())
+                {
+                    return Err("linked or non-directory path component".into());
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && missing_final
+                    && index + 1 == components.len() => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn chinese_paths(options: &V3Options<'_>, include_output: bool) -> Result<(), String> {
+    if options.r2t2.is_some() || options.breeze.is_some() {
+        return Err("Chinese text regression does not use speech tools".into());
+    }
+    for path in [options.model, options.data, options.state] {
+        chinese_path(path, false)?;
+    }
+    chinese_path(options.registration, true)?;
+    if include_output {
+        chinese_path(options.output, true)?;
+    }
+    Ok(())
+}
+
+fn chinese_policy(
+    prepared: &Prepared,
+    registered: &RegisteredDevelopment,
+    manifest: &ChineseManifest,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "version":1, "kind":"chinese_text_regression_v1",
+        "protocol_sha256":registered.protocol_sha256(), "manifest_sha256":manifest.sha256(),
+        "candidate_sha256":prepared.candidate, "base_sha256":prepared.protocol.base_hash,
+        "evaluator_sha256":hash_regular(&prepared.evaluator, 2 * 1024 * 1024 * 1024, stop)?,
+        "scoring_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_regression.rs"))),
+        "evaluation_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_v3_evaluation.rs"))),
+        "registration_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_chinese_registration.rs"))),
+        "protocol_verifier_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_v3_voice_recheck.rs"))),
+        "scoring":"exact-trim-v1", "normal_end":"registered-stop-token-v1",
+        "parameters":{
+            "backend":prepared.parameters["backend"], "precision":"f32", "decode":"greedy",
+            "max_tokens":prepared.text_options.max_tokens,
+            "max_context_tokens":prepared.parameters["max_context_tokens"],
+            "stop_tokens":prepared.text_options.stop_tokens,
+            "suppress_tokens":prepared.text_options.suppress_tokens,
+            "context":"fresh_per_input", "prompt":"manifest_user_text_only", "media":"none"
+        }
+    }))
+}
+
+fn check_chinese_policy(
+    options: &V3Options<'_>,
+    prepared: &Prepared,
+    registered: &RegisteredDevelopment,
+    manifest: &ChineseManifest,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    use std::ffi::OsStr;
+    let directory = crate::number_v3_voice_recheck::open_directory(options.registration)?;
+    let mut remaining = 2 * 1024 * 1024;
+    // Canonical bytes also reject duplicate and unknown fields rather than letting
+    // serde_json::Value silently coalesce them.
+    let v3 = serde_json::to_vec_pretty(&policy(prepared, registered)).map_err(|e| e.to_string())?;
+    if crate::number_v3_voice_recheck::read_child(
+        &directory,
+        OsStr::new("v3-evaluation-policy.json"),
+        1024 * 1024,
+        &mut remaining,
+        stop,
+    )? != v3
+    {
+        return Err("registered v3 policy changed".into());
+    }
+    let expected =
+        serde_json::to_vec_pretty(&chinese_policy(prepared, registered, manifest, stop)?)
+            .map_err(|e| e.to_string())?;
+    let actual = crate::number_v3_voice_recheck::read_child(
+        &directory,
+        OsStr::new("chinese-regression-policy.json"),
+        1024 * 1024,
+        &mut remaining,
+        stop,
+    )?;
+    if actual != expected {
+        return Err("registered Chinese regression policy changed".into());
+    }
+    Ok(format!("{:x}", Sha256::digest(&actual)))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChineseRunReport {
+    version: u32,
+    status: String,
+    candidate_eligible: bool,
+    protocol_sha256: String,
+    chinese_policy_sha256: String,
+    result: number_regression::Report,
+}
+
+fn verify_chinese_report(
+    report: &ChineseRunReport,
+    prepared: &Prepared,
+    registered: &RegisteredDevelopment,
+    manifest: &ChineseManifest,
+    policy_sha256: &str,
+) -> Result<(), String> {
+    if report.version != 1
+        || report.status != "insufficient_evidence"
+        || report.candidate_eligible
+        || report.protocol_sha256 != registered.protocol_sha256()
+        || report.chinese_policy_sha256 != policy_sha256
+    {
+        return Err("invalid Chinese regression report identity".into());
+    }
+    number_regression::verify(manifest, &prepared.text_options.stop_tokens, &report.result)
+}
+
+fn chinese_run_error(
+    registered: &RegisteredDevelopment,
+    policy_sha256: &str,
+    stage: &str,
+    detail: serde_json::Value,
+) -> String {
+    serde_json::json!({"status":"insufficient_evidence", "candidate_eligible":false,
+        "outcome":"incomplete_unverified", "protocol_sha256":registered.protocol_sha256(),
+        "chinese_policy_sha256":policy_sha256, "stage":stage, "detail":detail})
+    .to_string()
+}
+
+fn run_chinese_v3<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+    run: impl FnOnce(&Prepared, &ChineseManifest) -> Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
+    interrupted(stop)?;
+    chinese_paths(options, true)?;
+    let _leases = leases(options.state)?;
+    match fs::symlink_metadata(options.output) {
+        Ok(_) => return Err("Chinese regression report already exists".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let before = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+    let registered = verify_registration(
+        &registration_options(options, &before),
+        options.registration,
+        stop,
+    )?;
+    ensure_same_data(&before, &registered)?;
+    let manifest =
+        chinese_registration::frozen(options.data, options.registration, &registered, stop)?;
+    let policy_sha256 = check_chinese_policy(options, &before, &registered, &manifest, stop)?;
+    let result = run(&before, &manifest).map_err(|error| {
+        let detail = serde_json::from_str(&error)
+            .unwrap_or_else(|_| serde_json::Value::String(error.chars().take(1024).collect()));
+        chinese_run_error(&registered, &policy_sha256, "inference", detail)
+    })?;
+    let result: number_regression::Report =
+        serde_json::from_value(result).map_err(|e| e.to_string())?;
+    let report = ChineseRunReport {
+        version: 1,
+        status: "insufficient_evidence".into(),
+        candidate_eligible: false,
+        protocol_sha256: registered.protocol_sha256().into(),
+        chinese_policy_sha256: policy_sha256.clone(),
+        result,
+    };
+    verify_chinese_report(&report, &before, &registered, &manifest, &policy_sha256)?;
+    let postcheck = (|| -> Result<(), String> {
+        interrupted(stop)?;
+        let after = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+        if before.candidate != after.candidate
+            || before.protocol != after.protocol
+            || before.parameters != after.parameters
+        {
+            return Err("v3 inputs changed during Chinese evaluation".into());
+        }
+        let verified = verify_registration(
+            &registration_options(options, &after),
+            options.registration,
+            stop,
+        )?;
+        ensure_same_data(&after, &verified)?;
+        let after_manifest =
+            chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
+        let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
+        verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)
+    })();
+    if let Err(error) = postcheck {
+        return Err(chinese_run_error(
+            &registered,
+            &policy_sha256,
+            "postcheck",
+            serde_json::json!({"failure":error,"observations":report.result}),
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err(chinese_run_error(
+            &registered,
+            &policy_sha256,
+            "report_budget",
+            serde_json::json!({"failure":"Chinese regression report exceeds size limit", "observations":report.result}),
+        ));
+    }
+    write_noclobber(options.output, &bytes, stop).map_err(|error| {
+        chinese_run_error(
+            &registered,
+            &policy_sha256,
+            "publication",
+            serde_json::json!({"failure":error,"observations":report.result}),
+        )
+    })?;
+    serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
+/// The injected seam is for tests and cannot mark the run as real inference.
+pub fn evaluate_chinese_v3_with<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+    infer: impl FnMut(Arm, &str, &str) -> Result<DecodedText, String>,
+) -> Result<serde_json::Value, String> {
+    run_chinese_v3::<B>(options, device, stop, |prepared, manifest| {
+        number_regression::compare_with(manifest, &prepared.text_options.stop_tokens, stop, infer)
+    })
+}
+
+/// Verify a published report and recompute every row without running a model.
+pub fn recheck_chinese_v3<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    interrupted(stop)?;
+    chinese_paths(options, true)?;
+    let _leases = leases(options.state)?;
+    let prepared = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+    let registered = verify_registration(
+        &registration_options(options, &prepared),
+        options.registration,
+        stop,
+    )?;
+    ensure_same_data(&prepared, &registered)?;
+    let manifest =
+        chinese_registration::frozen(options.data, options.registration, &registered, stop)?;
+    let policy_sha256 = check_chinese_policy(options, &prepared, &registered, &manifest, stop)?;
+    let parent = options
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = options
+        .output
+        .file_name()
+        .ok_or("invalid report filename")?;
+    let directory = crate::number_v3_voice_recheck::open_directory(parent)?;
+    let mut remaining = 2 * 1024 * 1024;
+    let bytes = crate::number_v3_voice_recheck::read_child(
+        &directory,
+        name,
+        2 * 1024 * 1024,
+        &mut remaining,
+        stop,
+    )?;
+    let report: ChineseRunReport = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    verify_chinese_report(&report, &prepared, &registered, &manifest, &policy_sha256)?;
+    let after = prepare::<B>(options, device, stop, V3AsrMode::MetalF16)?;
+    if prepared.candidate != after.candidate
+        || prepared.protocol != after.protocol
+        || prepared.parameters != after.parameters
+    {
+        return Err("v3 inputs changed during Chinese recheck".into());
+    }
+    let verified = verify_registration(
+        &registration_options(options, &after),
+        options.registration,
+        stop,
+    )?;
+    ensure_same_data(&after, &verified)?;
+    let after_manifest =
+        chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
+    let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
+    verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)?;
+    interrupted(stop)?;
+    serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
+/// Execute only text prompts, with a fresh cache for each arm and case.
+pub fn evaluate_chinese_v3<B: AutodiffBackend>(
+    options: &V3Options<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    run_chinese_v3::<B>(options, device, stop, |prepared, manifest| {
+        let optimizer = prepared.checkpoint.restore::<B>(device)?;
+        let (a, b) = optimizer.export()?;
+        drop(optimizer);
+        let mut model = OmniModel::<B>::load(options.model, Precision::F32, device)
+            .map_err(|e| e.to_string())?;
+        if model.text.hidden_size() != prepared.protocol.width {
+            return Err("loaded v3 model width changed".into());
+        }
+        prepared.protocol.verify_model(options.model, stop)?;
+        number_regression::compare_real(
+            manifest,
+            &prepared.text_options.stop_tokens,
+            stop,
+            |arm, _id, prompt| {
+                interrupted(stop)?;
+                match arm {
+                    Arm::Baseline => model.text.clear_conv_lora(23).map_err(|e| e.to_string())?,
+                    Arm::Candidate => model
+                        .text
+                        .install_conv_lora(23, 4, &a, &b)
+                        .map_err(|e| e.to_string())?,
+                }
+                let messages =
+                    [serde_json::json!({"role":"user","content":[{"type":"text","text":prompt}]})];
+                let prompt = model
+                    .prepare_prompt(&messages, None, &[])
+                    .map_err(|e| e.to_string())?;
+                let result = generate_greedy(
+                    &model.text,
+                    prompt.embeddings,
+                    &mut model.new_text_cache(),
+                    &prepared.text_options,
+                    stop,
+                    |_| true,
+                )
+                .map_err(|e| e.to_string())?;
+                let text = model
+                    .tokenizer
+                    .decode(&result.tokens, true)
+                    .map_err(|e| e.to_string())?;
+                let end = match result.reason {
+                    EndReason::Stop(id) => TextEnd::Stop(id),
+                    EndReason::Limit => TextEnd::Limit,
+                    EndReason::Cancelled => TextEnd::Cancelled,
+                };
+                Ok(DecodedText { text, end })
+            },
+        )
+    })
 }
 
 fn run_v3<B: AutodiffBackend>(

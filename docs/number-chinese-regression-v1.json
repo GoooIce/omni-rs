@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "group": "chinese",
+  "scoring": "exact-trim-v1",
+  "normal_end": "registered-stop-token-v1",
+  "decode": "v3-greedy-v1",
+  "cases": [
+    {"id":"zh-01","prompt":"只用中文数字回答：一加一等于多少？","reference":"二"},
+    {"id":"zh-02","prompt":"只用中文数字回答：二加三等于多少？","reference":"五"},
+    {"id":"zh-03","prompt":"只用中文数字回答：六减二等于多少？","reference":"四"},
+    {"id":"zh-04","prompt":"只用中文数字回答：三乘三等于多少？","reference":"九"},
+    {"id":"zh-05","prompt":"只用中文数字回答：八除以二等于多少？","reference":"四"},
+    {"id":"zh-06","prompt":"只用中文数字回答：七加六等于多少？","reference":"十三"},
+    {"id":"zh-07","prompt":"只用中文数字回答：一个小时有多少分钟？","reference":"六十"},
+    {"id":"zh-08","prompt":"只用中文数字回答：一个星期有多少天？","reference":"七"},
+    {"id":"zh-09","prompt":"只用中文数字回答：篮子里有五个苹果，拿走两个，还剩几个？","reference":"三"},
+    {"id":"zh-10","prompt":"只用中文数字回答：一只手有多少根手指？","reference":"五"},
+    {"id":"zh-11","prompt":"只用中文数字回答：四加八等于多少？","reference":"十二"},
+    {"id":"zh-12","prompt":"只用中文数字回答：四乘五等于多少？","reference":"二十"}
+  ]
+}

@@ -2030,6 +2030,362 @@ fn v3_registration_and_mock_run_do_not_open_holdout_files() {
 
 #[cfg(all(unix, feature = "cpu"))]
 #[test]
+fn chinese_registered_mock_run_is_bounded_rechecked_and_never_opens_holdout() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::{
+        number_regression::Arm,
+        number_v3_evaluation::{
+            DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+            recheck_chinese_v3,
+        },
+    };
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let private = root.path().join("holdout");
+    fs::create_dir(&private).unwrap();
+    for name in ["manifest.json", "salt.bin", "holdout.wav"] {
+        let path = private.join(name);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let manifest_path = root.path().join("regression-inputs/chinese.json");
+    let manifest = json!({"version":1,"group":"chinese","scoring":"exact-trim-v1",
+        "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+        "cases":[{"id":"one","prompt":"计算一加一。","reference":"二"}]});
+    write_json(&manifest_path, &manifest);
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("chinese-registration");
+    let output = root.path().join("chinese-report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let report =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |arm, id, prompt| {
+            assert_eq!(id, "one");
+            assert_eq!(prompt, "计算一加一。");
+            Ok(DecodedText {
+                text: "二".into(),
+                end: if arm == Arm::Baseline {
+                    TextEnd::Stop(7)
+                } else {
+                    TextEnd::Limit
+                },
+            })
+        })
+        .unwrap();
+    assert_eq!(report["result"]["execution"], "injected_unverified");
+    assert_eq!(report["result"]["correct_delta"], -1);
+    assert_eq!(report["candidate_eligible"], false);
+    let published = fs::read(&output).unwrap();
+    assert_eq!(
+        recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap(),
+        report
+    );
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &options,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&output).unwrap(), published);
+    let duplicate = String::from_utf8(published.clone()).unwrap().replacen(
+        "\"version\": 1",
+        "\"version\": 1, \"version\": 1",
+        1,
+    );
+    fs::write(&output, duplicate).unwrap();
+    assert!(recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).is_err());
+    fs::write(&output, published).unwrap();
+    let next_output = root.path().join("next.json");
+    let next = V3Options {
+        output: &next_output,
+        ..options
+    };
+    let cancelled =
+        evaluate_chinese_v3_with::<Cpu>(&next, &Default::default(), &stop, |_, _, _| {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            Ok(DecodedText {
+                text: "二".into(),
+                end: TextEnd::Cancelled,
+            })
+        })
+        .unwrap_err();
+    let diagnostic: Value = serde_json::from_str(&cancelled).unwrap();
+    assert_eq!(diagnostic["status"], "insufficient_evidence");
+    assert_eq!(diagnostic["detail"]["outcome"], "cancelled_unverified");
+    assert_eq!(diagnostic["detail"]["observations"][0]["raw_text"], "二");
+    assert_eq!(
+        diagnostic["detail"]["observations"][0]["end"]["kind"],
+        "cancelled"
+    );
+    assert!(diagnostic["protocol_sha256"].as_str().is_some());
+    assert!(!next_output.exists());
+    stop.store(false, std::sync::atomic::Ordering::Release);
+    let policy_path = registration.join("chinese-regression-policy.json");
+    let policy = fs::read(&policy_path).unwrap();
+    fs::write(&policy_path, b"{\"version\":1,\"version\":1}").unwrap();
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &next,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    fs::write(&policy_path, policy).unwrap();
+    let plan_path = root.path().join("regression-plan.json");
+    let plan = fs::read(&plan_path).unwrap();
+    let mut changed_plan = plan.clone();
+    changed_plan.push(b' ');
+    fs::write(&plan_path, changed_plan).unwrap();
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &next,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    fs::write(&plan_path, plan).unwrap();
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(&next, &Default::default(), &stop, |_, _, _| {
+            write_json(&manifest_path, &json!({"changed":true}));
+            Ok(DecodedText {
+                text: "二".into(),
+                end: TextEnd::Stop(7),
+            })
+        })
+        .is_err()
+    );
+    assert!(!next_output.exists());
+    write_json(&manifest_path, &manifest);
+    write_json(&manifest_path, &json!({"changed":true}));
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &next,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    assert!(!next_output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chinese_registration_refuses_old_state_and_linked_paths() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        V3Options, evaluate_chinese_v3_with, preregister_chinese_v3, preregister_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    let manifest_path = root.path().join("regression-inputs/chinese.json");
+    write_json(
+        &manifest_path,
+        &json!({"version":1,"group":"chinese","scoring":"exact-trim-v1",
+        "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+        "cases":[{"id":"one","prompt":"计算一加一。","reference":"二"}]}),
+    );
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("old-registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let protocol = fs::read(registration.join("protocol.json")).unwrap();
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &options,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    assert!(preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).is_err());
+    assert!(!registration.join("chinese-regression-policy.json").exists());
+    assert_eq!(
+        fs::read(registration.join("protocol.json")).unwrap(),
+        protocol
+    );
+    assert!(!output.exists());
+
+    let link = root.path().join("linked-output-dir");
+    symlink(root.path(), &link).unwrap();
+    let linked_output = link.join("report.json");
+    let linked = V3Options {
+        output: &linked_output,
+        ..options
+    };
+    let error = evaluate_chinese_v3_with::<Cpu>(
+        &linked,
+        &Default::default(),
+        &stop,
+        |_, _, _| unreachable!(),
+    )
+    .unwrap_err();
+    assert!(error.contains("linked"), "{error}");
+    let traversing = root.path().join("regression-inputs/../report.json");
+    let traversing = V3Options {
+        output: &traversing,
+        ..options
+    };
+    let error = evaluate_chinese_v3_with::<Cpu>(
+        &traversing,
+        &Default::default(),
+        &stop,
+        |_, _, _| unreachable!(),
+    )
+    .unwrap_err();
+    assert!(error.contains("traversal"), "{error}");
+
+    let target = root.path().join("elsewhere.json");
+    fs::rename(&manifest_path, &target).unwrap();
+    symlink(&target, &manifest_path).unwrap();
+    let fresh = root.path().join("fresh-registration");
+    let linked_manifest = V3Options {
+        registration: &fresh,
+        ..options
+    };
+    assert!(preregister_chinese_v3::<Cpu>(&linked_manifest, &Default::default(), &stop).is_err());
+    assert!(!fresh.exists());
+    fs::remove_file(&manifest_path).unwrap();
+    fs::hard_link(&target, &manifest_path).unwrap();
+    assert!(preregister_chinese_v3::<Cpu>(&linked_manifest, &Default::default(), &stop).is_err());
+    assert!(!fresh.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chinese_rejects_duplicate_fields_inside_the_frozen_protocol() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture();
+    write_json(
+        &root.path().join("regression-inputs/chinese.json"),
+        &json!({
+            "version":1,"group":"chinese","scoring":"exact-trim-v1",
+            "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+            "cases":[{"id":"one","prompt":"计算一加一。","reference":"二"}]
+        }),
+    );
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let path = registration.join("protocol.json");
+    let original = fs::read_to_string(&path).unwrap();
+    let field = "\"rule\": \"number-plus-one-v1\"";
+    assert!(original.contains(field));
+    fs::write(
+        &path,
+        original.replacen(field, &format!("{field},\n{field}"), 1),
+    )
+    .unwrap();
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            Ok(DecodedText {
+                text: "二".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    assert!(
+        result.is_err(),
+        "duplicate protocol fields must fail closed"
+    );
+    assert!(!output.exists());
+    fs::write(&path, format!("{original} ")).unwrap();
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            Ok(DecodedText {
+                text: "二".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    assert!(result.is_err(), "changed protocol bytes must fail closed");
+    assert!(!output.exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+#[ignore = "explicit local real-weight run only; needs prepared public/development inputs and a new registration"]
+fn chinese_real_weights_explicit_opt_in() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        V3Options, evaluate_chinese_v3, preregister_chinese_v3, recheck_chinese_v3,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let path = |name| {
+        std::path::PathBuf::from(std::env::var_os(name).expect("explicit local path required"))
+    };
+    let model = path("OMNI_CHINESE_MODEL");
+    let data = path("OMNI_CHINESE_DATA");
+    let state = path("OMNI_CHINESE_STATE");
+    let registration = path("OMNI_CHINESE_REGISTRATION");
+    let output = path("OMNI_CHINESE_REPORT");
+    let options = V3Options {
+        model: &model,
+        data: &data,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let report = evaluate_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    assert_eq!(report["result"]["execution"], "local_rust_burn_unverified");
+    assert_eq!(report["candidate_eligible"], false);
+    assert_eq!(
+        recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap(),
+        report
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
 fn v3_trainer_locks_the_actual_checkpoint_namespace() {
     use burn::backend::{Autodiff, NdArray};
     use omni_rsi::{
