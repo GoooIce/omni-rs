@@ -331,16 +331,8 @@ fn bound_session_preserves_cache_on_rejected_step_and_continues() {
     }
     assert_eq!(control.weights().unwrap(), after_second);
     let returned = states(session.model().unwrap());
-    let (_trainer, mut model) = session.into_parts().unwrap();
-    let reference = SpeechOptimizer::<humming_model::Cpu>::from_values(
-        16,
-        2,
-        after_second.0,
-        after_second.1,
-        &Default::default(),
-    )
-    .unwrap();
-    reference.adapter().install(&mut model.text, 0).unwrap();
+    let (trainer, model) = session.into_parts().unwrap();
+    assert_eq!(trainer.weights().unwrap(), after_second);
     assert_eq!(returned, states(&model));
 }
 
@@ -374,4 +366,194 @@ fn failed_bind_returns_previous_model_and_usable_cache() {
     assert_eq!(trainer.weights().unwrap(), weights);
     assert_eq!(states(&model), before);
     model.text.forward(&[2], &mut cache).unwrap();
+}
+
+#[test]
+fn into_parts_returns_trained_model_with_usable_cache() {
+    let (_fixture, model) = humming_model::model();
+    let (_reference_fixture, mut reference_model) = humming_model::model();
+    let trainer = Trainer::<humming_model::Cpu>::new(16, 2, 0, 77, &Default::default()).unwrap();
+    let initial = trainer.weights().unwrap();
+    let mut session = trainer.bind(model).unwrap();
+    let samples: Vec<_> = (0..3200).map(|i| ((i as f32) * 0.08).sin() * 0.3).collect();
+    let mut frames = vec![vec![1; 4]; 4];
+    frames.push(vec![10; 4]);
+    let sample = FixedPrefix::new(&samples, 16_000, "hum", &frames).unwrap();
+    session.step(&sample, 19, &AtomicBool::new(false)).unwrap();
+    let weights = session.weights().unwrap();
+    assert_ne!(weights, initial);
+
+    let mut cache = session.model().unwrap().new_text_cache();
+    let mut control_cache = session.model().unwrap().new_text_cache();
+    session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[1, 2], &mut cache)
+        .unwrap();
+    session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[1, 2], &mut control_cache)
+        .unwrap();
+    let expected_continuation = session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[2], &mut control_cache)
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    let states = |model: &omni_lfm3::model::OmniModel<humming_model::Cpu>| {
+        model
+            .text
+            .forward(&[1, 2], &mut model.new_text_cache())
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()
+    };
+    let session_output = states(session.model().unwrap());
+    let reference = SpeechOptimizer::<humming_model::Cpu>::from_values(
+        16,
+        2,
+        weights.0.clone(),
+        weights.1.clone(),
+        &Default::default(),
+    )
+    .unwrap();
+    reference
+        .adapter()
+        .install(&mut reference_model.text, 0)
+        .unwrap();
+    let expected = states(&reference_model);
+    let (trainer, mut returned_model) = session.into_parts().unwrap();
+    assert_eq!(trainer.weights().unwrap(), weights);
+
+    let returned = states(&returned_model);
+    assert!(!returned.is_empty());
+    assert_eq!(returned.len(), expected.len());
+    assert!(
+        returned
+            .iter()
+            .chain(&expected)
+            .all(|value| value.is_finite())
+    );
+    let max_delta = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max)
+    };
+    let delta = max_delta(&returned, &expected);
+    println!("returned_vs_optimizer_output_max_delta={delta}");
+    assert!(
+        delta < 1e-7,
+        "returned adapter does not match optimizer: {delta}"
+    );
+    assert_eq!(returned, session_output);
+    let continuation = returned_model
+        .text
+        .forward(&[2], &mut cache)
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    assert_eq!(continuation, expected_continuation);
+
+    // Corrupt only after observing the returned model; the same output check
+    // must reject a model from which the trained adapter has been removed.
+    returned_model.text.clear_conv_lora(0).unwrap();
+    let corrupted = states(&returned_model);
+    let corrupted_delta = max_delta(&corrupted, &expected);
+    println!("removed_adapter_negative_control_max_delta={corrupted_delta}");
+    assert!(
+        corrupted_delta >= 1e-7,
+        "the output check missed a removed adapter"
+    );
+}
+
+#[test]
+fn external_backward_causes_reported_rollback_and_retry() {
+    let (_fixture, model) = humming_model::model();
+    let (_control_fixture, control_model) = humming_model::model();
+    let trainer = Trainer::<humming_model::Cpu>::new(16, 2, 0, 77, &Default::default()).unwrap();
+    let control = Trainer::<humming_model::Cpu>::new(16, 2, 0, 77, &Default::default()).unwrap();
+    let mut session = trainer.bind(model).unwrap();
+    let mut control = control.bind(control_model).unwrap();
+    let samples: Vec<_> = (0..3200).map(|i| ((i as f32) * 0.08).sin() * 0.3).collect();
+    let mut frames = vec![vec![1; 4]; 4];
+    frames.push(vec![10; 4]);
+    let sample = FixedPrefix::new(&samples, 16_000, "hum", &frames).unwrap();
+    let stop = AtomicBool::new(false);
+    session.step(&sample, 19, &stop).unwrap();
+    control.step(&sample, 19, &stop).unwrap();
+
+    let mut inference_cache = session.model().unwrap().new_text_cache();
+    let text = session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[1, 2], &mut inference_cache)
+        .unwrap();
+    let text = text.into_data().to_vec::<f32>().unwrap();
+    assert!(!text.is_empty() && text.iter().all(|v| v.is_finite()));
+    let media = [session
+        .model()
+        .unwrap()
+        .prepare_audio(&samples, 16_000)
+        .unwrap()];
+    let audio = session
+        .model()
+        .unwrap()
+        .teacher_forced_speech_states_with_media(&sample.messages(), &media, &frames)
+        .unwrap();
+    let audio = audio.into_data().to_vec::<f32>().unwrap();
+    assert!(!audio.is_empty() && audio.iter().all(|v| v.is_finite()));
+    session.step(&sample, 19, &stop).unwrap();
+    control.step(&sample, 19, &stop).unwrap();
+    assert_eq!(session.weights().unwrap(), control.weights().unwrap());
+    let cache_error = session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[2], &mut inference_cache)
+        .unwrap_err()
+        .to_string();
+    assert!(cache_error.contains("text cache belongs to a different model"));
+
+    let before = session.weights().unwrap();
+    let mut old_cache = session.model().unwrap().new_text_cache();
+    session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[1, 2], &mut old_cache)
+        .unwrap();
+    let output = session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[1, 2], &mut session.model().unwrap().new_text_cache())
+        .unwrap();
+    drop(output.sum().backward());
+    let error = session.step(&sample, 19, &stop).unwrap_err();
+    assert!(error.contains("missing speech LoRA A gradient"), "{error}");
+    assert_eq!(session.weights().unwrap(), before);
+    let cache_error = session
+        .model()
+        .unwrap()
+        .text
+        .forward(&[2], &mut old_cache)
+        .unwrap_err()
+        .to_string();
+    assert!(cache_error.contains("text cache belongs to a different model"));
+    session.step(&sample, 19, &stop).unwrap();
+    control.step(&sample, 19, &stop).unwrap();
+    assert_eq!(session.weights().unwrap(), control.weights().unwrap());
+    println!(
+        "ordinary_forward=ok; external_backward_error={error}; rollback_invalidated_cache=true; retry_matches_control=true"
+    );
 }

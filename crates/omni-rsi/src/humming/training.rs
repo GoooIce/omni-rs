@@ -113,7 +113,10 @@ impl<B: AutodiffBackend> TrainingSession<B> {
         }
     }
 
-    /// Read-only access supports inference without permitting adapter changes.
+    /// Borrow the autodiff model for forward inference and output readback.
+    /// The returned tensors and caches can share the optimizer's training graph:
+    /// do not call `backward` on inference outputs while reusing this trainer.
+    /// External backward is not supported and may cause the next step to fail.
     /// Successful steps and any rollback invalidate earlier inference caches.
     pub fn model(&self) -> Result<&OmniModel<B>, String> {
         self.ensure_usable()?;
@@ -126,6 +129,7 @@ impl<B: AutodiffBackend> TrainingSession<B> {
     }
 
     /// Release both objects only if model and optimizer are still consistent.
+    /// This does not detach the returned autodiff model from the trainer's graph.
     pub fn into_parts(self) -> Result<(Trainer<B>, OmniModel<B>), String> {
         self.ensure_usable()?;
         Ok((self.trainer, self.model))
