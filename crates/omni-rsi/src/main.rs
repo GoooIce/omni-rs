@@ -288,22 +288,8 @@ fn state_status(root: &Path, phase: &str, detail: &str, completed: usize) -> Res
     )
 }
 
-fn ddust_path() -> Option<PathBuf> {
-    let path = if let Some(registry) = std::env::var_os("DDUST_RUN_REGISTRY") {
-        PathBuf::from(registry).parent().map(|p| p.join("mps.lock"))
-    } else {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("code/ddust/.ddust/mps.lock"))
-    };
-    path.filter(|path| path.exists())
-}
-
 fn ddust_lease() -> Result<Option<Lease>, String> {
-    match ddust_path() {
-        Some(path) => Lease::try_acquire(&path)?
-            .map(Some)
-            .ok_or_else(|| "ddust accelerator lease is occupied".into()),
-        _ => Ok(None),
-    }
+    omni_rsi::lease::try_ddust_lease()
 }
 
 fn foreground_clear(root: &Path) -> bool {
@@ -504,6 +490,180 @@ fn run_speech_worker(
 
 type IdleProbe = Arc<dyn Fn(&Path) -> IdleSnapshot + Send + Sync>;
 
+thread_local! {
+    static WATCHDOG_PROBE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Called only at binary startup, before application threads are started. Other
+// threads still use the pre-existing hook; only a caught idle-probe panic is quiet.
+fn install_watchdog_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let probe = WATCHDOG_PROBE_ACTIVE
+            .try_with(|active| active.get())
+            .unwrap_or(false);
+        if !probe {
+            previous(info);
+        }
+    }));
+}
+
+fn checked_watchdog_probe(probe: impl FnOnce() -> bool, failed: &AtomicBool) -> bool {
+    WATCHDOG_PROBE_ACTIVE.with(|active| {
+        let was_active = active.replace(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(probe));
+        active.set(was_active);
+        match result {
+            Ok(allowed) => allowed,
+            Err(_) => {
+                failed.store(true, Ordering::Release);
+                false
+            }
+        }
+    })
+}
+
+// Console consumers are outside the scheduler's control. A bounded queue and a
+// detached writer keep a full pipe from retaining the runner or device lease.
+struct WatchOutput {
+    stdout: Option<std::sync::mpsc::SyncSender<WatchMessage>>,
+    stderr: Option<std::sync::mpsc::SyncSender<WatchMessage>>,
+}
+
+struct WatchMessage {
+    bytes: Vec<u8>,
+    delivered: std::sync::mpsc::Sender<bool>,
+}
+
+const MAX_WATCH_REPORT_BYTES: usize = 1_048_576;
+
+impl WatchOutput {
+    fn new() -> Self {
+        Self {
+            stdout: Self::writer(false),
+            stderr: Self::writer(true),
+        }
+    }
+
+    fn writer(stderr: bool) -> Option<std::sync::mpsc::SyncSender<WatchMessage>> {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut output: Box<dyn Write + Send> = {
+            use std::os::fd::FromRawFd;
+            let fd = if stderr {
+                libc::STDERR_FILENO
+            } else {
+                libc::STDOUT_FILENO
+            };
+            let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if copy < 0 {
+                return None;
+            }
+            Box::new(unsafe { std::fs::File::from_raw_fd(copy) })
+        };
+        #[cfg(not(unix))]
+        let mut output: Box<dyn Write + Send> = if stderr {
+            Box::new(std::io::stderr())
+        } else {
+            Box::new(std::io::stdout())
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<WatchMessage>(1);
+        std::thread::Builder::new()
+            .name("rsi-watch-output".into())
+            .spawn(move || {
+                for message in receiver {
+                    let delivered = output.write_all(&message.bytes).is_ok();
+                    let _ = message.delivered.send(delivered);
+                }
+            })
+            .ok()?;
+        Some(sender)
+    }
+
+    fn send(sender: &Option<std::sync::mpsc::SyncSender<WatchMessage>>, bytes: Vec<u8>) -> bool {
+        if bytes.len() > MAX_WATCH_REPORT_BYTES {
+            return false;
+        }
+        let Some(sender) = sender else {
+            return false;
+        };
+        let (delivered, result) = std::sync::mpsc::channel();
+        if sender.try_send(WatchMessage { bytes, delivered }).is_err() {
+            return false;
+        }
+        result
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or(false)
+    }
+}
+
+fn serialize_watch_report(report: &serde_json::Value) -> Result<Vec<u8>, String> {
+    use std::io::{self, Write};
+    struct Bounded(Vec<u8>);
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > MAX_WATCH_REPORT_BYTES - self.0.len() {
+                return Err(io::Error::other("round report exceeds byte limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = Bounded(Vec::with_capacity(MAX_WATCH_REPORT_BYTES));
+    serde_json::to_writer(&mut output, report)
+        .map_err(|error| format!("cannot serialize round report: {error}"))?;
+    output
+        .write_all(b"\n")
+        .map_err(|error| format!("cannot serialize round report: {error}"))?;
+    Ok(output.0)
+}
+
+fn persist_watch_report(root: &Path, report: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    if report.len() > MAX_WATCH_REPORT_BYTES {
+        return Err("round report exceeds byte limit".into());
+    }
+    let directory = root.join("idle-round-reports");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&directory)
+        .map_err(|error| error.to_string())?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".pending-")
+        .suffix(".tmp")
+        .tempfile_in(&directory)
+        .map_err(|error| error.to_string())?;
+    file.write_all(report)
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    let token = file
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(".pending-"))
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .ok_or("invalid temporary report name")?;
+    let path = directory.join(format!("round-{token}.json"));
+    file.persist_noclobber(&path)
+        .map_err(|error| error.error.to_string())?;
+    std::fs::File::open(&directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    std::fs::File::open(root)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
 struct WatchConfig<'a> {
     root: &'a Path,
     rounds: usize,
@@ -589,16 +749,21 @@ where
     if rounds == 0 || rounds > 1_000 {
         return Err("round count must be between 1 and 1000".into());
     }
+    let output = WatchOutput::new();
     let runner = Lease::try_acquire(&root.join("runner.lock"))?
         .ok_or("an RSI scheduler is already running")?;
     let mut completed = 0;
     let mut work_complete = false;
     let mut last_detail = String::new();
+    let mut unconfirmed_report = None;
     while completed < rounds && !stopping(root, &shutdown) {
         if let Some(detail) = waiting_for_work()? {
             if detail != last_detail {
                 state_status(root, "waiting", detail, completed)?;
-                eprintln!("omni-rsi: waiting: {detail}");
+                WatchOutput::send(
+                    &output.stderr,
+                    format!("omni-rsi: waiting: {detail}\n").into_bytes(),
+                );
                 last_detail = detail.into();
             }
             for _ in 0..5 {
@@ -617,7 +782,10 @@ where
         if let Some(blocker) = blocker {
             if blocker != last_detail {
                 state_status(root, "waiting", &blocker, completed)?;
-                eprintln!("omni-rsi: waiting: {blocker}");
+                WatchOutput::send(
+                    &output.stderr,
+                    format!("omni-rsi: waiting: {blocker}\n").into_bytes(),
+                );
                 last_detail = blocker;
             }
             for _ in 0..10 {
@@ -647,13 +815,17 @@ where
         let check_policy = policy.clone();
         let check_shutdown = shutdown.clone();
         let check_probe = probe.clone();
+        let probe_failed = Arc::new(AtomicBool::new(false));
+        let check_failed = probe_failed.clone();
         let watchdog = Watchdog::start(cancel.clone(), watchdog_interval, move || {
             !stopping(&check_root, &check_shutdown)
-                && check_policy.blocker(&check_probe(&check_root)).is_none()
+                && checked_watchdog_probe(
+                    || check_policy.blocker(&check_probe(&check_root)).is_none(),
+                    &check_failed,
+                )
                 && foreground_clear(&check_root)
         });
         state_status(root, "running", description, completed)?;
-        eprintln!("omni-rsi: starting idle round {}", completed + 1);
         let result = run_round(
             &cancel,
             HeldLeases {
@@ -666,11 +838,26 @@ where
         drop(ddust);
         drop(device_lease);
         if cancel.load(Ordering::Acquire) {
+            let probe_failed = probe_failed.load(Ordering::Acquire);
             if let Err(error) = on_yield() {
+                let error = if probe_failed {
+                    format!("{error}; idle probe failed")
+                } else {
+                    error
+                };
                 state_status(root, "error", &error, completed)?;
                 return Err(error);
             }
-            state_status(root, "waiting", "background work yielded", completed)?;
+            state_status(
+                root,
+                "waiting",
+                if probe_failed {
+                    "background work yielded; idle probe failed"
+                } else {
+                    "background work yielded"
+                },
+                completed,
+            )?;
             last_detail.clear();
             continue;
         }
@@ -691,11 +878,38 @@ where
                     }
                     continue;
                 }
-                completed += 1;
                 let complete =
                     report.get("complete").and_then(serde_json::Value::as_bool) == Some(true);
-                println!("{report}");
-                state_status(root, "waiting", "round complete", completed)?;
+                let bytes = match serialize_watch_report(&report) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        state_status(root, "error", &error, completed)?;
+                        return Err(error);
+                    }
+                };
+                let path = match persist_watch_report(root, &bytes) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let detail = format!("cannot persist completed round report: {error}");
+                        state_status(root, "error", &detail, completed)?;
+                        return Err(detail);
+                    }
+                };
+                completed += 1;
+                let delivered = WatchOutput::send(&output.stdout, bytes);
+                if !delivered {
+                    unconfirmed_report = Some(path);
+                }
+                state_status(
+                    root,
+                    "waiting",
+                    if delivered {
+                        "round complete"
+                    } else {
+                        "round complete; live report output unconfirmed; report saved"
+                    },
+                    completed,
+                )?;
                 if complete {
                     work_complete = true;
                     break;
@@ -708,6 +922,20 @@ where
         }
     }
     let stopped = stopping(root, &shutdown);
+    let mut final_detail = if !stopped && require_work_completion && !work_complete {
+        "round limit reached before training completed".to_owned()
+    } else {
+        String::new()
+    };
+    if let Some(path) = unconfirmed_report {
+        if !final_detail.is_empty() {
+            final_detail.push_str("; ");
+        }
+        final_detail.push_str(&format!(
+            "live report output unconfirmed; report saved at {}",
+            path.display()
+        ));
+    }
     let result = state_status(
         root,
         if stopped {
@@ -717,11 +945,7 @@ where
         } else {
             "complete"
         },
-        if !stopped && require_work_completion && !work_complete {
-            "round limit reached before training completed"
-        } else {
-            ""
-        },
+        &final_detail,
         completed,
     );
     let request = root.join("stop.request");
@@ -1053,6 +1277,7 @@ fn execute() -> Result<(), String> {
     }
 }
 fn main() {
+    install_watchdog_panic_hook();
     if let Err(error) = execute() {
         eprintln!("omni-rsi: {error}");
         std::process::exit(1);

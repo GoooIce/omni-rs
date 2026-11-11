@@ -234,9 +234,9 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
             supervisor_fd: fd("OMNI_AUDIO_IDLE_TEST_SOCKET"),
             ddust_fd: Some(fd("OMNI_AUDIO_IDLE_TEST_DDUST")),
         };
-        let stream = validate_supervision(&root, proof, Some(&root.join("mps.lock"))).unwrap();
+        let supervision = validate_supervision(&root, proof).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let monitor = monitor_supervisor(stop.clone(), stream);
+        let monitor = supervision.monitor(stop.clone()).unwrap();
         fs::write(root.join("validated"), b"ok").unwrap();
         let deadline = Instant::now() + Duration::from_secs(8);
         while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -273,6 +273,7 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
             "--nocapture",
         ])
         .env(CHILD, "1")
+        .env("DDUST_RUN_REGISTRY", root.join("registry.json"))
         .env("OMNI_AUDIO_IDLE_TEST_ROOT", root)
         .env("OMNI_AUDIO_IDLE_TEST_RUNNER", proof.runner_fd.to_string())
         .env("OMNI_AUDIO_IDLE_TEST_DEVICE", proof.device_fd.to_string())
@@ -475,6 +476,14 @@ fn v3_audio_route_counts_partial_then_complete_without_touching_legacy_state() {
     let legacy = root.join("audio-conditioned-v1");
     fs::create_dir(&legacy).unwrap();
     fs::write(legacy.join("keep"), b"legacy").unwrap();
+    let reports = root.join("idle-round-reports");
+    fs::create_dir(&reports).unwrap();
+    fs::write(
+        reports.join("round-existing.json"),
+        b"preserve existing report",
+    )
+    .unwrap();
+    fs::write(reports.join(".pending-interrupted.tmp"), b"incomplete").unwrap();
     let data_root = v3_fixture::fixture();
     let model = data_root.path().join("model");
     let stop = AtomicBool::new(false);
@@ -568,6 +577,30 @@ fi
         serde_json::from_slice(&fs::read(root.join("status.json")).unwrap()).unwrap();
     assert_eq!(status["phase"], "complete");
     assert_eq!(status["completed_this_session"], 2);
+    assert_eq!(
+        fs::read(reports.join("round-existing.json")).unwrap(),
+        b"preserve existing report"
+    );
+    assert_eq!(
+        fs::read(reports.join(".pending-interrupted.tmp")).unwrap(),
+        b"incomplete"
+    );
+    let generated: Vec<_> = fs::read_dir(&reports)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter(|path| path.file_name().unwrap() != "round-existing.json")
+        .collect();
+    assert_eq!(generated.len(), 2);
+    for path in generated {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("round-") && name.ends_with(".json"));
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(report["quality"], "not_assessed");
+    }
 }
 
 #[test]
@@ -670,4 +703,1144 @@ wait "$child"
         serde_json::from_slice(&fs::read(root.join("status.json")).unwrap()).unwrap();
     assert_eq!(status["phase"], "stopped");
     assert_eq!(status["completed_this_session"], 0);
+}
+
+#[test]
+fn review_configured_ddust_lock_is_held_before_the_worker_starts() {
+    use std::process::{Child, Command, Stdio};
+    const ROLE: &str = "AUDIO_REVIEW_DDUST_ROLE";
+    if std::env::var(ROLE).as_deref() == Ok("worker") {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let fd = |name| std::env::var(name).unwrap().parse::<i32>().unwrap();
+        let ddust_fd = std::env::var("AUDIO_REVIEW_DDUST_FD")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok());
+        let proof = AudioProof {
+            runner_fd: fd("AUDIO_REVIEW_RUNNER"),
+            device_fd: fd("AUDIO_REVIEW_DEVICE"),
+            supervisor_fd: fd("AUDIO_REVIEW_SUPERVISOR"),
+            ddust_fd,
+        };
+        let supervision = validate_supervision(&root, proof).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let _monitor = supervision.monitor(stop.clone()).unwrap();
+        fs::write(
+            root.join("ddust-worker-started"),
+            if ddust_fd.is_some() {
+                b"with".as_slice()
+            } else {
+                b"without".as_slice()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        return;
+    }
+    if std::env::var(ROLE).as_deref() == Ok("scheduler") {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  [ "$previous" = "--runner-fd" ] && runner="$arg"
+  [ "$previous" = "--device-fd" ] && device="$arg"
+  [ "$previous" = "--supervisor-fd" ] && supervisor="$arg"
+  [ "$previous" = "--ddust-fd" ] && ddust="$arg"
+  previous="$arg"
+done
+export AUDIO_REVIEW_DDUST_ROLE=worker AUDIO_REVIEW_ROOT="$state"
+export AUDIO_REVIEW_RUNNER="$runner" AUDIO_REVIEW_DEVICE="$device" AUDIO_REVIEW_SUPERVISOR="$supervisor"
+export AUDIO_REVIEW_DDUST_FD="$ddust"
+exec "$AUDIO_REVIEW_EXE" --exact audio_idle::tests::review_configured_ddust_lock_is_held_before_the_worker_starts --nocapture
+"#,
+        );
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "synthetic ddust",
+        );
+        config.probe = Arc::new(|_| idle(true));
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        let result = watch_audio(config, &root, &job(&root), &executable);
+        assert!(result.is_err(), "mock worker supplies no checkpoint");
+        return;
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let ddust = root.join("ddust");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&ddust).unwrap();
+    let registry = ddust.join("registry.json");
+    let lock = ddust.join("mps.lock");
+    fs::write(&registry, br#"{"version":1,"runs":{}}"#).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "audio_idle::tests::review_configured_ddust_lock_is_held_before_the_worker_starts",
+            "--nocapture",
+        ])
+        .env(ROLE, "scheduler")
+        .env("AUDIO_REVIEW_ROOT", root)
+        .env("AUDIO_REVIEW_EXE", std::env::current_exe().unwrap())
+        .env("HOME", &home)
+        .env("DDUST_RUN_REGISTRY", &registry)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    wait_file(&root.join("ddust-worker-started"));
+    let had_lock_file = lock.exists();
+    let inherited = fs::read(root.join("ddust-worker-started")).unwrap();
+    let competitor = Lease::try_acquire(&lock).unwrap();
+    let competitor_entered = competitor.is_some();
+    drop(competitor);
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "scheduler exited {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "scheduler did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "lock existed before peer={had_lock_file}, worker proof={}, peer acquired={competitor_entered}",
+        String::from_utf8_lossy(&inherited)
+    );
+    assert!(
+        had_lock_file,
+        "configured ddust lock was absent when the worker started"
+    );
+    assert_eq!(inherited, b"with", "worker did not inherit the ddust lease");
+    assert!(
+        !competitor_entered,
+        "competitor acquired the ddust lease during the worker"
+    );
+    assert!(
+        Lease::try_acquire(&lock).unwrap().is_some(),
+        "ddust lease was not released"
+    );
+}
+
+#[test]
+fn review_v3_started_marker_blocks_legacy_alias_before_worker_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let alias = root.join("number-audio-v3");
+    fs::create_dir(&alias).unwrap();
+    let marker = root.join("audio-idle-v3-started");
+    fs::write(&marker, b"reserved-v3").unwrap();
+    let executable = program(
+        &alias,
+        &format!(
+            "#!/bin/sh\ntouch '{}'\nexit 1\n",
+            alias.join("worker-started").display()
+        ),
+    );
+    let mut config = WatchConfig::new(
+        &alias,
+        1,
+        IdlePolicy::default(),
+        Arc::new(AtomicBool::new(false)),
+        "alias mock",
+    );
+    config.probe = Arc::new(|_| idle(true));
+    config.ddust_lease = || Ok(None);
+    config.wait_unit = Duration::from_millis(5);
+    config.watchdog_interval = Duration::from_millis(5);
+    config.worker_grace = Duration::from_millis(500);
+    let error = watch_audio(config, root, &job(root), &executable).unwrap_err();
+    assert!(
+        error.contains("already exists") || error.contains("reserved"),
+        "{error}"
+    );
+    assert!(!alias.join("worker-started").exists());
+    assert!(!alias.join("audio-idle-legacy-started").exists());
+    assert_eq!(fs::read(&marker).unwrap(), b"reserved-v3");
+}
+
+#[test]
+fn review_ddust_occupied_delays_worker_until_released() {
+    use std::process::{Child, Command, Stdio};
+    const ROLE: &str = "AUDIO_REVIEW_BUSY_DDUST";
+    if std::env::var_os(ROLE).is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+touch "$state/worker-started-after-ddust"
+sleep 30 &
+child=$!
+trap 'wait "$child" 2>/dev/null; exit 130' INT TERM
+wait "$child"
+"#,
+        );
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "busy ddust mock",
+        );
+        config.probe = Arc::new(|_| idle(true));
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        let error = watch_audio(config, &root, &job(&root), &executable).unwrap_err();
+        assert!(error.contains("no complete audio checkpoint"), "{error}");
+        return;
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("ddust")).unwrap();
+    let lock = root.join("ddust/mps.lock");
+    let held = Lease::try_acquire(&lock).unwrap().unwrap();
+    let mut child = Reap(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audio_idle::tests::review_ddust_occupied_delays_worker_until_released",
+                "--nocapture",
+            ])
+            .env(ROLE, "1")
+            .env("AUDIO_REVIEW_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("DDUST_RUN_REGISTRY", root.join("ddust/registry.json"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(bytes) = fs::read(root.join("status.json"))
+            && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && status["phase"] == "waiting"
+            && status["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("ddust accelerator lease is occupied"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not wait for the busy ddust lease"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!root.join("worker-started-after-ddust").exists());
+    assert!(!root.join("audio-idle-legacy-started").exists());
+    drop(held);
+    wait_file(&root.join("worker-started-after-ddust"));
+    assert!(Lease::try_acquire(&lock).unwrap().is_none());
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "busy ddust scheduler failed: {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "busy ddust scheduler did not stop"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(Lease::try_acquire(&lock).unwrap().is_some());
+}
+
+#[test]
+fn review_full_scheduler_stderr_never_blocks_foreground_yield() {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::{Child, Command, Stdio},
+    };
+    const ROLE: &str = "AUDIO_REVIEW_STDERR_ROLE";
+    if std::env::var(ROLE).as_deref() == Ok("scheduler") {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+printf '%s' "$$" > "$state/stderr-worker-pid"
+sleep 30 &
+child=$!
+trap 'wait "$child" 2>/dev/null; exit 130' INT TERM
+wait "$child"
+"#,
+        );
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "synthetic blocked stderr",
+        );
+        config.probe = Arc::new(|_| idle(true));
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        let result = watch_audio(config, &root, &job(&root), &executable);
+        if let Err(error) = result {
+            assert!(error.contains("no complete audio checkpoint"), "{error}");
+        }
+        return;
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("ddust")).unwrap();
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let mut filled = 0;
+    loop {
+        match writer.write(&[b'x'; 8192]) {
+            Ok(0) => panic!("unexpected zero while filling stderr"),
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => panic!("cannot fill synthetic stderr: {error}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "audio_idle::tests::review_full_scheduler_stderr_never_blocks_foreground_yield",
+            "--nocapture",
+        ])
+        .env(ROLE, "scheduler")
+        .env("AUDIO_REVIEW_ROOT", root)
+        .env("HOME", root.join("home"))
+        .env("DDUST_RUN_REGISTRY", root.join("ddust/registry.json"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(OwnedFd::from(writer)))
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(bytes) = fs::read(root.join("status.json"))
+            && serde_json::from_slice::<serde_json::Value>(&bytes)
+                .is_ok_and(|status| status["phase"] == "running")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not reach running phase"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let worker_pid = loop {
+        if let Ok(text) = fs::read_to_string(root.join("stderr-worker-pid"))
+            && let Ok(pid) = text.parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "mock worker did not start");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        unsafe { libc::kill(worker_pid, 0) },
+        0,
+        "mock worker did not start"
+    );
+    let foreground = Lease::try_acquire(&root.join("foreground.lock"))
+        .unwrap()
+        .unwrap();
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let released = loop {
+        if let Some(lease) = Lease::try_acquire(&root.join("device.lock")).unwrap() {
+            drop(lease);
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    if released {
+        assert_eq!(
+            unsafe { libc::kill(worker_pid, 0) },
+            -1,
+            "worker survived device release"
+        );
+    }
+    reader.set_nonblocking(true).unwrap();
+    let mut buffer = [0_u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("cannot drain synthetic stderr: {error}"),
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "scheduler exited {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not stop after stderr was drained"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(foreground);
+    println!("stderr filled={filled}, device released before drain={released}");
+    assert!(
+        released,
+        "full scheduler stderr blocked foreground device release"
+    );
+}
+
+#[test]
+fn review_watchdog_probe_panic_with_blocked_stderr_still_yields() {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::{Child, Command, Stdio},
+    };
+    const ROLE: &str = "AUDIO_REVIEW_PANIC_ROLE";
+    if std::env::var_os(ROLE).is_some() {
+        // Reproduce the CLI's startup ordering before starting scheduler threads.
+        crate::install_watchdog_panic_hook();
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+printf '%s' "$$" > "$state/panic-worker-pid"
+sleep 30 &
+child=$!
+trap 'wait "$child" 2>/dev/null; exit 130' INT TERM
+wait "$child"
+"#,
+        );
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "panic probe mock",
+        );
+        config.probe = Arc::new(|root| {
+            assert!(
+                !root.join("panic-probe").exists(),
+                "synthetic idle probe failure"
+            );
+            idle(true)
+        });
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        let error = watch_audio(config, &root, &job(&root), &executable).unwrap_err();
+        assert!(error.contains("no complete audio checkpoint"), "{error}");
+        assert!(error.contains("idle probe failed"), "{error}");
+        return;
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("home")).unwrap();
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[b'x'; 8192]) {
+            Ok(0) => panic!("unexpected zero while filling stderr"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => panic!("cannot fill stderr: {error}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+    let mut child = Reap(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audio_idle::tests::review_watchdog_probe_panic_with_blocked_stderr_still_yields",
+                "--nocapture",
+            ])
+            .env(ROLE, "1")
+            .env("AUDIO_REVIEW_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env_remove("DDUST_RUN_REGISTRY")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(OwnedFd::from(writer)))
+            .spawn()
+            .unwrap(),
+    );
+    wait_file(&root.join("panic-worker-pid"));
+    fs::write(root.join("panic-probe"), b"panic").unwrap();
+    thread::sleep(Duration::from_millis(200));
+    let foreground = Lease::try_acquire(&root.join("foreground.lock"))
+        .unwrap()
+        .unwrap();
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let released = loop {
+        if Lease::try_acquire(&root.join("device.lock"))
+            .unwrap()
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    reader.set_nonblocking(true).unwrap();
+    let mut buffer = [0_u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("cannot drain stderr: {error}"),
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not exit after stderr drained"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(foreground);
+    assert!(
+        released,
+        "watchdog panic hook blocked device release on full stderr"
+    );
+}
+
+#[test]
+fn review_fifo_foreground_lock_cannot_block_worker_cancellation() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        process::{Child, Command, Stdio},
+    };
+    const ROLE: &str = "AUDIO_REVIEW_FOREGROUND_FIFO";
+    if std::env::var_os(ROLE).is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+touch "$state/fifo-worker-started"
+sleep 30 &
+child=$!
+trap 'wait "$child" 2>/dev/null; exit 130' INT TERM
+wait "$child"
+"#,
+        );
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "fifo foreground mock",
+        );
+        config.probe = Arc::new(|_| idle(true));
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        let error = watch_audio(config, &root, &job(&root), &executable).unwrap_err();
+        assert!(error.contains("no complete audio checkpoint"), "{error}");
+        return;
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("home")).unwrap();
+    let mut child = Reap(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audio_idle::tests::review_fifo_foreground_lock_cannot_block_worker_cancellation",
+                "--nocapture",
+            ])
+            .env(ROLE, "1")
+            .env("AUDIO_REVIEW_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env_remove("DDUST_RUN_REGISTRY")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_file(&root.join("fifo-worker-started"));
+    let fifo = root.join("pending-fifo");
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let foreground = root.join("foreground.lock");
+    fs::rename(&fifo, &foreground).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let released = loop {
+        if Lease::try_acquire(&root.join("device.lock"))
+            .unwrap()
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Unblock the known-bad baseline before evaluating the assertion.
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&foreground)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not exit after opening FIFO reader"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(released, "foreground FIFO blocked device release");
+}
+
+fn check_blocked_output_does_not_prevent_scheduler_stop(selected: &str) {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::{
+            fd::AsRawFd,
+            unix::{net::UnixStream, process::CommandExt},
+        },
+        process::{Child, Command, Stdio},
+    };
+    const ROLE: &str = "AUDIO_REVIEW_OUTPUT_ROLE";
+    if let Ok(role) = std::env::var(ROLE) {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let executable = if role == "report" {
+            let report = write_checkpoint(
+                &root.join("stage"),
+                AudioProgress {
+                    epoch: 0,
+                    next_index: 1,
+                    updates: 1,
+                },
+            );
+            fs::write(
+                root.join("mock-output.json"),
+                serde_json::to_vec(&report).unwrap(),
+            )
+            .unwrap();
+            program(
+                &root,
+                r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+cp -R "$state/stage/audio-conditioned-v1" "$state/audio-conditioned-v1" || exit 93
+cat "$state/mock-output.json"
+"#,
+            )
+        } else {
+            program(&root, "#!/bin/sh\nexit 97\n")
+        };
+        let fd: i32 = std::env::var("AUDIO_REVIEW_OUTPUT_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let target = if role == "report" {
+            libc::STDOUT_FILENO
+        } else {
+            libc::STDERR_FILENO
+        };
+        assert_eq!(unsafe { libc::dup2(fd, target) }, target);
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "output mock",
+        );
+        config.probe = Arc::new(move |_| idle(role == "report"));
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        watch_audio(config, &root, &job(&root), &executable).unwrap();
+        // Do not let the test harness itself write to the deliberately full fd.
+        std::process::exit(0);
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let role = selected;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir(root.join("home")).unwrap();
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    // This socket is created by the test and has not been shared with the child yet.
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[b'x'; 8192]) {
+            Ok(0) => panic!("unexpected zero while filling output"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => panic!("cannot fill output: {error}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+    let fd = writer.as_raw_fd();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    let test = if role == "waiting" {
+        "audio_idle::tests::review_blocked_waiting_output_never_prevents_stop"
+    } else {
+        "audio_idle::tests::review_blocked_round_output_never_prevents_stop"
+    };
+    command
+        .args(["--exact", test, "--nocapture"])
+        .env(ROLE, role)
+        .env("AUDIO_REVIEW_ROOT", root)
+        .env("HOME", root.join("home"))
+        .env("AUDIO_REVIEW_OUTPUT_FD", fd.to_string())
+        .env_remove("DDUST_RUN_REGISTRY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = Reap(command.spawn().unwrap());
+    drop(writer);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let phase = fs::read(root.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value["phase"].as_str().map(str::to_owned));
+        let ready = if role == "waiting" {
+            phase.as_deref() == Some("waiting")
+        } else {
+            phase.as_deref() == Some("running")
+                && root.join("audio-conditioned-v1/latest.json").exists()
+                && Lease::try_acquire(&root.join("device.lock"))
+                    .unwrap()
+                    .is_some()
+        };
+        if ready {
+            break;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{role} scheduler exited before observation"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{role} scheduler did not reach output"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let released = loop {
+        if Lease::try_acquire(&root.join("runner.lock"))
+            .unwrap()
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited_before_drain = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{role}: {status}");
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    reader.set_nonblocking(true).unwrap();
+    let mut buffer = [0_u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("cannot drain {role} output: {error}"),
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{role}: {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{role} scheduler did not stop after drain"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    println!("{role}: runner released before draining output={released}");
+    assert!(
+        released,
+        "blocked {role} output prevented stop from releasing runner"
+    );
+    assert!(
+        exited_before_drain,
+        "blocked {role} output prevented process exit"
+    );
+    if role == "report" {
+        let mut report = write_checkpoint(
+            &root.join("resume-stage"),
+            AudioProgress {
+                epoch: 2,
+                next_index: 0,
+                updates: 4,
+            },
+        );
+        report["status"] = "complete".into();
+        fs::write(
+            root.join("resume-output.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        let executable = program(
+            root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+cp -R "$state/resume-stage/audio-conditioned-v1/." "$state/audio-conditioned-v1/" || exit 93
+cat "$state/resume-output.json"
+"#,
+        );
+        let mut config = WatchConfig::new(
+            root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "resume after blocked output",
+        );
+        config.probe = Arc::new(|_| idle(true));
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        let mut resume = job(root);
+        resume.start = AudioStart {
+            fresh: false,
+            resume: true,
+        };
+        watch_audio(config, root, &resume, &executable).unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status["phase"], "complete");
+    } else {
+        assert!(
+            preflight(root, &job(root)).is_ok(),
+            "waiting did not start a worker or reserve state"
+        );
+    }
+}
+
+#[test]
+fn review_blocked_waiting_output_never_prevents_stop() {
+    check_blocked_output_does_not_prevent_scheduler_stop("waiting");
+}
+
+#[test]
+fn review_blocked_round_output_never_prevents_stop() {
+    check_blocked_output_does_not_prevent_scheduler_stop("report");
+}
+
+#[test]
+fn review_final_round_report_is_recoverable_when_stdout_is_blocked() {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::{
+            fd::AsRawFd,
+            unix::{net::UnixStream, process::CommandExt},
+        },
+        process::{Child, Command, Stdio},
+    };
+    const ROLE: &str = "AUDIO_REVIEW_FINAL_REPORT";
+    if std::env::var_os(ROLE).is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
+        let mut report = write_checkpoint(
+            &root.join("stage"),
+            AudioProgress {
+                epoch: 2,
+                next_index: 0,
+                updates: 4,
+            },
+        );
+        report["status"] = "complete".into();
+        fs::write(
+            root.join("mock-output.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+cp -R "$state/stage/audio-conditioned-v1" "$state/audio-conditioned-v1" || exit 93
+cat "$state/mock-output.json"
+"#,
+        );
+        let fd: i32 = std::env::var("AUDIO_REVIEW_OUTPUT_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(fd, libc::STDOUT_FILENO) },
+            libc::STDOUT_FILENO
+        );
+        let mut config = WatchConfig::new(
+            &root,
+            1,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "final report mock",
+        );
+        config.probe = Arc::new(|_| idle(true));
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(500);
+        watch_audio(config, &root, &job(&root), &executable).unwrap();
+        std::process::exit(0);
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("home")).unwrap();
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[b'x'; 8192]) {
+            Ok(0) => panic!("unexpected zero while filling stdout"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => panic!("cannot fill stdout: {error}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+    let fd = writer.as_raw_fd();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "audio_idle::tests::review_final_round_report_is_recoverable_when_stdout_is_blocked",
+            "--nocapture",
+        ])
+        .env(ROLE, "1")
+        .env("AUDIO_REVIEW_ROOT", root)
+        .env("AUDIO_REVIEW_OUTPUT_FD", fd.to_string())
+        .env("HOME", root.join("home"))
+        .env_remove("DDUST_RUN_REGISTRY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = Reap(command.spawn().unwrap());
+    drop(writer);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Ok(bytes) = fs::read(root.join("status.json"))
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && value["phase"] == "complete"
+        {
+            break Some(value);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let runner_released = loop {
+        if Lease::try_acquire(&root.join("runner.lock"))
+            .unwrap()
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited_before_drain = loop {
+        if let Some(exit) = child.0.try_wait().unwrap() {
+            assert!(exit.success(), "{exit}");
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let report = fs::read_dir(root.join("idle-round-reports"))
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .and_then(Result::ok)
+        .and_then(|entry| {
+            let path = entry.path();
+            let bytes = fs::read(&path).ok()?;
+            Some((
+                path,
+                serde_json::from_slice::<serde_json::Value>(&bytes).ok()?,
+            ))
+        });
+    reader.set_nonblocking(true).unwrap();
+    let mut buffer = [0_u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("cannot drain stdout: {error}"),
+        }
+        if let Some(exit) = child.0.try_wait().unwrap() {
+            assert!(exit.success(), "{exit}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test child did not finish after drain"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let status = status.expect("final status did not complete while stdout was blocked");
+    let detail = status["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("live report output unconfirmed") && detail.contains("idle-round-reports"),
+        "{detail}"
+    );
+    assert!(runner_released, "runner was still held");
+    assert!(exited_before_drain, "scheduler process did not exit");
+    let (path, report) = report.expect("no recoverable round report");
+    assert!(detail.contains(&path.display().to_string()), "{detail}");
+    assert_eq!(report["training_status"], "complete");
+    assert_eq!(report["quality"], "not_assessed");
+    assert_eq!(report["progress"]["updates"], 4);
 }

@@ -6,6 +6,7 @@ extern crate self as omni_rsi;
 #[path = "../tests/support/number_v3_fixture.rs"]
 mod number_v3_fixture;
 
+pub mod audio_idle_state;
 pub mod chart;
 pub mod child;
 pub mod evolution;

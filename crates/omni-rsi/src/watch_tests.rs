@@ -204,3 +204,198 @@ fn mock_pending_work_does_not_count_as_a_completed_round() {
         1
     );
 }
+
+#[test]
+fn review_oversized_mock_round_report_is_rejected_before_persistence() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut config = WatchConfig::new(
+        root,
+        1,
+        IdlePolicy::default(),
+        Arc::new(AtomicBool::new(false)),
+        "oversized mock report",
+    );
+    config.probe = Arc::new(|_| mock_snapshot(true));
+    config.ddust_lease = || Ok(None);
+    config.wait_unit = Duration::from_millis(5);
+    config.watchdog_interval = Duration::from_millis(5);
+    let error = watch(
+        config,
+        || Ok(None),
+        |_| Ok(json!({"content":"x".repeat(1_048_576)})),
+    )
+    .expect_err("oversized report was accepted");
+    assert!(
+        error.contains("report") && error.contains("limit"),
+        "{error}"
+    );
+    assert!(!root.join("idle-round-reports").exists());
+    let status = wait_for_status(root, "error");
+    assert_eq!(status["completed_this_session"], 0);
+    assert!(
+        Lease::try_acquire(&root.join("device.lock"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        Lease::try_acquire(&root.join("runner.lock"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn review_report_serialization_counts_quotes_and_final_newline_in_the_limit() {
+    let exact = serde_json::Value::String("x".repeat(MAX_WATCH_REPORT_BYTES - 3));
+    let bytes = serialize_watch_report(&exact).unwrap();
+    assert_eq!(bytes.len(), MAX_WATCH_REPORT_BYTES);
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    let overflow = serde_json::Value::String("x".repeat(MAX_WATCH_REPORT_BYTES - 2));
+    assert!(
+        serialize_watch_report(&overflow)
+            .unwrap_err()
+            .contains("byte limit")
+    );
+}
+
+#[test]
+fn review_report_persistence_also_rejects_unbounded_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let oversized = vec![b'x'; MAX_WATCH_REPORT_BYTES + 1];
+    let error = persist_watch_report(directory.path(), &oversized).unwrap_err();
+    assert!(error.contains("byte limit"), "{error}");
+    assert!(!directory.path().join("idle-round-reports").exists());
+}
+
+#[test]
+fn review_report_persistence_failure_records_error_and_preserves_existing_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let reports = root.join("idle-round-reports");
+    fs::write(&reports, b"preserve existing file").unwrap();
+    let mut config = WatchConfig::new(
+        root,
+        1,
+        IdlePolicy::default(),
+        Arc::new(AtomicBool::new(false)),
+        "report failure mock",
+    );
+    config.probe = Arc::new(|_| mock_snapshot(true));
+    config.ddust_lease = || Ok(None);
+    config.wait_unit = Duration::from_millis(5);
+    config.watchdog_interval = Duration::from_millis(5);
+    let error = watch(config, || Ok(None), |_| Ok(json!({"complete":true})))
+        .expect_err("report persistence unexpectedly succeeded");
+    assert!(
+        error.contains("cannot persist completed round report"),
+        "{error}"
+    );
+    let status = wait_for_status(root, "error");
+    assert_eq!(status["completed_this_session"], 0);
+    assert_eq!(fs::read(&reports).unwrap(), b"preserve existing file");
+    assert!(
+        Lease::try_acquire(&root.join("device.lock"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        Lease::try_acquire(&root.join("runner.lock"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn review_cli_hook_delegates_other_thread_during_watchdog_probe_failure() {
+    use std::sync::atomic::AtomicUsize;
+    const ROLE: &str = "AUDIO_REVIEW_CONCURRENT_PANIC";
+    if std::env::var_os(ROLE).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "watch_tests::review_cli_hook_delegates_other_thread_during_watchdog_probe_failure",
+                "--nocapture",
+            ])
+            .env(ROLE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    std::panic::set_hook(Box::new(move |_| {
+        observed.fetch_add(1, Ordering::AcqRel);
+    }));
+    // Model the binary startup, before any application thread is created.
+    install_watchdog_panic_hook();
+    let trigger = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let other_done = Arc::new(AtomicBool::new(false));
+    let other_entered = entered.clone();
+    let done = other_done.clone();
+    let other = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !other_entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "watchdog probe did not enter");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(std::panic::catch_unwind(|| panic!("ordinary thread panic")).is_err());
+        done.store(true, Ordering::Release);
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut config = WatchConfig::new(
+        directory.path(),
+        1,
+        IdlePolicy::default(),
+        shutdown.clone(),
+        "panic hook mock",
+    );
+    let check_trigger = trigger.clone();
+    config.probe = Arc::new(move |_| {
+        if check_trigger.load(Ordering::Acquire) {
+            entered.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !other_done.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "ordinary panic did not finish");
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("watchdog probe failed");
+        }
+        mock_snapshot(true)
+    });
+    config.ddust_lease = || Ok(None);
+    config.wait_unit = Duration::from_millis(5);
+    config.watchdog_interval = Duration::from_millis(5);
+    watch(
+        config,
+        || Ok(None),
+        |cancel| {
+            trigger.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !cancel.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "probe failure did not cancel work"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            shutdown.store(true, Ordering::Release);
+            Ok(json!({"complete":false}))
+        },
+    )
+    .unwrap();
+    other.join().unwrap();
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        1,
+        "other thread diagnostic was lost or probe panic escaped"
+    );
+}

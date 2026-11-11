@@ -20,27 +20,7 @@ pub(super) struct AudioProof {
 }
 
 fn namespace(root: &Path, job: &AudioJob) -> PathBuf {
-    if job.number_v3 {
-        root.join("number-audio-v3")
-    } else {
-        root.to_owned()
-    }
-}
-
-fn marker(root: &Path, job: &AudioJob) -> PathBuf {
-    root.join(if job.number_v3 {
-        "audio-idle-v3-started"
-    } else {
-        "audio-idle-legacy-started"
-    })
-}
-
-fn exists(path: &Path) -> Result<bool, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
+    omni_rsi::audio_idle_state::namespace(root, job.number_v3)
 }
 
 fn checkpoint(root: &Path, job: &AudioJob) -> Result<Option<AudioCheckpointSummary>, String> {
@@ -60,11 +40,7 @@ pub(super) fn preflight(root: &Path, job: &AudioJob) -> Result<(), String> {
         return Err("audio epochs and update budget must be between 1 and 100".into());
     }
     if job.start.fresh {
-        if exists(&namespace(root, job).join("audio-conditioned-v1"))?
-            || exists(&marker(root, job))?
-        {
-            return Err("audio training state already exists; preserve it and explicitly resume a complete checkpoint".into());
-        }
+        omni_rsi::audio_idle_state::check_fresh(root, job.number_v3)?;
     } else if checkpoint(root, job)?.is_none() {
         return Err("no complete audio checkpoint to resume; existing state is untouched".into());
     }
@@ -73,19 +49,7 @@ pub(super) fn preflight(root: &Path, job: &AudioJob) -> Result<(), String> {
 
 #[cfg(unix)]
 fn mark_started(root: &Path, job: &AudioJob) -> Result<(), String> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(marker(root, job))
-        .map_err(|error| format!("cannot reserve fresh audio state: {error}"))?;
-    file.write_all(b"audio-idle-started-v1\n")
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    std::fs::File::open(root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| error.to_string())
+    omni_rsi::audio_idle_state::reserve_fresh(root, job.number_v3)
 }
 
 #[cfg(unix)]
@@ -384,114 +348,17 @@ fn run_worker(
 }
 
 #[cfg(unix)]
-fn verify_lease(fd: i32, path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if fd < 3 || unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return Err("missing inherited lease descriptor".into());
-    }
-    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_file()
-        || metadata.dev() != stat.st_dev as u64
-        || metadata.ino() != stat.st_ino as u64
-    {
-        return Err("inherited lease does not match the scheduler state".into());
-    }
-    // This uses the inherited open file description, not a second lock acquisition.
-    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("inherited cooperative lease is not held".into());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn supervisor_alive(stream: &std::os::unix::net::UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut poll = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut poll, 1, 0) == 0 }
-}
-
-#[cfg(unix)]
-fn monitor_supervisor(
-    stop: Arc<AtomicBool>,
-    stream: std::os::unix::net::UnixStream,
-) -> omni_rsi::watchdog::Watchdog {
-    omni_rsi::watchdog::Watchdog::start(stop, std::time::Duration::from_millis(100), move || {
-        supervisor_alive(&stream)
-    })
-}
-
-#[cfg(unix)]
 fn validate_supervision(
     root: &Path,
     proof: AudioProof,
-    ddust: Option<&Path>,
-) -> Result<std::os::unix::net::UnixStream, String> {
-    use std::{
-        collections::HashSet,
-        os::{fd::FromRawFd, unix::net::UnixStream},
-    };
-    let fds = [
-        Some(proof.runner_fd),
-        Some(proof.device_fd),
-        Some(proof.supervisor_fd),
+) -> Result<omni_rsi::audio_idle_state::AudioSupervision, String> {
+    omni_rsi::audio_idle_state::AudioSupervision::validate(
+        root,
+        proof.runner_fd,
+        proof.device_fd,
+        proof.supervisor_fd,
         proof.ddust_fd,
-    ];
-    let mut distinct = HashSet::new();
-    if fds
-        .into_iter()
-        .flatten()
-        .any(|fd| fd < 3 || !distinct.insert(fd))
-    {
-        return Err("invalid inherited descriptors".into());
-    }
-    verify_lease(proof.runner_fd, &root.join("runner.lock"))?;
-    verify_lease(proof.device_fd, &root.join("device.lock"))?;
-    match (ddust, proof.ddust_fd) {
-        (Some(path), Some(fd)) => verify_lease(fd, path)?,
-        (None, None) => {}
-        _ => return Err("ddust lease changed before the worker started".into()),
-    }
-    let mut socket_type: libc::c_int = 0;
-    let mut len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            proof.supervisor_fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&mut socket_type as *mut libc::c_int).cast(),
-            &mut len,
-        )
-    } != 0
-        || socket_type != libc::SOCK_STREAM
-    {
-        return Err("missing supervisor socket".into());
-    }
-    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut address_len = std::mem::size_of_val(&address) as libc::socklen_t;
-    if unsafe {
-        libc::getpeername(
-            proof.supervisor_fd,
-            (&mut address as *mut libc::sockaddr_storage).cast(),
-            &mut address_len,
-        )
-    } != 0
-        || i32::from(address.ss_family) != libc::AF_UNIX
-    {
-        return Err("invalid supervisor socket".into());
-    }
-    let stream = unsafe { UnixStream::from_raw_fd(proof.supervisor_fd) };
-    if !supervisor_alive(&stream) {
-        return Err("supervisor is no longer present".into());
-    }
-    if !super::foreground_clear(root) {
-        return Err("foreground RSI request is active".into());
-    }
-    Ok(stream)
+    )
 }
 
 #[cfg(unix)]
@@ -502,13 +369,10 @@ pub(super) fn work(
     proof: AudioProof,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    use omni_rsi::speech_audio_round::{
-        AudioRoundOptions, train_audio_round, train_v3_audio_round,
-    };
-    let ddust = super::ddust_path();
-    let stream = validate_supervision(root, proof, ddust.as_deref())
+    use omni_rsi::speech_audio_round::{AudioRoundOptions, train_supervised_audio_round};
+    let supervision = validate_supervision(root, proof)
         .map_err(|error| format!("supervised audio worker rejected: {error}"))?;
-    let _watchdog = monitor_supervisor(stop.clone(), stream);
+    let _watchdog = supervision.monitor(stop.clone())?;
     let options = AudioRoundOptions {
         model,
         data: &job.data,
@@ -517,11 +381,13 @@ pub(super) fn work(
         max_updates: job.updates_per_round,
         resume: job.start.resume,
     };
-    let result = if job.number_v3 {
-        train_v3_audio_round::<super::TrainingBackend>(&options, &Default::default(), &stop)?
-    } else {
-        train_audio_round::<super::TrainingBackend>(&options, &Default::default(), &stop)?
-    };
+    let result = train_supervised_audio_round::<super::TrainingBackend>(
+        &options,
+        &Default::default(),
+        &stop,
+        job.number_v3,
+        &supervision,
+    )?;
     println!(
         "{}",
         serde_json::to_string(&result).map_err(|error| error.to_string())?

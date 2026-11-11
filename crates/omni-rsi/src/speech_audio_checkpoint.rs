@@ -104,6 +104,7 @@ fn audio_shared_sources() -> Vec<(&'static str, &'static [u8])> {
         source!("speech_audio_data.rs", "speech_audio_data.rs"),
         source!("speech_audio_round.rs", "speech_audio_round.rs"),
         source!("audio_idle.rs", "audio_idle.rs"),
+        source!("audio_idle_state.rs", "audio_idle_state.rs"),
         source!("lease.rs", "lease.rs"),
         source!("fingerprint.rs", "fingerprint.rs"),
         source!("audio_main.rs", "audio_main.rs"),

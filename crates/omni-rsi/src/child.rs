@@ -184,7 +184,6 @@ fn run_inner(
             group_signal(id, libc::SIGKILL)?;
             let _ = guard.child.wait();
             if group_exists(id) {
-                eprintln!("omni-rsi: waiting for the training process group to exit");
                 while group_exists(id) {
                     thread::sleep(Duration::from_millis(100));
                 }

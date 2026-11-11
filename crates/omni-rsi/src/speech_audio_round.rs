@@ -45,7 +45,13 @@ pub fn train_audio_round<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<AudioRoundResult, String> {
-    train_round::<B>(options, device, stop, false)
+    train_round::<B, _>(options, device, stop, false, || {
+        if options.resume {
+            Ok(())
+        } else {
+            crate::audio_idle_state::check_fresh(options.state, false)
+        }
+    })
 }
 
 /// Explicit isolated v3 number training. It never reads holdout contents.
@@ -54,7 +60,32 @@ pub fn train_v3_audio_round<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<AudioRoundResult, String> {
-    train_round::<B>(options, device, stop, true)
+    train_round::<B, _>(options, device, stop, true, || {
+        if options.resume {
+            Ok(())
+        } else {
+            crate::audio_idle_state::check_fresh(options.state, true)
+        }
+    })
+}
+
+/// Train or resume an idle round only after cooperative supervision was verified.
+#[cfg(unix)]
+pub fn train_supervised_audio_round<B: AutodiffBackend>(
+    options: &AudioRoundOptions<'_>,
+    device: &B::Device,
+    stop: &AtomicBool,
+    v3: bool,
+    supervision: &crate::audio_idle_state::AudioSupervision,
+) -> Result<AudioRoundResult, String> {
+    supervision.check_scope(options.state)?;
+    train_round::<B, _>(options, device, stop, v3, || {
+        if options.resume {
+            supervision.check_scope(options.state)
+        } else {
+            supervision.check_fresh(options.state, v3)
+        }
+    })
 }
 
 enum TrainingData {
@@ -88,11 +119,12 @@ impl TrainingData {
     }
 }
 
-fn train_round<B: AutodiffBackend>(
+fn train_round<B: AutodiffBackend, F: FnOnce() -> Result<(), String>>(
     options: &AudioRoundOptions<'_>,
     device: &B::Device,
     stop: &AtomicBool,
     v3: bool,
+    validate_reservation: F,
 ) -> Result<AudioRoundResult, String> {
     if !(1..=100).contains(&options.epochs) || !(1..=100).contains(&options.max_updates) {
         return Err("audio training epochs and update budget must be between 1 and 100".into());
@@ -115,6 +147,7 @@ fn train_round<B: AutodiffBackend>(
     } else {
         None
     };
+    validate_reservation()?;
     let directory = state.join("audio-conditioned-v1");
     let exists = match std::fs::symlink_metadata(&directory) {
         Ok(_) => true,
