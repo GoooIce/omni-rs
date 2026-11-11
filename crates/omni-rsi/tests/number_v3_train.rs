@@ -2361,6 +2361,303 @@ fn review_chinese_fixture() -> tempfile::TempDir {
     root
 }
 
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chosen_root_ancestor_alias_works_for_chinese_register_run_and_recheck() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+        recheck_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("synthetic-parent-alias");
+    symlink(root.path().parent().unwrap(), &alias).unwrap();
+    let selected = alias.join(root.path().file_name().unwrap());
+    let model = selected.join("model");
+    let state = selected.join("state");
+    let registration = selected.join("registration");
+    let output = selected.join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: &selected,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let report =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            Ok(DecodedText {
+                text: "11".into(),
+                end: TextEnd::Stop(7),
+            })
+        })
+        .unwrap();
+    assert_eq!(report["candidate_eligible"], false);
+    assert_eq!(
+        recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap(),
+        report
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chosen_ancestor_alias_does_not_allow_internal_links_or_final_report_link() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+        recheck_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("synthetic-parent-alias");
+    symlink(root.path().parent().unwrap(), &alias).unwrap();
+    let data = alias.join(root.path().file_name().unwrap());
+    let model = data.join("model");
+    let state = data.join("state");
+    let registration = data.join("registration");
+    let output = data.join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: &data,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let plan = root.path().join("regression-plan.json");
+    let saved_plan = root.path().join("synthetic-saved-plan.json");
+    fs::rename(&plan, &saved_plan).unwrap();
+    symlink(&saved_plan, &plan).unwrap();
+    assert!(preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).is_err());
+    assert!(!registration.exists());
+    fs::remove_file(&plan).unwrap();
+    fs::rename(&saved_plan, &plan).unwrap();
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+
+    let mut changed = false;
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            if !changed {
+                fs::rename(&plan, &saved_plan).unwrap();
+                symlink(&saved_plan, &plan).unwrap();
+                changed = true;
+            }
+            Ok(DecodedText {
+                text: "11".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    assert!(result.unwrap_err().contains("postcheck"));
+    assert!(!output.exists());
+    fs::remove_file(&plan).unwrap();
+    fs::rename(&saved_plan, &plan).unwrap();
+    evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "11".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+
+    let report = root.path().join("report.json");
+    let saved_report = root.path().join("synthetic-saved-report.json");
+    fs::rename(&report, &saved_report).unwrap();
+    symlink(&saved_report, &report).unwrap();
+    assert!(recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).is_err());
+    fs::remove_file(&report).unwrap();
+    fs::rename(&saved_report, &report).unwrap();
+    recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chosen_data_root_cannot_hide_a_link_in_nested_registration_path() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+        recheck_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("trusted-parent-alias");
+    symlink(root.path().parent().unwrap(), &alias).unwrap();
+    let data = alias.join(root.path().file_name().unwrap());
+    let model = data.join("model");
+    let state = data.join("state");
+    let other_parent = root.path().join("synthetic-registration-parent");
+    fs::create_dir(&other_parent).unwrap();
+    symlink(&other_parent, root.path().join("internal-link")).unwrap();
+    let registration = data.join("internal-link/registration");
+    let output = data.join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: &data,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    assert!(
+        preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false),)
+            .is_err()
+    );
+    assert!(!other_parent.join("registration").exists());
+
+    let safe_registration = data.join("registration");
+    let safe = V3Options {
+        registration: &safe_registration,
+        ..options
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&safe, &Default::default(), &stop).unwrap();
+    // Spell the same data root differently to exercise alias recognition.
+    let linked_output = root.path().join("internal-link/report.json");
+    let unsafe_output = V3Options {
+        output: &linked_output,
+        ..safe
+    };
+    let error = evaluate_chinese_v3_with::<Cpu>(
+        &unsafe_output,
+        &Default::default(),
+        &stop,
+        |_, _, _| unreachable!(),
+    )
+    .unwrap_err();
+    assert!(error.contains("linked"), "{error}");
+    assert!(!other_parent.join("report.json").exists());
+
+    let safe = V3Options {
+        output: &output,
+        ..unsafe_output
+    };
+    evaluate_chinese_v3_with::<Cpu>(&safe, &Default::default(), &stop, |_, _, _| {
+        Ok(DecodedText {
+            text: "11".into(),
+            end: TextEnd::Stop(7),
+        })
+    })
+    .unwrap();
+    let saved = other_parent.join("report.json");
+    fs::rename(root.path().join("report.json"), &saved).unwrap();
+    let saved_bytes = fs::read(&saved).unwrap();
+    let unsafe_output = V3Options {
+        output: &linked_output,
+        ..safe
+    };
+    let error = recheck_chinese_v3::<Cpu>(&unsafe_output, &Default::default(), &stop).unwrap_err();
+    assert!(error.contains("linked"), "{error}");
+    assert_eq!(fs::read(saved).unwrap(), saved_bytes);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chosen_ancestor_retarget_during_inference_prevents_publication() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let aliases = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("synthetic-parent-alias");
+    symlink(root.path().parent().unwrap(), &alias).unwrap();
+    let data = alias.join(root.path().file_name().unwrap());
+    let model = data.join("model");
+    let state = data.join("state");
+    let registration = data.join("registration");
+    let output = data.join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: &data,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let mut changed = false;
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            if !changed {
+                fs::remove_file(&alias).unwrap();
+                symlink(other.path(), &alias).unwrap();
+                changed = true;
+            }
+            Ok(DecodedText {
+                text: "11".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    assert!(result.unwrap_err().contains("postcheck"));
+    assert!(!root.path().join("report.json").exists());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn chosen_separate_state_alias_keeps_checkpoint_descendants_nofollow() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = review_chinese_fixture();
+    let state_parent = tempfile::tempdir().unwrap();
+    fs::rename(root.path().join("state"), state_parent.path().join("state")).unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("synthetic-state-parent");
+    symlink(state_parent.path(), &alias).unwrap();
+    let state = alias.join("state");
+    let model = root.path().join("model");
+    let registration = root.path().join("registration");
+    let output = root.path().join("report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let checkpoints = state_parent
+        .path()
+        .join("state/number-audio-v3/audio-conditioned-v1/checkpoints");
+    let saved = state_parent.path().join("synthetic-saved-checkpoints");
+    fs::rename(&checkpoints, &saved).unwrap();
+    symlink(&saved, &checkpoints).unwrap();
+    assert!(
+        evaluate_chinese_v3_with::<Cpu>(
+            &options,
+            &Default::default(),
+            &stop,
+            |_, _, _| unreachable!()
+        )
+        .is_err()
+    );
+    assert!(!output.exists());
+}
+
 #[cfg(unix)]
 fn review_set_old_access_time(path: &Path) {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};

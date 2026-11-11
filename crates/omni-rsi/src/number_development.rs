@@ -847,6 +847,45 @@ fn validate_target_wav(
 
 #[cfg(unix)]
 fn open_root(path: &Path) -> Result<File, String> {
+    open_strict_root(&resolve_selected_path(path, false)?)
+}
+
+// The caller selects the root; aliases in its parent are trusted. Its last
+// component and everything opened relative to it remain no-follow.
+pub(crate) fn resolve_selected_path(path: &Path, missing_final: bool) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return Err("invalid selected path".into());
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("parent traversal is not allowed".into());
+    }
+    let Some(name) = path.file_name() else {
+        return std::fs::canonicalize(path).map_err(|e| e.to_string());
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolved = std::fs::canonicalize(parent)
+        .map_err(|e| e.to_string())?
+        .join(name);
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("selected path final component is a symlink".into());
+        }
+        Ok(_) => (),
+        Err(error) if missing_final && error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn open_strict_root(path: &Path) -> Result<File, String> {
     use std::path::Component;
     if path.as_os_str().is_empty() {
         return Err("empty v3 root path".into());
@@ -1522,7 +1561,13 @@ fn regression_identities(
     Ok((format!("{:x}", Sha256::digest(plan_bytes)), identities))
 }
 
-fn hash_regular_path(path: &Path, limit: u64, stop: &AtomicBool) -> Result<String, String> {
+fn hash_regular_path(
+    path: &Path,
+    anchor: Option<&Path>,
+    limit: u64,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    use std::path::Component;
     check_stop(stop)?;
     let parent = path
         .parent()
@@ -1532,7 +1577,29 @@ fn hash_regular_path(path: &Path, limit: u64, stop: &AtomicBool) -> Result<Strin
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("invalid artifact filename")?;
-    let file = open_child(&open_root(parent)?, name, false)?;
+    // The selected root's ancestors may contain aliases. Descendants may not:
+    // walk them from the root descriptor instead of resolving their parent.
+    let directory = if let Some(anchor) = anchor {
+        let relative = parent.strip_prefix(anchor).map_err(|e| e.to_string())?;
+        let mut directory = open_root(anchor)?;
+        for component in relative.components() {
+            match component {
+                Component::CurDir => (),
+                Component::Normal(name) => {
+                    let name = name.to_str().ok_or("invalid artifact directory")?;
+                    directory = open_child(&directory, name, true)?;
+                }
+                _ => return Err("artifact traversal is unsupported".into()),
+            }
+        }
+        directory
+    } else {
+        // Unknown external artifacts have no supplied root to anchor against.
+        // Require a physical path so an alternate spelling cannot turn a
+        // descendant symlink into a trusted artifact parent.
+        open_strict_root(parent)?
+    };
+    let file = open_child(&directory, name, false)?;
     let observer = file.try_clone().map_err(|e| e.to_string())?;
     let before = observer.metadata().map_err(|e| e.to_string())?;
     if !same_single_link_file(&before, &before) {
@@ -1848,9 +1915,27 @@ fn common_identities(
     }) {
         return Err("target model or codec changed during loading".into());
     }
-    let candidate_sha256 = hash_regular_path(&options.candidate_file, 256 * 1024 * 1024, stop)?;
-    let evaluator_sha256 =
-        hash_regular_path(&options.evaluator_file, 2 * 1024 * 1024 * 1024, stop)?;
+    let root_for = |path: &Path| {
+        if path.starts_with(options.data_root) {
+            Some(options.data_root)
+        } else if path.starts_with(&options.model_dir) {
+            Some(options.model_dir.as_path())
+        } else {
+            None
+        }
+    };
+    let candidate_sha256 = hash_regular_path(
+        &options.candidate_file,
+        root_for(&options.candidate_file),
+        256 * 1024 * 1024,
+        stop,
+    )?;
+    let evaluator_sha256 = hash_regular_path(
+        &options.evaluator_file,
+        root_for(&options.evaluator_file),
+        2 * 1024 * 1024 * 1024,
+        stop,
+    )?;
     let r2t2_sha256 = options
         .r2t2
         .as_ref()

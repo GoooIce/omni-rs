@@ -268,7 +268,9 @@ fn prepare<B: AutodiffBackend>(
     let (candidate, checkpoint, candidate_file) = if let Some(state) = chinese_state {
         state.checkpoint::<B>(&protocol, device, stop)?
     } else {
-        let checkpoint_state = options.state.join("number-audio-v3");
+        let checkpoint_state =
+            crate::number_development::resolve_selected_path(options.state, false)?
+                .join("number-audio-v3");
         let directory = checkpoint_state.join("audio-conditioned-v1");
         let pointer: serde_json::Value =
             serde_json::from_slice(&read_regular(&directory.join("latest.json"), 4096)?)
@@ -423,7 +425,7 @@ pub fn preregister_v3<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16, false)
+    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16, false, None)
 }
 
 /// Register an explicitly selected local R2T2 backend and precision.
@@ -436,7 +438,7 @@ pub fn preregister_v3_with_asr<B: AutodiffBackend>(
     if options.r2t2.is_none() {
         return Err("ASR mode requires a local R2T2 model and executable".into());
     }
-    preregister_with_mode::<B>(options, device, stop, mode, false)
+    preregister_with_mode::<B>(options, device, stop, mode, false, None)
 }
 
 /// Freeze a new, separately scoped Chinese text policy before any observations.
@@ -446,8 +448,17 @@ pub fn preregister_chinese_v3<B: AutodiffBackend>(
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
-    chinese_paths(options, false)?;
-    preregister_with_mode::<B>(options, device, stop, V3AsrMode::MetalF16, true)
+    let roots = SelectedChinesePaths::resolve(options, false)?;
+    let options = roots.options();
+    chinese_paths(&options, false)?;
+    preregister_with_mode::<B>(
+        &options,
+        device,
+        stop,
+        V3AsrMode::MetalF16,
+        true,
+        Some(&roots),
+    )
 }
 
 fn preregister_with_mode<B: AutodiffBackend>(
@@ -456,8 +467,12 @@ fn preregister_with_mode<B: AutodiffBackend>(
     stop: &AtomicBool,
     mode: V3AsrMode,
     chinese: bool,
+    roots: Option<&SelectedChinesePaths>,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
+    if let Some(roots) = roots {
+        roots.verify()?;
+    }
     let chinese_state = if chinese {
         Some(ChineseState::acquire(options.state, stop)?)
     } else {
@@ -493,6 +508,9 @@ fn preregister_with_mode<B: AutodiffBackend>(
             .ok_or("missing Chinese state guard")?
             .verify(stop)?;
     }
+    if let Some(roots) = roots {
+        roots.verify()?;
+    }
     let registration = preregister(
         &registration_options(options, &before),
         options.registration,
@@ -524,6 +542,9 @@ fn preregister_with_mode<B: AutodiffBackend>(
     }
     ensure_same_data(&after, &checked)?;
     validate_frozen_mapping(&checked)?;
+    if let Some(roots) = roots {
+        roots.verify()?;
+    }
     let document = policy(&after, &checked);
     let bytes = serde_json::to_vec_pretty(&document).map_err(|e| e.to_string())?;
     write_noclobber(
@@ -549,6 +570,9 @@ fn preregister_with_mode<B: AutodiffBackend>(
             stop,
         )?;
     }
+    if let Some(roots) = roots {
+        roots.verify()?;
+    }
     Ok(
         serde_json::json!({"status":"insufficient_evidence","candidate_eligible":false,
         "protocol_sha256":checked.protocol_sha256(),"candidate_sha256":after.candidate}),
@@ -571,9 +595,179 @@ fn check_policy(
     Ok(())
 }
 
-// These paths are caller-selected, but links and parent traversal must not redirect
-// the new registration or report. Concurrent replacement of ancestors is outside
-// this local, cooperatively leased interface's trust boundary.
+struct SelectedPath {
+    original: PathBuf,
+    resolved: PathBuf,
+    missing_final: bool,
+}
+
+impl SelectedPath {
+    fn new(path: &Path, missing_final: bool, roots: &[&Self]) -> Result<Self, String> {
+        use std::path::Component;
+        if path.as_os_str().is_empty() {
+            return Err("invalid selected path".into());
+        }
+        let components: Vec<_> = path.components().collect();
+        if components
+            .iter()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            return Err("parent traversal is not allowed".into());
+        }
+        if !path.is_absolute() {
+            let cwd = fs::canonicalize(".").map_err(|e| e.to_string())?;
+            if let Some(root) = roots.iter().find(|root| root.resolved == cwd) {
+                let resolved = root.resolved.join(path);
+                chinese_path(&resolved, missing_final)?;
+                return Ok(Self {
+                    original: path.into(),
+                    resolved,
+                    missing_final,
+                });
+            }
+        }
+        let mut prefix = PathBuf::new();
+        for (index, component) in components.iter().enumerate() {
+            prefix.push(component.as_os_str());
+            // Once a selected root is reached, do not canonicalize any of its
+            // descendants: check them from its physical path without following links.
+            let root = roots
+                .iter()
+                .find(|root| prefix == root.original || prefix == root.resolved)
+                .copied()
+                .or_else(|| {
+                    if index + 1 == components.len() {
+                        return None;
+                    }
+                    let physical = fs::canonicalize(&prefix).ok()?;
+                    roots.iter().find(|root| physical == root.resolved).copied()
+                });
+            if let Some(root) = root {
+                let relative = path.strip_prefix(&prefix).map_err(|e| e.to_string())?;
+                let resolved = root.resolved.join(relative);
+                chinese_path(&resolved, missing_final)?;
+                return Ok(Self {
+                    original: path.into(),
+                    resolved,
+                    missing_final,
+                });
+            }
+        }
+        Ok(Self {
+            original: path.into(),
+            resolved: crate::number_development::resolve_selected_path(path, missing_final)?,
+            missing_final,
+        })
+    }
+}
+
+// Only ancestors of explicitly selected roots are trusted as aliases. The
+// final components and all paths derived below those roots remain no-follow.
+struct SelectedChinesePaths {
+    model: SelectedPath,
+    data: SelectedPath,
+    state: SelectedPath,
+    registration: SelectedPath,
+    output: Option<SelectedPath>,
+    unused_output: PathBuf,
+}
+
+impl SelectedChinesePaths {
+    fn resolve(options: &V3Options<'_>, include_output: bool) -> Result<Self, String> {
+        if options.r2t2.is_some() || options.breeze.is_some() {
+            return Err("Chinese text regression does not use speech tools".into());
+        }
+        let data = SelectedPath::new(options.data, false, &[])?;
+        let model = SelectedPath::new(options.model, false, &[&data])?;
+        let state = SelectedPath::new(options.state, false, &[&data, &model])?;
+        let registration = SelectedPath::new(options.registration, true, &[&data, &model, &state])?;
+        let output = include_output
+            .then(|| {
+                SelectedPath::new(
+                    options.output,
+                    true,
+                    &[&data, &model, &state, &registration],
+                )
+            })
+            .transpose()?;
+        let selected = Self {
+            model,
+            data,
+            state,
+            registration,
+            output,
+            unused_output: options.output.into(),
+        };
+        // A root selected later may itself contain one selected earlier.
+        // Check those reverse relationships before reading any artifacts.
+        let roots = [
+            &selected.data,
+            &selected.model,
+            &selected.state,
+            &selected.registration,
+        ];
+        for root in roots {
+            for candidate in roots {
+                let checked =
+                    SelectedPath::new(&candidate.original, candidate.missing_final, &[root])?;
+                if checked.resolved != candidate.resolved {
+                    return Err("linked nested Chinese path".into());
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    fn options(&self) -> V3Options<'_> {
+        V3Options {
+            model: &self.model.resolved,
+            data: &self.data.resolved,
+            state: &self.state.resolved,
+            registration: &self.registration.resolved,
+            output: self
+                .output
+                .as_ref()
+                .map_or(self.unused_output.as_path(), |path| path.resolved.as_path()),
+            r2t2: None,
+            breeze: None,
+        }
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        let original = V3Options {
+            model: &self.model.original,
+            data: &self.data.original,
+            state: &self.state.original,
+            registration: &self.registration.original,
+            output: self
+                .output
+                .as_ref()
+                .map_or(self.unused_output.as_path(), |path| path.original.as_path()),
+            r2t2: None,
+            breeze: None,
+        };
+        let current = Self::resolve(&original, self.output.is_some())?;
+        for (before, after) in [
+            (&self.model, &current.model),
+            (&self.data, &current.data),
+            (&self.state, &current.state),
+            (&self.registration, &current.registration),
+        ] {
+            if before.resolved != after.resolved {
+                return Err("selected Chinese path changed during operation".into());
+            }
+        }
+        if self.output.as_ref().map(|path| &path.resolved)
+            != current.output.as_ref().map(|path| &path.resolved)
+        {
+            return Err("selected Chinese path changed during operation".into());
+        }
+        Ok(())
+    }
+}
+
+// Validate the resolved physical path again. Same-account concurrent replacement
+// of path components between checks remains outside this cooperative interface.
 fn chinese_path(path: &Path, missing_final: bool) -> Result<(), String> {
     use std::path::Component;
     let components: Vec<_> = path.components().collect();
@@ -731,10 +925,14 @@ fn run_chinese_v3<B: AutodiffBackend>(
     options: &V3Options<'_>,
     device: &B::Device,
     stop: &AtomicBool,
-    run: impl FnOnce(&Prepared, &ChineseManifest) -> Result<serde_json::Value, String>,
+    run: impl FnOnce(&V3Options<'_>, &Prepared, &ChineseManifest) -> Result<serde_json::Value, String>,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
+    let roots = SelectedChinesePaths::resolve(options, true)?;
+    let selected = roots.options();
+    let options = &selected;
     chinese_paths(options, true)?;
+    roots.verify()?;
     let chinese_state = ChineseState::acquire(options.state, stop)?;
     match fs::symlink_metadata(options.output) {
         Ok(_) => return Err("Chinese regression report already exists".into()),
@@ -761,7 +959,7 @@ fn run_chinese_v3<B: AutodiffBackend>(
     let manifest =
         chinese_registration::frozen(options.data, options.registration, &registered, stop)?;
     let policy_sha256 = check_chinese_policy(options, &before, &registered, &manifest, stop)?;
-    let result = run(&before, &manifest).map_err(|error| {
+    let result = run(options, &before, &manifest).map_err(|error| {
         let detail = serde_json::from_str(&error)
             .unwrap_or_else(|_| serde_json::Value::String(error.chars().take(1024).collect()));
         chinese_run_error(&registered, &policy_sha256, "inference", detail)
@@ -779,6 +977,7 @@ fn run_chinese_v3<B: AutodiffBackend>(
     verify_chinese_report(&report, &before, &registered, &manifest, &policy_sha256)?;
     let postcheck = (|| -> Result<(), String> {
         interrupted(stop)?;
+        roots.verify()?;
         chinese_state.verify(stop)?;
         chinese_registration::current(options.data, stop)?;
         chinese_registration::preflight_protocol(options.registration, stop)?;
@@ -807,6 +1006,7 @@ fn run_chinese_v3<B: AutodiffBackend>(
             chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
         let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
         chinese_state.verify(stop)?;
+        roots.verify()?;
         verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)
     })();
     if let Err(error) = postcheck {
@@ -844,7 +1044,7 @@ pub fn evaluate_chinese_v3_with<B: AutodiffBackend>(
     stop: &AtomicBool,
     infer: impl FnMut(Arm, &str, &str) -> Result<DecodedText, String>,
 ) -> Result<serde_json::Value, String> {
-    run_chinese_v3::<B>(options, device, stop, |prepared, manifest| {
+    run_chinese_v3::<B>(options, device, stop, |_, prepared, manifest| {
         number_regression::compare_with(manifest, &prepared.text_options.stop_tokens, stop, infer)
     })
 }
@@ -856,7 +1056,11 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
     interrupted(stop)?;
+    let roots = SelectedChinesePaths::resolve(options, true)?;
+    let selected = roots.options();
+    let options = &selected;
     chinese_paths(options, true)?;
+    roots.verify()?;
     let chinese_state = ChineseState::acquire(options.state, stop)?;
     chinese_registration::current(options.data, stop)?;
     chinese_registration::preflight_protocol(options.registration, stop)?;
@@ -927,6 +1131,7 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
     let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
     chinese_state.verify(stop)?;
     verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)?;
+    roots.verify()?;
     interrupted(stop)?;
     serde_json::to_value(report).map_err(|e| e.to_string())
 }
@@ -937,7 +1142,7 @@ pub fn evaluate_chinese_v3<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    run_chinese_v3::<B>(options, device, stop, |prepared, manifest| {
+    run_chinese_v3::<B>(options, device, stop, |options, prepared, manifest| {
         let optimizer = prepared.checkpoint.restore::<B>(device)?;
         let (a, b) = optimizer.export()?;
         drop(optimizer);
