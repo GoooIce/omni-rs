@@ -23,6 +23,7 @@ pub mod number_gate;
 pub mod number_holdout_ledger;
 pub mod number_v3_evaluation;
 mod number_v3_target;
+pub mod number_v3_voice_recheck;
 pub mod platform;
 mod private_acl;
 pub mod reader;

@@ -1155,7 +1155,39 @@ pub struct RegisteredDevelopment {
     swaps: Vec<FrozenSwap>,
 }
 
+// A borrowed view is only used by read-only diagnostics. It is not a
+// RegisteredDevelopment and cannot be used to obtain a holdout credential.
+#[derive(Clone, Copy)]
+pub(crate) struct DevelopmentView<'a> {
+    pub(crate) cases: &'a [DevelopmentRecord],
+    pub(crate) protocol_sha256: &'a str,
+    pub(crate) swaps: &'a [FrozenSwap],
+}
+
+pub(crate) struct DevelopmentRecheck {
+    dev: Vec<DevelopmentRecord>,
+    protocol_sha256: String,
+    swaps: Vec<FrozenSwap>,
+}
+
+impl DevelopmentRecheck {
+    pub(crate) fn view(&self) -> DevelopmentView<'_> {
+        DevelopmentView {
+            cases: &self.dev,
+            protocol_sha256: &self.protocol_sha256,
+            swaps: &self.swaps,
+        }
+    }
+}
+
 impl RegisteredDevelopment {
+    pub(crate) fn recheck_view(&self) -> DevelopmentView<'_> {
+        DevelopmentView {
+            cases: &self.data.dev,
+            protocol_sha256: &self.protocol_sha256,
+            swaps: &self.swaps,
+        }
+    }
     pub fn data(&self) -> &DevelopmentData {
         &self.data
     }
@@ -1692,11 +1724,24 @@ fn validate_target_model(
     })
 }
 
-fn snapshot(
+struct CommonIdentities {
+    policy: serde_json::Value,
+    base_model_sha256: String,
+    codec_sha256: String,
+    candidate_sha256: String,
+    evaluator_sha256: String,
+    r2t2_sha256: Option<String>,
+    breeze_sha256: Option<String>,
+    regression_plan_sha256: String,
+    regression_inputs: Vec<RegressionIdentity>,
+}
+
+fn common_identities(
     options: &RegistrationOptions<'_>,
-    data: &DevelopmentData,
+    dev: &[DevelopmentRecord],
+    target_binding: Option<&TargetBinding>,
     stop: &AtomicBool,
-) -> Result<FrozenProtocol, String> {
+) -> Result<CommonIdentities, String> {
     check_stop(stop)?;
     if options.backend.trim().is_empty()
         || options.backend.trim() != options.backend
@@ -1705,9 +1750,7 @@ fn snapshot(
     {
         return Err("invalid preregistered backend".into());
     }
-    let swaps = swap_mapping(&data.dev)?;
-    let distinct_swap_pcm = data
-        .dev
+    let distinct_swap_pcm = dev
         .iter()
         .map(|row| &row.pcm_sha256)
         .collect::<HashSet<_>>()
@@ -1715,7 +1758,7 @@ fn snapshot(
     let (regression_plan_sha256, regression_inputs) =
         regression_identities(options.data_root, stop)?;
     let (base_model_sha256, codec_sha256) = model_and_codec_fingerprints(&options.model_dir, stop)?;
-    if data.target_binding.as_ref().is_some_and(|binding| {
+    if target_binding.is_some_and(|binding| {
         binding.base_model_sha256 != base_model_sha256 || binding.codec_sha256 != codec_sha256
     }) {
         return Err("target model or codec changed during loading".into());
@@ -1764,17 +1807,8 @@ fn snapshot(
             "speech_repetition_window":64, "speech_top_k":"checkpoint_default", "speech_sample_rate":24000},
         "regression_criterion":"no_degradation", "source_declarations":"unverified", "reference_verification":"unverified"
     });
-    Ok(FrozenProtocol {
-        version: 1,
+    Ok(CommonIdentities {
         policy,
-        train_manifest_sha256: data.train_manifest_sha256.clone(),
-        dev_manifest_sha256: data.dev_manifest_sha256.clone(),
-        train_groups_sha256: data.train_groups_sha256.clone(),
-        dev_groups_sha256: data.dev_groups_sha256.clone(),
-        train_cases: case_identities(&data.train)?,
-        dev_cases: case_identities(&data.dev)?,
-        swaps,
-        blind_public_fingerprint: data.blind.fingerprint()?,
         base_model_sha256,
         codec_sha256,
         candidate_sha256,
@@ -1783,6 +1817,35 @@ fn snapshot(
         breeze_sha256,
         regression_plan_sha256,
         regression_inputs,
+    })
+}
+
+fn snapshot(
+    options: &RegistrationOptions<'_>,
+    data: &DevelopmentData,
+    stop: &AtomicBool,
+) -> Result<FrozenProtocol, String> {
+    let swaps = swap_mapping(&data.dev)?;
+    let common = common_identities(options, &data.dev, data.target_binding.as_ref(), stop)?;
+    Ok(FrozenProtocol {
+        version: 1,
+        policy: common.policy,
+        train_manifest_sha256: data.train_manifest_sha256.clone(),
+        dev_manifest_sha256: data.dev_manifest_sha256.clone(),
+        train_groups_sha256: data.train_groups_sha256.clone(),
+        dev_groups_sha256: data.dev_groups_sha256.clone(),
+        train_cases: case_identities(&data.train)?,
+        dev_cases: case_identities(&data.dev)?,
+        swaps,
+        blind_public_fingerprint: data.blind.fingerprint()?,
+        base_model_sha256: common.base_model_sha256,
+        codec_sha256: common.codec_sha256,
+        candidate_sha256: common.candidate_sha256,
+        evaluator_sha256: common.evaluator_sha256,
+        r2t2_sha256: common.r2t2_sha256,
+        breeze_sha256: common.breeze_sha256,
+        regression_plan_sha256: common.regression_plan_sha256,
+        regression_inputs: common.regression_inputs,
     })
 }
 
@@ -1867,16 +1930,27 @@ pub fn verify_registration(
     check_stop(stop)?;
     let directory = open_root(destination)?;
     let bytes = read_child(&directory, "protocol.json", 32 * 1024 * 1024, stop)?;
-    let envelope: Envelope =
-        serde_json::from_slice(&bytes).map_err(|e| format!("invalid preregistration: {e}"))?;
-    if envelope.version != 1
-        || envelope.protocol.version != 1
-        || envelope.status != "insufficient_evidence"
-        || envelope.candidate_eligible
-        || protocol_hash(&envelope.protocol)? != envelope.protocol_sha256
-    {
-        return Err("invalid preregistration checksum or status".into());
-    }
+    let registration = verify_open_registration(options, &directory, &bytes, stop)?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(registration)
+}
+
+// Full registration verification recomputes both training and development
+// identities before it constructs a RegisteredDevelopment.
+fn verify_open_registration(
+    options: &RegistrationOptions<'_>,
+    directory: &File,
+    bytes: &[u8],
+    stop: &AtomicBool,
+) -> Result<RegisteredDevelopment, String> {
+    check_stop(stop)?;
+    let envelope = parse_registration(bytes)?;
     let data = DevelopmentData::load_with_model(options.data_root, &options.model_dir, stop)?;
     let current = snapshot(options, &data, stop)?;
     if current != envelope.protocol {
@@ -1886,15 +1960,110 @@ pub fn verify_registration(
     // A reader racing publication also makes the already-synced protocol entry
     // and its directory durable before it returns a usable snapshot.
     directory.sync_all().map_err(|e| e.to_string())?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| e.to_string())?;
     Ok(RegisteredDevelopment {
         data,
+        protocol_sha256: envelope.protocol_sha256,
+        swaps: envelope.protocol.swaps,
+    })
+}
+
+fn parse_registration(bytes: &[u8]) -> Result<Envelope, String> {
+    let envelope: Envelope =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid preregistration: {e}"))?;
+    if envelope.version != 1
+        || envelope.protocol.version != 1
+        || envelope.status != "insufficient_evidence"
+        || envelope.candidate_eligible
+        || protocol_hash(&envelope.protocol)? != envelope.protocol_sha256
+    {
+        return Err("invalid preregistration checksum or status".into());
+    }
+    Ok(envelope)
+}
+
+// Recompute actual dev inputs and every available local identity; deliberately
+// do not load train manifests or media. This separate type cannot be converted
+// to RegisteredDevelopment and makes no claim about cross-partition PCM.
+pub(crate) fn verify_open_development_recheck(
+    options: &RegistrationOptions<'_>,
+    directory: &File,
+    bytes: &[u8],
+    stop: &AtomicBool,
+) -> Result<DevelopmentRecheck, String> {
+    check_stop(stop)?;
+    let envelope = parse_registration(bytes)?;
+    let protocol = &envelope.protocol;
+    let root = open_root(options.data_root)?;
+    if read_child(&root, "layout.v3", 128, stop)? != LAYOUT {
+        return Err("requires an isolated v3 train/dev dataset".into());
+    }
+    let blind_bytes = read_child(&root, "holdout-public.json", 4 * 1024 * 1024, stop)?;
+    let public_value: serde_json::Value =
+        serde_json::from_slice(&blind_bytes).map_err(|e| e.to_string())?;
+    if public_value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+    {
+        return Err("formal holdout requires v2 public metadata".into());
+    }
+    let blind = PublicMetadata::from_json(&blind_bytes)?;
+    let groups_bytes = read_child(&root, "dev.groups.v3.json", MAX_MANIFEST, stop)?;
+    let groups = parse_groups(&groups_bytes, "dev")?;
+    let dev_bytes = read_child(&root, "dev.v3.json", MAX_MANIFEST, stop)?;
+    let records = parse_split(&dev_bytes, "dev")?;
+    check_group_manifest(&records, &groups)?;
+    validate_groups(&[], &groups, blind.sources())?;
+    if format!("{:x}", Sha256::digest(&dev_bytes)) != protocol.dev_manifest_sha256
+        || format!("{:x}", Sha256::digest(&groups_bytes)) != protocol.dev_groups_sha256
+        || blind.fingerprint()? != protocol.blind_public_fingerprint
+    {
+        return Err("development manifests or public metadata changed".into());
+    }
+    let has_targets = records.iter().any(|record| record.speech_target.is_some());
+    let target_directory = if has_targets {
+        Some(open_child(&root, "dev-target-media", true)?)
+    } else {
+        None
+    };
+    let media = open_child(&root, "dev-media", true)?;
+    let mut total_samples = 0;
+    let mut total_bytes = 0;
+    let mut target_cache = HashMap::new();
+    let dev = load_media(
+        records,
+        &media,
+        target_directory.as_ref(),
+        &mut total_samples,
+        &mut total_bytes,
+        &mut target_cache,
+        stop,
+    )?;
+    let target_binding = if has_targets {
+        Some(validate_target_model(&[], &dev, &options.model_dir, stop)?)
+    } else {
+        None
+    };
+    if case_identities(&dev)? != protocol.dev_cases || swap_mapping(&dev)? != protocol.swaps {
+        return Err("development identities or swap mapping changed".into());
+    }
+    let common = common_identities(options, &dev, target_binding.as_ref(), stop)?;
+    if common.policy != protocol.policy
+        || common.base_model_sha256 != protocol.base_model_sha256
+        || common.codec_sha256 != protocol.codec_sha256
+        || common.candidate_sha256 != protocol.candidate_sha256
+        || common.evaluator_sha256 != protocol.evaluator_sha256
+        || common.r2t2_sha256 != protocol.r2t2_sha256
+        || common.breeze_sha256 != protocol.breeze_sha256
+        || common.regression_plan_sha256 != protocol.regression_plan_sha256
+        || common.regression_inputs != protocol.regression_inputs
+    {
+        return Err("preregistered local identities or parameters changed".into());
+    }
+    check_stop(stop)?;
+    directory.sync_all().map_err(|e| e.to_string())?;
+    Ok(DevelopmentRecheck {
+        dev,
         protocol_sha256: envelope.protocol_sha256,
         swaps: envelope.protocol.swaps,
     })

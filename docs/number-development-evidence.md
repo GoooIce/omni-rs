@@ -31,6 +31,27 @@ cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-def
 
 报告中的数字评分复用已有中文/阿拉伯数字和静音字面规则，成对统计复用 `number_gate`；其来源独立性仍只是分组声明。`silence_numeric_rate` 是输出中出现数字字面的比例，不等同于幻觉率，例如“请再说一遍”也可能被计入。当前真实或注入执行均固定为 `insufficient_evidence`、`candidate_eligible=false`，不构造保留集凭据、不读取保留秘密或发布候选。注入回调标记为 `injected_unverified`，不能作为真实执行或质量证据。
 
+## 保存的开发语音工件复核
+
+`number_v3_voice_recheck::recheck_registered_voice_file` 接受已由 `verify_registration` 重验的开发注册、注册目录、保存的比较报告和显式开发语音目录；其返回值是只读诊断，不写文件。它重新检查注册协议摘要、报告的候选/底座/完整 codec/评估器身份、v3 策略与报告参数，以及每个开发题两臂的原音、冻结换音和静音观察。它有界读取每条保存的 frames JSON 和 WAV，检查文件哈希、帧形状及码值、24 kHz 单声道 float32 样本、相对所给策略的停止 token 和 EOS，并用保存的转写及实际换入音频的规则答案重算逐题 CER、数字判断和各臂/条件汇总。无音频、无效帧和异常结束的记录保留在结果中；缺失、重复、冲突、可检测的篡改、超过预算或取消均返回错误，不对剩余条目冒充完整结果。另有接收已解析 `Value` 的 `recheck_registered_voice`；若来源是文件，应使用文件入口以拒绝重复 JSON 字段。
+
+显式本地入口可将诊断打印到标准输出；调用方须提供注册时使用的原评估器文件、候选文件、模型、开发数据和 R2T2 身份文件，若注册还绑定 Breeze 则在末尾追加其模型和二进制路径。入口逐级打开并固定注册目录，然后重新读取和比较协议、实际开发清单与音频、公开保留元数据、回归输入清单、模型、完整 codec、候选、评估器和工具身份，不读取训练清单、训练音频或训练目标。它使用专门的受限开发视图，不构造或返回 `RegisteredDevelopment` 或 `VerifiedDevelopment`；输出明确标记 `training_identity=not_reverified`、`partition_isolation=not_reverified`、`protocol_authenticity=not_verified`。所给协议和对应本地文件的摘要一致，不证明协议确曾冻结、训练数据未改变、跨分区真实隔离或来源许可；这些仍需独立的完整注册核验与人工证据。模型和工具文件只用于身份核对，不启动模型、codec 或 ASR。`DATA` 必须是已授权的开发数据目录，`VOICE_DIR` 必须是开发语音工件目录，不能指向私有保留材料；入口无法自行识别用户指定目录的真实用途。在这些路径选择前提下，它不打开私有保留题、盐或媒体。
+
+```sh
+CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
+  cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
+  --example number_voice_recheck -- "$MODEL" "$DATA" "$CANDIDATE" "$EVALUATOR" \
+  "$REGISTRATION" "$REPORT" "$VOICE_DIR" "$BACKEND" "$R2T2_MODEL" "$R2T2_BINARY"
+```
+
+注册、报告与语音目录的路径逐级拒绝符号链接和 `..`，文件拒绝符号链接与硬链接；中文目录可用。macOS 上若路径经过 `/var` 或 `/tmp` 等系统别名，请先使用物理路径。报告最多 64 MiB、750,000 个 JSON 节点和 6,000 条观察，协议最多 32 MiB、1,000,000 个节点，单个 frames 文件最多 2 MiB、30,000 个节点，语音工件读取合计最多 256 MiB；节点预算在解析期间执行，包含对象键。同时执行冻结策略及单条 30 秒、合计 1,200 秒等上限；预算可能保守地拒绝更大的既有工件。正常停止声明必须与保存的最后一个 token 一致，仍不证明真实生成。结果对应本次实际读取的字节；不证明文件在之后保持不变，也不抵御同一账户的主动篡改。
+
+CLI 使用受监督的本地子进程完成身份核验和复核，Ctrl-C 会中止该进程组，核验完成前不会向标准输出发布结果；`native` 特性为该复核和取消路径所必需。结果输出也由独立进程监督：接收方不读取时可以取消，输出阶段在 30 秒后触发超时和进程终止；管道关闭、超时或取消均以非零状态退出，终止后还需等待操作系统回收进程。标准输出可能已经包含部分或全部结果，不能撤回，调用方应检查退出状态及完整 JSON。Unix 错误提示限于 4,096 字节，通过父子专用 socket 传递给单独受监督的短超时写入进程，不依赖临时目录，不把错误文本放进进程参数，也不修改继承的 stderr 描述符状态。stderr 被堵塞或关闭、socket 无法分配或子进程无法启动时，提示可能截断或缺失，退出状态仍为非零。Unix 的 CPU-only 构建不能执行复核，也使用该有界路径报告缺少 `native`；非 Unix 的受监督输出不受支持。库的同步 `VoiceRecheckRegistration::verify_and_recheck` 对沿用的旧身份哈希本身不提供分块取消保证；需要此保证的调用方应采用受监督进程。开发清单和公开保留元数据沿用原有解析路径，上述报告、协议和帧文件的节点预算与解析期取消不能外推到它们。外部强制杀死监督进程时，操作系统可能留下工作进程，调用方须自行确认其退出。
+
+身份哈希的字节协议与 #79 的 `speech_asr.rs`、`speech_checkpoint.rs` 保持原样；复核路径改动了计入 v3 身份的 `number_development.rs`，也改动了 v3 策略绑定的 `number_v3_evaluation.rs`。因此旧 v3 注册、策略或训练检查点在当前源码下可能因源码身份变化被拒绝；旧检查点须原样保留，不能自动迁移、覆盖，也不能声称可恢复。新的工作须在最终集成基线上重新生成和核验相关身份，不能把本次合成测试视为迁移证明。
+
+语音策略文件独立于通用注册协议，其来源真实性未被该注册对象认证；同时更改策略和报告时，本入口无法确认原冻结策略，因此结果明确标记 `policy_authenticity=cannot_recompute`、`termination_verified=false`，逐条正常结束和相关统计仅相对于所给策略。一致性检查、文件哈希和保存的转写不证明实际执行或人工听审。复核不重跑 codec，不能证明帧与 WAV 的因果对应，也不验证来源许可、回归或模型改善；报告中的训练数据摘要、训练实现摘要、旧 codec 权重摘要和更新次数列为未复算。结果始终为 `insufficient_evidence`、`candidate_eligible=false`，不能构造 `VerifiedDevelopment`、读取保留集或晋级。并行身份和门控修复合并后，须在最终基线上重新验证注册与本入口。
+
 ## 开发文本观察的复算预检
 
 `recheck_registered_observations` 接受已注册的 train/dev 快照和一份不可信报告，核对协议身份，并要求每个开发案例恰有两臂各三条原音、冻结交换和等长静音观察。它依据注册中的实际 PCM 重算输入哈希与样本数，按换入音频的规则答案及完整静音原文重新计算文本结果、正常结束计数和成对统计；缺失、重复、换音频、PCM 不符、逐题分数或汇总不一致会拒绝。数值门槛只按声明的来源 ID 与报告的结束事件计算：30 个不同 ID、至少 5 个百分点及预注册的 95% 区间下界；不同 ID 不能证明真实说话人或来源独立。

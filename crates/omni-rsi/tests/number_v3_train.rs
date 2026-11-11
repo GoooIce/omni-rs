@@ -562,6 +562,11 @@ fn evaluation_fixture() -> tempfile::TempDir {
 
 #[cfg(all(unix, feature = "cpu"))]
 fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
+    evaluation_fixture_with_options(signed_zero, false)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn evaluation_fixture_with_options(signed_zero: bool, fractional_cer: bool) -> tempfile::TempDir {
     use burn::{
         backend::{Autodiff, NdArray},
         tensor::backend::Backend,
@@ -603,6 +608,10 @@ fn evaluation_fixture_with_signed_zero(signed_zero: bool) -> tempfile::TempDir {
     let group_path = path.join("dev.groups.v3.json");
     let mut dev: Value = serde_json::from_slice(&fs::read(&dev_path).unwrap()).unwrap();
     let mut groups: Value = serde_json::from_slice(&fs::read(&group_path).unwrap()).unwrap();
+    if fractional_cer {
+        dev["records"][0]["spoken_number"] = 25.into();
+        dev["records"][0]["answer"] = 26.into();
+    }
     if signed_zero {
         let file = path.join("dev-media/dev-a.wav");
         let mut writer = hound::WavWriter::create(
@@ -2287,4 +2296,2111 @@ fn v3_real_codec_rejects_forged_frames_before_new_and_resumed_checkpoints() {
     }
     assert!(!fresh.join("number-audio-v3/audio-conditioned-v1").exists());
     assert_eq!(fs::read(pointer).unwrap(), pointer_before);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+struct VoiceRecheckFixture {
+    _root: tempfile::TempDir,
+    registered: omni_rsi::number_development::RegisteredDevelopment,
+    registration_dir: std::path::PathBuf,
+    report: Value,
+    voice_dir: std::path::PathBuf,
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture() -> VoiceRecheckFixture {
+    voice_recheck_fixture_with_failures(false)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_options(
+    fixture: &VoiceRecheckFixture,
+) -> omni_rsi::number_development::RegistrationOptions<'_> {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::number_development::{RegistrationOptions, ToolPaths};
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = fixture.registration_dir.parent().unwrap();
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(root.join("state/number-audio-v3/audio-conditioned-v1/latest.json")).unwrap(),
+    )
+    .unwrap();
+    RegistrationOptions {
+        data_root: root,
+        model_dir: root.join("model"),
+        candidate_file: root
+            .join("state/number-audio-v3/audio-conditioned-v1/checkpoints")
+            .join(format!("{}.json", pointer["sha256"].as_str().unwrap())),
+        evaluator_file: std::env::current_exe().unwrap(),
+        backend: Cpu::name(&Default::default()),
+        r2t2: Some(ToolPaths {
+            model: root.join("r2t2"),
+            binary: root.join("r2t2-binary"),
+        }),
+        breeze: None,
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture_with_failures(failures: bool) -> VoiceRecheckFixture {
+    voice_recheck_fixture_variant(failures, false)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture_fractional_cer() -> VoiceRecheckFixture {
+    voice_recheck_fixture_variant(false, true)
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn voice_recheck_fixture_variant(failures: bool, fractional_cer: bool) -> VoiceRecheckFixture {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use omni_rsi::{
+        number_development::{RegistrationOptions, ToolPaths, verify_registration},
+        number_v3_evaluation::{
+            DecodedSpeech, DecodedText, TextEnd, V3AsrMode, V3Options, evaluate_v3_voice_with,
+            preregister_v3_with_asr,
+        },
+        speech_asr::AsrEvent,
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let root = evaluation_fixture_with_options(false, fractional_cer);
+    let root_path = fs::canonicalize(root.path()).unwrap();
+    let model = root_path.join("model");
+    let state = root_path.join("state");
+    let registration = root_path.join("registration");
+    let output = root_path.join("report.json");
+    let voice_dir = root_path.join("voice-output");
+    let (r2t2, binary) = fake_r2t2(&root_path);
+    let options = V3Options {
+        model: &model,
+        data: &root_path,
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: Some((&r2t2, &binary)),
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    let device = Default::default();
+    preregister_v3_with_asr::<Cpu>(&options, &device, &stop, V3AsrMode::CpuF32).unwrap();
+    let mut index = 0;
+    let report = evaluate_v3_voice_with::<Cpu>(
+        &options,
+        &voice_dir,
+        &device,
+        &stop,
+        V3AsrMode::CpuF32,
+        |_, _, samples| {
+            let current = index;
+            index += 1;
+            let value = if samples.iter().all(|v| *v == 0.0) {
+                0.125
+            } else if samples[1] < 0.4 {
+                0.5
+            } else {
+                0.25
+            };
+            Ok((
+                DecodedText {
+                    text: "fixture".into(),
+                    end: TextEnd::Stop(7),
+                },
+                DecodedSpeech {
+                    tokens: vec![7],
+                    frames: vec![
+                        vec![if failures && current == 1 { 2017 } else { 1 }; 12],
+                        vec![2016; 12],
+                    ],
+                    samples: if failures && current == 2 {
+                        Vec::new()
+                    } else if failures && current == 3 {
+                        vec![f32::NAN, 0.0]
+                    } else {
+                        vec![value, -value]
+                    },
+                    end: if failures && current == 0 {
+                        TextEnd::Limit
+                    } else {
+                        TextEnd::Stop(7)
+                    },
+                },
+            ))
+        },
+        |wav| {
+            let sample = hound::WavReader::open(wav)
+                .unwrap()
+                .samples::<f32>()
+                .next()
+                .unwrap()
+                .unwrap();
+            Ok(AsrEvent {
+                text: if sample == 0.5 {
+                    "十六"
+                } else if sample == 0.25 {
+                    "13"
+                } else {
+                    "一"
+                }
+                .into(),
+                language: "zh".into(),
+            })
+        },
+    )
+    .unwrap();
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(state.join("number-audio-v3/audio-conditioned-v1/latest.json")).unwrap(),
+    )
+    .unwrap();
+    let candidate = state
+        .join("number-audio-v3/audio-conditioned-v1/checkpoints")
+        .join(format!("{}.json", pointer["sha256"].as_str().unwrap()));
+    let registered = verify_registration(
+        &RegistrationOptions {
+            data_root: &root_path,
+            model_dir: model,
+            candidate_file: candidate,
+            evaluator_file: std::env::current_exe().unwrap(),
+            backend: Cpu::name(&device),
+            r2t2: Some(ToolPaths {
+                model: r2t2,
+                binary,
+            }),
+            breeze: None,
+        },
+        &registration,
+        &stop,
+    )
+    .unwrap();
+    VoiceRecheckFixture {
+        _root: root,
+        registered,
+        registration_dir: registration,
+        report,
+        voice_dir,
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_recomputes_swapped_cer_without_granting_eligibility() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["status"], "insufficient_evidence");
+    assert_eq!(checked["candidate_eligible"], false);
+    assert_eq!(checked["execution_verified"], false);
+    assert_eq!(checked["policy_authenticity"], "cannot_recompute");
+    assert_eq!(checked["termination_verified"], false);
+    assert_eq!(checked["observations"][0]["cer"], 0.0);
+    assert_eq!(checked["observations"][1]["audio_case_id"], "dev-b");
+    assert_eq!(checked["observations"][1]["cer"], 1.0);
+    assert_eq!(checked["observations"][2]["silence_numeric"], true);
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["original"]["mean_case_cer"],
+        0.5
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_text_stop_token_outside_frozen_policy() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    fixture.report["observations"][0]["end"] = json!({"stop_token": 999});
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(
+        result.is_err(),
+        "an unregistered text stop cannot be accepted"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_missing_silence_score_instead_of_assuming_null() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    fixture.report["observations"][2]["speech"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cer");
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "an omitted score is not an explicit null");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_duplicate_fields_in_the_frozen_protocol() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let path = fixture.registration_dir.join("protocol.json");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen("\"version\": 1,", "\"version\": 999,\n  \"version\": 1,", 1);
+    assert_ne!(changed, original);
+    fs::write(&path, changed).unwrap();
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "duplicate frozen fields must be rejected");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_file_entry_reads_saved_report_and_rejects_duplicate_keys() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    let fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("report.json");
+    let run = || {
+        recheck_registered_voice_file(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &path,
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+    };
+    let checked = run().unwrap();
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["original"]["mean_case_cer"],
+        0.5
+    );
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen(
+        "\"status\": \"insufficient_evidence\",",
+        "\"status\": \"passed\",\n  \"status\": \"insufficient_evidence\",",
+        1,
+    );
+    assert_ne!(changed, original);
+    fs::write(&path, changed).unwrap();
+    assert!(run().is_err(), "duplicate report fields must be rejected");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_excess_observations_during_parsing() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    let fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("oversized.json");
+    // The trailing malformed object must never be parsed: the 6001st entry
+    // already exceeds the unconditional safety limit.
+    let report = format!(
+        "{{\"observations\":[{},{{\"unfinished\"",
+        vec!["0"; 6001].join(",")
+    );
+    fs::write(&path, report).unwrap();
+    let error = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &path,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("too many speech observations"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_caps_unknown_report_and_frame_nodes_during_parsing() {
+    use omni_rsi::number_v3_voice_recheck::{
+        recheck_registered_voice, recheck_registered_voice_file,
+    };
+    let mut fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("nodes.json");
+    let report = format!(
+        "{{\"unknown\":[{},{{\"unfinished\"",
+        vec!["0"; 750_001].join(",")
+    );
+    fs::write(&path, report).unwrap();
+    let error = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &path,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("JSON node budget exceeded"), "{error}");
+
+    let frame_path = fixture.voice_dir.join("000000.frames.json");
+    let bytes = format!(
+        "{{\"tokens\":[],\"frames\":[[{}]]}}",
+        vec!["0"; 30_001].join(",")
+    );
+    fs::write(&frame_path, &bytes).unwrap();
+    fixture.report["observations"][0]["speech"]["frames_sha256"] =
+        format!("{:x}", Sha256::digest(bytes.as_bytes())).into();
+    let error = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("JSON node budget exceeded"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_caps_protocol_nodes_before_schema_parsing() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let document = format!(
+        "{{\"unknown\":[{},{{\"unfinished\"",
+        vec!["0"; 1_000_001].join(",")
+    );
+    fs::write(fixture.registration_dir.join("protocol.json"), document).unwrap();
+    let error = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("JSON node budget exceeded"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_can_be_cancelled_while_processing_a_large_report() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        thread,
+        time::Duration,
+    };
+    let fixture = voice_recheck_fixture();
+    let path = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("large.json");
+    let report = format!("{{\"unknown\":[{}]}}", vec!["0"; 700_000].join(","));
+    fs::write(&path, report).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        signal.store(true, Ordering::Release);
+    });
+    let error = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &path,
+        &fixture.voice_dir,
+        &stop,
+    )
+    .unwrap_err();
+    thread.join().unwrap();
+    assert!(error.contains("interrupted"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built number_voice_recheck example"]
+fn voice_recheck_cli_rejects_linked_registration_ancestor_before_reading() {
+    use std::{os::unix::fs::symlink, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    fs::create_dir_all(root.join("actual/registration")).unwrap();
+    fs::write(
+        root.join("actual/registration/protocol.json"),
+        b"{unfinished",
+    )
+    .unwrap();
+    symlink(root.join("actual"), root.join("alias")).unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let output = Command::new(example)
+        .args(["unused", "unused", "unused", "unused"])
+        .arg(root.join("alias/registration"))
+        .args(["unused", "unused", "cpu", "unused", "unused"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(error.contains("without following links"), "{error}");
+    assert!(!error.contains("invalid preregistration"), "{error}");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_keeps_registration_directory_pinned_across_verification() {
+    use omni_rsi::number_v3_voice_recheck::VoiceRecheckRegistration;
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let options = voice_recheck_options(&fixture);
+    let opened = VoiceRecheckRegistration::open(&fixture.registration_dir).unwrap();
+    fs::rename(&fixture.registration_dir, root.join("pinned-registration")).unwrap();
+    fs::create_dir(&fixture.registration_dir).unwrap();
+    fs::write(
+        fixture.registration_dir.join("protocol.json"),
+        b"{unfinished",
+    )
+    .unwrap();
+    let result = opened
+        .verify_and_recheck(
+            &options,
+            &root.join("report.json"),
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        result["protocol_sha256"],
+        fixture.registered.protocol_sha256()
+    );
+    assert_eq!(result["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_uses_development_inputs_without_opening_training_media() {
+    use omni_rsi::number_v3_voice_recheck::VoiceRecheckRegistration;
+    use std::os::unix::fs::symlink;
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let options = voice_recheck_options(&fixture);
+    for name in [
+        "train-media",
+        "train-target-media",
+        "train.v3.json",
+        "train.groups.v3.json",
+    ] {
+        let path = root.join(name);
+        fs::rename(&path, root.join(format!("unavailable-{name}"))).unwrap();
+        symlink(root.join("must-not-be-read"), path).unwrap();
+    }
+    fs::create_dir(root.join("holdout")).unwrap();
+    for name in ["manifest.json", "salt.bin", "holdout.wav"] {
+        symlink(
+            root.join("must-not-be-read"),
+            root.join("holdout").join(name),
+        )
+        .unwrap();
+    }
+    let registration = VoiceRecheckRegistration::open(&fixture.registration_dir).unwrap();
+    let result = registration
+        .verify_and_recheck(
+            &options,
+            &root.join("report.json"),
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        result["protocol_sha256"],
+        fixture.registered.protocol_sha256()
+    );
+    assert_eq!(result["training_identity"], "not_reverified");
+    assert_eq!(result["partition_isolation"], "not_reverified");
+    assert_eq!(result["protocol_authenticity"], "not_verified");
+    assert_eq!(result["candidate_eligible"], false);
+    let candidate = fs::read(&options.candidate_file).unwrap();
+    fs::write(&options.candidate_file, b"changed synthetic candidate").unwrap();
+    assert!(
+        registration
+            .verify_and_recheck(
+                &options,
+                &root.join("report.json"),
+                &fixture.voice_dir,
+                &AtomicBool::new(false),
+            )
+            .is_err(),
+        "candidate identity must still be rechecked"
+    );
+    fs::write(&options.candidate_file, candidate).unwrap();
+    fs::write(
+        root.join("dev-media/dev-a.wav"),
+        b"changed synthetic development audio",
+    )
+    .unwrap();
+    assert!(
+        registration
+            .verify_and_recheck(
+                &options,
+                &root.join("report.json"),
+                &fixture.voice_dir,
+                &AtomicBool::new(false),
+            )
+            .is_err(),
+        "actual development audio must still be rechecked"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_rehashed_protocol_with_forged_candidate_identity() {
+    use omni_rsi::number_v3_voice_recheck::VoiceRecheckRegistration;
+    let fixture = voice_recheck_fixture();
+    let options = voice_recheck_options(&fixture);
+    let path = fixture.registration_dir.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    envelope["protocol"]["candidate_sha256"] = "0".repeat(64).into();
+    let bytes = serde_json::to_vec(&envelope["protocol"]).unwrap();
+    let mut hash = Sha256::new();
+    hash.update(b"omni-rsi-number-development-preregistration-v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(&bytes);
+    envelope["protocol_sha256"] = format!("{:x}", hash.finalize()).into();
+    write_json(&path, &envelope);
+    let error = VoiceRecheckRegistration::open(&fixture.registration_dir)
+        .unwrap()
+        .verify_and_recheck(
+            &options,
+            &fixture
+                .registration_dir
+                .parent()
+                .unwrap()
+                .join("report.json"),
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("local identities or parameters changed"),
+        "{error}"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built number_voice_recheck example"]
+fn voice_recheck_cli_uses_only_development_material() {
+    use std::{os::unix::fs::symlink, process::Command};
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let options = voice_recheck_options(&fixture);
+    for name in [
+        "train-media",
+        "train-target-media",
+        "train.v3.json",
+        "train.groups.v3.json",
+    ] {
+        let path = root.join(name);
+        fs::rename(&path, root.join(format!("unavailable-{name}"))).unwrap();
+        symlink(root.join("must-not-be-read"), path).unwrap();
+    }
+    let tool = options.r2t2.as_ref().unwrap();
+    let output =
+        Command::new(std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE"))
+            .arg(&options.model_dir)
+            .arg(root)
+            .arg(&options.candidate_file)
+            .arg(&options.evaluator_file)
+            .arg(&fixture.registration_dir)
+            .arg(root.join("report.json"))
+            .arg(&fixture.voice_dir)
+            .arg(&options.backend)
+            .arg(&tool.model)
+            .arg(&tool.binary)
+            .output()
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["protocol_sha256"],
+        fixture.registered.protocol_sha256()
+    );
+    assert_eq!(result["training_identity"], "not_reverified");
+    assert_eq!(result["partition_isolation"], "not_reverified");
+    assert_eq!(result["candidate_eligible"], false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_full_pipe() -> (fs::File, fs::File, usize) {
+    use std::{
+        fs::File,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let reader = unsafe { File::from_raw_fd(fds[0]) };
+    let writer = unsafe { File::from_raw_fd(fds[1]) };
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0
+    );
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let filler = [b'~'; 4096];
+    let mut filled = 0_usize;
+    loop {
+        let n = unsafe { libc::write(writer.as_raw_fd(), filler.as_ptr().cast(), filler.len()) };
+        if n < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            break;
+        }
+        assert!(n > 0);
+        filled += n as usize;
+    }
+    assert!(filled >= 4096);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+        0
+    );
+    (reader, writer, filled)
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_read_pipe_to_eof<R: std::io::Read + std::os::fd::AsRawFd>(
+    mut reader: R,
+) -> Vec<u8> {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut bytes = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 4096];
+        match reader.read(&mut buffer) {
+            Ok(0) => return bytes,
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) => panic!("pipe did not reach EOF within its deadline: {error}"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_command_output(
+    mut command: std::process::Command,
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        drop(child.stdout.take());
+        drop(child.stderr.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("CLI diagnostic did not finish within its deadline");
+    }
+    let status = child.wait().unwrap();
+    let stdout = voice_recheck_read_pipe_to_eof(child.stdout.take().unwrap());
+    let stderr = voice_recheck_read_pipe_to_eof(child.stderr.take().unwrap());
+    (status, stdout, stderr)
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_cli_blocked_output(block_stderr: bool) {
+    use std::{
+        io::Read,
+        os::fd::AsRawFd,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = voice_recheck_fixture();
+    let options = voice_recheck_options(&fixture);
+    let root = fixture.registration_dir.parent().unwrap();
+    let tool = options.r2t2.as_ref().unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let command = || {
+        let mut command = Command::new(&example);
+        command
+            .arg(&options.model_dir)
+            .arg(root)
+            .arg(&options.candidate_file)
+            .arg(&options.evaluator_file)
+            .arg(&fixture.registration_dir)
+            .arg(root.join("report.json"))
+            .arg(&fixture.voice_dir)
+            .arg(&options.backend)
+            .arg(&tool.model)
+            .arg(&tool.binary);
+        command
+    };
+    let reference = command().output().unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert!(
+        reference.stdout.len() > 4096,
+        "the actual CLI result must exceed the released pipe space"
+    );
+    let (mut reader, writer, filled) = voice_recheck_full_pipe();
+    let mut actual = command();
+    actual.stdout(Stdio::from(writer));
+    let blocked_stderr = if block_stderr {
+        let (reader, writer, _) = voice_recheck_full_pipe();
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let witness = writer.try_clone().unwrap();
+        actual.stderr(Stdio::from(writer));
+        Some((reader, witness, flags))
+    } else {
+        actual.stderr(Stdio::piped());
+        None
+    };
+    let mut child = actual.spawn().unwrap();
+    // Command retains its configured descriptors after spawn; close those
+    // copies so the test can observe EOF once the CLI and its workers exit.
+    drop(actual);
+    reader.read_exact(&mut [0; 4096]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut started = false;
+    while Instant::now() < deadline {
+        let mut available: libc::c_int = 0;
+        assert_eq!(
+            unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut available) },
+            0
+        );
+        if available as usize >= filled {
+            started = true;
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !started {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI did not begin writing into the blocked output pipe");
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stderr_flags_changed = false;
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        if let Some((_, witness, flags)) = blocked_stderr.as_ref() {
+            stderr_flags_changed |=
+                unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) } != *flags;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI remained blocked after SIGINT");
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "a cancelled output is not a completed result"
+    );
+    if !block_stderr {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("interrupted") && error.contains("partial result"),
+            "{error}"
+        );
+    }
+    if let Some((stderr_reader, witness, flags)) = blocked_stderr {
+        assert!(
+            !stderr_flags_changed,
+            "stderr flags changed while reporting cancellation"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) },
+            flags,
+            "stderr flags must be restored"
+        );
+        drop(witness);
+        let _ = voice_recheck_read_pipe_to_eof(stderr_reader);
+    }
+    let bytes = voice_recheck_read_pipe_to_eof(reader);
+    let prefix = filled - 4096;
+    assert!(
+        bytes.len() > prefix,
+        "some real CLI output should already have been written"
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&bytes[prefix..]).is_err(),
+        "the received result is partial"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_interrupts_a_partially_written_blocked_stdout() {
+    voice_recheck_cli_blocked_output(false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_interrupts_when_stdout_and_stderr_are_blocked() {
+    voice_recheck_cli_blocked_output(true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_bounds_a_large_error_when_stderr_is_unread() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let registration = root.join("registration");
+    fs::create_dir(&registration).unwrap();
+    let protocol = format!("{{\"{}\":null}}", "x".repeat(1024 * 1024));
+    fs::write(registration.join("protocol.json"), protocol).unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut child = Command::new(example)
+        .args(["unused", "unused", "unused", "unused"])
+        .arg(registration)
+        .args(["unused", "unused", "cpu", "unused", "unused"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        // Stop only this CLI and its worker; close the unread pipe so failure
+        // cleanup itself cannot remain blocked on the intentionally full pipe.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        drop(child.stderr.take());
+        thread::sleep(Duration::from_millis(300));
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI remained blocked while emitting a large error");
+    }
+    let status = child.wait().unwrap();
+    let error = voice_recheck_read_pipe_to_eof(child.stderr.take().unwrap());
+    assert!(!status.success());
+    assert!(
+        !error.is_empty(),
+        "a writable stderr should receive a diagnostic"
+    );
+    assert!(error.len() <= 8192, "stderr must have a bounded diagnostic");
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_displays_normal_errors_without_recursive_reporters() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let registration = root.join("registration");
+    fs::create_dir(&registration).unwrap();
+    fs::write(registration.join("protocol.json"), b"{unfinished").unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut child = Command::new(example)
+        .args(["unused", "unused", "unused", "unused"])
+        .arg(registration)
+        .args(["unused", "unused", "cpu", "unused", "unused"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        drop(child.stderr.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("CLI did not finish reporting an ordinary error");
+    }
+    assert!(!child.wait().unwrap().success());
+    let bytes = voice_recheck_read_pipe_to_eof(child.stderr.take().unwrap());
+    let error = String::from_utf8(bytes).unwrap();
+    assert!(error.contains("invalid JSON"), "{error}");
+    assert!(error.len() <= 4096, "diagnostic must be bounded");
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_blocked_error(binary_env: &str, unusable_tmp: bool, send_interrupt: bool) {
+    use std::{
+        os::fd::AsRawFd,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let example = std::env::var_os(binary_env).expect("set the CLI test executable");
+    let root = tempfile::tempdir().unwrap();
+    let command = || {
+        let mut command = Command::new(&example);
+        command.args([
+            "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu", "unused",
+            "unused",
+        ]);
+        if unusable_tmp {
+            command.env("TMPDIR", root.path().join("missing"));
+        }
+        command
+    };
+    let (status, stdout, stderr) = voice_recheck_command_output(command());
+    assert!(!status.success());
+    assert!(stdout.is_empty());
+    let expected = if binary_env == "VOICE_RECHECK_CPU_EXAMPLE" {
+        "requires the native feature"
+    } else {
+        "No such file or directory"
+    };
+    assert!(String::from_utf8_lossy(&stderr).contains(expected));
+    let (reader, writer, _) = voice_recheck_full_pipe();
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    let witness = writer.try_clone().unwrap();
+    let mut actual = command();
+    actual.stderr(Stdio::from(writer));
+    let blocked_stdout = if unusable_tmp {
+        let (reader, writer, _) = voice_recheck_full_pipe();
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let witness = writer.try_clone().unwrap();
+        actual.stdout(Stdio::from(writer));
+        Some((reader, witness, flags))
+    } else {
+        actual.stdout(Stdio::null());
+        None
+    };
+    let mut child = actual.spawn().unwrap();
+    drop(actual);
+    if send_interrupt {
+        thread::sleep(Duration::from_millis(60));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the full stderr should still have an active reporter"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("CLI remained blocked on stderr");
+    }
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+    drop(witness);
+    let _ = voice_recheck_read_pipe_to_eof(reader);
+    if let Some((reader, witness, flags)) = blocked_stdout {
+        assert_eq!(
+            unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        drop(witness);
+        let _ = voice_recheck_read_pipe_to_eof(reader);
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_bounds_an_unread_stderr() {
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", false, false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_interrupts_without_leaking_error_writer() {
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", false, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_bad_tmpdir_unread_stderr_and_sigint_are_bounded() {
+    voice_recheck_blocked_error("VOICE_RECHECK_EXAMPLE", true, false);
+    voice_recheck_blocked_error("VOICE_RECHECK_EXAMPLE", true, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_bad_tmpdir_unread_stderr_and_sigint_are_bounded() {
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", true, false);
+    voice_recheck_blocked_error("VOICE_RECHECK_CPU_EXAMPLE", true, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_rejects_registration_error_as_tmpdir_error() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let writable = root.join("writable-tmp");
+    fs::create_dir(&writable).unwrap();
+    let probe = writable.join("same-uid-write-probe");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .unwrap();
+    fs::remove_file(probe).unwrap();
+    let registration = root.join("intentionally-missing-registration");
+    assert_eq!(
+        fs::symlink_metadata(&registration).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    assert_eq!(
+        fs::metadata(&example).unwrap().permissions().mode() & 0o6000,
+        0,
+        "CLI must inherit the test uid and gid"
+    );
+    let mut command = Command::new(example);
+    command
+        .arg(root.join("unused-model"))
+        .arg(root.join("unused-data"))
+        .arg(root.join("unused-candidate"))
+        .arg(root.join("unused-evaluator"))
+        .arg(&registration)
+        .arg(root.join("unused-report"))
+        .arg(root.join("unused-voice"))
+        .args(["cpu", "unused-r2t2-model", "unused-r2t2-binary"])
+        .env("TMPDIR", &writable);
+    let (status, stdout, stderr) = voice_recheck_command_output(command);
+    assert!(!status.success());
+    assert!(stdout.is_empty());
+    let error = String::from_utf8_lossy(&stderr);
+    assert!(
+        error.contains("voice recheck worker failed")
+            && error.contains("cannot open artifact without following links"),
+        "{error}"
+    );
+    assert!(
+        error.contains("os error 2"),
+        "control must reproduce the legacy false positive: {error}"
+    );
+    eprintln!(
+        "TMPDIR_NEGATIVE_CONTROL writable=true registration_missing=true legacy_match={} exact_match={} stderr={error:?}",
+        error.contains("os error"),
+        voice_recheck_is_tmpdir_error(&error, libc::ENOENT)
+    );
+    assert!(
+        !voice_recheck_is_tmpdir_error(&error, libc::ENOENT),
+        "registration failure was mistaken for a TMPDIR failure: {error}"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_is_tmpdir_error(error: &str, errno: i32) -> bool {
+    error
+        == format!(
+            "number_voice_recheck: {}\n",
+            std::io::Error::from_raw_os_error(errno)
+        )
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+struct VoiceTmpCase {
+    name: &'static str,
+    path: std::path::PathBuf,
+    errno: i32,
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+struct VoiceTmpCases {
+    _root: tempfile::TempDir,
+    root: std::path::PathBuf,
+    cases: Vec<VoiceTmpCase>,
+    readonly_skipped: bool,
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_tmp_cases(readonly_mode: u32) -> VoiceTmpCases {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = fs::canonicalize(root.path()).unwrap();
+    let missing = path.join("missing");
+    let ordinary_file = path.join("not-a-directory");
+    let readonly = path.join("not-writable");
+    fs::write(&ordinary_file, b"synthetic").unwrap();
+    fs::create_dir(&readonly).unwrap();
+    assert_eq!(
+        fs::symlink_metadata(&missing).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(
+        fs::symlink_metadata(&ordinary_file)
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+    let probe = |directory: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("same-uid-write-probe"))
+    };
+    let missing_error = probe(&missing).unwrap_err();
+    let not_dir_error = probe(&ordinary_file).unwrap_err();
+    assert_eq!(missing_error.raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(not_dir_error.raw_os_error(), Some(libc::ENOTDIR));
+    let mut cases = vec![
+        VoiceTmpCase {
+            name: "missing",
+            path: missing,
+            errno: libc::ENOENT,
+        },
+        VoiceTmpCase {
+            name: "not-a-directory",
+            path: ordinary_file,
+            errno: libc::ENOTDIR,
+        },
+    ];
+    let readonly_skipped =
+        match fs::set_permissions(&readonly, fs::Permissions::from_mode(readonly_mode)) {
+            Ok(()) => match probe(&readonly) {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    let errno = error
+                        .raw_os_error()
+                        .expect("permission denial must have an OS error");
+                    assert!(
+                        errno == libc::EACCES || errno == libc::EPERM,
+                        "unexpected permission error: {error}"
+                    );
+                    eprintln!(
+                        "TMPDIR_READONLY=PROBE_DENIED uid={} errno={errno}",
+                        unsafe { libc::geteuid() }
+                    );
+                    cases.push(VoiceTmpCase {
+                        name: "readonly",
+                        path: readonly,
+                        errno,
+                    });
+                    false
+                }
+                Ok(file) => {
+                    drop(file);
+                    fs::remove_file(readonly.join("same-uid-write-probe")).unwrap();
+                    eprintln!(
+                        "TMPDIR_READONLY=SKIPPED uid={} reason=same-uid-create-succeeded",
+                        unsafe { libc::geteuid() }
+                    );
+                    true
+                }
+                Err(error) => panic!("readonly permission probe was inconclusive: {error}"),
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) || error.raw_os_error() == Some(libc::EROFS) =>
+            {
+                eprintln!(
+                    "TMPDIR_READONLY=SKIPPED uid={} reason=cannot-set-mode error={error}",
+                    unsafe { libc::geteuid() }
+                );
+                true
+            }
+            Err(error) => panic!("cannot configure readonly permission probe: {error}"),
+        };
+    VoiceTmpCases {
+        _root: root,
+        root: path,
+        cases,
+        readonly_skipped,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_assert_tmp_cases(
+    fixture: &VoiceTmpCases,
+    example: &std::ffi::OsStr,
+    cpu_only: bool,
+) {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    assert_eq!(
+        fs::metadata(example).unwrap().permissions().mode() & 0o6000,
+        0,
+        "CLI must inherit the probe uid and gid"
+    );
+    const USAGE_ERROR: &str = "number_voice_recheck: Usage: number_voice_recheck MODEL DATA CANDIDATE EVALUATOR REGISTRATION REPORT VOICE_DIR BACKEND R2T2_MODEL R2T2_BINARY [BREEZE_MODEL BREEZE_BINARY]\nReads only explicitly supplied development artifacts. It does not run a model, codec, ASR, or grant eligibility.\n";
+    const CPU_ERROR: &str =
+        "number_voice_recheck: voice recheck CLI requires the native feature for cancellation\n";
+    let registration = fixture.root.join("intentionally-missing-registration");
+    assert_eq!(
+        fs::symlink_metadata(&registration).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    for case in &fixture.cases {
+        for valid_args in [false, true] {
+            let mut command = Command::new(example);
+            if valid_args {
+                command
+                    .arg(fixture.root.join("unused-model"))
+                    .arg(fixture.root.join("unused-data"))
+                    .arg(fixture.root.join("unused-candidate"))
+                    .arg(fixture.root.join("unused-evaluator"))
+                    .arg(&registration)
+                    .arg(fixture.root.join("unused-report"))
+                    .arg(fixture.root.join("unused-voice"))
+                    .args(["cpu", "unused-r2t2-model", "unused-r2t2-binary"]);
+            }
+            command.env("TMPDIR", &case.path);
+            let (status, stdout, stderr) = voice_recheck_command_output(command);
+            assert_eq!(status.code(), Some(1), "{} exited unexpectedly", case.name);
+            assert!(stdout.is_empty());
+            let error = String::from_utf8_lossy(&stderr);
+            if !valid_args {
+                assert_eq!(error, USAGE_ERROR, "{} usage diagnostic changed", case.name);
+            } else if cpu_only {
+                assert_eq!(
+                    error, CPU_ERROR,
+                    "{} CPU-only diagnostic changed",
+                    case.name
+                );
+            } else {
+                assert!(
+                    voice_recheck_is_tmpdir_error(&error, case.errno),
+                    "{} expected errno {} from TMPDIR, got {error:?}",
+                    case.name,
+                    case.errno
+                );
+            }
+        }
+        eprintln!(
+            "TMPDIR_CASE_EXECUTED={} cli={}",
+            case.name,
+            if cpu_only { "cpu-only" } else { "native,cpu" }
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_reports_unusable_tmpdir() {
+    let fixture = voice_recheck_tmp_cases(0o500);
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    voice_recheck_assert_tmp_cases(&fixture, &example, false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built CPU-only number_voice_recheck example"]
+fn voice_recheck_cpu_only_reports_unusable_tmpdir() {
+    let fixture = voice_recheck_tmp_cases(0o500);
+    let example =
+        std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
+    voice_recheck_assert_tmp_cases(&fixture, &example, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires native and CPU-only number_voice_recheck examples"]
+fn voice_recheck_writable_permission_control_skips_only_readonly_case() {
+    let fixture = voice_recheck_tmp_cases(0o700);
+    assert!(
+        fixture.readonly_skipped,
+        "same-uid writable directory must skip the readonly case"
+    );
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.name)
+            .collect::<Vec<_>>(),
+        ["missing", "not-a-directory"]
+    );
+    let native = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let cpu = std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
+    voice_recheck_assert_tmp_cases(&fixture, &native, false);
+    voice_recheck_assert_tmp_cases(&fixture, &cpu, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires native and CPU-only number_voice_recheck examples"]
+fn voice_recheck_internal_error_worker_refuses_oversized_input() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    for variable in ["VOICE_RECHECK_EXAMPLE", "VOICE_RECHECK_CPU_EXAMPLE"] {
+        let example = std::env::var_os(variable).expect("set both CLI test executables");
+        for size in [4096, 4097] {
+            let mut child = Command::new(&example)
+                .arg("--internal-voice-recheck-error")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&vec![b'x'; size])
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            if size == 4096 {
+                assert!(output.status.success());
+                assert_eq!(output.stderr, vec![b'x'; size]);
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "oversized diagnostic must not be reported as complete"
+                );
+                assert!(
+                    output.stderr.is_empty(),
+                    "oversized diagnostic must not be emitted"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires native and CPU-only number_voice_recheck examples"]
+fn voice_recheck_exhausted_descriptor_budget_fails_without_hanging() {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    for variable in ["VOICE_RECHECK_EXAMPLE", "VOICE_RECHECK_CPU_EXAMPLE"] {
+        let example = std::env::var_os(variable).expect("set both CLI test executables");
+        for help in [true, false] {
+            let mut command = Command::new(&example);
+            if help {
+                command.arg("--help");
+            } else {
+                command.args([
+                    "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu",
+                    "unused", "unused",
+                ]);
+            }
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: 4,
+                        rlim_max: 4,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            drop(command);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("descriptor exhaustion caused an unbounded wait");
+            }
+            let output = child.wait_with_output().unwrap();
+            if help {
+                assert!(
+                    output.status.success(),
+                    "limited process could not start: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+            } else {
+                assert!(!output.status.success());
+                assert!(output.stdout.is_empty());
+                assert!(
+                    output.stderr.is_empty(),
+                    "socket allocation should fail with one free descriptor"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_returns_failure_if_output_reader_closes() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = voice_recheck_fixture();
+    let options = voice_recheck_options(&fixture);
+    let root = fixture.registration_dir.parent().unwrap();
+    let tool = options.r2t2.as_ref().unwrap();
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut child = Command::new(example)
+        .arg(&options.model_dir)
+        .arg(root)
+        .arg(&options.candidate_file)
+        .arg(&options.evaluator_file)
+        .arg(&fixture.registration_dir)
+        .arg(root.join("report.json"))
+        .arg(&fixture.voice_dir)
+        .arg(&options.backend)
+        .arg(&tool.model)
+        .arg(&tool.binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("actual CLI failed to exit after its output reader closed");
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("partial result"));
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example and lsof"]
+fn voice_recheck_cli_interrupts_an_in_progress_legacy_identity_hash() {
+    use burn::{
+        backend::{Autodiff, NdArray},
+        tensor::backend::Backend,
+    };
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    type Cpu = Autodiff<NdArray<f32>>;
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(root.join("state/number-audio-v3/audio-conditioned-v1/latest.json")).unwrap(),
+    )
+    .unwrap();
+    let candidate = root
+        .join("state/number-audio-v3/audio-conditioned-v1/checkpoints")
+        .join(format!("{}.json", pointer["sha256"].as_str().unwrap()));
+    let weights = root.join("r2t2/model.safetensors");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&weights)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 * 1024)
+        .unwrap(); // sparse synthetic bytes
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let mut process = Command::new(example)
+        .arg(root.join("model"))
+        .arg(root)
+        .arg(candidate)
+        .arg(std::env::current_exe().unwrap())
+        .arg(&fixture.registration_dir)
+        .arg(root.join("report.json"))
+        .arg(&fixture.voice_dir)
+        .arg(Cpu::name(&Default::default()))
+        .arg(root.join("r2t2"))
+        .arg(root.join("r2t2-binary"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut hashing_pid = None;
+    while Instant::now() < deadline {
+        let output = Command::new("/usr/sbin/lsof")
+            .arg("-t")
+            .arg("--")
+            .arg(&weights)
+            .output()
+            .unwrap();
+        if let Ok(pid) = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<i32>()
+        {
+            hashing_pid = Some(pid);
+            break;
+        }
+        if process.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if hashing_pid.is_none() {
+        let _ = process.kill();
+        let _ = process.wait();
+        panic!("synthetic R2T2 hash was not observed");
+    }
+    assert_eq!(unsafe { libc::kill(process.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && process.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if process.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(hashing_pid.unwrap(), libc::SIGKILL);
+        }
+        let _ = process.kill();
+        let _ = process.wait();
+        panic!("CLI did not stop its in-progress identity hash");
+    }
+    let output = process.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted"));
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_unrecognized_fields_in_the_frozen_envelope() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let path = fixture.registration_dir.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    envelope["approved"] = true.into();
+    write_json(&path, &envelope);
+    assert!(
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &fixture.report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+        .is_err()
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_keeps_invalid_and_abnormally_ended_observations() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture_with_failures(true);
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["observations"].as_array().unwrap().len(), 12);
+    assert_eq!(checked["observations"][0]["valid"], true);
+    assert_eq!(checked["observations"][0]["normal_end"], false);
+    assert_eq!(checked["observations"][0]["cer"], 0.0);
+    assert_eq!(checked["observations"][1]["valid"], false);
+    assert!(checked["observations"][1]["cer"].is_null());
+    assert_eq!(checked["observations"][2]["valid"], false);
+    assert!(checked["observations"][2]["cer"].is_null());
+    assert_eq!(checked["observations"][3]["valid"], false);
+    assert!(checked["observations"][3]["cer"].is_null());
+    assert_eq!(checked["speech_summary"]["status"], "partial_unverified");
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["swapped"]["observations"],
+        2
+    );
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["swapped"]["cer_cases"],
+        1
+    );
+    assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_a_stop_token_missing_from_saved_tokens() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    let frame_path = fixture.voice_dir.join("000000.frames.json");
+    let mut frames: Value = serde_json::from_slice(&fs::read(&frame_path).unwrap()).unwrap();
+    frames["tokens"] = json!([8]);
+    let bytes = serde_json::to_vec(&frames).unwrap();
+    fs::write(frame_path, &bytes).unwrap();
+    fixture.report["observations"][0]["speech"]["frames_sha256"] =
+        format!("{:x}", Sha256::digest(&bytes)).into();
+    assert_eq!(
+        fixture.report["observations"][0]["speech"]["end"]["stop_token"],
+        7
+    );
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "contradictory stop token was accepted");
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_incomplete_wrongly_mapped_or_forged_reports() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let mut variants = Vec::new();
+    let mut report = fixture.report.clone();
+    report["observations"].as_array_mut().unwrap().pop();
+    variants.push(("missing observation", report));
+    let mut report = fixture.report.clone();
+    report["observations"][1] = report["observations"][0].clone();
+    variants.push(("duplicate observation", report));
+    let mut report = fixture.report.clone();
+    report["observations"][1]["audio_case_id"] = "dev-a".into();
+    variants.push(("wrong swapped audio", report));
+    let mut report = fixture.report.clone();
+    report["candidate_checkpoint_sha256"] = "0".repeat(64).into();
+    variants.push(("different candidate", report));
+    let mut report = fixture.report.clone();
+    report["parameters"]["output_speech"]["codebooks"] = 11.into();
+    variants.push(("different policy", report));
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["cer"] = 0.25.into();
+    variants.push(("forged case CER", report));
+    let mut report = fixture.report.clone();
+    report["output_speech_r2t2_cer"]["by_arm"]["baseline"]["original"]["cer_cases"] = 1.into();
+    variants.push(("forged aggregate", report));
+    let mut report = fixture.report.clone();
+    report["candidate_eligible"] = true.into();
+    variants.push(("self-reported eligibility", report));
+    for (name, report) in variants {
+        assert!(
+            recheck_registered_voice(
+                &fixture.registered,
+                &fixture.registration_dir,
+                &report,
+                &fixture.voice_dir,
+                &AtomicBool::new(false),
+            )
+            .is_err(),
+            "{name} was accepted"
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_changed_or_malformed_saved_artifacts() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let frame_path = fixture.voice_dir.join("000000.frames.json");
+    let original_frames = fs::read(&frame_path).unwrap();
+    let wav_path = fixture.voice_dir.join("000000.wav");
+    let original_wav = fs::read(&wav_path).unwrap();
+    let run = |report: &Value| {
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false),
+        )
+    };
+    fs::write(&frame_path, b"different").unwrap();
+    assert!(run(&fixture.report).is_err());
+    let mut frames: Value = serde_json::from_slice(&original_frames).unwrap();
+    frames["frames"][0][0] = 2017.into();
+    let bytes = serde_json::to_vec(&frames).unwrap();
+    fs::write(&frame_path, &bytes).unwrap();
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["frames_sha256"] =
+        format!("{:x}", Sha256::digest(&bytes)).into();
+    assert!(
+        run(&report).is_err(),
+        "a matching hash cannot make invalid codes valid"
+    );
+    fs::write(&frame_path, &original_frames).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&frame_path)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(
+        run(&fixture.report).is_err(),
+        "an oversized frame file must be rejected before reading"
+    );
+    fs::write(&frame_path, &original_frames).unwrap();
+    let mut writer = hound::WavWriter::create(
+        &wav_path,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    writer.write_sample(0.5_f32).unwrap();
+    writer.write_sample(-0.5_f32).unwrap();
+    writer.finalize().unwrap();
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["audio_sha256"] =
+        format!("{:x}", Sha256::digest(fs::read(&wav_path).unwrap())).into();
+    assert!(
+        run(&report).is_err(),
+        "a matching hash cannot change the WAV rate"
+    );
+    fs::write(&wav_path, original_wav).unwrap();
+    fs::remove_file(&frame_path).unwrap();
+    assert!(
+        run(&fixture.report).is_err(),
+        "a missing artifact cannot be skipped"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_links_and_traversal_but_accepts_chinese_paths() {
+    use omni_rsi::number_v3_voice_recheck::{
+        recheck_registered_voice, recheck_registered_voice_file,
+    };
+    use std::os::unix::fs::symlink;
+    let fixture = voice_recheck_fixture();
+    let run = |report: &Value, directory: &Path| {
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            report,
+            directory,
+            &AtomicBool::new(false),
+        )
+    };
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["frames_file"] = "../000000.frames.json".into();
+    assert!(run(&report, &fixture.voice_dir).is_err());
+    let parent = fixture.voice_dir.parent().unwrap();
+    let alias = parent.join("voice-link");
+    symlink(&fixture.voice_dir, &alias).unwrap();
+    assert!(run(&fixture.report, &alias).is_err());
+    assert!(run(&fixture.report, &fixture.voice_dir.join("../voice-output")).is_err());
+    let frame = fixture.voice_dir.join("000000.frames.json");
+    let saved = parent.join("saved-frames");
+    fs::rename(&frame, &saved).unwrap();
+    symlink(&saved, &frame).unwrap();
+    assert!(run(&fixture.report, &fixture.voice_dir).is_err());
+    fs::remove_file(&frame).unwrap();
+    fs::hard_link(&saved, &frame).unwrap();
+    assert!(run(&fixture.report, &fixture.voice_dir).is_err());
+    fs::remove_file(&frame).unwrap();
+    fs::rename(&saved, &frame).unwrap();
+    let report_link = parent.join("report-link.json");
+    symlink(parent.join("report.json"), &report_link).unwrap();
+    assert!(
+        recheck_registered_voice_file(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &report_link,
+            &fixture.voice_dir,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let chinese = parent.join("中文语音");
+    fs::rename(&fixture.voice_dir, &chinese).unwrap();
+    assert!(run(&fixture.report, &chinese).is_ok());
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_rejects_cancellation_and_resource_limits() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let fixture = voice_recheck_fixture();
+    let result = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        Path::new("/not-an-input"),
+        &AtomicBool::new(true),
+    );
+    assert!(matches!(result, Err(ref error) if error == "interrupted"));
+    let mut report = fixture.report.clone();
+    report["observations"][0]["speech"]["sample_count"] = 720_001.into();
+    assert!(
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let path = fixture.registration_dir.join("v3-evaluation-policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    policy["parameters"]["output_speech"]["max_total_output_samples"] = 1.into();
+    write_json(&path, &policy);
+    let mut report = fixture.report.clone();
+    report["parameters"] = policy["parameters"].clone();
+    assert!(
+        recheck_registered_voice(
+            &fixture.registered,
+            &fixture.registration_dir,
+            &report,
+            &fixture.voice_dir,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_never_opens_synthetic_private_holdout_entries() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let fixture = voice_recheck_fixture();
+    let private = fixture.registration_dir.parent().unwrap().join("holdout");
+    fs::create_dir(&private).unwrap();
+    for name in ["manifest.json", "salt.bin", "holdout.wav"] {
+        let path = private.join(name);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_accepts_reordered_fields_in_the_valid_registered_protocol() {
+    use omni_rsi::{
+        number_development::{RegistrationOptions, ToolPaths, verify_registration},
+        number_v3_voice_recheck::recheck_registered_voice,
+    };
+    let fixture = voice_recheck_fixture();
+    let root = fixture.registration_dir.parent().unwrap();
+    let protocol_path = fixture.registration_dir.join("protocol.json");
+    let mut envelope: Value = serde_json::from_slice(&fs::read(&protocol_path).unwrap()).unwrap();
+    let object = envelope["protocol"].as_object_mut().unwrap();
+    let case = object.get_mut("train_cases").unwrap()[0]
+        .as_object_mut()
+        .unwrap();
+    let id = case.shift_remove("id").unwrap();
+    case.insert("id".into(), id);
+    let source = case.get_mut("source").unwrap().as_object_mut().unwrap();
+    let recording = source.shift_remove("recording_sha256").unwrap();
+    source.insert("recording_sha256".into(), recording);
+    let provenance = case
+        .get_mut("source_provenance")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    let status = provenance.shift_remove("status").unwrap();
+    provenance.insert("status".into(), status);
+    let swap = object.get_mut("swaps").unwrap()[0].as_object_mut().unwrap();
+    let case_id = swap.shift_remove("case_id").unwrap();
+    swap.insert("case_id".into(), case_id);
+    let regression = object.get_mut("regression_inputs").unwrap()[0]
+        .as_object_mut()
+        .unwrap();
+    let name = regression.shift_remove("name").unwrap();
+    regression.insert("name".into(), name);
+    let version = object.shift_remove("version").unwrap();
+    object.insert("version".into(), version);
+    write_json(&protocol_path, &envelope);
+    let candidate = root
+        .join("state/number-audio-v3/audio-conditioned-v1/checkpoints")
+        .join(format!(
+            "{}.json",
+            fixture.report["candidate_checkpoint_sha256"]
+                .as_str()
+                .unwrap()
+        ));
+    let stop = AtomicBool::new(false);
+    let verified = verify_registration(
+        &RegistrationOptions {
+            data_root: root,
+            model_dir: root.join("model"),
+            candidate_file: candidate,
+            evaluator_file: std::env::current_exe().unwrap(),
+            backend: "autodiff<ndarray>".into(),
+            r2t2: Some(ToolPaths {
+                model: root.join("r2t2"),
+                binary: root.join("r2t2-binary"),
+            }),
+            breeze: None,
+        },
+        &fixture.registration_dir,
+        &stop,
+    )
+    .unwrap();
+    assert!(
+        recheck_registered_voice(
+            &verified,
+            &fixture.registration_dir,
+            &fixture.report,
+            &fixture.voice_dir,
+            &stop
+        )
+        .is_ok(),
+        "JSON field order must not change a registered protocol"
+    );
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_marks_jointly_changed_policy_as_not_recomputable() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice;
+    let mut fixture = voice_recheck_fixture();
+    let policy_path = fixture.registration_dir.join("v3-evaluation-policy.json");
+    let mut policy: Value = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy["parameters"]["stop_tokens"] = json!([999]);
+    policy["parameters"]["output_speech"]["text_stop_tokens"] = json!([999]);
+    write_json(&policy_path, &policy);
+    fixture.report["parameters"] = policy["parameters"].clone();
+    for row in fixture.report["observations"].as_array_mut().unwrap() {
+        row["end"] = json!({"stop_token":999});
+        row["speech"]["end"] = json!({"stop_token":999});
+        let path = fixture
+            .voice_dir
+            .join(row["speech"]["frames_file"].as_str().unwrap());
+        let mut frames: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        frames["tokens"] = json!([999]);
+        let bytes = serde_json::to_vec(&frames).unwrap();
+        fs::write(path, &bytes).unwrap();
+        row["speech"]["frames_sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
+    }
+    let checked = recheck_registered_voice(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &fixture.report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["policy_authenticity"], "cannot_recompute");
+    assert_eq!(checked["termination_verified"], false);
+    assert_eq!(checked["candidate_eligible"], false);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn voice_recheck_recomputes_fractional_cer_after_report_json_roundtrip() {
+    use omni_rsi::number_v3_voice_recheck::recheck_registered_voice_file;
+    let fixture = voice_recheck_fixture_fractional_cer();
+    let report = fixture
+        .registration_dir
+        .parent()
+        .unwrap()
+        .join("report.json");
+    let checked = recheck_registered_voice_file(
+        &fixture.registered,
+        &fixture.registration_dir,
+        &report,
+        &fixture.voice_dir,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(checked["observations"][0]["cer"], 1.0 / 3.0);
+    assert_eq!(
+        checked["speech_summary"]["by_arm"]["baseline"]["original"]["mean_case_cer"],
+        (1.0 / 3.0 + 1.0) / 2.0
+    );
 }
