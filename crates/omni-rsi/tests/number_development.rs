@@ -617,6 +617,64 @@ fn isolated_train_dev_loads_without_opening_any_holdout_secret_file() {
 
 #[cfg(unix)]
 #[test]
+fn caller_selected_root_accepts_ancestor_alias_but_rejects_final_link() {
+    use std::os::unix::fs::symlink;
+    let root = fixture();
+    let aliases = tempfile::tempdir().unwrap();
+    let parent_alias = aliases.path().join("synthetic-parent-alias");
+    symlink(root.path().parent().unwrap(), &parent_alias).unwrap();
+    let via_ancestor = parent_alias.join(root.path().file_name().unwrap());
+    let data = DevelopmentData::load(&via_ancestor, &AtomicBool::new(false)).unwrap();
+    assert_eq!(data.train().len(), 1);
+    assert_eq!(data.dev().len(), 2);
+    let final_alias = aliases.path().join("synthetic-final-alias");
+    symlink(root.path(), &final_alias).unwrap();
+    assert!(DevelopmentData::load(&final_alias, &AtomicBool::new(false)).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn registration_accepts_parent_alias_without_following_internal_candidate_links() {
+    use std::os::unix::fs::symlink;
+    let root = fixture();
+    artifacts(root.path());
+    let aliases = tempfile::tempdir().unwrap();
+    let parent_alias = aliases.path().join("synthetic-parent-alias");
+    symlink(root.path().parent().unwrap(), &parent_alias).unwrap();
+    let selected = parent_alias.join(root.path().file_name().unwrap());
+    let stop = AtomicBool::new(false);
+    let chosen = options(&selected);
+    let registration = selected.join("registration");
+    preregister(&chosen, &registration, &stop).unwrap();
+    verify_registration(&chosen, &registration, &stop).unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(
+        outside.path().join("candidate.json"),
+        b"synthetic candidate",
+    )
+    .unwrap();
+    symlink(outside.path(), root.path().join("linked-candidate-parent")).unwrap();
+    let mut linked = options(&selected);
+    linked.candidate_file = selected.join("linked-candidate-parent/candidate.json");
+    assert!(preregister(&linked, &selected.join("linked-registration"), &stop).is_err());
+
+    // An alternate spelling must not reclassify a linked descendant as an
+    // independently trusted external artifact.
+    fs::create_dir(outside.path().join("nested")).unwrap();
+    fs::write(
+        outside.path().join("nested/candidate.json"),
+        b"synthetic candidate",
+    )
+    .unwrap();
+    linked.candidate_file = root
+        .path()
+        .join("linked-candidate-parent/nested/candidate.json");
+    assert!(preregister(&linked, &selected.join("alternate-registration"), &stop).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn any_source_group_shared_between_partitions_is_rejected_before_media_access() {
     for field in [
         "speaker_sha256",

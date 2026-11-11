@@ -49,7 +49,11 @@ fn cancelled(stop: &AtomicBool) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn open_child(directory: &File, name: &OsStr, is_directory: bool) -> Result<File, String> {
+pub(crate) fn open_child(
+    directory: &File,
+    name: &OsStr,
+    is_directory: bool,
+) -> Result<File, String> {
     use std::{
         ffi::CString,
         os::{
@@ -74,7 +78,7 @@ fn open_child(directory: &File, name: &OsStr, is_directory: bool) -> Result<File
 }
 
 #[cfg(not(unix))]
-fn open_child(_: &File, _: &OsStr, _: bool) -> Result<File, String> {
+pub(crate) fn open_child(_: &File, _: &OsStr, _: bool) -> Result<File, String> {
     Err("voice recheck requires no-follow Unix file access".into())
 }
 
@@ -102,7 +106,7 @@ fn open_directory_with_parent(path: &Path) -> Result<(File, File), String> {
     Ok((directory, parent))
 }
 
-fn open_directory(path: &Path) -> Result<File, String> {
+pub(crate) fn open_directory(path: &Path) -> Result<File, String> {
     open_directory_with_parent(path).map(|(directory, _)| directory)
 }
 
@@ -127,7 +131,7 @@ fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
     false
 }
 
-fn read_child(
+pub(crate) fn read_child(
     directory: &File,
     name: &OsStr,
     limit: u64,
@@ -137,7 +141,10 @@ fn read_child(
     cancelled(stop)?;
     let mut file = open_child(directory, name, false)?;
     let before = file.metadata().map_err(|e| e.to_string())?;
-    if !same_file(&before, &before) || before.len() == 0 || before.len() > limit {
+    if !same_file(&before, &before) {
+        return Err("artifact must be a single-link regular file".into());
+    }
+    if before.len() == 0 || before.len() > limit {
         return Err("invalid or oversized voice artifact".into());
     }
     *remaining = remaining
@@ -310,7 +317,11 @@ impl Read for CancelReader<'_> {
     }
 }
 
-fn strict_json(bytes: &[u8], node_limit: usize, stop: &AtomicBool) -> Result<Value, String> {
+pub(crate) fn strict_json(
+    bytes: &[u8],
+    node_limit: usize,
+    stop: &AtomicBool,
+) -> Result<Value, String> {
     let reader = BufReader::with_capacity(
         16 * 1024,
         CancelReader {
@@ -432,6 +443,55 @@ struct ProtocolSnapshot {
     regression_inputs: Vec<ProtocolRegression>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProtocolEnvelope {
+    version: u32,
+    status: String,
+    candidate_eligible: bool,
+    protocol_sha256: String,
+    protocol: ProtocolSnapshot,
+}
+
+pub(crate) fn strict_registered_protocol(
+    bytes: &[u8],
+    expected_id: &str,
+    stop: &AtomicBool,
+) -> Result<Value, String> {
+    let envelope = strict_json(bytes, MAX_PROTOCOL_JSON_NODES, stop)?;
+    let protocol = validate_registered_protocol(&envelope, expected_id)?;
+    let typed: ProtocolEnvelope = serde_json::from_value(envelope).map_err(|e| e.to_string())?;
+    if serde_json::to_vec_pretty(&typed).map_err(|e| e.to_string())? != bytes {
+        return Err("registered protocol encoding changed".into());
+    }
+    Ok(protocol)
+}
+
+fn validate_registered_protocol(envelope: &Value, expected_id: &str) -> Result<Value, String> {
+    let protocol_value = envelope
+        .get("protocol")
+        .filter(|v| v.is_object())
+        .ok_or("missing frozen protocol")?;
+    let protocol: ProtocolSnapshot = serde_json::from_value(protocol_value.clone())
+        .map_err(|e| format!("unsupported frozen protocol: {e}"))?;
+    let protocol_bytes = serde_json::to_vec(&protocol).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"omni-rsi-number-development-preregistration-v1\0");
+    digest.update((protocol_bytes.len() as u64).to_be_bytes());
+    digest.update(&protocol_bytes);
+    let id = format!("{:x}", digest.finalize());
+    if envelope.as_object().is_none_or(|fields| fields.len() != 5)
+        || envelope["version"] != 1
+        || envelope["status"] != "insufficient_evidence"
+        || envelope["candidate_eligible"] != false
+        || envelope["protocol_sha256"] != id
+        || id != expected_id
+    {
+        return Err("frozen protocol does not match the registered comparison".into());
+    }
+    serde_json::to_value(protocol).map_err(|e| e.to_string())
+}
+
 fn registered_documents(
     directory: &File,
     view: DevelopmentView<'_>,
@@ -447,27 +507,9 @@ fn registered_documents(
         stop,
     )?;
     let envelope = strict_json(&bytes, MAX_PROTOCOL_JSON_NODES, stop)?;
-    let protocol_value = envelope
-        .get("protocol")
-        .filter(|v| v.is_object())
-        .ok_or("missing frozen protocol")?;
-    let protocol: ProtocolSnapshot = serde_json::from_value(protocol_value.clone())
-        .map_err(|e| format!("unsupported frozen protocol: {e}"))?;
-    let protocol_bytes = serde_json::to_vec(&protocol).map_err(|e| e.to_string())?;
-    let protocol = serde_json::to_value(&protocol).map_err(|e| e.to_string())?;
-    let mut digest = Sha256::new();
-    digest.update(b"omni-rsi-number-development-preregistration-v1\0");
-    digest.update((protocol_bytes.len() as u64).to_be_bytes());
-    digest.update(&protocol_bytes);
-    let id = format!("{:x}", digest.finalize());
-    if envelope.as_object().is_none_or(|fields| fields.len() != 5)
-        || envelope["version"] != 1
-        || envelope["status"] != "insufficient_evidence"
-        || envelope["candidate_eligible"] != false
-        || envelope["protocol_sha256"] != id
-        || id != view.protocol_sha256
-        || report["protocol_sha256"] != id
-    {
+    let protocol = validate_registered_protocol(&envelope, view.protocol_sha256)?;
+    let id = view.protocol_sha256;
+    if report["protocol_sha256"] != id {
         return Err("frozen protocol does not match the registered comparison".into());
     }
     for (report_key, protocol_key) in [
@@ -1063,4 +1105,65 @@ fn recheck_voice_in_directory(
         "protocol_sha256":view.protocol_sha256,
         "v3_policy_sha256":policy_hash,"text_recheck":text_check,"observations":checked,"speech_summary":speech_summary}),
     )
+}
+
+#[cfg(test)]
+mod frozen_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn strict_protocol_rejects_rebinding_a_frozen_manifest() {
+        let protocol = ProtocolSnapshot {
+            version: 1,
+            policy: json!({}),
+            train_manifest_sha256: "train".into(),
+            dev_manifest_sha256: "dev".into(),
+            train_groups_sha256: "train-groups".into(),
+            dev_groups_sha256: "dev-groups".into(),
+            train_cases: vec![],
+            dev_cases: vec![],
+            swaps: vec![],
+            blind_public_fingerprint: "public".into(),
+            base_model_sha256: "base".into(),
+            codec_sha256: "codec".into(),
+            candidate_sha256: "candidate".into(),
+            evaluator_sha256: "evaluator".into(),
+            r2t2_sha256: None,
+            breeze_sha256: None,
+            regression_plan_sha256: "plan".into(),
+            regression_inputs: vec![ProtocolRegression {
+                name: "chinese".into(),
+                manifest_file: "chinese.json".into(),
+                sha256: "manifest".into(),
+            }],
+        };
+        let bytes = serde_json::to_vec(&protocol).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"omni-rsi-number-development-preregistration-v1\0");
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+        let id = format!("{:x}", hash.finalize());
+        let mut envelope = ProtocolEnvelope {
+            version: 1,
+            status: "insufficient_evidence".into(),
+            candidate_eligible: false,
+            protocol_sha256: id.clone(),
+            protocol,
+        };
+        let original = serde_json::to_vec_pretty(&envelope).unwrap();
+        let stop = AtomicBool::new(false);
+        let value = strict_registered_protocol(&original, &id, &stop).unwrap();
+        assert_eq!(value["regression_inputs"][0]["sha256"], "manifest");
+        envelope.protocol.regression_inputs[0].sha256 = "changed".into();
+        let changed = serde_json::to_vec_pretty(&envelope).unwrap();
+        assert!(strict_registered_protocol(&changed, &id, &stop).is_err());
+        envelope.protocol.regression_inputs[0].sha256 = "manifest".into();
+        envelope.protocol.regression_inputs[0].manifest_file = "other.json".into();
+        let changed = serde_json::to_vec_pretty(&envelope).unwrap();
+        assert!(strict_registered_protocol(&changed, &id, &stop).is_err());
+        envelope.protocol.regression_inputs[0].manifest_file = "chinese.json".into();
+        envelope.protocol.regression_plan_sha256 = "other-plan".into();
+        let changed = serde_json::to_vec_pretty(&envelope).unwrap();
+        assert!(strict_registered_protocol(&changed, &id, &stop).is_err());
+    }
 }

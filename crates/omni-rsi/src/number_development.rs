@@ -18,6 +18,7 @@ use std::{
 
 const LAYOUT: &[u8] = b"omni-rsi-number-train-dev-v3\n";
 const MAX_MANIFEST: usize = 8 * 1024 * 1024;
+const MAX_REGRESSION_MANIFEST: usize = 256 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
 const MAX_TOTAL_MEDIA: usize = 128 * 1024 * 1024;
 const MAX_TOTAL_SAMPLES: usize = 16_000 * 1_200;
@@ -846,12 +847,61 @@ fn validate_target_wav(
 
 #[cfg(unix)]
 fn open_root(path: &Path) -> Result<File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| format!("v3 dataset root: {e}"))?;
+    open_strict_root(&resolve_selected_path(path, false)?)
+}
+
+// The caller selects the root; aliases in its parent are trusted. Its last
+// component and everything opened relative to it remain no-follow.
+pub(crate) fn resolve_selected_path(path: &Path, missing_final: bool) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return Err("invalid selected path".into());
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("parent traversal is not allowed".into());
+    }
+    let Some(name) = path.file_name() else {
+        return std::fs::canonicalize(path).map_err(|e| e.to_string());
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolved = std::fs::canonicalize(parent)
+        .map_err(|e| e.to_string())?
+        .join(name);
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("selected path final component is a symlink".into());
+        }
+        Ok(_) => (),
+        Err(error) if missing_final && error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn open_strict_root(path: &Path) -> Result<File, String> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return Err("empty v3 root path".into());
+    }
+    let mut file =
+        File::open(if path.is_absolute() { "/" } else { "." }).map_err(|e| e.to_string())?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => (),
+            Component::Normal(name) => {
+                file =
+                    open_child_os(&file, name, true).map_err(|e| format!("v3 dataset root: {e}"))?
+            }
+            _ => return Err("v3 root traversal is unsupported".into()),
+        }
+    }
     if !file.metadata().map_err(|e| e.to_string())?.is_dir() {
         return Err("invalid v3 dataset root".into());
     }
@@ -865,11 +915,23 @@ fn open_child(directory: &File, name: &str, is_directory: bool) -> Result<File, 
 
 #[cfg(unix)]
 fn open_child_io(directory: &File, name: &str, is_directory: bool) -> std::io::Result<File> {
+    open_child_os(directory, std::ffi::OsStr::new(name), is_directory)
+}
+
+#[cfg(unix)]
+fn open_child_os(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    is_directory: bool,
+) -> std::io::Result<File> {
     use std::{
         ffi::CString,
-        os::fd::{AsRawFd, FromRawFd},
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
     };
-    let name = CString::new(name)
+    let name = CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid filename"))?;
     let flags = libc::O_RDONLY
         | libc::O_NOFOLLOW
@@ -908,6 +970,52 @@ fn read_child(
 ) -> Result<Vec<u8>, String> {
     check_stop(stop)?;
     read_open_file(open_child(directory, name, false)?, limit, stop)
+}
+
+#[cfg(unix)]
+fn same_single_link_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.is_file()
+        && after.is_file()
+        && before.nlink() == 1
+        && after.nlink() == 1
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_single_link_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn read_single_link_child(
+    directory: &File,
+    name: &str,
+    limit: usize,
+    stop: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    check_stop(stop)?;
+    let file = open_child(directory, name, false)?;
+    let observer = file.try_clone().map_err(|e| e.to_string())?;
+    let before = observer.metadata().map_err(|e| e.to_string())?;
+    if !same_single_link_file(&before, &before) {
+        return Err("artifact must be a single-link regular file".into());
+    }
+    if before.len() == 0 || before.len() > limit as u64 {
+        return Err("invalid or oversized artifact".into());
+    }
+    let bytes = read_open_file(file, limit, stop)?;
+    let after = observer.metadata().map_err(|e| e.to_string())?;
+    if !same_single_link_file(&before, &after) {
+        return Err("artifact changed while reading".into());
+    }
+    check_stop(stop)?;
+    Ok(bytes)
 }
 
 /// Reopen a previously admitted target through no-follow directory handles.
@@ -1409,7 +1517,8 @@ fn regression_identities(
     stop: &AtomicBool,
 ) -> Result<(String, Vec<RegressionIdentity>), String> {
     let root = open_root(root)?;
-    let plan_bytes = read_child(&root, "regression-plan.json", MAX_MANIFEST, stop)?;
+    let plan_bytes =
+        read_single_link_child(&root, "regression-plan.json", MAX_REGRESSION_MANIFEST, stop)?;
     let plan: RegressionPlan =
         serde_json::from_slice(&plan_bytes).map_err(|e| format!("invalid regression plan: {e}"))?;
     let required: HashSet<_> = ["chinese", "english", "other_omni", "reading", "dialogue"]
@@ -1431,7 +1540,12 @@ fn regression_identities(
         {
             return Err("invalid preregistered regression group".into());
         }
-        let bytes = read_child(&directory, &group.manifest_file, MAX_MANIFEST, stop)?;
+        let bytes = read_single_link_child(
+            &directory,
+            &group.manifest_file,
+            MAX_REGRESSION_MANIFEST,
+            stop,
+        )?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("invalid regression manifest: {e}"))?;
         if !value.is_object() {
@@ -1447,17 +1561,56 @@ fn regression_identities(
     Ok((format!("{:x}", Sha256::digest(plan_bytes)), identities))
 }
 
-fn hash_regular_path(path: &Path, limit: u64, stop: &AtomicBool) -> Result<String, String> {
+fn hash_regular_path(
+    path: &Path,
+    anchor: Option<&Path>,
+    limit: u64,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    use std::path::Component;
     check_stop(stop)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid artifact filename")?;
+    // The selected root's ancestors may contain aliases. Descendants may not:
+    // walk them from the root descriptor instead of resolving their parent.
+    let directory = if let Some(anchor) = anchor {
+        let relative = parent.strip_prefix(anchor).map_err(|e| e.to_string())?;
+        let mut directory = open_root(anchor)?;
+        for component in relative.components() {
+            match component {
+                Component::CurDir => (),
+                Component::Normal(name) => {
+                    let name = name.to_str().ok_or("invalid artifact directory")?;
+                    directory = open_child(&directory, name, true)?;
+                }
+                _ => return Err("artifact traversal is unsupported".into()),
+            }
+        }
+        directory
+    } else {
+        // Unknown external artifacts have no supplied root to anchor against.
+        // Require a physical path so an alternate spelling cannot turn a
+        // descendant symlink into a trusted artifact parent.
+        open_strict_root(parent)?
+    };
+    let file = open_child(&directory, name, false)?;
+    let observer = file.try_clone().map_err(|e| e.to_string())?;
+    let before = observer.metadata().map_err(|e| e.to_string())?;
+    if !same_single_link_file(&before, &before) {
+        return Err("artifact must be a single-link regular file".into());
     }
-    let file = options.open(path).map_err(|e| e.to_string())?;
-    hash_open_regular(file, limit, stop)
+    let hash = hash_open_regular(file, limit, stop)?;
+    let after = observer.metadata().map_err(|e| e.to_string())?;
+    if !same_single_link_file(&before, &after) {
+        return Err("artifact changed while hashing".into());
+    }
+    Ok(hash)
 }
 
 fn hash_open_regular(mut file: File, limit: u64, stop: &AtomicBool) -> Result<String, String> {
@@ -1762,9 +1915,27 @@ fn common_identities(
     }) {
         return Err("target model or codec changed during loading".into());
     }
-    let candidate_sha256 = hash_regular_path(&options.candidate_file, 256 * 1024 * 1024, stop)?;
-    let evaluator_sha256 =
-        hash_regular_path(&options.evaluator_file, 2 * 1024 * 1024 * 1024, stop)?;
+    let root_for = |path: &Path| {
+        if path.starts_with(options.data_root) {
+            Some(options.data_root)
+        } else if path.starts_with(&options.model_dir) {
+            Some(options.model_dir.as_path())
+        } else {
+            None
+        }
+    };
+    let candidate_sha256 = hash_regular_path(
+        &options.candidate_file,
+        root_for(&options.candidate_file),
+        256 * 1024 * 1024,
+        stop,
+    )?;
+    let evaluator_sha256 = hash_regular_path(
+        &options.evaluator_file,
+        root_for(&options.evaluator_file),
+        2 * 1024 * 1024 * 1024,
+        stop,
+    )?;
     let r2t2_sha256 = options
         .r2t2
         .as_ref()
@@ -1929,7 +2100,7 @@ pub fn verify_registration(
 ) -> Result<RegisteredDevelopment, String> {
     check_stop(stop)?;
     let directory = open_root(destination)?;
-    let bytes = read_child(&directory, "protocol.json", 32 * 1024 * 1024, stop)?;
+    let bytes = read_single_link_child(&directory, "protocol.json", 32 * 1024 * 1024, stop)?;
     let registration = verify_open_registration(options, &directory, &bytes, stop)?;
     let parent = destination
         .parent()

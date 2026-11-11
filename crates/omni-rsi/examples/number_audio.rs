@@ -2,8 +2,8 @@
 use omni_rsi::{
     lease::Lease,
     number_v3_evaluation::{
-        V3AsrMode, V3Options, evaluate_v3, evaluate_v3_voice, preregister_v3,
-        preregister_v3_with_asr,
+        V3AsrMode, V3Options, evaluate_chinese_v3, evaluate_v3, evaluate_v3_voice,
+        preregister_chinese_v3, preregister_v3, preregister_v3_with_asr, recheck_chinese_v3,
     },
     speech_asr,
     speech_audio_data::generate_rule_manifest,
@@ -28,7 +28,7 @@ type ModelBackend = burn::backend::NdArray<f32>;
 compile_error!("select the cpu or metal feature");
 type TrainingBackend = burn::backend::Autodiff<ModelBackend>;
 
-const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n  number_audio preregister-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR [TOOL OPTIONS]\n  number_audio dev-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON [TOOL OPTIONS]\n\nTOOL OPTIONS: --r2t2-model PATH --r2t2-binary PATH [--r2t2-mode cpu-f32|metal-f16] --breeze-model PATH --breeze-binary PATH. For dev-v3 with R2T2, --voice-dir NEW_DIRECTORY is required. Reports never activate a candidate.";
+const USAGE: &str = "Usage:\n  number_audio fingerprint-tts BREEZE_MODEL BREEZE_BINARY\n  number_audio fingerprint-asr R2T2_MODEL R2T2_BINARY\n  number_audio verify-input WAV R2T2_MODEL R2T2_BINARY\n  number_audio encode-target MODEL_DIR ANSWER_WAV\n  number_audio build DATA_DIR PLAN_JSON\n  number_audio dev MODEL_DIR DATA_DIR STATE_DIR REPORT_JSON [R2T2_MODEL R2T2_BINARY]\n  number_audio preregister-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR [TOOL OPTIONS]\n  number_audio dev-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON [TOOL OPTIONS]\n  number_audio preregister-chinese-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR\n  number_audio dev-chinese-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON\n  number_audio recheck-chinese-v3 MODEL_DIR DATA_DIR STATE_DIR REGISTRATION_DIR REPORT_JSON\n\nTOOL OPTIONS: --r2t2-model PATH --r2t2-binary PATH [--r2t2-mode cpu-f32|metal-f16] --breeze-model PATH --breeze-binary PATH. For dev-v3 with R2T2, --voice-dir NEW_DIRECTORY is required. Reports never activate a candidate.";
 
 #[derive(Default)]
 struct LocalTools {
@@ -186,11 +186,24 @@ fn execute() -> Result<(), String> {
                 serde_json::to_string(&result).map_err(|error| error.to_string())?
             );
         }
-        Some(command @ ("preregister-v3" | "dev-v3")) => {
-            let is_registration = command == "preregister-v3";
+        Some(
+            command @ ("preregister-v3"
+            | "dev-v3"
+            | "preregister-chinese-v3"
+            | "dev-chinese-v3"
+            | "recheck-chinese-v3"),
+        ) => {
+            let is_registration = matches!(command, "preregister-v3" | "preregister-chinese-v3");
+            let is_chinese = matches!(
+                command,
+                "preregister-chinese-v3" | "dev-chinese-v3" | "recheck-chinese-v3"
+            );
             let positional = if is_registration { 5 } else { 6 };
             if args.len() < positional {
                 return Err(USAGE.into());
+            }
+            if is_chinese && args.len() != positional {
+                return Err("Chinese text regression takes no speech tool options".into());
             }
             let tools = local_tools(&args[positional..])?;
             validate_v3_tool_options(is_registration, &tools)?;
@@ -220,7 +233,13 @@ fn execute() -> Result<(), String> {
                     .zip(tools.breeze_binary.as_deref()),
             };
             let mode = tools.r2t2_mode.unwrap_or(V3AsrMode::MetalF16);
-            let result = if is_registration && options.r2t2.is_some() {
+            let result = if command == "preregister-chinese-v3" {
+                preregister_chinese_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
+            } else if command == "dev-chinese-v3" {
+                evaluate_chinese_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
+            } else if command == "recheck-chinese-v3" {
+                recheck_chinese_v3::<TrainingBackend>(&options, &Default::default(), &stop)?
+            } else if is_registration && options.r2t2.is_some() {
                 preregister_v3_with_asr::<TrainingBackend>(
                     &options,
                     &Default::default(),
@@ -264,6 +283,9 @@ mod tests {
     fn help_lists_explicit_v3_registration_and_development_commands() {
         assert!(USAGE.contains("preregister-v3"));
         assert!(USAGE.contains("dev-v3"));
+        assert!(USAGE.contains("preregister-chinese-v3"));
+        assert!(USAGE.contains("dev-chinese-v3"));
+        assert!(USAGE.contains("recheck-chinese-v3"));
     }
     #[test]
     fn local_tool_options_require_complete_unique_pairs() {
