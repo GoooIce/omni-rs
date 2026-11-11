@@ -3,6 +3,8 @@
 //! The guarded interface owns both the PCM stream and reducer. It does not
 //! load weights or manage a playback device or a producer stop barrier.
 
+pub mod software_output;
+
 use std::{
     fmt,
     sync::{
