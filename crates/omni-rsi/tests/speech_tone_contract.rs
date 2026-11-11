@@ -14,7 +14,7 @@ fn synthetic_record(root: &Path, split: ToneSplit, id: &str, seed: i16) -> ToneR
     let directory = match split {
         ToneSplit::Train => "train",
         ToneSplit::Dev => "dev",
-        ToneSplit::Holdout => panic!("the shared contract fixture has no holdout audio"),
+        ToneSplit::Holdout => "holdout",
     };
     fs::create_dir_all(root.join(directory)).unwrap();
     let path = format!("{directory}/{id}.wav");
@@ -227,6 +227,33 @@ fn public_groups_reject_cross_split_and_allow_same_split_reuse() {
             }
             assert_both_reject(&cross_split, root.path(), group.name());
         }
+    }
+}
+
+#[test]
+fn public_groups_allow_same_holdout_reuse() {
+    for group in [
+        Group::Speaker,
+        Group::Session,
+        Group::DerivedFamily,
+        Group::TextFamily,
+        Group::AudioHash,
+    ] {
+        let (root, mut data) = fixture();
+        data.records.push(synthetic_record(
+            root.path(),
+            ToneSplit::Holdout,
+            "holdout-a",
+            5,
+        ));
+        data.records.push(synthetic_record(
+            root.path(),
+            ToneSplit::Holdout,
+            "holdout-b",
+            6,
+        ));
+        group.copy(&mut data, root.path(), 4, 5);
+        assert_both_accept(&data, root.path());
     }
 }
 
