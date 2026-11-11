@@ -81,7 +81,7 @@ fn public_commitment_exposes_no_answer_number_or_audio_path() {
     assert_eq!(value.as_object().unwrap().len(), 3);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[test]
 fn custodian_seals_use_distinct_secret_salts_and_private_files() {
     use std::os::unix::fs::PermissionsExt;
@@ -252,7 +252,7 @@ fn source_evidence_is_never_published() {
     assert!(!public.contains("private-reviewer"));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[test]
 fn source_evidence_is_persisted_in_the_private_manifest() {
     let seal = seal_for_custodian(&manifest_with_source_evidence()).unwrap();
@@ -267,14 +267,25 @@ fn source_evidence_is_persisted_in_the_private_manifest() {
     );
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "macos"))]
 #[test]
-fn private_persistence_is_rejected_on_unsupported_platforms() {
+fn private_persistence_without_verifiable_acl_fails_closed() {
     let seal = seal_for_custodian(&manifest_with_source_evidence()).unwrap();
     let root = tempfile::tempdir().unwrap();
+    // A supported Linux temporary directory can inherit a safe ACL. Remove
+    // both ACLs deliberately rather than assuming its initial state.
+    #[cfg(all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    remove_linux_acls(root.path());
     let private = root.path().join("private");
     let error = seal.persist_private(&private).unwrap_err();
-    assert!(error.contains("not supported"), "{error}");
+    assert!(
+        error.contains("not supported") || error.contains("unsupported") || error.contains("ACL"),
+        "{error}"
+    );
     assert!(!private.exists());
     let media = root.path().join("media");
     std::fs::create_dir(&media).unwrap();
@@ -285,8 +296,46 @@ fn private_persistence_is_rejected_on_unsupported_platforms() {
     )
     .unwrap();
     let error = seal.persist_private(&private).unwrap_err();
-    assert!(error.contains("not supported"), "{error}");
+    assert!(
+        error.contains("not supported") || error.contains("unsupported") || error.contains("ACL"),
+        "{error}"
+    );
     assert!(!private.exists());
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn remove_linux_acls(directory: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+
+    let dir = std::fs::File::open(directory).unwrap();
+    for name in [c"system.posix_acl_default", c"system.posix_acl_access"] {
+        let result = unsafe { libc::fremovexattr(dir.as_raw_fd(), name.as_ptr()) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENODATA | libc::EOPNOTSUPP | libc::ENOSYS)
+                ),
+                "cannot remove {name:?}: {error}"
+            );
+        }
+        let result =
+            unsafe { libc::fgetxattr(dir.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_eq!(result, -1, "{name:?} is still readable");
+        let error = std::io::Error::last_os_error();
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENODATA | libc::EOPNOTSUPP | libc::ENOSYS)
+            ),
+            "unexpected {name:?} status: {error}"
+        );
+    }
 }
 
 #[cfg(unix)]

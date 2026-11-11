@@ -17,6 +17,57 @@ const MAX_TOTAL_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 #[path = "number_blind_holdout_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+mod unsupported_acl_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_acl_platform_does_not_reserve_or_open_a_holdout() {
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        std::fs::write(media.join("synthetic.wav"), b"synthetic").unwrap();
+        let manifest = BlindManifest {
+            cases: vec![BlindCase {
+                case_id: "synthetic".into(),
+                spoken_number: 1,
+                answer: 2,
+                audio_file: "synthetic.wav".into(),
+                audio_sha256: format!("{:x}", Sha256::digest(b"synthetic")),
+                recording_sha256: "1".repeat(64),
+                family_sha256: "2".repeat(64),
+                speaker_sha256: "3".repeat(64),
+                session_sha256: "4".repeat(64),
+                private_source: serde_json::Map::new(),
+            }],
+        };
+        let seal = seal_for_custodian_with_media_metadata(&manifest, &media).unwrap();
+        let ledger = root.path().join("ledger");
+        let private = root.path().join("not-opened");
+        crate::private_acl::simulate_unsupported(|| {
+            let error = seal
+                .persist_private(&private)
+                .err()
+                .expect("private persistence accepted");
+            assert!(
+                error.contains("ACL") || error.contains("not supported"),
+                "{error}"
+            );
+            let error = open_once(
+                seal.public(),
+                synthetic_verified_development(seal.public()),
+                &ledger,
+                &private,
+            )
+            .err()
+            .expect("unsupported ACL platform accepted");
+            assert!(error.contains("ACL"), "{error}");
+            assert!(!ledger.exists());
+            assert!(!private.exists());
+        });
+    }
+}
+
 // One identity schema drives both flat wire formats, the conversion and its
 // validation, while preserving existing public Rust fields and JSON bytes.
 macro_rules! blind_identity_types {
@@ -179,6 +230,25 @@ pub struct VerifiedDevelopment {
     candidate_sha256: String,
 }
 
+impl VerifiedDevelopment {
+    pub(crate) fn identities(&self) -> (&str, &str, &str) {
+        (
+            &self.metadata_sha256,
+            &self.protocol_sha256,
+            &self.candidate_sha256,
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_verified_development(public: &PublicMetadata) -> VerifiedDevelopment {
+    VerifiedDevelopment {
+        metadata_sha256: public.fingerprint().expect("synthetic metadata"),
+        protocol_sha256: "1".repeat(64),
+        candidate_sha256: "2".repeat(64),
+    }
+}
+
 pub struct OpenedHoldout {
     manifest: BlindManifest,
     audio: Vec<Vec<u8>>,
@@ -193,13 +263,11 @@ impl OpenedHoldout {
     }
 }
 
-/// Requires an opaque verified-development permit before accessing any private files.
-pub fn open_once(
+/// Validate a permit without examining the ledger or private files.
+pub(crate) fn verify_development_metadata(
     public: &PublicMetadata,
-    verified: VerifiedDevelopment,
-    ledger_directory: &std::path::Path,
-    private_directory: &std::path::Path,
-) -> Result<OpenedHoldout, String> {
+    verified: &VerifiedDevelopment,
+) -> Result<PublicMetadata, String> {
     let checked = PublicMetadata::from_json(&public.to_json()?)?;
     if checked.fingerprint()? != verified.metadata_sha256
         || !valid_hash(&verified.protocol_sha256)
@@ -210,6 +278,42 @@ pub fn open_once(
     if checked.version != 2 {
         return Err("public holdout metadata lacks a committed media capacity".into());
     }
+    Ok(checked)
+}
+
+/// Requires an opaque verified-development permit before accessing private files.
+/// Linux accepts only explicitly owner-only ACLs on verified tmpfs or btrfs;
+/// ambiguous or unsupported ACL/filesystem results fail before reservation.
+pub fn open_once(
+    public: &PublicMetadata,
+    verified: VerifiedDevelopment,
+    ledger_directory: &std::path::Path,
+    private_directory: &std::path::Path,
+) -> Result<OpenedHoldout, String> {
+    // An unverifiable platform must not consume a one-shot reservation.
+    verify_development_metadata(public, &verified)?;
+    crate::private_acl::ensure_supported()?;
+    #[cfg(all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    private_directory_metadata(private_directory)?;
+    let reserved = reserve_holdout(public, verified, ledger_directory)?;
+    open_reserved(reserved, private_directory, None)
+}
+
+/// An internal, single-use result of a durably recorded reservation.
+pub(crate) struct ReservedHoldout {
+    checked: PublicMetadata,
+}
+
+pub(crate) fn reserve_holdout(
+    public: &PublicMetadata,
+    verified: VerifiedDevelopment,
+    ledger_directory: &std::path::Path,
+) -> Result<ReservedHoldout, String> {
+    let checked = verify_development_metadata(public, &verified)?;
     crate::number_holdout_ledger::record_attempt(
         ledger_directory,
         &crate::number_holdout_ledger::Reservation {
@@ -236,22 +340,47 @@ pub fn open_once(
     {
         unsafe { libc::_exit(73) }
     }
+    Ok(ReservedHoldout { checked })
+}
+
+/// Inspect only the directory metadata. This never opens the private files.
+pub(crate) fn private_directory_metadata(
+    private_directory: &std::path::Path,
+) -> Result<std::fs::Metadata, String> {
     let directory =
         std::fs::symlink_metadata(private_directory).map_err(|error| error.to_string())?;
     if !directory.is_dir() || directory.file_type().is_symlink() {
         return Err("invalid private holdout directory".into());
     }
+    let file = crate::private_acl::checked_directory(private_directory)?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    crate::private_acl::ensure_current_owner(&opened)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if directory.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if directory.dev() != opened.dev() || directory.ino() != opened.ino() {
+            return Err("private holdout directory changed during verification".into());
+        }
+        if opened.permissions().mode() & 0o077 != 0 {
             return Err("private holdout directory lacks private permissions".into());
         }
     }
-    let salt = read_private_file(private_directory, "salt.bin", 32)?;
+    Ok(opened)
+}
+
+pub(crate) fn open_reserved(
+    reserved: ReservedHoldout,
+    private_directory: &std::path::Path,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<OpenedHoldout, String> {
+    let checked = reserved.checked;
+    check_open_cancel(stop)?;
+    private_directory_metadata(private_directory)?;
+    let salt = read_private_file(private_directory, "salt.bin", 32, stop)?;
     let salt: [u8; 32] = salt.try_into().map_err(|_| "invalid secret salt length")?;
-    let manifest_bytes = read_private_file(private_directory, "manifest.json", MAX_MANIFEST_BYTES)?;
-    let media_sizes = read_private_file(private_directory, "media-sizes.bin", 10_001 * 8)?;
+    let manifest_bytes =
+        read_private_file(private_directory, "manifest.json", MAX_MANIFEST_BYTES, stop)?;
+    let media_sizes = read_private_file(private_directory, "media-sizes.bin", 10_001 * 8, stop)?;
     if manifest_commitment_v2(&salt, &manifest_bytes, &media_sizes) != checked.content_sha256 {
         return Err("private holdout commitment mismatch".into());
     }
@@ -290,14 +419,19 @@ pub fn open_once(
     let mut total = 0_u64;
     let mut audio = Vec::with_capacity(manifest.cases.len());
     for (case, size) in manifest.cases.iter().zip(sizes) {
-        let bytes = read_private_file(private_directory, &case.audio_file, MAX_MEDIA_BYTES)?;
+        let bytes = read_private_file(private_directory, &case.audio_file, MAX_MEDIA_BYTES, stop)?;
         total = total
             .checked_add(bytes.len() as u64)
             .ok_or("private holdout audio too large")?;
+        let mut audio_hash = Sha256::new();
+        for chunk in bytes.chunks(64 * 1024) {
+            check_open_cancel(stop)?;
+            audio_hash.update(chunk);
+        }
         if bytes.len() as u64 != size
             || total > audio_total_bytes
             || bytes.is_empty()
-            || format!("{:x}", Sha256::digest(&bytes)) != case.audio_sha256
+            || format!("{:x}", audio_hash.finalize()) != case.audio_sha256
         {
             return Err("private holdout audio mismatch or size limit".into());
         }
@@ -309,22 +443,33 @@ pub fn open_once(
     Ok(OpenedHoldout { manifest, audio })
 }
 
+fn check_open_cancel(stop: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        Err("interrupted".into())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn read_private_file(
     directory: &std::path::Path,
     name: &str,
     limit: usize,
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>, String> {
     use std::{
         fs::OpenOptions,
         io::Read,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
+    check_open_cancel(stop)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(directory.join(name))
         .map_err(|error| error.to_string())?;
+    crate::private_acl::ensure_safe_acl(&file)?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() > limit as u64 {
         return Err("invalid private holdout file".into());
@@ -333,9 +478,16 @@ fn read_private_file(
         return Err("secret salt lacks private permissions".into());
     }
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+    let mut file = file.take(limit as u64 + 1);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_open_cancel(stop)?;
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
     if bytes.len() > limit || bytes.len() as u64 != metadata.len() {
         return Err("private holdout file changed or exceeded its limit".into());
     }
@@ -343,7 +495,12 @@ fn read_private_file(
 }
 
 #[cfg(not(unix))]
-fn read_private_file(_: &std::path::Path, _: &str, _: usize) -> Result<Vec<u8>, String> {
+fn read_private_file(
+    _: &std::path::Path,
+    _: &str,
+    _: usize,
+    _: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<u8>, String> {
     Err("private holdout reading is not supported on this platform".into())
 }
 
@@ -373,18 +530,31 @@ impl CustodianSeal {
     }
 
     /// Custodian-only creation of a new private directory. No existing secret is read.
+    /// Linux requires verified tmpfs or btrfs and explicitly readable owner-only access
+    /// and default ACLs; ambiguous ACL results fail before creating secrets.
     #[cfg(unix)]
     pub fn persist_private(&self, directory: &std::path::Path) -> Result<(), String> {
         use std::{
             fs::{DirBuilder, File, OpenOptions},
             io::Write,
-            os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+            os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         };
 
+        let parent = directory
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        crate::private_acl::checked_directory(parent)?;
         DirBuilder::new()
             .mode(0o700)
             .create(directory)
             .map_err(|error| error.to_string())?;
+        let private_directory = crate::private_acl::checked_directory(directory)?;
+        crate::private_acl::ensure_current_owner(
+            &private_directory
+                .metadata()
+                .map_err(|error| error.to_string())?,
+        )?;
         let mut files = vec![
             ("salt.bin", self.secret_salt.as_slice()),
             ("manifest.json", self.manifest_bytes.as_slice()),
@@ -399,18 +569,20 @@ impl CustodianSeal {
                 .mode(0o600)
                 .open(directory.join(name))
                 .map_err(|error| error.to_string())?;
+            crate::private_acl::ensure_safe_acl(&output)?;
+            let metadata = output.metadata().map_err(|error| error.to_string())?;
+            crate::private_acl::ensure_current_owner(&metadata)?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+                return Err("private holdout file lacks owner read/write permissions".into());
+            }
             output
                 .write_all(contents)
                 .and_then(|_| output.sync_all())
                 .map_err(|error| error.to_string())?;
         }
-        File::open(directory)
-            .and_then(|file| file.sync_all())
+        private_directory
+            .sync_all()
             .map_err(|error| error.to_string())?;
-        let parent = directory
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
         File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;
