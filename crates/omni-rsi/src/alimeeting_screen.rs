@@ -102,12 +102,16 @@ struct Report {
     deferred: Vec<Deferred>,
 }
 
+fn trim_number_punctuation(normalized: &str) -> (&str, &str) {
+    let is_boundary = |ch: char| ch.is_whitespace() || ",，。.!！?？、:：;；".contains(ch);
+    let without_prefix = normalized.trim_start_matches(is_boundary);
+    let prefix = &normalized[..normalized.len() - without_prefix.len()];
+    (prefix, without_prefix.trim_end_matches(is_boundary))
+}
+
 // The scoring parser accepts answer labels and many extra forms. This lexical
 // gate first restricts it to the documented whole-number-v1 vocabulary.
-fn whole_number(mark: &str) -> Option<u8> {
-    let normalized: String = mark.nfkc().collect();
-    let text = normalized
-        .trim_matches(|ch: char| ch.is_whitespace() || ",，。.!！?？、:：;；".contains(ch));
+fn whole_number(text: &str) -> Option<u8> {
     if text.is_empty() {
         return None;
     }
@@ -138,27 +142,19 @@ fn whole_number(mark: &str) -> Option<u8> {
 // NFKC can convert circled or superscript characters to digits, and stripping
 // a leading period can turn a decimal fragment into an integer. Keep those
 // lexical matches visible for review without assigning a candidate number.
-fn ambiguous_notation(mark: &str) -> bool {
+fn ambiguous_notation(mark: &str, prefix: &str) -> bool {
     let chinese_digits = "零〇一二两三四五六七八九十";
-    if mark.chars().any(|ch| {
+    if prefix.contains('.') {
+        return true;
+    }
+    mark.chars().any(|ch| {
         if ch.is_ascii_digit() || ('０'..='９').contains(&ch) || chinese_digits.contains(ch) {
             return false;
         }
         ch.to_string()
             .nfkc()
             .any(|normalized| normalized.is_ascii_digit() || chinese_digits.contains(normalized))
-    }) {
-        return true;
-    }
-    let normalized: String = mark.nfkc().collect();
-    let text = normalized
-        .trim_matches(|ch: char| ch.is_whitespace() || ",，。!！?？、:：;；".contains(ch));
-    text.starts_with('.')
-        && text
-            .trim_start_matches(|ch: char| ch == '.' || ch.is_whitespace())
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_digit() || chinese_digits.contains(ch))
+    })
 }
 
 fn recording_id(relative: &str) -> Result<String, String> {
@@ -311,7 +307,9 @@ pub fn screen(input: &Path, output: &Path) -> Result<(), String> {
                 return Err("total intervals exceed limit".into());
             }
             for (interval_offset, interval) in tier.intervals.iter().enumerate() {
-                let Some(number) = whole_number(&interval.mark) else {
+                let normalized: String = interval.mark.nfkc().collect();
+                let (prefix, text) = trim_number_punctuation(&normalized);
+                let Some(number) = whole_number(text) else {
                     continue;
                 };
                 let neighbor_has_text = interval_offset
@@ -341,15 +339,15 @@ pub fn screen(input: &Path, output: &Path) -> Result<(), String> {
                         &interval.mark,
                     ],
                 )?;
-                let reasons: &'static [&'static str] =
-                    match (ambiguous_notation(&interval.mark), neighbor_has_text) {
-                        (true, true) => {
-                            &["ambiguous_numeric_notation", "adjacent_nonempty_interval"]
-                        }
-                        (true, false) => &["ambiguous_numeric_notation"],
-                        (false, true) => &["adjacent_nonempty_interval"],
-                        (false, false) => &[],
-                    };
+                let reasons: &'static [&'static str] = match (
+                    ambiguous_notation(&interval.mark, prefix),
+                    neighbor_has_text,
+                ) {
+                    (true, true) => &["ambiguous_numeric_notation", "adjacent_nonempty_interval"],
+                    (true, false) => &["ambiguous_numeric_notation"],
+                    (false, true) => &["adjacent_nonempty_interval"],
+                    (false, false) => &[],
+                };
                 if let Some(&reason) = reasons.first() {
                     deferred.push(Deferred {
                         source_file: relative.clone(),

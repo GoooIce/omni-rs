@@ -336,6 +336,78 @@ fn leading_period_before_chinese_number_is_deferred() {
 }
 
 #[test]
+fn mixed_leading_punctuation_with_a_period_is_deferred() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("textgrid_dir");
+    fs::create_dir(&input).unwrap();
+    let ambiguous = [
+        ".,一",
+        "．，一",
+        ".,1",
+        "，．１",
+        ",.一",
+        "，.1",
+        ".，十",
+        ". , \t一",
+        "！．、１２",
+        "，．，两",
+    ];
+    let unambiguous = [
+        (",一", 1),
+        ("，１", 1),
+        ("。一", 1),
+        ("一.", 1),
+        ("十二。", 12),
+        (" １２， ", 12),
+    ];
+    let rejected = [".", "。", "1.2", "．，一二", "．，01", "正文.,一"];
+    for (index, mark) in ambiguous
+        .iter()
+        .copied()
+        .chain(unambiguous.iter().map(|(mark, _)| *mark))
+        .chain(rejected)
+        .enumerate()
+    {
+        fs::write(
+            input.join(format!("R{index:04}.TextGrid")),
+            single_interval("c1", mark),
+        )
+        .unwrap();
+    }
+    let output = root.join("candidates.json");
+    let result = run_cli(&input, &output);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(report["summary"]["candidate_count"], unambiguous.len());
+    assert_eq!(
+        report["summary"]["deferred_ambiguous_notation_count"],
+        ambiguous.len()
+    );
+    let candidates = report["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), unambiguous.len());
+    for (row, (mark, number)) in candidates.iter().zip(unambiguous) {
+        assert_eq!(row["mark"], mark);
+        assert_eq!(row["candidate_number"], number);
+    }
+    let deferred = report["deferred"].as_array().unwrap();
+    assert_eq!(deferred.len(), ambiguous.len());
+    for (row, mark) in deferred.iter().zip(ambiguous) {
+        assert_eq!(row["mark"], mark);
+        assert_eq!(row["reason"], "ambiguous_numeric_notation");
+        assert_eq!(
+            row["reasons"],
+            serde_json::json!(["ambiguous_numeric_notation"])
+        );
+        assert!(row.get("candidate_number").is_none());
+    }
+}
+
+#[test]
 fn compatibility_digits_and_leading_decimal_are_deferred_for_review() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -370,12 +442,17 @@ fn ambiguous_notation_and_neighbor_context_are_both_reported() {
     let root = temp.path().canonicalize().unwrap();
     let input = root.join("textgrid_dir");
     fs::create_dir(&input).unwrap();
-    let grid = "File type = \"ooTextFile\"\nObject class = \"TextGrid\"\nxmin = 0\nxmax = 2\n\
-        tiers? <exists>\nsize = 1\nitem []:\nitem [1]:\nclass = \"IntervalTier\"\n\
-        name = \"c1\"\nxmin = 0\nxmax = 2\nintervals: size = 2\n\
-        intervals [1]:\nxmin = 0\nxmax = 1\ntext = \".一\"\n\
-        intervals [2]:\nxmin = 1\nxmax = 2\ntext = \"个\"\n";
-    fs::write(input.join("R0001.TextGrid"), grid).unwrap();
+    let marks = [".一", ".,一", "．，１"];
+    for (index, mark) in marks.iter().enumerate() {
+        let grid = format!(
+            "File type = \"ooTextFile\"\nObject class = \"TextGrid\"\nxmin = 0\nxmax = 2\n\
+             tiers? <exists>\nsize = 1\nitem []:\nitem [1]:\nclass = \"IntervalTier\"\n\
+             name = \"c1\"\nxmin = 0\nxmax = 2\nintervals: size = 2\n\
+             intervals [1]:\nxmin = 0\nxmax = 1\ntext = \"{mark}\"\n\
+             intervals [2]:\nxmin = 1\nxmax = 2\ntext = \"个\"\n"
+        );
+        fs::write(input.join(format!("R{index:04}.TextGrid")), grid).unwrap();
+    }
     let output = root.join("candidates.json");
     let result = run_cli(&input, &output);
     assert!(
@@ -385,17 +462,22 @@ fn ambiguous_notation_and_neighbor_context_are_both_reported() {
     );
     let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
     assert_eq!(report["summary"]["candidate_count"], 0);
-    assert_eq!(report["summary"]["deferred_adjacent_count"], 1);
-    assert_eq!(report["summary"]["deferred_ambiguous_notation_count"], 1);
+    assert_eq!(report["summary"]["deferred_adjacent_count"], marks.len());
     assert_eq!(
-        report["deferred"][0]["reason"],
-        "ambiguous_numeric_notation"
+        report["summary"]["deferred_ambiguous_notation_count"],
+        marks.len()
     );
-    assert_eq!(
-        report["deferred"][0]["reasons"],
-        serde_json::json!(["ambiguous_numeric_notation", "adjacent_nonempty_interval"])
-    );
-    assert!(report["deferred"][0].get("candidate_number").is_none());
+    let deferred = report["deferred"].as_array().unwrap();
+    assert_eq!(deferred.len(), marks.len());
+    for (row, mark) in deferred.iter().zip(marks) {
+        assert_eq!(row["mark"], mark);
+        assert_eq!(row["reason"], "ambiguous_numeric_notation");
+        assert_eq!(
+            row["reasons"],
+            serde_json::json!(["ambiguous_numeric_notation", "adjacent_nonempty_interval"])
+        );
+        assert!(row.get("candidate_number").is_none());
+    }
 }
 
 #[test]
