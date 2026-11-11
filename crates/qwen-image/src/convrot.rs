@@ -212,8 +212,8 @@ mod tests {
             let mut direct = 0.0;
             let mut rotated = 0.0;
             for k in 0..4 {
-                direct += x[0 * 4 + k] * w[row * 4 + k];
-                rotated += x_rot[0 * 4 + k] * w_rot[row * 4 + k];
+                direct += x[k] * w[row * 4 + k];
+                rotated += x_rot[k] * w_rot[row * 4 + k];
             }
             assert!((direct - rotated).abs() < 1.0e-4, "{direct} != {rotated}");
         }

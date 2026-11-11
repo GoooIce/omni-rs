@@ -8,6 +8,7 @@
 //! CUBECL_DEBUG_OPTION=profile CUBECL_DEBUG_LOG=1 cargo test --release \
 //!   --features metal --test fusion_probe -- --ignored --nocapture
 //! ```
+#![cfg(feature = "metal")]
 
 use burn::backend::wgpu::Metal;
 use burn::tensor::{FloatDType, Tensor, TensorData, backend::Backend};
