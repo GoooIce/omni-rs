@@ -3414,76 +3414,290 @@ fn voice_recheck_cpu_only_bad_tmpdir_unread_stderr_and_sigint_are_bounded() {
 #[cfg(all(target_os = "macos", feature = "cpu"))]
 #[test]
 #[ignore = "requires the separately built native number_voice_recheck example"]
-fn voice_recheck_cli_reports_unusable_tmpdir() {
+fn voice_recheck_cli_rejects_registration_error_as_tmpdir_error() {
     use std::{os::unix::fs::PermissionsExt, process::Command};
     let root = tempfile::tempdir().unwrap();
-    let missing = root.path().join("missing");
-    let ordinary_file = root.path().join("not-a-directory");
-    let readonly = root.path().join("not-writable");
+    let root = fs::canonicalize(root.path()).unwrap();
+    let writable = root.join("writable-tmp");
+    fs::create_dir(&writable).unwrap();
+    let probe = writable.join("same-uid-write-probe");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .unwrap();
+    fs::remove_file(probe).unwrap();
+    let registration = root.join("intentionally-missing-registration");
+    assert_eq!(
+        fs::symlink_metadata(&registration).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    assert_eq!(
+        fs::metadata(&example).unwrap().permissions().mode() & 0o6000,
+        0,
+        "CLI must inherit the test uid and gid"
+    );
+    let mut command = Command::new(example);
+    command
+        .arg(root.join("unused-model"))
+        .arg(root.join("unused-data"))
+        .arg(root.join("unused-candidate"))
+        .arg(root.join("unused-evaluator"))
+        .arg(&registration)
+        .arg(root.join("unused-report"))
+        .arg(root.join("unused-voice"))
+        .args(["cpu", "unused-r2t2-model", "unused-r2t2-binary"])
+        .env("TMPDIR", &writable);
+    let (status, stdout, stderr) = voice_recheck_command_output(command);
+    assert!(!status.success());
+    assert!(stdout.is_empty());
+    let error = String::from_utf8_lossy(&stderr);
+    assert!(
+        error.contains("voice recheck worker failed")
+            && error.contains("cannot open artifact without following links"),
+        "{error}"
+    );
+    assert!(
+        error.contains("os error 2"),
+        "control must reproduce the legacy false positive: {error}"
+    );
+    eprintln!(
+        "TMPDIR_NEGATIVE_CONTROL writable=true registration_missing=true legacy_match={} exact_match={} stderr={error:?}",
+        error.contains("os error"),
+        voice_recheck_is_tmpdir_error(&error, libc::ENOENT)
+    );
+    assert!(
+        !voice_recheck_is_tmpdir_error(&error, libc::ENOENT),
+        "registration failure was mistaken for a TMPDIR failure: {error}"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_is_tmpdir_error(error: &str, errno: i32) -> bool {
+    error
+        == format!(
+            "number_voice_recheck: {}\n",
+            std::io::Error::from_raw_os_error(errno)
+        )
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+struct VoiceTmpCase {
+    name: &'static str,
+    path: std::path::PathBuf,
+    errno: i32,
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+struct VoiceTmpCases {
+    _root: tempfile::TempDir,
+    root: std::path::PathBuf,
+    cases: Vec<VoiceTmpCase>,
+    readonly_skipped: bool,
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_tmp_cases(readonly_mode: u32) -> VoiceTmpCases {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = fs::canonicalize(root.path()).unwrap();
+    let missing = path.join("missing");
+    let ordinary_file = path.join("not-a-directory");
+    let readonly = path.join("not-writable");
     fs::write(&ordinary_file, b"synthetic").unwrap();
     fs::create_dir(&readonly).unwrap();
-    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
-    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
-    for tmp in [missing, ordinary_file, readonly] {
-        for valid_args in [false, true] {
-            let mut command = Command::new(&example);
-            if valid_args {
-                command.args([
-                    "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu",
-                    "unused", "unused",
-                ]);
+    assert_eq!(
+        fs::symlink_metadata(&missing).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(
+        fs::symlink_metadata(&ordinary_file)
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+    let probe = |directory: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("same-uid-write-probe"))
+    };
+    let missing_error = probe(&missing).unwrap_err();
+    let not_dir_error = probe(&ordinary_file).unwrap_err();
+    assert_eq!(missing_error.raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(not_dir_error.raw_os_error(), Some(libc::ENOTDIR));
+    let mut cases = vec![
+        VoiceTmpCase {
+            name: "missing",
+            path: missing,
+            errno: libc::ENOENT,
+        },
+        VoiceTmpCase {
+            name: "not-a-directory",
+            path: ordinary_file,
+            errno: libc::ENOTDIR,
+        },
+    ];
+    let readonly_skipped =
+        match fs::set_permissions(&readonly, fs::Permissions::from_mode(readonly_mode)) {
+            Ok(()) => match probe(&readonly) {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    let errno = error
+                        .raw_os_error()
+                        .expect("permission denial must have an OS error");
+                    assert!(
+                        errno == libc::EACCES || errno == libc::EPERM,
+                        "unexpected permission error: {error}"
+                    );
+                    eprintln!(
+                        "TMPDIR_READONLY=PROBE_DENIED uid={} errno={errno}",
+                        unsafe { libc::geteuid() }
+                    );
+                    cases.push(VoiceTmpCase {
+                        name: "readonly",
+                        path: readonly,
+                        errno,
+                    });
+                    false
+                }
+                Ok(file) => {
+                    drop(file);
+                    fs::remove_file(readonly.join("same-uid-write-probe")).unwrap();
+                    eprintln!(
+                        "TMPDIR_READONLY=SKIPPED uid={} reason=same-uid-create-succeeded",
+                        unsafe { libc::geteuid() }
+                    );
+                    true
+                }
+                Err(error) => panic!("readonly permission probe was inconclusive: {error}"),
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) || error.raw_os_error() == Some(libc::EROFS) =>
+            {
+                eprintln!(
+                    "TMPDIR_READONLY=SKIPPED uid={} reason=cannot-set-mode error={error}",
+                    unsafe { libc::geteuid() }
+                );
+                true
             }
-            command.env("TMPDIR", &tmp);
+            Err(error) => panic!("cannot configure readonly permission probe: {error}"),
+        };
+    VoiceTmpCases {
+        _root: root,
+        root: path,
+        cases,
+        readonly_skipped,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn voice_recheck_assert_tmp_cases(
+    fixture: &VoiceTmpCases,
+    example: &std::ffi::OsStr,
+    cpu_only: bool,
+) {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    assert_eq!(
+        fs::metadata(example).unwrap().permissions().mode() & 0o6000,
+        0,
+        "CLI must inherit the probe uid and gid"
+    );
+    const USAGE_ERROR: &str = "number_voice_recheck: Usage: number_voice_recheck MODEL DATA CANDIDATE EVALUATOR REGISTRATION REPORT VOICE_DIR BACKEND R2T2_MODEL R2T2_BINARY [BREEZE_MODEL BREEZE_BINARY]\nReads only explicitly supplied development artifacts. It does not run a model, codec, ASR, or grant eligibility.\n";
+    const CPU_ERROR: &str =
+        "number_voice_recheck: voice recheck CLI requires the native feature for cancellation\n";
+    let registration = fixture.root.join("intentionally-missing-registration");
+    assert_eq!(
+        fs::symlink_metadata(&registration).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    for case in &fixture.cases {
+        for valid_args in [false, true] {
+            let mut command = Command::new(example);
+            if valid_args {
+                command
+                    .arg(fixture.root.join("unused-model"))
+                    .arg(fixture.root.join("unused-data"))
+                    .arg(fixture.root.join("unused-candidate"))
+                    .arg(fixture.root.join("unused-evaluator"))
+                    .arg(&registration)
+                    .arg(fixture.root.join("unused-report"))
+                    .arg(fixture.root.join("unused-voice"))
+                    .args(["cpu", "unused-r2t2-model", "unused-r2t2-binary"]);
+            }
+            command.env("TMPDIR", &case.path);
             let (status, stdout, stderr) = voice_recheck_command_output(command);
-            assert!(!status.success());
+            assert_eq!(status.code(), Some(1), "{} exited unexpectedly", case.name);
             assert!(stdout.is_empty());
             let error = String::from_utf8_lossy(&stderr);
-            assert!(
-                error.contains(if valid_args { "os error" } else { "Usage:" }),
-                "missing diagnostic: {error:?}"
-            );
+            if !valid_args {
+                assert_eq!(error, USAGE_ERROR, "{} usage diagnostic changed", case.name);
+            } else if cpu_only {
+                assert_eq!(
+                    error, CPU_ERROR,
+                    "{} CPU-only diagnostic changed",
+                    case.name
+                );
+            } else {
+                assert!(
+                    voice_recheck_is_tmpdir_error(&error, case.errno),
+                    "{} expected errno {} from TMPDIR, got {error:?}",
+                    case.name,
+                    case.errno
+                );
+            }
         }
+        eprintln!(
+            "TMPDIR_CASE_EXECUTED={} cli={}",
+            case.name,
+            if cpu_only { "cpu-only" } else { "native,cpu" }
+        );
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires the separately built native number_voice_recheck example"]
+fn voice_recheck_cli_reports_unusable_tmpdir() {
+    let fixture = voice_recheck_tmp_cases(0o500);
+    let example = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    voice_recheck_assert_tmp_cases(&fixture, &example, false);
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
 #[test]
 #[ignore = "requires the separately built CPU-only number_voice_recheck example"]
 fn voice_recheck_cpu_only_reports_unusable_tmpdir() {
-    use std::{os::unix::fs::PermissionsExt, process::Command};
-    let root = tempfile::tempdir().unwrap();
-    let missing = root.path().join("missing");
-    let ordinary_file = root.path().join("not-a-directory");
-    let readonly = root.path().join("not-writable");
-    fs::write(&ordinary_file, b"synthetic").unwrap();
-    fs::create_dir(&readonly).unwrap();
-    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
+    let fixture = voice_recheck_tmp_cases(0o500);
     let example =
         std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
-    for tmp in [missing, ordinary_file, readonly] {
-        for valid_args in [false, true] {
-            let mut command = Command::new(&example);
-            if valid_args {
-                command.args([
-                    "unused", "unused", "unused", "unused", "unused", "unused", "unused", "cpu",
-                    "unused", "unused",
-                ]);
-            }
-            command.env("TMPDIR", &tmp);
-            let (status, stdout, stderr) = voice_recheck_command_output(command);
-            assert!(!status.success());
-            assert!(stdout.is_empty());
-            let error = String::from_utf8_lossy(&stderr);
-            assert!(
-                error.contains(if valid_args {
-                    "requires the native feature"
-                } else {
-                    "Usage:"
-                }),
-                "missing diagnostic: {error:?}"
-            );
-        }
-    }
+    voice_recheck_assert_tmp_cases(&fixture, &example, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+#[ignore = "requires native and CPU-only number_voice_recheck examples"]
+fn voice_recheck_writable_permission_control_skips_only_readonly_case() {
+    let fixture = voice_recheck_tmp_cases(0o700);
+    assert!(
+        fixture.readonly_skipped,
+        "same-uid writable directory must skip the readonly case"
+    );
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.name)
+            .collect::<Vec<_>>(),
+        ["missing", "not-a-directory"]
+    );
+    let native = std::env::var_os("VOICE_RECHECK_EXAMPLE").expect("set VOICE_RECHECK_EXAMPLE");
+    let cpu = std::env::var_os("VOICE_RECHECK_CPU_EXAMPLE").expect("set VOICE_RECHECK_CPU_EXAMPLE");
+    voice_recheck_assert_tmp_cases(&fixture, &native, false);
+    voice_recheck_assert_tmp_cases(&fixture, &cpu, true);
 }
 
 #[cfg(all(target_os = "macos", feature = "cpu"))]
