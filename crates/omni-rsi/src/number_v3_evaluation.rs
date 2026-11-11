@@ -616,8 +616,8 @@ impl SelectedPath {
         }
         if !path.is_absolute() {
             let cwd = fs::canonicalize(".").map_err(|e| e.to_string())?;
-            if let Some(root) = roots.iter().find(|root| root.resolved == cwd) {
-                let resolved = root.resolved.join(path);
+            if roots.iter().any(|root| cwd.starts_with(&root.resolved)) {
+                let resolved = cwd.join(path);
                 chinese_path(&resolved, missing_final)?;
                 return Ok(Self {
                     original: path.into(),

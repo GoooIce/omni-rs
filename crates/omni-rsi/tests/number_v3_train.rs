@@ -5763,3 +5763,86 @@ fn voice_recheck_recomputes_fractional_cer_after_report_json_roundtrip() {
         (1.0 / 3.0 + 1.0) / 2.0
     );
 }
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn relative_output_link_inside_selected_data_root_is_rejected() {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+    };
+    use std::{os::unix::fs::symlink, process::Command};
+    type Cpu = Autodiff<NdArray<f32>>;
+    const ROOT: &str = "OMNI_RSI_TEST_RELATIVE_ALIAS_ROOT";
+
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = std::path::PathBuf::from(root);
+        let model = root.join("model");
+        let state = root.join("state");
+        let registration = root.join("review-registration");
+        let options = V3Options {
+            model: &model,
+            data: &root,
+            state: &state,
+            registration: &registration,
+            output: Path::new("output-alias/report.json"),
+            r2t2: None,
+            breeze: None,
+        };
+        let error = evaluate_chinese_v3_with::<Cpu>(
+            &options,
+            &Default::default(),
+            &AtomicBool::new(false),
+            |_, _, _| {
+                Ok(DecodedText {
+                    text: "二".into(),
+                    end: TextEnd::Stop(7),
+                })
+            },
+        )
+        .expect_err("internal output link must be rejected");
+        assert!(error.contains("linked"), "unexpected error: {error}");
+        return;
+    }
+
+    let root = evaluation_fixture();
+    write_json(
+        &root.path().join("regression-inputs/chinese.json"),
+        &json!({"version":1,"group":"chinese","scoring":"exact-trim-v1",
+        "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+        "cases":[{"id":"one","prompt":"计算一加一。","reference":"二"}]}),
+    );
+    let outside = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested-review");
+    fs::create_dir(&nested).unwrap();
+    symlink(outside.path(), nested.join("output-alias")).unwrap();
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("review-registration");
+    let output = root.path().join("unused-report.json");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false)).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("relative_output_link_inside_selected_data_root_is_rejected")
+        .arg("--nocapture")
+        .current_dir(&nested)
+        .env(ROOT, root.path())
+        .output()
+        .unwrap();
+    let escaped = outside.path().join("report.json").exists();
+    assert!(
+        child.status.success() && !escaped,
+        "child status={}, outside report={escaped}, stderr={}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
