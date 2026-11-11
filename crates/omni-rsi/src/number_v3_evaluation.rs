@@ -601,6 +601,84 @@ struct SelectedPath {
     missing_final: bool,
 }
 
+// Follow aliases only until their resolved path enters a selected root. Once
+// inside, validate the remaining path without following any more links.
+fn resolve_below_selected_root(
+    path: &Path,
+    roots: &[&SelectedPath],
+    missing_final: bool,
+) -> Result<Option<PathBuf>, String> {
+    use std::{collections::VecDeque, ffi::OsString, path::Component};
+
+    fn prepend(path: &Path, pending: &mut VecDeque<OsString>) -> Result<(), String> {
+        for component in path.components().rev() {
+            match component {
+                Component::Normal(name) => pending.push_front(name.to_os_string()),
+                Component::ParentDir => pending.push_front(OsString::from("..")),
+                Component::CurDir | Component::RootDir => {}
+                Component::Prefix(_) => return Err("unsupported selected path prefix".into()),
+            }
+        }
+        Ok(())
+    }
+
+    let mut current = if path.is_absolute() {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        fs::canonicalize(".").map_err(|error| error.to_string())?
+    };
+    let mut pending = VecDeque::new();
+    prepend(path, &mut pending)?;
+    let mut links = 0;
+    loop {
+        if roots.iter().any(|root| current.starts_with(&root.resolved)) {
+            for part in pending {
+                current.push(part);
+            }
+            chinese_path(&current, missing_final)?;
+            return Ok(Some(current));
+        }
+        let Some(part) = pending.pop_front() else {
+            return Ok(None);
+        };
+        if part == ".." {
+            current.pop();
+            continue;
+        }
+        let candidate = current.join(&part);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if pending.is_empty() {
+                    return Err("selected path final component is a symlink".into());
+                }
+                links += 1;
+                if links > 40 {
+                    return Err("too many linked path components".into());
+                }
+                let target = fs::read_link(&candidate).map_err(|error| error.to_string())?;
+                if target.is_absolute() {
+                    current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+                }
+                prepend(&target, &mut pending)?;
+            }
+            Ok(metadata) => {
+                if !pending.is_empty() && !metadata.is_dir() {
+                    return Err("non-directory selected path component".into());
+                }
+                current = candidate;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && missing_final
+                    && pending.is_empty() =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 impl SelectedPath {
     fn new(path: &Path, missing_final: bool, roots: &[&Self]) -> Result<Self, String> {
         use std::path::Component;
@@ -614,44 +692,14 @@ impl SelectedPath {
         {
             return Err("parent traversal is not allowed".into());
         }
-        if !path.is_absolute() {
-            let cwd = fs::canonicalize(".").map_err(|e| e.to_string())?;
-            if roots.iter().any(|root| cwd.starts_with(&root.resolved)) {
-                let resolved = cwd.join(path);
-                chinese_path(&resolved, missing_final)?;
-                return Ok(Self {
-                    original: path.into(),
-                    resolved,
-                    missing_final,
-                });
-            }
-        }
-        let mut prefix = PathBuf::new();
-        for (index, component) in components.iter().enumerate() {
-            prefix.push(component.as_os_str());
-            // Once a selected root is reached, do not canonicalize any of its
-            // descendants: check them from its physical path without following links.
-            let root = roots
-                .iter()
-                .find(|root| prefix == root.original || prefix == root.resolved)
-                .copied()
-                .or_else(|| {
-                    if index + 1 == components.len() {
-                        return None;
-                    }
-                    let physical = fs::canonicalize(&prefix).ok()?;
-                    roots.iter().find(|root| physical == root.resolved).copied()
-                });
-            if let Some(root) = root {
-                let relative = path.strip_prefix(&prefix).map_err(|e| e.to_string())?;
-                let resolved = root.resolved.join(relative);
-                chinese_path(&resolved, missing_final)?;
-                return Ok(Self {
-                    original: path.into(),
-                    resolved,
-                    missing_final,
-                });
-            }
+        if !roots.is_empty()
+            && let Some(resolved) = resolve_below_selected_root(path, roots, missing_final)?
+        {
+            return Ok(Self {
+                original: path.into(),
+                resolved,
+                missing_final,
+            });
         }
         Ok(Self {
             original: path.into(),

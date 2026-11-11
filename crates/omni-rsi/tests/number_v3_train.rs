@@ -5846,3 +5846,122 @@ fn relative_output_link_inside_selected_data_root_is_rejected() {
         String::from_utf8_lossy(&child.stderr)
     );
 }
+#[cfg(all(unix, feature = "cpu"))]
+#[derive(Clone, Copy)]
+enum ExternalAlias {
+    Safe,
+    SafeChain,
+    EntryThenEscape,
+    TargetThroughEscape,
+    Cycle,
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+fn check_external_alias_into_selected_subdirectory(scenario: ExternalAlias) {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+    };
+    use std::os::unix::fs::symlink;
+    type Cpu = Autodiff<NdArray<f32>>;
+
+    let root = evaluation_fixture();
+    write_json(
+        &root.path().join("regression-inputs/chinese.json"),
+        &json!({"version":1,"group":"chinese","scoring":"exact-trim-v1",
+        "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+        "cases":[{"id":"one","prompt":"计算一加一。","reference":"二"}]}),
+    );
+    let outside = tempfile::tempdir().unwrap();
+    let alias_root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested-review");
+    fs::create_dir(&nested).unwrap();
+    symlink(outside.path(), nested.join("escape")).unwrap();
+    let entry = alias_root.path().join("entry");
+    let output = match scenario {
+        ExternalAlias::Safe => {
+            symlink(&nested, &entry).unwrap();
+            entry.join("report.json")
+        }
+        ExternalAlias::SafeChain => {
+            let intermediate = alias_root.path().join("intermediate");
+            symlink(&nested, &intermediate).unwrap();
+            symlink(&intermediate, &entry).unwrap();
+            entry.join("report.json")
+        }
+        ExternalAlias::EntryThenEscape => {
+            symlink(&nested, &entry).unwrap();
+            entry.join("escape/report.json")
+        }
+        ExternalAlias::TargetThroughEscape => {
+            symlink(nested.join("escape"), &entry).unwrap();
+            entry.join("report.json")
+        }
+        ExternalAlias::Cycle => {
+            symlink(&entry, &entry).unwrap();
+            entry.join("report.json")
+        }
+    };
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("review-registration");
+    let options = V3Options {
+        model: &model,
+        data: root.path(),
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            Ok(DecodedText {
+                text: "二".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    if matches!(scenario, ExternalAlias::Safe | ExternalAlias::SafeChain) {
+        assert!(result.is_ok(), "valid alias was rejected: {result:?}");
+        assert!(nested.join("report.json").is_file());
+    } else {
+        let escaped = outside.path().join("report.json").exists();
+        assert!(
+            result.is_err() && !escaped,
+            "outside report={escaped}, result={result:?}"
+        );
+        assert!(result.unwrap_err().contains("linked"));
+    }
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn external_alias_into_selected_subdirectory_is_allowed() {
+    check_external_alias_into_selected_subdirectory(ExternalAlias::Safe);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn external_alias_chain_into_selected_subdirectory_is_allowed() {
+    check_external_alias_into_selected_subdirectory(ExternalAlias::SafeChain);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn external_alias_cannot_follow_link_below_selected_root() {
+    check_external_alias_into_selected_subdirectory(ExternalAlias::EntryThenEscape);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn external_alias_target_cannot_traverse_link_below_selected_root() {
+    check_external_alias_into_selected_subdirectory(ExternalAlias::TargetThroughEscape);
+}
+
+#[cfg(all(unix, feature = "cpu"))]
+#[test]
+fn external_alias_cycle_is_rejected() {
+    check_external_alias_into_selected_subdirectory(ExternalAlias::Cycle);
+}
