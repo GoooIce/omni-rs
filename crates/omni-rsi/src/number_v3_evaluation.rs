@@ -601,6 +601,27 @@ struct SelectedPath {
     missing_final: bool,
 }
 
+// Normalize the filesystem spelling after the caller's no-follow checks so
+// that reverse nested-root checks also compare the same physical identity.
+fn normalize_selected_path(path: &Path, missing_final: bool) -> Result<PathBuf, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("selected path final component is a symlink".into())
+        }
+        Ok(_) => fs::canonicalize(path).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && missing_final => {
+            let parent = path.parent().ok_or("selected path has no parent")?;
+            let name = path
+                .file_name()
+                .ok_or("selected path has no final component")?;
+            Ok(fs::canonicalize(parent)
+                .map_err(|error| error.to_string())?
+                .join(name))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 // Follow aliases only until their resolved path enters a selected root. Once
 // inside, validate the remaining path without following any more links.
 fn resolve_below_selected_root(
@@ -665,7 +686,10 @@ fn resolve_below_selected_root(
                 if !pending.is_empty() && !metadata.is_dir() {
                     return Err("non-directory selected path component".into());
                 }
-                current = candidate;
+                // A case-insensitive filesystem can spell this component
+                // differently from the selected root while naming the same
+                // directory. Normalize before the next boundary check.
+                current = fs::canonicalize(&candidate).map_err(|error| error.to_string())?;
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound
@@ -692,18 +716,16 @@ impl SelectedPath {
         {
             return Err("parent traversal is not allowed".into());
         }
-        if !roots.is_empty()
+        let resolved = if !roots.is_empty()
             && let Some(resolved) = resolve_below_selected_root(path, roots, missing_final)?
         {
-            return Ok(Self {
-                original: path.into(),
-                resolved,
-                missing_final,
-            });
-        }
+            resolved
+        } else {
+            crate::number_development::resolve_selected_path(path, missing_final)?
+        };
         Ok(Self {
             original: path.into(),
-            resolved: crate::number_development::resolve_selected_path(path, missing_final)?,
+            resolved: normalize_selected_path(&resolved, missing_final)?,
             missing_final,
         })
     }

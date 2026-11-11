@@ -5965,3 +5965,126 @@ fn external_alias_target_cannot_traverse_link_below_selected_root() {
 fn external_alias_cycle_is_rejected() {
     check_external_alias_into_selected_subdirectory(ExternalAlias::Cycle);
 }
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn check_case_alias_below_selected_root(escape: bool, alternate_root: bool) {
+    use burn::backend::{Autodiff, NdArray};
+    use omni_rsi::number_v3_evaluation::{
+        DecodedText, TextEnd, V3Options, evaluate_chinese_v3_with, preregister_chinese_v3,
+        recheck_chinese_v3,
+    };
+    use std::os::unix::fs::{MetadataExt, symlink};
+    type Cpu = Autodiff<NdArray<f32>>;
+
+    let root = evaluation_fixture();
+    let physical = fs::canonicalize(root.path()).unwrap();
+    let mut name = physical.file_name().unwrap().to_str().unwrap().to_owned();
+    let index = name.find(|c: char| c.is_ascii_alphabetic()).unwrap();
+    let original = name.as_bytes()[index] as char;
+    let changed = if original.is_ascii_lowercase() {
+        original.to_ascii_uppercase()
+    } else {
+        original.to_ascii_lowercase()
+    };
+    name.replace_range(index..index + 1, &changed.to_string());
+    let alternate = physical.with_file_name(name);
+    let same_directory = fs::metadata(&alternate)
+        .ok()
+        .zip(fs::metadata(&physical).ok())
+        .is_some_and(|(left, right)| left.dev() == right.dev() && left.ino() == right.ino());
+    if !same_directory {
+        eprintln!("case-sensitive test filesystem; case alias not available");
+        return;
+    }
+    write_json(
+        &root.path().join("regression-inputs/chinese.json"),
+        &json!({"version":1,"group":"chinese","scoring":"exact-trim-v1",
+        "normal_end":"registered-stop-token-v1","decode":"v3-greedy-v1",
+        "cases":[{"id":"one","prompt":"计算一加一。","reference":"二"}]}),
+    );
+    let outside = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested-case");
+    fs::create_dir(&nested).unwrap();
+    symlink(outside.path(), nested.join("escape")).unwrap();
+    let output_root = if alternate_root {
+        &physical
+    } else {
+        &alternate
+    };
+    let output = if escape {
+        output_root.join("nested-case/escape/report.json")
+    } else {
+        output_root.join("nested-case/report.json")
+    };
+    let model = root.path().join("model");
+    let state = root.path().join("state");
+    let registration = root.path().join("case-registration");
+    let options = V3Options {
+        model: &model,
+        data: if alternate_root {
+            &alternate
+        } else {
+            root.path()
+        },
+        state: &state,
+        registration: &registration,
+        output: &output,
+        r2t2: None,
+        breeze: None,
+    };
+    let stop = AtomicBool::new(false);
+    preregister_chinese_v3::<Cpu>(&options, &Default::default(), &stop).unwrap();
+    let result =
+        evaluate_chinese_v3_with::<Cpu>(&options, &Default::default(), &stop, |_, _, _| {
+            Ok(DecodedText {
+                text: "二".into(),
+                end: TextEnd::Stop(7),
+            })
+        });
+    if escape {
+        let escaped = outside.path().join("report.json").exists();
+        assert!(
+            result.is_err() && !escaped,
+            "outside report={escaped}, result={result:?}"
+        );
+        assert!(result.unwrap_err().contains("linked"));
+        let recheck = recheck_chinese_v3::<Cpu>(&options, &Default::default(), &stop);
+        assert!(recheck.unwrap_err().contains("linked"));
+
+        let escaped_registration = output_root.join("nested-case/escape/registration");
+        let escaped_options = V3Options {
+            registration: &escaped_registration,
+            ..options
+        };
+        let registration_result =
+            preregister_chinese_v3::<Cpu>(&escaped_options, &Default::default(), &stop);
+        assert!(registration_result.unwrap_err().contains("linked"));
+        assert!(!outside.path().join("registration").exists());
+    } else {
+        assert!(result.is_ok(), "valid case alias rejected: {result:?}");
+        assert!(nested.join("report.json").is_file());
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+fn case_alias_to_selected_root_is_allowed() {
+    check_case_alias_below_selected_root(false, false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+fn case_alias_cannot_follow_link_below_selected_root() {
+    check_case_alias_below_selected_root(true, false);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+fn case_alias_of_selected_root_preserves_safe_output() {
+    check_case_alias_below_selected_root(false, true);
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+#[test]
+fn case_alias_of_selected_root_cannot_follow_link() {
+    check_case_alias_below_selected_root(true, true);
+}
