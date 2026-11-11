@@ -29,6 +29,11 @@ mod unix {
             }
         }
     }
+    impl AsRawFd for Lease {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.0.as_raw_fd()
+        }
+    }
     impl Drop for Lease {
         fn drop(&mut self) {
             unsafe {

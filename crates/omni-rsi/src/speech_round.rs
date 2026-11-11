@@ -148,6 +148,12 @@ where
         .ok_or("another speech trainer owns this state")?;
     cancelled(stop)?;
     let saved = SpeechCheckpoint::load(options.state)?;
+    if saved
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.protocol.implementation_hash != implementation_hash())
+    {
+        return Err("speech checkpoint implementation changed; existing state is untouched".into());
+    }
     let mut progress = saved
         .as_ref()
         .map(|checkpoint| checkpoint.progress.clone())

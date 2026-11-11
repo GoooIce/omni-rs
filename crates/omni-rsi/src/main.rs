@@ -1,4 +1,5 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+mod audio_idle;
 use omni_lfm3::Precision;
 use omni_rsi::{
     chart::Question,
@@ -72,6 +73,23 @@ enum Command {
         idle_seconds: u64,
         #[command(flatten)]
         job: SpeechJob,
+    },
+    /// Train an audio-conditioned answer adapter during idle time.
+    AudioWatch {
+        #[arg(long, default_value_t = 4)]
+        rounds: usize,
+        #[arg(long, default_value_t = 300)]
+        idle_seconds: u64,
+        #[command(flatten)]
+        job: AudioJob,
+    },
+    /// Internal audio worker; accepts only inherited cooperative leases.
+    #[command(hide = true)]
+    AudioWork {
+        #[command(flatten)]
+        job: AudioJob,
+        #[command(flatten)]
+        proof: audio_idle::AudioProof,
     },
     /// Run a bounded speech training round as a supervised foreground job.
     SpeechOnce {
@@ -152,6 +170,33 @@ struct SpeechJob {
     /// Process explicitly queued speech and include verified samples at epoch boundaries.
     #[arg(long)]
     online: bool,
+}
+
+#[derive(Clone, ClapArgs)]
+struct AudioJob {
+    /// Authorized local audio data, with a legacy manifest or v3 layout.
+    #[arg(long)]
+    data: PathBuf,
+    /// Use the isolated number-v3 checkpoint namespace.
+    #[arg(long)]
+    number_v3: bool,
+    #[arg(long, default_value_t = 1)]
+    epochs: usize,
+    #[arg(long, default_value_t = 1)]
+    updates_per_round: usize,
+    #[command(flatten)]
+    start: AudioStart,
+}
+
+#[derive(Clone, ClapArgs)]
+#[group(required = true, multiple = false)]
+struct AudioStart {
+    /// Start a new state; refuse an existing checkpoint directory.
+    #[arg(long)]
+    fresh: bool,
+    /// Resume a complete, matching checkpoint.
+    #[arg(long)]
+    resume: bool,
 }
 #[derive(Clone, ClapArgs)]
 struct Tuning {
@@ -243,14 +288,18 @@ fn state_status(root: &Path, phase: &str, detail: &str, completed: usize) -> Res
     )
 }
 
-fn ddust_lease() -> Result<Option<Lease>, String> {
+fn ddust_path() -> Option<PathBuf> {
     let path = if let Some(registry) = std::env::var_os("DDUST_RUN_REGISTRY") {
         PathBuf::from(registry).parent().map(|p| p.join("mps.lock"))
     } else {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join("code/ddust/.ddust/mps.lock"))
     };
-    match path {
-        Some(path) if path.exists() => Lease::try_acquire(&path)?
+    path.filter(|path| path.exists())
+}
+
+fn ddust_lease() -> Result<Option<Lease>, String> {
+    match ddust_path() {
+        Some(path) => Lease::try_acquire(&path)?
             .map(Some)
             .ok_or_else(|| "ddust accelerator lease is occupied".into()),
         _ => Ok(None),
@@ -465,6 +514,8 @@ struct WatchConfig<'a> {
     ddust_lease: fn() -> Result<Option<Lease>, String>,
     wait_unit: Duration,
     watchdog_interval: Duration,
+    worker_grace: Duration,
+    require_work_completion: bool,
 }
 
 impl<'a> WatchConfig<'a> {
@@ -485,18 +536,42 @@ impl<'a> WatchConfig<'a> {
             ddust_lease,
             wait_unit: Duration::from_secs(1),
             watchdog_interval: Duration::from_millis(500),
+            worker_grace: Duration::from_secs(10),
+            require_work_completion: false,
         }
     }
 }
 
-fn watch<F, P>(
-    config: WatchConfig<'_>,
-    mut waiting_for_work: P,
-    mut run_round: F,
-) -> Result<(), String>
+fn watch<F, P>(config: WatchConfig<'_>, waiting_for_work: P, mut run_round: F) -> Result<(), String>
 where
     F: FnMut(&AtomicBool) -> Result<serde_json::Value, String>,
     P: FnMut() -> Result<Option<&'static str>, String>,
+{
+    watch_with_leases(
+        config,
+        waiting_for_work,
+        |stop, _| run_round(stop),
+        || Ok(()),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct HeldLeases<'a> {
+    runner: &'a Lease,
+    device: &'a Lease,
+    ddust: Option<&'a Lease>,
+}
+
+fn watch_with_leases<F, P, Y>(
+    config: WatchConfig<'_>,
+    mut waiting_for_work: P,
+    mut run_round: F,
+    mut on_yield: Y,
+) -> Result<(), String>
+where
+    F: FnMut(&AtomicBool, HeldLeases<'_>) -> Result<serde_json::Value, String>,
+    P: FnMut() -> Result<Option<&'static str>, String>,
+    Y: FnMut() -> Result<(), String>,
 {
     let WatchConfig {
         root,
@@ -508,13 +583,16 @@ where
         ddust_lease,
         wait_unit,
         watchdog_interval,
+        worker_grace: _,
+        require_work_completion,
     } = config;
     if rounds == 0 || rounds > 1_000 {
         return Err("round count must be between 1 and 1000".into());
     }
-    let _runner = Lease::try_acquire(&root.join("runner.lock"))?
+    let runner = Lease::try_acquire(&root.join("runner.lock"))?
         .ok_or("an RSI scheduler is already running")?;
     let mut completed = 0;
+    let mut work_complete = false;
     let mut last_detail = String::new();
     while completed < rounds && !stopping(root, &shutdown) {
         if let Some(detail) = waiting_for_work()? {
@@ -576,11 +654,22 @@ where
         });
         state_status(root, "running", description, completed)?;
         eprintln!("omni-rsi: starting idle round {}", completed + 1);
-        let result = run_round(&cancel);
+        let result = run_round(
+            &cancel,
+            HeldLeases {
+                runner: &runner,
+                device: &device_lease,
+                ddust: ddust.as_ref(),
+            },
+        );
         drop(watchdog);
         drop(ddust);
         drop(device_lease);
         if cancel.load(Ordering::Acquire) {
+            if let Err(error) = on_yield() {
+                state_status(root, "error", &error, completed)?;
+                return Err(error);
+            }
             state_status(root, "waiting", "background work yielded", completed)?;
             last_detail.clear();
             continue;
@@ -608,6 +697,7 @@ where
                 println!("{report}");
                 state_status(root, "waiting", "round complete", completed)?;
                 if complete {
+                    work_complete = true;
                     break;
                 }
             }
@@ -620,8 +710,18 @@ where
     let stopped = stopping(root, &shutdown);
     let result = state_status(
         root,
-        if stopped { "stopped" } else { "complete" },
-        "",
+        if stopped {
+            "stopped"
+        } else if require_work_completion && !work_complete {
+            "partial"
+        } else {
+            "complete"
+        },
+        if !stopped && require_work_completion && !work_complete {
+            "round limit reached before training completed"
+        } else {
+            ""
+        },
         completed,
     );
     let request = root.join("stop.request");
@@ -712,6 +812,29 @@ fn execute() -> Result<(), String> {
                 },
                 |stop| run_speech_worker(&model, &args.state, &job, stop),
             )
+        }
+        Command::AudioWatch {
+            rounds,
+            idle_seconds,
+            job,
+        } => {
+            audio_idle::preflight(&args.state, &job)?;
+            let policy = IdlePolicy {
+                min_idle_seconds: idle_seconds as f64,
+                ..Default::default()
+            };
+            let config = WatchConfig::new(
+                &args.state,
+                rounds,
+                policy,
+                shutdown,
+                "audio-conditioned training",
+            );
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            audio_idle::watch_audio(config, &model, &job, &executable)
+        }
+        Command::AudioWork { job, proof } => {
+            audio_idle::work(&model, &args.state, &job, proof, shutdown)
         }
         Command::SpeechOnce { job } => {
             let _foreground = Lease::try_acquire(&args.state.join("foreground.lock"))?

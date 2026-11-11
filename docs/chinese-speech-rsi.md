@@ -14,7 +14,7 @@
 
 2026-11-10 的隔离 Rust／Burn 实验以本机 6 条种子完成一轮 Metal 训练，并用固定 10 题与 R2T2 比较：底座 CER 为 60.3%，候选为 87.2%，正常结束分别为 10/10 和 8/10。候选未通过门槛，没有发布；该开发集结果不能代表最终保留集表现。闲时调度的 mock 验证独立进行。
 
-音频条件听答有独立的 Rust／Burn 前台训练入口：真实输入音频经推理使用的 WAV 解码、降混、重采样及媒体绑定进入上下文；答案文字必需，语音码和结束帧可选，答案不放进输入提示。[训练步骤](../crates/omni-rsi/src/speech_audio.rs)和[独立检查点](../crates/omni-rsi/src/speech_audio_checkpoint.rs)分别处理更新和恢复，检查点保存在 `audio-conditioned-v1` 子目录。该路线尚未接入闲时调度、生成验收或候选发布；规则真值数据与独立评估仍由 [#82](https://github.com/GoooIce/omni-rs/issues/82) 处理。现有 `speech-watch` 仍执行自朗读路线；数值对照和参数更新不代表听答能力已提高。
+音频条件听答有独立的 Rust／Burn 前台入口和显式 `audio-watch` 闲时入口：输入音频经推理使用的 WAV 解码、降混、重采样及媒体绑定进入上下文；答案文字必需，语音码和结束帧可选，答案不放进输入提示。[训练步骤](../crates/omni-rsi/src/speech_audio.rs)和[独立检查点](../crates/omni-rsi/src/speech_audio_checkpoint.rs)分别处理更新和恢复，检查点保存在 `audio-conditioned-v1` 子目录。该路线不自动运行生成验收或候选发布；规则真值数据与独立评估仍由 [#82](https://github.com/GoooIce/omni-rs/issues/82) 处理。现有 `speech-watch` 仍执行自朗读路线；数值对照和参数更新不代表听答能力已提高。
 
 [语气数据与反事实评估合同](speech-tone-contract.md)是独立的 Rust 准入与已有预测汇总基础设施，保留多人分歧、弃判及逐题来源；它尚未接入训练或模型推理，也不证明真实语气识别能力。
 
@@ -44,7 +44,7 @@
 
 输入 WAV 的原始 float 样本须逐声道有限且位于 `[-1, 1]`；不能依靠降混抵消越界值。此前因声道抵消而被接受的越界文件现在会被拒绝，需保留原件并另行提供合规数据。合法波形经降混和重采样后可能出现有限过冲，训练保留解码器输出的实际 PCM，不裁剪或归一化；数据身份仍绑定 WAV 字节，跨划分检查使用实际 PCM。直接调用 `AudioAnswer::new` 或 `new_text_only` 的 PCM 契约仍要求有限且在 `[-1, 1]`，只有经 WAV 校验和解码的内部样本可包含有限过冲。
 
-这次输入校验和装配变更会改变 legacy 与 number-v3 音频训练实现身份，旧音频检查点不会自动迁移，须保留原状态和原程序。v3 数据身份、开发预注册及绑定相关源码的评分身份也可能改变；旧冻结记录和报告不能当作新协议结果。#79 自朗读的实现摘要源码未改动。
+输入校验、样本装配和闲时调度的源码变更会改变 legacy 与 number-v3 音频训练实现身份，旧音频检查点不会自动迁移，须保留原状态和原程序。v3 数据身份、开发预注册及绑定相关源码的评分身份也可能改变；旧冻结记录和报告不能当作新协议结果。闲时调度接线也改变了 #79 自朗读实现摘要；其旧检查点同样须保留原程序与状态，不会自动迁移。
 
 每个记录代表**完整输入已经结束之后**的一个回答目标，全部 WAV 位于答案之前。它不表达输入进行中不同时间的目标；要训练某个前缀，只能提供该时刻已可用的音频，不能把后续录音放入 WAV。实时分段和带时间戳的因果训练不在此入口内。
 
@@ -57,6 +57,28 @@ CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/
   --epochs 2 --max-updates 1
 # 继续：使用相同参数，末尾加 --resume
 ```
+
+### 闲时音频条件训练
+
+闲时路线使用同样的已授权本地模型与音频数据，不录音、不自动发布或晋级。`audio-watch` 必须明确选择首次 `--fresh` 或从完整状态 `--resume`；`--number-v3` 选择 v3，省略它选择 legacy。如下示例从项目根目录运行，先按[项目工作流](agent-workflow.md)准备共享 target：
+
+```sh
+uv run --no-project python scripts/share-target.py
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --offline --locked \
+  --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
+  --bin omni-rsi -- --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
+  --state /path/to/rsi-state audio-watch --data /path/to/authorized-training-data \
+  --fresh --epochs 2 --updates-per-round 1 --rounds 4
+# 已有完整匹配检查点时，用 --resume 替换 --fresh；v3 还须添加 --number-v3。
+```
+
+`--epochs` 是总目标 epoch，`--updates-per-round` 是每次闲时运行最多的更新数，二者均为 1–100；`--rounds` 是本次调度最多完成的轮次（1–1000）。需要配合前台协作的命令须使用同一 `--state` 根目录。legacy 检查点位于 `audio-conditioned-v1/`，v3 位于 `number-audio-v3/audio-conditioned-v1/`；两条路线的首次启动标记分别是 `audio-idle-legacy-started` 和 `audio-idle-v3-started`。
+
+调度器复用空闲策略、watchdog、设备和可用的 ddust 租约，并在受监督的子进程组中执行训练。前台到来或请求停止时，先取消并等待整个进程组退出，再释放设备租约；先尝试协作取消，10 秒后强制终止，系统若不能结束进程组则继续等待。每次完整更新的检查点按现有协议保存，后续闲时只从完整检查点继续。首次启动标记在 worker 启动前持久化；若中断时没有完整 pointer，状态会报告错误，不能自动续训或再次按 fresh 使用该状态，程序不清理它。已存在、损坏或实现身份不匹配的检查点也不会被覆盖或迁移。预检仅核验 checkpoint 完整性和实现身份，实际模型、codec 与数据匹配仍由 worker 的 `load(expected)` 在训练前校验。
+
+worker 的 stdout 和 stderr 分别在运行时限制为 1 MiB 和 64 KiB，超限时取消进程组；输出不写入无界临时文件。Unix 下通过继承的协作租约描述符及监督 socket 连接 worker，监督端消失时请求取消；非 Unix 失败关闭。这些机制要求受控本地进程及共享状态目录，不防御同账号刻意伪造描述符或进程脱离受监督进程组。
+
+轮次结果的 `training_status` 为 `partial` 或 `complete`，`quality` 始终为 `not_assessed`；达到 `--rounds` 而未完成 epoch 时状态为 `partial`，显式停止为 `stopped`，失败为 `error`。即使训练状态为 `complete`，也只表示达到配置的训练进度，不代表听答能力、质量验收或晋级资格。
 
 该命令不启动麦克风、下载数据、发布候选或更改已运行的会话。它持有同一 `--state` 下的 `foreground.lock` 和 `device.lock`，也遵守现有 ddust 全局锁：优先使用 `DDUST_RUN_REGISTRY` 所在目录的 `mps.lock`，否则使用已有的 `~/code/ddust/.ddust/mps.lock`。不同 state 目录的 RSI 设备锁彼此独立；未接入这些协作锁的其他应用也不受协调。直接调用 Rust 训练接口的程序须自行持有设备租约。
 
