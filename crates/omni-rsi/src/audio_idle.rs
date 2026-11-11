@@ -15,8 +15,6 @@ pub(super) struct AudioProof {
     device_fd: i32,
     #[arg(long)]
     supervisor_fd: i32,
-    #[arg(long)]
-    ddust_fd: Option<i32>,
 }
 
 fn namespace(root: &Path, job: &AudioJob) -> PathBuf {
@@ -176,7 +174,6 @@ fn configure_inherited(command: &mut std::process::Command, proof: AudioProof) {
         Some(proof.runner_fd),
         Some(proof.device_fd),
         Some(proof.supervisor_fd),
-        proof.ddust_fd,
     ];
     // Only the forked child changes descriptor flags; the scheduler keeps its leases.
     unsafe {
@@ -231,7 +228,6 @@ fn run_worker(
         runner_fd: leases.runner.as_raw_fd(),
         device_fd: leases.device.as_raw_fd(),
         supervisor_fd: worker_socket.as_raw_fd(),
-        ddust_fd: leases.ddust.map(AsRawFd::as_raw_fd),
     };
     let (output_reader, output_writer) = UnixStream::pair().map_err(|error| error.to_string())?;
     let (log_reader, log_writer) = UnixStream::pair().map_err(|error| error.to_string())?;
@@ -266,9 +262,6 @@ fn run_worker(
         .stderr(Stdio::from(OwnedFd::from(log_writer)));
     if job.number_v3 {
         command.arg("--number-v3");
-    }
-    if let Some(fd) = proof.ddust_fd {
-        command.arg("--ddust-fd").arg(fd.to_string());
     }
     configure_inherited(&mut command, proof);
     let local_stop = AtomicBool::new(false);
@@ -357,7 +350,6 @@ fn validate_supervision(
         proof.runner_fd,
         proof.device_fd,
         proof.supervisor_fd,
-        proof.ddust_fd,
     )
 }
 
@@ -372,7 +364,6 @@ pub(super) fn work(
     use omni_rsi::speech_audio_round::{AudioRoundOptions, train_supervised_audio_round};
     let supervision = validate_supervision(root, proof)
         .map_err(|error| format!("supervised audio worker rejected: {error}"))?;
-    let _watchdog = supervision.monitor(stop.clone())?;
     let options = AudioRoundOptions {
         model,
         data: &job.data,
@@ -444,7 +435,6 @@ mod unsupported_tests {
             runner_fd: 3,
             device_fd: 4,
             supervisor_fd: 5,
-            ddust_fd: None,
         };
         assert!(
             work(root, root, &job, proof, Arc::new(AtomicBool::new(false)))

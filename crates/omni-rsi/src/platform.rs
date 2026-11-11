@@ -2,6 +2,78 @@
 use crate::idle::IdleSnapshot;
 use std::{collections::HashMap, path::Path};
 
+// Read only a bounded amount from a short-lived process group. This also lets
+// tests exercise hung and overproducing mock commands without sampling a device.
+#[cfg(unix)]
+pub fn bounded_process_output(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    use std::{
+        io::{ErrorKind, Read},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::Stdio,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+    let (mut reader, writer) = UnixStream::pair().map_err(|error| error.to_string())?;
+    reader
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader_stop = stop.clone();
+    let reader_done = done.clone();
+    let output = thread::Builder::new()
+        .name("rsi-probe-output".into())
+        .spawn(move || -> Result<Vec<u8>, String> {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => return Ok(bytes),
+                    Ok(count) if count <= limit.saturating_sub(bytes.len()) => {
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    Ok(_) => {
+                        reader_stop.store(true, Ordering::Release);
+                        return Err("idle probe output exceeded byte limit".into());
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if reader_done.load(Ordering::Acquire) {
+                            return Ok(bytes);
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => {
+                        reader_stop.store(true, Ordering::Release);
+                        return Err(error.to_string());
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("cannot start probe output reader: {error}"))?;
+    let status =
+        crate::child::run_with_timeout(command, &stop, Duration::from_millis(100), timeout);
+    done.store(true, Ordering::Release);
+    let bytes = output
+        .join()
+        .map_err(|_| "idle probe output reader panicked".to_owned())??;
+    if !status?.success() {
+        return Err("idle probe command failed".into());
+    }
+    Ok(bytes)
+}
+
 /// Parse process snapshots while ignoring this scheduler's own worker tree.
 /// Missing or malformed information fails closed rather than declaring idle.
 pub fn competing_process_from_ps(output: &str, current: u32) -> Option<bool> {
@@ -169,17 +241,15 @@ mod macos {
     }
 
     fn competing_process() -> Option<bool> {
-        let output = Command::new("/bin/ps")
-            .args(["-axo", "pid=,ppid=,comm=,args="])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        competing_process_from_ps(
-            std::str::from_utf8(&output.stdout).ok()?,
-            std::process::id(),
+        let mut command = Command::new("/bin/ps");
+        command.args(["-axo", "pid=,ppid=,comm=,args="]);
+        let output = super::bounded_process_output(
+            command,
+            std::time::Duration::from_millis(750),
+            4 * 1024 * 1024,
         )
+        .ok()?;
+        competing_process_from_ps(std::str::from_utf8(&output).ok()?, std::process::id())
     }
 
     pub fn snapshot(root: &Path) -> IdleSnapshot {

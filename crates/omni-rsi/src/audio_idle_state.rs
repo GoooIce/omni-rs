@@ -149,40 +149,29 @@ pub struct AudioSupervision {
     root: PathBuf,
     runner_fd: i32,
     device_fd: i32,
-    ddust_fd: Option<i32>,
     stream: std::os::unix::net::UnixStream,
 }
 
 #[cfg(unix)]
 impl AudioSupervision {
+    /// Validate RSI's own leases and supervisor socket.
     pub fn validate(
         root: &Path,
         runner_fd: i32,
         device_fd: i32,
         supervisor_fd: i32,
-        ddust_fd: Option<i32>,
     ) -> Result<Self, String> {
         use std::{
             collections::HashSet,
             os::{fd::FromRawFd, unix::net::UnixStream},
         };
-        let fds = [
-            Some(runner_fd),
-            Some(device_fd),
-            Some(supervisor_fd),
-            ddust_fd,
-        ];
+        let fds = [runner_fd, device_fd, supervisor_fd];
         let mut distinct = HashSet::new();
-        if fds
-            .into_iter()
-            .flatten()
-            .any(|fd| fd < 3 || !distinct.insert(fd))
-        {
+        if fds.into_iter().any(|fd| fd < 3 || !distinct.insert(fd)) {
             return Err("invalid inherited descriptors".into());
         }
         verify_lease(runner_fd, &root.join("runner.lock"))?;
         verify_lease(device_fd, &root.join("device.lock"))?;
-        Self::verify_ddust(ddust_fd)?;
         let mut socket_type: libc::c_int = 0;
         let mut len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
         if unsafe {
@@ -226,18 +215,8 @@ impl AudioSupervision {
             root: root.canonicalize().map_err(|error| error.to_string())?,
             runner_fd,
             device_fd,
-            ddust_fd,
             stream,
         })
-    }
-
-    fn verify_ddust(fd: Option<i32>) -> Result<(), String> {
-        let path = crate::lease::ddust_lock_path()?;
-        match (path, fd) {
-            (Some(path), Some(fd)) => verify_lease(fd, &path),
-            (None, None) => Ok(()),
-            _ => Err("ddust lease changed before the worker started".into()),
-        }
     }
 
     pub fn monitor(
@@ -252,6 +231,39 @@ impl AudioSupervision {
         ))
     }
 
+    /// Keep cancellation tied to the supervisor for the entire public training call.
+    pub(crate) fn while_connected<R>(
+        &self,
+        stop: &std::sync::atomic::AtomicBool,
+        work: impl FnOnce() -> R,
+    ) -> Result<R, String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stream = self.stream.try_clone().map_err(|error| error.to_string())?;
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            // The guard also stops and joins the monitor while unwinding.
+            struct Finish<'a>(&'a AtomicBool);
+            impl Drop for Finish<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    if !supervisor_alive(&stream) {
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+            let finish = Finish(&done);
+            let result = work();
+            drop(finish);
+            Ok(result)
+        })
+    }
+
     pub(crate) fn check_scope(&self, root: &Path) -> Result<(), String> {
         if root.canonicalize().map_err(|error| error.to_string())? != self.root
             || !supervisor_alive(&self.stream)
@@ -260,11 +272,53 @@ impl AudioSupervision {
         }
         verify_lease(self.runner_fd, &root.join("runner.lock"))?;
         verify_lease(self.device_fd, &root.join("device.lock"))?;
-        Self::verify_ddust(self.ddust_fd)
+        Ok(())
     }
 
     pub(crate) fn check_fresh(&self, root: &Path, v3: bool) -> Result<(), String> {
         self.check_scope(root)?;
         check_worker_fresh(root, v3)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::AudioSupervision;
+    use std::{
+        os::unix::net::UnixStream,
+        path::PathBuf,
+        sync::atomic::{AtomicBool, Ordering},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn supervised_work_cancels_on_disconnect_and_stops_monitor_on_return() {
+        let (parent, stream) = UnixStream::pair().unwrap();
+        let supervision = AudioSupervision {
+            root: PathBuf::new(),
+            runner_fd: -1,
+            device_fd: -1,
+            stream,
+        };
+        let stop = AtomicBool::new(false);
+        supervision
+            .while_connected(&stop, || {
+                drop(parent);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !stop.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "disconnect did not cancel work");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+            .unwrap();
+
+        let (_parent, stream) = UnixStream::pair().unwrap();
+        let supervision = AudioSupervision {
+            stream,
+            ..supervision
+        };
+        let stop = AtomicBool::new(false);
+        supervision.while_connected(&stop, || ()).unwrap();
+        assert!(!stop.load(Ordering::Acquire));
     }
 }

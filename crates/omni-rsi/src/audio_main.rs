@@ -61,7 +61,19 @@ fn device_lease(state: &Path, stop: &AtomicBool) -> Result<Lease, String> {
 }
 
 fn ddust_lease() -> Result<Option<Lease>, String> {
-    omni_rsi::lease::try_ddust_lease()
+    let path = if let Some(registry) = std::env::var_os("DDUST_RUN_REGISTRY") {
+        PathBuf::from(registry)
+            .parent()
+            .map(|parent| parent.join("mps.lock"))
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("code/ddust/.ddust/mps.lock"))
+    };
+    match path {
+        Some(path) if path.exists() => Lease::try_acquire(&path)?
+            .map(Some)
+            .ok_or_else(|| "ddust accelerator lease is occupied".into()),
+        _ => Ok(None),
+    }
 }
 
 fn execute() -> Result<(), String> {

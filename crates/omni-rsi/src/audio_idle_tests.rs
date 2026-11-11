@@ -232,7 +232,6 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
             runner_fd: fd("OMNI_AUDIO_IDLE_TEST_RUNNER"),
             device_fd: fd("OMNI_AUDIO_IDLE_TEST_DEVICE"),
             supervisor_fd: fd("OMNI_AUDIO_IDLE_TEST_SOCKET"),
-            ddust_fd: Some(fd("OMNI_AUDIO_IDLE_TEST_DDUST")),
         };
         let supervision = validate_supervision(&root, proof).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -257,13 +256,11 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
     let device = Lease::try_acquire(&root.join("device.lock"))
         .unwrap()
         .unwrap();
-    let ddust = Lease::try_acquire(&root.join("mps.lock")).unwrap().unwrap();
     let (parent, worker) = UnixStream::pair().unwrap();
     let proof = AudioProof {
         runner_fd: runner.as_raw_fd(),
         device_fd: device.as_raw_fd(),
         supervisor_fd: worker.as_raw_fd(),
-        ddust_fd: Some(ddust.as_raw_fd()),
     };
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -273,14 +270,13 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
             "--nocapture",
         ])
         .env(CHILD, "1")
-        .env("DDUST_RUN_REGISTRY", root.join("registry.json"))
+        .env(
+            "DDUST_RUN_REGISTRY",
+            root.join("synthetic-registry/runs.json"),
+        )
         .env("OMNI_AUDIO_IDLE_TEST_ROOT", root)
         .env("OMNI_AUDIO_IDLE_TEST_RUNNER", proof.runner_fd.to_string())
         .env("OMNI_AUDIO_IDLE_TEST_DEVICE", proof.device_fd.to_string())
-        .env(
-            "OMNI_AUDIO_IDLE_TEST_DDUST",
-            proof.ddust_fd.unwrap().to_string(),
-        )
         .env(
             "OMNI_AUDIO_IDLE_TEST_SOCKET",
             proof.supervisor_fd.to_string(),
@@ -296,11 +292,6 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        Lease::try_acquire(&root.join("mps.lock"))
-            .unwrap()
-            .is_none()
-    );
     drop(parent);
     assert!(child.join().unwrap().unwrap().success());
     assert!(
@@ -309,7 +300,6 @@ fn inherited_leases_and_supervisor_survive_exec_and_detect_loss() {
             .is_none()
     );
     drop(device);
-    drop(ddust);
     assert!(
         Lease::try_acquire(&root.join("device.lock"))
             .unwrap()
@@ -706,142 +696,6 @@ wait "$child"
 }
 
 #[test]
-fn review_configured_ddust_lock_is_held_before_the_worker_starts() {
-    use std::process::{Child, Command, Stdio};
-    const ROLE: &str = "AUDIO_REVIEW_DDUST_ROLE";
-    if std::env::var(ROLE).as_deref() == Ok("worker") {
-        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
-        let fd = |name| std::env::var(name).unwrap().parse::<i32>().unwrap();
-        let ddust_fd = std::env::var("AUDIO_REVIEW_DDUST_FD")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok());
-        let proof = AudioProof {
-            runner_fd: fd("AUDIO_REVIEW_RUNNER"),
-            device_fd: fd("AUDIO_REVIEW_DEVICE"),
-            supervisor_fd: fd("AUDIO_REVIEW_SUPERVISOR"),
-            ddust_fd,
-        };
-        let supervision = validate_supervision(&root, proof).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let _monitor = supervision.monitor(stop.clone()).unwrap();
-        fs::write(
-            root.join("ddust-worker-started"),
-            if ddust_fd.is_some() {
-                b"with".as_slice()
-            } else {
-                b"without".as_slice()
-            },
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        return;
-    }
-    if std::env::var(ROLE).as_deref() == Ok("scheduler") {
-        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
-        let executable = program(
-            &root,
-            r#"#!/bin/sh
-previous=
-for arg in "$@"; do
-  [ "$previous" = "--state" ] && state="$arg"
-  [ "$previous" = "--runner-fd" ] && runner="$arg"
-  [ "$previous" = "--device-fd" ] && device="$arg"
-  [ "$previous" = "--supervisor-fd" ] && supervisor="$arg"
-  [ "$previous" = "--ddust-fd" ] && ddust="$arg"
-  previous="$arg"
-done
-export AUDIO_REVIEW_DDUST_ROLE=worker AUDIO_REVIEW_ROOT="$state"
-export AUDIO_REVIEW_RUNNER="$runner" AUDIO_REVIEW_DEVICE="$device" AUDIO_REVIEW_SUPERVISOR="$supervisor"
-export AUDIO_REVIEW_DDUST_FD="$ddust"
-exec "$AUDIO_REVIEW_EXE" --exact audio_idle::tests::review_configured_ddust_lock_is_held_before_the_worker_starts --nocapture
-"#,
-        );
-        let mut config = WatchConfig::new(
-            &root,
-            1,
-            IdlePolicy::default(),
-            Arc::new(AtomicBool::new(false)),
-            "synthetic ddust",
-        );
-        config.probe = Arc::new(|_| idle(true));
-        config.wait_unit = Duration::from_millis(5);
-        config.watchdog_interval = Duration::from_millis(5);
-        config.worker_grace = Duration::from_millis(500);
-        let result = watch_audio(config, &root, &job(&root), &executable);
-        assert!(result.is_err(), "mock worker supplies no checkpoint");
-        return;
-    }
-    struct Reap(Child);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let home = root.join("home");
-    let ddust = root.join("ddust");
-    fs::create_dir(&home).unwrap();
-    fs::create_dir(&ddust).unwrap();
-    let registry = ddust.join("registry.json");
-    let lock = ddust.join("mps.lock");
-    fs::write(&registry, br#"{"version":1,"runs":{}}"#).unwrap();
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "audio_idle::tests::review_configured_ddust_lock_is_held_before_the_worker_starts",
-            "--nocapture",
-        ])
-        .env(ROLE, "scheduler")
-        .env("AUDIO_REVIEW_ROOT", root)
-        .env("AUDIO_REVIEW_EXE", std::env::current_exe().unwrap())
-        .env("HOME", &home)
-        .env("DDUST_RUN_REGISTRY", &registry)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut child = Reap(child);
-    wait_file(&root.join("ddust-worker-started"));
-    let had_lock_file = lock.exists();
-    let inherited = fs::read(root.join("ddust-worker-started")).unwrap();
-    let competitor = Lease::try_acquire(&lock).unwrap();
-    let competitor_entered = competitor.is_some();
-    drop(competitor);
-    fs::write(root.join("stop.request"), b"stop").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "scheduler exited {status}");
-            break;
-        }
-        assert!(Instant::now() < deadline, "scheduler did not exit");
-        thread::sleep(Duration::from_millis(10));
-    }
-    println!(
-        "lock existed before peer={had_lock_file}, worker proof={}, peer acquired={competitor_entered}",
-        String::from_utf8_lossy(&inherited)
-    );
-    assert!(
-        had_lock_file,
-        "configured ddust lock was absent when the worker started"
-    );
-    assert_eq!(inherited, b"with", "worker did not inherit the ddust lease");
-    assert!(
-        !competitor_entered,
-        "competitor acquired the ddust lease during the worker"
-    );
-    assert!(
-        Lease::try_acquire(&lock).unwrap().is_some(),
-        "ddust lease was not released"
-    );
-}
-
-#[test]
 fn review_v3_started_marker_blocks_legacy_alias_before_worker_launch() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -876,109 +730,6 @@ fn review_v3_started_marker_blocks_legacy_alias_before_worker_launch() {
     assert!(!alias.join("worker-started").exists());
     assert!(!alias.join("audio-idle-legacy-started").exists());
     assert_eq!(fs::read(&marker).unwrap(), b"reserved-v3");
-}
-
-#[test]
-fn review_ddust_occupied_delays_worker_until_released() {
-    use std::process::{Child, Command, Stdio};
-    const ROLE: &str = "AUDIO_REVIEW_BUSY_DDUST";
-    if std::env::var_os(ROLE).is_some() {
-        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_REVIEW_ROOT").unwrap());
-        let executable = program(
-            &root,
-            r#"#!/bin/sh
-previous=
-for arg in "$@"; do
-  [ "$previous" = "--state" ] && state="$arg"
-  previous="$arg"
-done
-touch "$state/worker-started-after-ddust"
-sleep 30 &
-child=$!
-trap 'wait "$child" 2>/dev/null; exit 130' INT TERM
-wait "$child"
-"#,
-        );
-        let mut config = WatchConfig::new(
-            &root,
-            1,
-            IdlePolicy::default(),
-            Arc::new(AtomicBool::new(false)),
-            "busy ddust mock",
-        );
-        config.probe = Arc::new(|_| idle(true));
-        config.wait_unit = Duration::from_millis(5);
-        config.watchdog_interval = Duration::from_millis(5);
-        config.worker_grace = Duration::from_millis(500);
-        let error = watch_audio(config, &root, &job(&root), &executable).unwrap_err();
-        assert!(error.contains("no complete audio checkpoint"), "{error}");
-        return;
-    }
-    struct Reap(Child);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    fs::create_dir(root.join("home")).unwrap();
-    fs::create_dir(root.join("ddust")).unwrap();
-    let lock = root.join("ddust/mps.lock");
-    let held = Lease::try_acquire(&lock).unwrap().unwrap();
-    let mut child = Reap(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "audio_idle::tests::review_ddust_occupied_delays_worker_until_released",
-                "--nocapture",
-            ])
-            .env(ROLE, "1")
-            .env("AUDIO_REVIEW_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env("DDUST_RUN_REGISTRY", root.join("ddust/registry.json"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Ok(bytes) = fs::read(root.join("status.json"))
-            && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            && status["phase"] == "waiting"
-            && status["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("ddust accelerator lease is occupied"))
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "scheduler did not wait for the busy ddust lease"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!root.join("worker-started-after-ddust").exists());
-    assert!(!root.join("audio-idle-legacy-started").exists());
-    drop(held);
-    wait_file(&root.join("worker-started-after-ddust"));
-    assert!(Lease::try_acquire(&lock).unwrap().is_none());
-    fs::write(root.join("stop.request"), b"stop").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "busy ddust scheduler failed: {status}");
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "busy ddust scheduler did not stop"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(Lease::try_acquire(&lock).unwrap().is_some());
 }
 
 #[test]
@@ -1033,7 +784,6 @@ wait "$child"
     }
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    fs::create_dir(root.join("home")).unwrap();
     fs::create_dir(root.join("ddust")).unwrap();
     let (mut reader, mut writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
@@ -1056,7 +806,6 @@ wait "$child"
         ])
         .env(ROLE, "scheduler")
         .env("AUDIO_REVIEW_ROOT", root)
-        .env("HOME", root.join("home"))
         .env("DDUST_RUN_REGISTRY", root.join("ddust/registry.json"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1201,7 +950,6 @@ wait "$child"
     }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    fs::create_dir(root.join("home")).unwrap();
     let (mut reader, mut writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
     loop {
@@ -1223,8 +971,10 @@ wait "$child"
             ])
             .env(ROLE, "1")
             .env("AUDIO_REVIEW_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env_remove("DDUST_RUN_REGISTRY")
+            .env(
+                "DDUST_RUN_REGISTRY",
+                root.join("synthetic-registry/runs.json"),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::from(OwnedFd::from(writer)))
             .spawn()
@@ -1326,7 +1076,6 @@ wait "$child"
     }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    fs::create_dir(root.join("home")).unwrap();
     let mut child = Reap(
         Command::new(std::env::current_exe().unwrap())
             .args([
@@ -1336,8 +1085,10 @@ wait "$child"
             ])
             .env(ROLE, "1")
             .env("AUDIO_REVIEW_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env_remove("DDUST_RUN_REGISTRY")
+            .env(
+                "DDUST_RUN_REGISTRY",
+                root.join("synthetic-registry/runs.json"),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1462,7 +1213,6 @@ cat "$state/mock-output.json"
     let role = selected;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    fs::create_dir(root.join("home")).unwrap();
     let (mut reader, mut writer) = UnixStream::pair().unwrap();
     // This socket is created by the test and has not been shared with the child yet.
     writer.set_nonblocking(true).unwrap();
@@ -1487,9 +1237,11 @@ cat "$state/mock-output.json"
         .args(["--exact", test, "--nocapture"])
         .env(ROLE, role)
         .env("AUDIO_REVIEW_ROOT", root)
-        .env("HOME", root.join("home"))
         .env("AUDIO_REVIEW_OUTPUT_FD", fd.to_string())
-        .env_remove("DDUST_RUN_REGISTRY")
+        .env(
+            "DDUST_RUN_REGISTRY",
+            root.join("synthetic-registry/runs.json"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1722,7 +1474,6 @@ cat "$state/mock-output.json"
     }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    fs::create_dir(root.join("home")).unwrap();
     let (mut reader, mut writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
     loop {
@@ -1746,8 +1497,10 @@ cat "$state/mock-output.json"
         .env(ROLE, "1")
         .env("AUDIO_REVIEW_ROOT", root)
         .env("AUDIO_REVIEW_OUTPUT_FD", fd.to_string())
-        .env("HOME", root.join("home"))
-        .env_remove("DDUST_RUN_REGISTRY")
+        .env(
+            "DDUST_RUN_REGISTRY",
+            root.join("synthetic-registry/runs.json"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1843,4 +1596,133 @@ cat "$state/mock-output.json"
     assert_eq!(report["training_status"], "complete");
     assert_eq!(report["quality"], "not_assessed");
     assert_eq!(report["progress"]["updates"], 4);
+}
+
+#[test]
+fn review_blocked_idle_probe_cancels_and_reaps_running_worker() {
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::AtomicUsize;
+    const ROLE: &str = "AUDIO_390_BLOCKED_PROBE";
+    if std::env::var_os(ROLE).is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("AUDIO_390_ROOT").unwrap());
+        let executable = program(
+            &root,
+            r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  [ "$previous" = "--state" ] && state="$arg"
+  previous="$arg"
+done
+printf '%s' "$$" > "$state/probe-worker-pid"
+sleep 30 &
+child=$!
+trap 'wait "$child" 2>/dev/null; exit 130' INT TERM
+wait "$child"
+"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut config = WatchConfig::new(
+            &root,
+            2,
+            IdlePolicy::default(),
+            Arc::new(AtomicBool::new(false)),
+            "blocked probe mock",
+        );
+        config.probe = Arc::new(move |path| {
+            if calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                fs::write(path.join("probe-blocked"), b"blocked").unwrap();
+                while !path.join("probe-release").exists() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            idle(true)
+        });
+        config.ddust_lease = || Ok(None);
+        config.wait_unit = Duration::from_millis(5);
+        config.watchdog_interval = Duration::from_millis(5);
+        config.worker_grace = Duration::from_millis(300);
+        let _ = watch_audio(config, &root, &job(&root), &executable);
+        return;
+    }
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mut scheduler = Reap(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audio_idle::tests::review_blocked_idle_probe_cancels_and_reaps_running_worker",
+                "--nocapture",
+            ])
+            .env(ROLE, "1")
+            .env("AUDIO_390_ROOT", root)
+            .env(
+                "DDUST_RUN_REGISTRY",
+                root.join("synthetic-registry/runs.json"),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_file(&root.join("probe-blocked"));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let worker = loop {
+        if let Ok(text) = fs::read_to_string(root.join("probe-worker-pid"))
+            && let Ok(pid) = text.parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "mock worker did not start");
+        thread::sleep(Duration::from_millis(5));
+    };
+    let foreground = Lease::try_acquire(&root.join("foreground.lock"))
+        .unwrap()
+        .unwrap();
+    fs::write(root.join("stop.request"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let released = loop {
+        if Lease::try_acquire(&root.join("device.lock"))
+            .unwrap()
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let worker_gone = unsafe { libc::kill(worker, 0) } == -1;
+    fs::write(root.join("probe-release"), b"release").unwrap();
+    drop(foreground);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = scheduler.0.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            unsafe {
+                libc::kill(-worker, libc::SIGKILL);
+            }
+            panic!("scheduler did not finish after releasing mock probe");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    println!("device_released_before_probe_release={released}; worker_reaped={worker_gone}");
+    assert!(
+        released,
+        "blocked idle probe retained the device after stop"
+    );
+    assert!(
+        worker_gone,
+        "device released before worker process was reaped"
+    );
 }

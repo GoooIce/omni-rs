@@ -132,12 +132,12 @@ fn fixed_baseline_legacy_and_v3_cannot_be_inspected_or_restored() {
         );
         #[cfg(feature = "native")]
         {
-            let home = root.join("fake-home");
-            fs::create_dir(&home).unwrap();
             let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omni-rsi"));
             command
-                .env("HOME", &home)
-                .env_remove("DDUST_RUN_REGISTRY")
+                .env(
+                    "DDUST_RUN_REGISTRY",
+                    root.join("synthetic-registry/runs.json"),
+                )
                 .arg("--model")
                 .arg(root)
                 .arg("--state")

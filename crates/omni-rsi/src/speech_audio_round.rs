@@ -79,13 +79,15 @@ pub fn train_supervised_audio_round<B: AutodiffBackend>(
     supervision: &crate::audio_idle_state::AudioSupervision,
 ) -> Result<AudioRoundResult, String> {
     supervision.check_scope(options.state)?;
-    train_round::<B, _>(options, device, stop, v3, || {
-        if options.resume {
-            supervision.check_scope(options.state)
-        } else {
-            supervision.check_fresh(options.state, v3)
-        }
-    })
+    supervision.while_connected(stop, || {
+        train_round::<B, _>(options, device, stop, v3, || {
+            if options.resume {
+                supervision.check_scope(options.state)
+            } else {
+                supervision.check_fresh(options.state, v3)
+            }
+        })
+    })?
 }
 
 enum TrainingData {

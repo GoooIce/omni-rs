@@ -69,11 +69,12 @@ fn review_foreground_fresh_rejects_idle_reservations() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let (state, marker) = setup(root, v3, alias);
-        fs::create_dir(root.join("home")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_omni-rsi-audio"));
         command
-            .env("HOME", root.join("home"))
-            .env_remove("DDUST_RUN_REGISTRY")
+            .env(
+                "DDUST_RUN_REGISTRY",
+                root.join("synthetic-registry/runs.json"),
+            )
             .arg("--model")
             .arg(root)
             .arg("--data")
@@ -110,12 +111,13 @@ fn check_supervised_resume_scope(test: &str, mode: &str) {
     const ROLE: &str = "AUDIO_REVIEW_SUPERVISION_ROLE";
     if std::env::var_os(ROLE).is_none() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir(temp.path().join("home")).unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
             .env(ROLE, "1")
-            .env("HOME", temp.path().join("home"))
-            .env_remove("DDUST_RUN_REGISTRY")
+            .env(
+                "DDUST_RUN_REGISTRY",
+                temp.path().join("synthetic-registry/runs.json"),
+            )
             .output()
             .unwrap();
         assert!(
@@ -145,7 +147,6 @@ fn check_supervised_resume_scope(test: &str, mode: &str) {
         runner.as_raw_fd(),
         device.as_raw_fd(),
         child.as_raw_fd(),
-        None,
     )
     .unwrap();
     let _keepalive = if mode == "dead" {
@@ -244,7 +245,6 @@ fn review_actual_supervised_worker_enters_its_reserved_fresh_namespace() {
         let data = root.join("data");
         fs::create_dir_all(&state).unwrap();
         fs::create_dir(&data).unwrap();
-        fs::create_dir(root.join("home")).unwrap();
         fs::write(data.join("manifest.json"), b"invalid synthetic manifest").unwrap();
         omni_rsi::audio_idle_state::reserve_fresh(&state, v3).unwrap();
         let runner = Lease::try_acquire(&state.join("runner.lock"))
@@ -257,8 +257,10 @@ fn review_actual_supervised_worker_enters_its_reserved_fresh_namespace() {
         let fds = [runner.as_raw_fd(), device.as_raw_fd(), worker.as_raw_fd()];
         let mut command = Command::new(env!("CARGO_BIN_EXE_omni-rsi"));
         command
-            .env("HOME", root.join("home"))
-            .env_remove("DDUST_RUN_REGISTRY")
+            .env(
+                "DDUST_RUN_REGISTRY",
+                root.join("synthetic-registry/runs.json"),
+            )
             .arg("--model")
             .arg(root)
             .arg("--state")

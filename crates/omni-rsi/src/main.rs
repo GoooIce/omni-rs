@@ -289,7 +289,17 @@ fn state_status(root: &Path, phase: &str, detail: &str, completed: usize) -> Res
 }
 
 fn ddust_lease() -> Result<Option<Lease>, String> {
-    omni_rsi::lease::try_ddust_lease()
+    let path = if let Some(registry) = std::env::var_os("DDUST_RUN_REGISTRY") {
+        PathBuf::from(registry).parent().map(|p| p.join("mps.lock"))
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("code/ddust/.ddust/mps.lock"))
+    };
+    match path {
+        Some(path) if path.exists() => Lease::try_acquire(&path)?
+            .map(Some)
+            .ok_or_else(|| "ddust accelerator lease is occupied".into()),
+        _ => Ok(None),
+    }
 }
 
 fn foreground_clear(root: &Path) -> bool {
@@ -492,35 +502,174 @@ type IdleProbe = Arc<dyn Fn(&Path) -> IdleSnapshot + Send + Sync>;
 
 thread_local! {
     static WATCHDOG_PROBE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCHEDULER_LEASE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // Called only at binary startup, before application threads are started. Other
-// threads still use the pre-existing hook; only a caught idle-probe panic is quiet.
+// threads still use the pre-existing hook; caught probe and scheduler panics
+// cannot block on stderr while the scheduler owns a device lease.
 fn install_watchdog_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let probe = WATCHDOG_PROBE_ACTIVE
             .try_with(|active| active.get())
             .unwrap_or(false);
-        if !probe {
+        let scheduler = SCHEDULER_LEASE_ACTIVE
+            .try_with(|active| active.get())
+            .unwrap_or(false);
+        if !probe && !scheduler {
             previous(info);
         }
     }));
 }
 
-fn checked_watchdog_probe(probe: impl FnOnce() -> bool, failed: &AtomicBool) -> bool {
-    WATCHDOG_PROBE_ACTIVE.with(|active| {
-        let was_active = active.replace(true);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(probe));
-        active.set(was_active);
-        match result {
-            Ok(allowed) => allowed,
-            Err(_) => {
-                failed.store(true, Ordering::Release);
-                false
+struct SchedulerLeasePanicGuard(bool);
+impl SchedulerLeasePanicGuard {
+    fn enter() -> Self {
+        Self(SCHEDULER_LEASE_ACTIVE.with(|active| active.replace(true)))
+    }
+}
+impl Drop for SchedulerLeasePanicGuard {
+    fn drop(&mut self) {
+        SCHEDULER_LEASE_ACTIVE.with(|active| active.set(self.0));
+    }
+}
+
+// Each scheduler has one probe worker. Timed-out workers retain their slots
+// until they actually exit; no new scheduler may accumulate blocked workers.
+struct ProbeSlot {
+    worker: std::sync::Weak<()>,
+    timed_out: Arc<AtomicBool>,
+}
+static PROBE_SLOTS: std::sync::Mutex<Vec<ProbeSlot>> = std::sync::Mutex::new(Vec::new());
+const MAX_PROBE_WORKERS: usize = 32;
+const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+type ProbeReply = std::sync::mpsc::SyncSender<Result<Option<String>, String>>;
+
+#[derive(Clone)]
+struct IdleObserverClient {
+    sender: std::sync::mpsc::SyncSender<ProbeReply>,
+    pending: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+}
+
+impl IdleObserverClient {
+    fn observe(&self) -> Result<Option<String>, String> {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return Err("previous idle probe is still blocked".into());
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        if self.sender.try_send(sender).is_err() {
+            self.pending.store(false, Ordering::Release);
+            return Err("idle probe worker unavailable".into());
+        }
+        match receiver.recv_timeout(IDLE_PROBE_TIMEOUT) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.timed_out.store(true, Ordering::Release);
+                Err("idle probe timed out".into())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("idle probe disconnected".into())
             }
         }
-    })
+    }
+}
+
+struct IdleObserver {
+    sender: Option<std::sync::mpsc::SyncSender<ProbeReply>>,
+    pending: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IdleObserver {
+    // Start before taking any scheduler/device lease, so thread creation does
+    // not leave a held device behind if the operating system stalls.
+    fn start(
+        root: PathBuf,
+        policy: IdlePolicy,
+        shutdown: Arc<AtomicBool>,
+        probe: IdleProbe,
+    ) -> Result<Self, String> {
+        let mut slots = PROBE_SLOTS
+            .lock()
+            .map_err(|_| "idle probe registry unavailable".to_owned())?;
+        slots.retain(|slot| slot.worker.strong_count() > 0);
+        if slots
+            .iter()
+            .any(|slot| slot.timed_out.load(Ordering::Acquire))
+        {
+            return Err("previous idle probe is still blocked".into());
+        }
+        if slots.len() >= MAX_PROBE_WORKERS {
+            return Err("too many concurrent idle probes".into());
+        }
+        let token = Arc::new(());
+        let weak = Arc::downgrade(&token);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ProbeReply>(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let pending_worker = pending.clone();
+        let worker = std::thread::Builder::new()
+            .name("rsi-idle-probe".into())
+            .spawn(move || {
+                let _token = token;
+                while let Ok(reply) = receiver.recv() {
+                    let result = WATCHDOG_PROBE_ACTIVE.with(|active| {
+                        let was_active = active.replace(true);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if stopping(&root, &shutdown) {
+                                return Some("stop requested".into());
+                            }
+                            policy
+                                .blocker(&probe(&root))
+                                .map(str::to_owned)
+                                .or_else(|| {
+                                    (!foreground_clear(&root))
+                                        .then(|| "foreground RSI request".into())
+                                })
+                        }));
+                        active.set(was_active);
+                        result.map_err(|_| "idle probe panicked".to_owned())
+                    });
+                    pending_worker.store(false, Ordering::Release);
+                    let _ = reply.send(result);
+                }
+            })
+            .map_err(|error| format!("cannot start idle probe: {error}"))?;
+        slots.push(ProbeSlot {
+            worker: weak,
+            timed_out: timed_out.clone(),
+        });
+        Ok(Self {
+            sender: Some(sender),
+            pending,
+            timed_out,
+            worker: Some(worker),
+        })
+    }
+
+    fn client(&self) -> IdleObserverClient {
+        IdleObserverClient {
+            sender: self.sender.as_ref().expect("observer live").clone(),
+            pending: self.pending.clone(),
+            timed_out: self.timed_out.clone(),
+        }
+    }
+}
+
+impl Drop for IdleObserver {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            // Do not join an uninterruptible probe. Its global slot stays busy
+            // until it actually returns and observes the closed channel.
+            if !self.pending.load(Ordering::Acquire) {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 
 // Console consumers are outside the scheduler's control. A bounded queue and a
@@ -664,6 +813,23 @@ fn persist_watch_report(root: &Path, report: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn watch_error(
+    root: &Path,
+    completed: usize,
+    error: String,
+    unconfirmed: &Option<PathBuf>,
+) -> Result<(), String> {
+    let mut detail = error;
+    if let Some(path) = unconfirmed {
+        detail.push_str(&format!(
+            "; live report output unconfirmed; report saved at {}",
+            path.display()
+        ));
+    }
+    state_status(root, "error", &detail, completed)?;
+    Err(detail)
+}
+
 struct WatchConfig<'a> {
     root: &'a Path,
     rounds: usize,
@@ -719,7 +885,6 @@ where
 struct HeldLeases<'a> {
     runner: &'a Lease,
     device: &'a Lease,
-    ddust: Option<&'a Lease>,
 }
 
 fn watch_with_leases<F, P, Y>(
@@ -749,6 +914,8 @@ where
     if rounds == 0 || rounds > 1_000 {
         return Err("round count must be between 1 and 1000".into());
     }
+    let observer = IdleObserver::start(root.to_owned(), policy, shutdown.clone(), probe)?;
+    let observation = observer.client();
     let output = WatchOutput::new();
     let runner = Lease::try_acquire(&root.join("runner.lock"))?
         .ok_or("an RSI scheduler is already running")?;
@@ -757,7 +924,11 @@ where
     let mut last_detail = String::new();
     let mut unconfirmed_report = None;
     while completed < rounds && !stopping(root, &shutdown) {
-        if let Some(detail) = waiting_for_work()? {
+        let pending = match waiting_for_work() {
+            Ok(pending) => pending,
+            Err(error) => return watch_error(root, completed, error, &unconfirmed_report),
+        };
+        if let Some(detail) = pending {
             if detail != last_detail {
                 state_status(root, "waiting", detail, completed)?;
                 WatchOutput::send(
@@ -774,11 +945,10 @@ where
             }
             continue;
         }
-        let state = probe(root);
-        let blocker = policy
-            .blocker(&state)
-            .map(str::to_owned)
-            .or_else(|| (!foreground_clear(root)).then(|| "foreground RSI request".into()));
+        let blocker = match observation.observe() {
+            Ok(blocker) => blocker,
+            Err(error) => return watch_error(root, completed, error, &unconfirmed_report),
+        };
         if let Some(blocker) = blocker {
             if blocker != last_detail {
                 state_status(root, "waiting", &blocker, completed)?;
@@ -796,7 +966,27 @@ where
             }
             continue;
         }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let check_observation = observation.clone();
+        let probe_failed = Arc::new(AtomicBool::new(false));
+        let check_failed = probe_failed.clone();
+        // Start the watchdog before taking the device lease as well.
+        let watchdog =
+            Watchdog::start(
+                cancel.clone(),
+                watchdog_interval,
+                move || match check_observation.observe() {
+                    Ok(blocker) => blocker.is_none(),
+                    Err(_) => {
+                        check_failed.store(true, Ordering::Release);
+                        false
+                    }
+                },
+            );
+        let quiet_panic = SchedulerLeasePanicGuard::enter();
         let Some(device_lease) = Lease::try_acquire(&root.join("device.lock"))? else {
+            drop(quiet_panic);
+            drop(watchdog);
             state_status(root, "waiting", "RSI device lease occupied", completed)?;
             std::thread::sleep(wait_unit);
             continue;
@@ -805,65 +995,78 @@ where
             Ok(lease) => lease,
             Err(message) => {
                 drop(device_lease);
+                drop(quiet_panic);
+                drop(watchdog);
                 state_status(root, "waiting", &message, completed)?;
                 std::thread::sleep(wait_unit * 2);
                 continue;
             }
         };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let check_root = root.to_owned();
-        let check_policy = policy.clone();
-        let check_shutdown = shutdown.clone();
-        let check_probe = probe.clone();
-        let probe_failed = Arc::new(AtomicBool::new(false));
-        let check_failed = probe_failed.clone();
-        let watchdog = Watchdog::start(cancel.clone(), watchdog_interval, move || {
-            !stopping(&check_root, &check_shutdown)
-                && checked_watchdog_probe(
-                    || check_policy.blocker(&check_probe(&check_root)).is_none(),
-                    &check_failed,
-                )
-                && foreground_clear(&check_root)
-        });
+        if cancel.load(Ordering::Acquire) {
+            drop(watchdog);
+            drop(ddust);
+            drop(device_lease);
+            drop(quiet_panic);
+            if probe_failed.load(Ordering::Acquire) {
+                return watch_error(
+                    root,
+                    completed,
+                    "idle probe failed".into(),
+                    &unconfirmed_report,
+                );
+            }
+            last_detail.clear();
+            continue;
+        }
         state_status(root, "running", description, completed)?;
-        let result = run_round(
-            &cancel,
-            HeldLeases {
-                runner: &runner,
-                device: &device_lease,
-                ddust: ddust.as_ref(),
-            },
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_round(
+                &cancel,
+                HeldLeases {
+                    runner: &runner,
+                    device: &device_lease,
+                },
+            )
+        }));
+        if result.is_err() {
+            cancel.store(true, Ordering::Release);
+        }
         drop(watchdog);
         drop(ddust);
         drop(device_lease);
-        if cancel.load(Ordering::Acquire) {
-            let probe_failed = probe_failed.load(Ordering::Acquire);
-            if let Err(error) = on_yield() {
-                let error = if probe_failed {
-                    format!("{error}; idle probe failed")
-                } else {
-                    error
-                };
-                state_status(root, "error", &error, completed)?;
-                return Err(error);
+        drop(quiet_panic);
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                return watch_error(
+                    root,
+                    completed,
+                    "idle round panicked".into(),
+                    &unconfirmed_report,
+                );
             }
-            state_status(
-                root,
-                "waiting",
-                if probe_failed {
-                    "background work yielded; idle probe failed"
-                } else {
-                    "background work yielded"
-                },
-                completed,
-            )?;
-            last_detail.clear();
-            continue;
+        };
+        let was_cancelled = cancel.load(Ordering::Acquire);
+        let probe_failed = probe_failed.load(Ordering::Acquire);
+        if was_cancelled && let Err(error) = on_yield() {
+            let error = if probe_failed {
+                format!("{error}; idle probe failed")
+            } else {
+                error
+            };
+            return watch_error(root, completed, error, &unconfirmed_report);
         }
         match result {
             Ok(report) => {
                 if report.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+                    if probe_failed {
+                        return watch_error(
+                            root,
+                            completed,
+                            "idle probe failed".into(),
+                            &unconfirmed_report,
+                        );
+                    }
                     state_status(
                         root,
                         "waiting",
@@ -883,16 +1086,14 @@ where
                 let bytes = match serialize_watch_report(&report) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        state_status(root, "error", &error, completed)?;
-                        return Err(error);
+                        return watch_error(root, completed, error, &unconfirmed_report);
                     }
                 };
                 let path = match persist_watch_report(root, &bytes) {
                     Ok(path) => path,
                     Err(error) => {
                         let detail = format!("cannot persist completed round report: {error}");
-                        state_status(root, "error", &detail, completed)?;
-                        return Err(detail);
+                        return watch_error(root, completed, detail, &unconfirmed_report);
                     }
                 };
                 completed += 1;
@@ -910,14 +1111,37 @@ where
                     },
                     completed,
                 )?;
+                if probe_failed {
+                    return watch_error(
+                        root,
+                        completed,
+                        "idle probe failed".into(),
+                        &unconfirmed_report,
+                    );
+                }
                 if complete {
                     work_complete = true;
                     break;
                 }
+                if was_cancelled {
+                    last_detail.clear();
+                }
             }
             Err(error) => {
-                state_status(root, "error", &error, completed)?;
-                return Err(error);
+                if probe_failed {
+                    return watch_error(
+                        root,
+                        completed,
+                        format!("{error}; idle probe failed"),
+                        &unconfirmed_report,
+                    );
+                }
+                if was_cancelled {
+                    state_status(root, "waiting", "background work yielded", completed)?;
+                    last_detail.clear();
+                    continue;
+                }
+                return watch_error(root, completed, error, &unconfirmed_report);
             }
         }
     }
