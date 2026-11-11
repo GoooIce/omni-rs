@@ -6,6 +6,9 @@ extern crate self as omni_rsi;
 #[path = "../tests/support/number_v3_fixture.rs"]
 mod number_v3_fixture;
 
+mod alimeeting_fs;
+pub mod alimeeting_screen;
+mod alimeeting_textgrid;
 pub mod chart;
 pub mod child;
 pub mod evolution;
