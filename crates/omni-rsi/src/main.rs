@@ -1048,17 +1048,24 @@ where
         };
         let was_cancelled = cancel.load(Ordering::Acquire);
         let probe_failed = probe_failed.load(Ordering::Acquire);
-        if was_cancelled && let Err(error) = on_yield() {
-            let error = if probe_failed {
+        let yield_error = if was_cancelled {
+            on_yield().err()
+        } else {
+            None
+        };
+        let yield_error = yield_error.map(|error| {
+            if probe_failed {
                 format!("{error}; idle probe failed")
             } else {
                 error
-            };
-            return watch_error(root, completed, error, &unconfirmed_report);
-        }
+            }
+        });
         match result {
             Ok(report) => {
                 if report.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+                    if let Some(error) = yield_error {
+                        return watch_error(root, completed, error, &unconfirmed_report);
+                    }
                     if probe_failed {
                         return watch_error(
                             root,
@@ -1111,6 +1118,9 @@ where
                     },
                     completed,
                 )?;
+                if let Some(error) = yield_error {
+                    return watch_error(root, completed, error, &unconfirmed_report);
+                }
                 if probe_failed {
                     return watch_error(
                         root,
@@ -1128,6 +1138,9 @@ where
                 }
             }
             Err(error) => {
+                if let Some(error) = yield_error {
+                    return watch_error(root, completed, error, &unconfirmed_report);
+                }
                 if probe_failed {
                     return watch_error(
                         root,

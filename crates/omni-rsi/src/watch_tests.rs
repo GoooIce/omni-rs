@@ -937,3 +937,54 @@ fn review_independent_healthy_schedulers_can_probe_concurrently() {
     other.join().unwrap().unwrap();
     result.unwrap();
 }
+#[test]
+fn review_successful_round_report_survives_failed_yield_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let changed = Arc::new(AtomicBool::new(false));
+    let probe_changed = changed.clone();
+    let mut config = WatchConfig::new(
+        root,
+        1,
+        IdlePolicy::default(),
+        shutdown.clone(),
+        "yield failure mock",
+    );
+    config.probe = Arc::new(move |_| {
+        let mut snapshot = mock_snapshot(true);
+        if probe_changed.load(Ordering::Acquire) {
+            snapshot.idle_seconds = Some(0.0);
+        }
+        snapshot
+    });
+    config.ddust_lease = || Ok(None);
+    config.wait_unit = Duration::from_millis(5);
+    config.watchdog_interval = Duration::from_millis(5);
+    let error = watch_with_leases(
+        config,
+        || Ok(None),
+        |cancel, _| {
+            changed.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !cancel.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "watchdog did not cancel");
+                thread::sleep(Duration::from_millis(5));
+            }
+            shutdown.store(true, Ordering::Release);
+            Ok(json!({"complete": true, "synthetic": "completed"}))
+        },
+        || Err("synthetic yield check failed".into()),
+    )
+    .unwrap_err();
+    assert!(error.contains("synthetic yield check failed"), "{error}");
+    let status = wait_for_status(root, "error");
+    assert_eq!(status["completed_this_session"], 1);
+    let entries: Vec<_> = fs::read_dir(root.join("idle-round-reports"))
+        .unwrap()
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(entries[0].as_ref().unwrap().path()).unwrap()).unwrap();
+    assert_eq!(report["synthetic"], "completed");
+}
