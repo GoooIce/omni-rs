@@ -45,6 +45,7 @@ pub mod speech_round;
 pub mod speech_seed;
 mod speech_target_format;
 pub mod speech_tone;
+pub mod speech_tone_input;
 pub mod speech_training;
 pub mod storage;
 pub mod watchdog;
