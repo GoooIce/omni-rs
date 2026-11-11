@@ -6,7 +6,7 @@ mod unix {
         fs::{self, File, OpenOptions},
         os::{
             fd::{AsRawFd, FromRawFd},
-            unix::fs::MetadataExt,
+            unix::fs::{MetadataExt, OpenOptionsExt},
         },
         path::Path,
     };
@@ -17,11 +17,27 @@ mod unix {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            let file = OpenOptions::new()
+            Self::try_acquire_existing_parent(path)
+        }
+
+        pub(super) fn try_acquire_existing_parent(path: &Path) -> Result<Option<Self>, String> {
+            match fs::metadata(path) {
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err("lease path is not a regular file".into());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            let mut options = OpenOptions::new();
+            options
                 .create(true)
                 .append(true)
-                .open(path)
-                .map_err(|e| e.to_string())?;
+                .custom_flags(libc::O_NONBLOCK);
+            let file = options.open(path).map_err(|e| e.to_string())?;
+            if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+                return Err("lease path is not a regular file".into());
+            }
             Self::lock(file)
         }
 
@@ -78,6 +94,11 @@ mod unix {
             } else {
                 Err(error.to_string())
             }
+        }
+    }
+    impl AsRawFd for Lease {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.0.as_raw_fd()
         }
     }
     impl Drop for Lease {

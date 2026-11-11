@@ -37,6 +37,14 @@ pub struct AudioProgress {
     pub updates: usize,
 }
 
+/// Integrity and implementation identity only; this is not a restorable checkpoint
+/// and does not establish that the current model or dataset matches it.
+pub struct AudioCheckpointSummary {
+    pub protocol_version: u32,
+    pub progress: AudioProgress,
+    pub checkpoint_sha256: String,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct AudioCheckpoint {
     protocol: AudioProtocol,
@@ -95,6 +103,9 @@ fn audio_shared_sources() -> Vec<(&'static str, &'static [u8])> {
         source!("speech_audio_checkpoint.rs", "speech_audio_checkpoint.rs"),
         source!("speech_audio_data.rs", "speech_audio_data.rs"),
         source!("speech_audio_round.rs", "speech_audio_round.rs"),
+        source!("audio_idle.rs", "audio_idle.rs"),
+        source!("audio_idle_state.rs", "audio_idle_state.rs"),
+        source!("lease.rs", "lease.rs"),
         source!("fingerprint.rs", "fingerprint.rs"),
         source!("audio_main.rs", "audio_main.rs"),
         source!("Cargo.toml", "../Cargo.toml"),
@@ -329,9 +340,43 @@ impl AudioCheckpoint {
         Ok(id)
     }
 
-    /// Reject old formats, changed source/data/model, and damaged checkpoint files.
-    pub fn load(state: &Path, expected: &AudioProtocol) -> Result<Option<Self>, String> {
-        validate(expected, &AudioProgress::default())?;
+    /// Inspect integrity and implementation identity without authorizing a restore.
+    /// Model and data matching still requires `load` with an expected protocol.
+    ///
+    /// A preflight result cannot restore optimizer state without `load(expected)`:
+    /// ```compile_fail
+    /// # use omni_rsi::speech_audio_checkpoint::AudioCheckpoint;
+    /// # use burn::tensor::backend::AutodiffBackend;
+    /// fn restore_from_preflight<B: AutodiffBackend>(state: &std::path::Path, device: &B::Device) {
+    ///     let info = AudioCheckpoint::inspect(state).unwrap().unwrap();
+    ///     let _ = info.restore::<B>(device);
+    /// }
+    /// ```
+    /// A checkpoint obtained through the checked API supports the same generic call:
+    /// ```no_run
+    /// # use omni_rsi::speech_audio_checkpoint::AudioCheckpoint;
+    /// # use burn::tensor::backend::AutodiffBackend;
+    /// fn restore_checked<B: AutodiffBackend>(checkpoint: &AudioCheckpoint, device: &B::Device) {
+    ///     let _ = checkpoint.restore::<B>(device);
+    /// }
+    /// fn inspect_only(state: &std::path::Path) {
+    ///     let info = AudioCheckpoint::inspect(state).unwrap().unwrap();
+    ///     let _ = info.protocol_version;
+    /// }
+    /// ```
+    pub fn inspect(state: &Path) -> Result<Option<AudioCheckpointSummary>, String> {
+        Ok(
+            Self::read_validated(state)?.map(|(checkpoint, checkpoint_sha256)| {
+                AudioCheckpointSummary {
+                    protocol_version: checkpoint.protocol.version,
+                    progress: checkpoint.progress,
+                    checkpoint_sha256,
+                }
+            }),
+        )
+    }
+
+    fn read_validated(state: &Path) -> Result<Option<(Self, String)>, String> {
         let directory = state.join("audio-conditioned-v1");
         let pointer = directory.join("latest.json");
         let info = match fs::symlink_metadata(&pointer) {
@@ -349,7 +394,8 @@ impl AudioCheckpoint {
             .get("sha256")
             .and_then(|value| value.as_str())
             .filter(|id| hex_id(id))
-            .ok_or("invalid audio checkpoint pointer")?;
+            .ok_or("invalid audio checkpoint pointer")?
+            .to_owned();
         let path = directory.join("checkpoints").join(format!("{id}.json"));
         let info = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if !info.is_file() || info.len() > 256 * 1024 * 1024 {
@@ -361,6 +407,15 @@ impl AudioCheckpoint {
         }
         let checkpoint: Self = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         validate(&checkpoint.protocol, &checkpoint.progress)?;
+        Ok(Some((checkpoint, id)))
+    }
+
+    /// Reject old formats, changed source/data/model, and damaged checkpoint files.
+    pub fn load(state: &Path, expected: &AudioProtocol) -> Result<Option<Self>, String> {
+        validate(expected, &AudioProgress::default())?;
+        let Some((checkpoint, _)) = Self::read_validated(state)? else {
+            return Ok(None);
+        };
         if &checkpoint.protocol != expected {
             return Err(
                 "audio checkpoint does not match the current model, data or protocol".into(),

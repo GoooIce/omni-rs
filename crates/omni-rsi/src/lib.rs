@@ -9,6 +9,7 @@ mod number_v3_fixture;
 mod alimeeting_fs;
 pub mod alimeeting_screen;
 mod alimeeting_textgrid;
+pub mod audio_idle_state;
 pub mod chart;
 pub mod child;
 pub mod evolution;
