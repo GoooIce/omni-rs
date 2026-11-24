@@ -81,9 +81,13 @@ Offline audio sources sharing text-decoder steps while retaining independent res
 **Continuous synthesis batch**:
 Speech requests sharing semantic-head and depth-decoder work at a codec-frame boundary. Each request owns its backbone history, sampler, audio codec and output. Finishing one voice does not reset another voice's state.
 
+**Speech script**:
+The complete text a speaker submits for synthesis in one action, spoken in order as one or more speech texts.
+_Avoid_: speech text, long text, passage, prompt
+
 **Speech text**:
 The words one speech synthesis is asked to speak, including official inline vocal events.
-_Avoid_: voice instruction, enhancer prompt, prompt
+_Avoid_: voice instruction, enhancer prompt, prompt, speech script
 
 **Voice instruction**:
 Optional natural-language direction for how a speech synthesis should sound, in the same language as the speech text. Empty means that synthesis has no voice instruction.
@@ -94,7 +98,7 @@ The words actually spoken in a reference recording. It stays paired with that re
 _Avoid_: speech text, voice instruction
 
 **Voice-conditioning**:
-The optional voice instruction and optional reference recording, with its reference transcript, fixed for one speech synthesis.
+The optional voice instruction and optional reference recording, with its reference transcript. It is fixed for one speech synthesis, and every speech synthesis of one speech script shares the same one.
 _Avoid_: speech text, enhancer prompt
 
 **Enhancer prompt**:
