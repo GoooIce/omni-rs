@@ -11,7 +11,6 @@ description = "MERT2, SheetSage2 and YuE2 music inference in Rust and Burn"
 [features]
 default = ["metal"]
 metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune"]
-webgpu = ["burn/webgpu", "burn/fusion"]
 cpu = ["burn/ndarray"]
 
 [dependencies]
@@ -33,6 +32,10 @@ rand_distr = "0.5"
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
 
 [patch.crates-io]
+cubek-matmul = { path = "../../vendor/cubek-matmul" }
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
 burn-fusion = { path = "../../vendor/burn-fusion" }
 cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
 cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
@@ -43,6 +46,13 @@ burn = { path = "../../vendor/burn" }
 lto = "thin"
 codegen-units = 1
 [profile.dev]
+debug = "line-tables-only"
+incremental = false
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

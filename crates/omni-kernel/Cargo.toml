@@ -17,7 +17,7 @@ burn-ir = { version = "=0.21.0", default-features = false, features = ["std"] }
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-burn-ane = { path = "../burn-ane", features = ["metal-shared"], optional = true }
+burn-ane = { path = "../burn-ane", version = "=0.21.0", default-features = false, features = ["metal-shared"], optional = true }
 objc2-metal = "0.3"
 wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"] }
 
@@ -28,6 +28,9 @@ half = "=2.7.1"
 [workspace]
 
 [patch.crates-io]
+cubek-matmul = { path = "../../vendor/cubek-matmul" }
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
 burn-fusion = { path = "../../vendor/burn-fusion" }
 cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
 cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
@@ -36,7 +39,14 @@ burn-router = { path = "../../vendor/burn-router" }
 burn = { path = "../../vendor/burn" }
 
 [profile.dev]
+debug = "line-tables-only"
+incremental = false
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

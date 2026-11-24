@@ -48,6 +48,7 @@ spirv = [
     "tracel-ash",
     "cubecl-common/compilation-cache",
     "cubecl-common/hash",
+    "vulkan-portability",
 ]
 spirv-dump = ["std"]
 std = [
@@ -63,6 +64,7 @@ tracing = [
     "cubecl-core/tracing",
 ]
 vulkan-validate = []
+vulkan-portability = ["wgpu/vulkan-portability"]
 
 [lib]
 name = "cubecl_wgpu"
@@ -189,8 +191,11 @@ version = "0.4.45"
 
 [target.'cfg(target_os = "macos")'.dependencies.wgpu]
 version = "29"
+default-features = false
 features = [
-    "vulkan-portability",
+    "std",
+    "metal",
+    "wgsl",
     "fragile-send-sync-non-atomic-wasm",
 ]
 

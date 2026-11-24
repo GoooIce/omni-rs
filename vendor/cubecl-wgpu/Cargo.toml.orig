@@ -37,10 +37,12 @@ spirv = [
     "tracel-ash",
     "cubecl-common/compilation-cache",
     "cubecl-common/hash",
+    "vulkan-portability",
 ]
 
 spirv-dump = ["std"]
 vulkan-validate = []
+vulkan-portability = ["wgpu/vulkan-portability"]
 
 tracing = [
     "dep:tracing",
@@ -93,11 +95,13 @@ wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
 # wgpu = { git = "https://github.com/tracel-ai/wgpu", features = ["fragile-send-sync-non-atomic-wasm"], rev = "624db2ae762b83446693020ae637e2c5879b3af9" }
 ## For development on wgpu uncomment this one and make it point to your local wgpu repo
 # wgpu = { path = "../../../../tracel/wgpu/wgpu", features = ["fragile-send-sync-non-atomic-wasm"]}
-## On macOS, the `vulkan-portability` feature is required due to the MoltenVK translation layer.
+## macOS defaults to native Metal. MoltenVK is an explicit `vulkan-portability` opt-in.
 # To install MoltenVK, install the VulkanSDK: https://vulkan.lunarg.com/sdk/home#mac
 [target.'cfg(target_os = "macos")'.dependencies]
-wgpu = { workspace = true, features = [
-    "vulkan-portability",
+wgpu = { workspace = true, default-features = false, features = [
+    "std",
+    "metal",
+    "wgsl",
     "fragile-send-sync-non-atomic-wasm",
 ] }
 ## Uncomment if targeting metal through msl feature

@@ -7,7 +7,7 @@ description = "Confucius4-R2T2 streaming speech recognition with Burn, Metal and
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "r2t2"
@@ -54,12 +54,10 @@ required-features = ["ane", "metal", "microphone"]
 default = ["native", "metal"]
 native = ["dep:clap", "dep:hound", "dep:memmap2", "dep:pollster"]
 metal = ["burn/metal", "burn/fusion", "burn/autotune", "dep:omni-kernel"]
-webgpu = ["burn/webgpu", "burn/fusion"]
 cpu = ["burn/ndarray"]
 microphone = ["native", "dep:cpal", "dep:ctrlc"]
 coreml = ["native", "dep:sha2"]
 ane = ["native", "burn/ane", "burn/ndarray", "omni-kernel?/ane"]
-wasm = ["webgpu", "tokenizers/unstable_wasm", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-time"]
 
 [dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
@@ -76,14 +74,6 @@ memmap2 = { version = "0.9", optional = true }
 pollster = { version = "0.4", optional = true }
 cpal = { version = "0.16", optional = true }
 ctrlc = { version = "3.4", optional = true }
-wasm-bindgen = { version = "0.2", optional = true }
-wasm-bindgen-futures = { version = "0.4", optional = true }
-js-sys = { version = "0.3", optional = true }
-serde-wasm-bindgen = { version = "0.6", optional = true }
-web-time = { version = "1", optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 omni-kernel = { path = "crates/omni-kernel", optional = true }
@@ -93,8 +83,10 @@ burn = { version = "=0.21.0", default-features = false, features = ["std", "ndar
 pollster = "0.4"
 
 [patch.crates-io]
+cubek-matmul = { path = "vendor/cubek-matmul" }
 burn-cubecl = { path = "vendor/burn-cubecl" }
 cubecl-common = { path = "vendor/cubecl-common" }
+cubecl-cpp = { path = "vendor/cubecl-cpp" }
 burn-fusion = { path = "vendor/burn-fusion" }
 cubecl-runtime = { path = "vendor/cubecl-runtime" }
 cubecl-wgpu = { path = "vendor/cubecl-wgpu" }
@@ -106,7 +98,14 @@ lto = "thin"
 codegen-units = 1
 
 [profile.dev]
+debug = "line-tables-only"
+incremental = false
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

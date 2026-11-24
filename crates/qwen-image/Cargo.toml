@@ -10,11 +10,10 @@ description = "Qwen-Image-2.1-Turbo local image inference in Rust and Burn"
 
 [features]
 default = ["metal"]
-metal = ["burn/metal", "burn/fusion", "burn/autotune", "burn/ndarray", "dep:burn-cubecl", "dep:cubek-attention", "dep:cubecl", "dep:cubecl-cpp", "dep:cubecl-runtime", "dep:objc2-metal", "dep:wgpu", "omni-minicpm-v/metal"]
+metal = ["burn/metal", "burn/fusion", "burn/autotune", "dep:burn-cubecl", "dep:cubek-attention", "dep:cubecl", "dep:cubecl-cpp", "dep:cubecl-runtime", "dep:objc2-metal", "dep:wgpu", "omni-minicpm-v/metal"]
 ane = ["metal", "burn/ane", "omni-kernel/ane"]
 # burn-cubecl + cubecl also back the rewrite backend's raw (non-fusion)
 # runtime — see rewrite::minicpm::Native.
-webgpu = ["burn/webgpu", "burn/fusion", "burn/ndarray", "dep:burn-cubecl", "dep:cubecl", "omni-minicpm-v/webgpu"]
 cpu = ["burn/ndarray", "omni-minicpm-v/cpu"]
 # Prompt-rewrite backend on local MiniCPM-V checkpoints (see
 # docs/qwen-image-rewrite.md). Without it, `--rewrite` reports a clear
@@ -61,9 +60,12 @@ required-features = ["metal"]
 
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
+omni-minicpm-v = { path = "../minicpm-v", default-features = false, features = ["cpu"] }
 half = "=2.7.1"
+tempfile = "3"
 
 [patch.crates-io]
+cubek-matmul = { path = "../../vendor/cubek-matmul" }
 burn-cubecl = { path = "../../vendor/burn-cubecl" }
 cubecl-common = { path = "../../vendor/cubecl-common" }
 cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
@@ -78,7 +80,14 @@ lto = "thin"
 codegen-units = 16
 
 [profile.dev]
+debug = "line-tables-only"
+incremental = false
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

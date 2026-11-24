@@ -33,3 +33,12 @@ objc2-metal = { version = "0.3", features = [
     "MTLResource",
     "MTLTensor",
 ] }
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

@@ -15,8 +15,25 @@ cubecl = { version = "=0.10.0", default-features = false, features = ["std", "st
 serde_json = "1"
 
 [patch.crates-io]
+cubek-matmul = { path = "../../vendor/cubek-matmul" }
+burn-cubecl = { path = "../../vendor/burn-cubecl" }
+cubecl-common = { path = "../../vendor/cubecl-common" }
+cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
+burn-fusion = { path = "../../vendor/burn-fusion" }
+cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+burn-router = { path = "../../vendor/burn-router" }
 burn = { path = "../../vendor/burn" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

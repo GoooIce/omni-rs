@@ -11,7 +11,6 @@ description = "Local HTTP adapters for Omni Burn inference"
 [features]
 default = ["metal"]
 metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune", "omni-hy-mt/metal", "omni-breeze-tts/metal", "omni-qwen-image/metal", "omni-music/metal", "omni-lfm3/metal"]
-webgpu = ["burn/webgpu", "burn/fusion", "omni-hy-mt/webgpu", "omni-breeze-tts/webgpu", "omni-qwen-image/webgpu", "omni-music/webgpu", "omni-lfm3/webgpu"]
 cpu = ["burn/ndarray", "omni-hy-mt/cpu", "omni-breeze-tts/cpu", "omni-qwen-image/cpu", "omni-music/cpu", "omni-lfm3/cpu"]
 
 [dependencies]
@@ -35,6 +34,7 @@ hound = "3.5"
 tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
+cubek-matmul = { path = "../../vendor/cubek-matmul" }
 burn-cubecl = { path = "../../vendor/burn-cubecl" }
 cubecl-common = { path = "../../vendor/cubecl-common" }
 cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
@@ -48,6 +48,13 @@ burn = { path = "../../vendor/burn" }
 lto = "thin"
 codegen-units = 16
 [profile.dev]
+debug = "line-tables-only"
+incremental = false
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.debug-full]
+inherits = "dev"
+debug = 2
+incremental = true

@@ -441,7 +441,6 @@ dependencies = [
  "burn-cuda",
  "burn-dispatch",
  "burn-flex",
- "burn-ir",
  "burn-ndarray",
  "burn-nn",
  "burn-optim",
@@ -541,7 +540,6 @@ checksum = "681478c5438ab6c753a55b85f5b42e5bd4c1f69a8564f2afa2f698ac396ba556"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -589,7 +587,6 @@ checksum = "a6c66b49136fc11f59773054358f401fbec7fa0d69615f55ef22c29cf241c9b7"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -721,7 +718,6 @@ checksum = "66af82fdaaf2ad0fa4b0dae90119aa94f333105d76d520e0eb48917717c06fde"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -810,7 +806,6 @@ dependencies = [
  "aligned-vec",
  "bon",
  "burn-cubecl",
- "burn-fusion",
  "burn-ir",
  "burn-tensor",
  "bytemuck",
@@ -833,7 +828,6 @@ checksum = "6eb009254af15922cb37814f3b3b61043046193ba2fde97c3879a25fbd51a92e"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -1660,8 +1654,6 @@ dependencies = [
 [[package]]
 name = "cubek-matmul"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a4cea5f0f439907dc953c7638a6204b3f055f1bcbd10db91dfc5faa030ac1c"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -3792,6 +3784,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "tokenizers",
 ]
@@ -3802,7 +3795,6 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "clap",
- "getrandom 0.4.3",
  "half",
  "hound",
  "memmap2",
@@ -5049,6 +5041,19 @@ dependencies = [
  "thiserror 1.0.69",
  "torch-sys",
  "zip 0.6.6",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
