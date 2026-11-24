@@ -54,9 +54,13 @@ fn independent_self_reading_implementation_identity_is_unchanged() {
     // aligned dependency locks (ADR-0005). Independently audited input changes
     // are limited to the three included lockfiles; the identity algorithm and
     // checkpoint rejection guards are unchanged.
+    // Repinned on 2026-11-24 after the native-only manifests: since 1373a67 the
+    // hashed inputs changed only in those lockfiles (wasm-only dependencies
+    // left, one crate moved from 1.0.151 to 1.0.154). The earlier pin matched
+    // neither that revision nor its own.
     assert_eq!(
         omni_rsi::speech_checkpoint::implementation_hash(),
-        "425b2d350d3d112a7f2c8813d621de24813c5e6af0c609eab0cd943d14b2711e"
+        "2d60e1d7eca057df45222bbebff391bec8c0a55fe5c07ab20bad32c72a61a80c"
     );
 }
 
