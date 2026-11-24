@@ -19,8 +19,7 @@
 离线测试要求当前 Cargo 使用的可信 home 已有锁文件所需的依赖缓存；新克隆或新建的空 Cargo home 不会自带缓存，`--offline` 不会下载依赖。以下沿用调用者现有的 Cargo home，不自动修改其设置；构建产物使用本检出的私有 target：
 
 ```sh
-CARGO_TARGET_DIR="$PWD/artifacts/humming-training-target" \
 CARGO_BUILD_JOBS=1 CARGO_NET_OFFLINE=true \
-  cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
+  ./scripts/cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features cpu --test humming_training -- --test-threads=1
 ```

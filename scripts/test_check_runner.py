@@ -7,11 +7,82 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
-from check import plan, run_steps
+from check import fingerprint, plan, run_steps
 
 
 class CheckRunnerTests(unittest.TestCase):
+    def test_recovery_notes_do_not_invalidate_source_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text("source contract")
+            before = fingerprint(root)
+            (root / "NOTES.md").write_text("current progress")
+            self.assertEqual(fingerprint(root), before)
+            (root / "README.md").write_text("changed contract")
+            self.assertNotEqual(fingerprint(root), before)
+
+    def test_quick_resume_repeats_live_preflight_when_layout_changes(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            (root / "artifacts").mkdir()
+            state = root / "artifacts/layout"
+            state.write_text("ok")
+            script = f"from pathlib import Path; import sys; sys.exit(Path({str(state)!r}).read_text() != 'ok')"
+            steps = [dict(id="target-layout", command=[sys.executable, "-c", script], timeout=2)]
+            first = root / "artifacts/first"
+            second = root / "artifacts/second"
+            self.assertEqual(run_steps(root, steps, first, "quick"), 0)
+            state.write_text("broken")
+            self.assertEqual(run_steps(root, steps, second, "quick", first / "report.json"), 1)
+            resumed = json.loads((second / "report.json").read_text())["steps"][0]
+            self.assertEqual(resumed["status"], "failed")
+            self.assertNotIn("reused_from", resumed)
+
+    def test_low_disk_space_stops_before_cargo_is_started(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()), patch("check.environment", return_value={}), \
+                patch("check.shutil.disk_usage", return_value=SimpleNamespace(free=1024)), \
+                patch("check.subprocess.Popen") as spawn:
+            root = Path(tmp)
+            steps = [dict(id="test", command=["cargo", "test"], timeout=2)]
+            self.assertEqual(run_steps(root, steps, root / "artifacts/report", "metal"), 1)
+            spawn.assert_not_called()
+
+    def test_metal_plan_checks_local_wiring_and_lints_the_gpu_manifests(self):
+        root = Path(__file__).resolve().parents[1]
+        steps = plan(root, "metal", root / "artifacts/unused-plan")
+        names = [step["id"] for step in steps]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(names[:3], ["target-layout", "build-policy", "local-hooks"])
+        self.assertIn("repository", names)
+        self.assertIn("python-tests", names)
+        self.assertIn("fmt-root", names)
+        for manifest in json.loads((root / "scripts/checks.json").read_text())["manifests"]:
+            if not manifest["metal"]:
+                continue
+            name = Path(manifest["path"]).parent.name if "/" in manifest["path"] else "root"
+            self.assertLess(names.index("clippy-" + name), names.index("test-" + name))
+            for step in steps:
+                if step["id"] in ("clippy-" + name, "test-" + name):
+                    self.assertIn(manifest["path"], step["command"])
+                    self.assertNotIn("--no-default-features", step["command"])
+        self.assertLess(names.index("test-root"), names.index("attention-oracle"))
+        self.assertNotIn("verify-audio-cpu-context", names)
+
+    def test_metal_plan_keeps_full_weight_ndarray_integrations_in_explicit_cpu_diagnostics(self):
+        root = Path(__file__).resolve().parents[1]
+        metal = next(step["command"] for step in plan(root, "metal", root / "artifacts/unused-plan")
+                     if step["id"] == "test-minicpm-v")
+        self.assertNotIn("--tests", metal)
+        self.assertIn("metal_spot", metal)
+        self.assertNotIn("greedy_parity", metal)
+        self.assertNotIn("image_parity", metal)
+        cpu = next(step["command"] for step in plan(root, "cpu", root / "artifacts/unused-plan")
+                   if step["id"] == "test-minicpm-v")
+        self.assertIn("--tests", cpu)
+
     def test_cpu_resume_reruns_tests_when_unrecorded_backend_flags_change(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
                 patch("check.shutil.which", return_value=None):

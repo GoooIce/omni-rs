@@ -15,7 +15,8 @@ import subprocess
 import sys
 import time
 
-from target_layout import primary_checkout
+from target_layout import cargo_target, integration_tests
+from cargo_commands import plan_failures
 
 ROOT = Path(__file__).resolve().parents[1]
 SKIP = {".git", ".cache", "target", "artifacts", "models", "pkg", "dist", "node_modules", "__pycache__"}
@@ -27,7 +28,7 @@ def fingerprint(root):
         dirs[:] = sorted(d for d in dirs if d not in SKIP and not d.startswith(".venv"))
         for name in sorted(files):
             path = Path(directory) / name
-            if name == ".DS_Store" or path.is_symlink():
+            if name in (".DS_Store", "NOTES.md") or path.is_symlink():
                 continue
             digest.update(str(path.relative_to(root)).encode() + b"\0")
             digest.update(path.read_bytes())
@@ -54,11 +55,10 @@ def environment():
 
 def plan(root, profile, output):
     config = json.loads((root / "scripts/checks.json").read_text())
-    primary = primary_checkout(root)
     steps = []
 
-    def cargo_target(relative):
-        return str(primary / relative)
+    def output_dir(manifest):
+        return str(cargo_target(root, manifest))
 
     def add(name, command, timeout=1800, stdout=None):
         step = {"id": name, "command": command, "timeout": timeout}
@@ -67,7 +67,11 @@ def plan(root, profile, output):
         steps.append(step)
 
     python = sys.executable
-    if profile in ("quick", "cpu"):
+    add("target-layout", [python, "scripts/share-target.py", "--check"], 60)
+    add("build-policy", [python, "scripts/build_policy.py"], 60)
+    if profile == "metal":
+        add("local-hooks", [python, "scripts/install-hooks.py", "--check"], 60)
+    if profile in ("quick", "cpu", "metal"):
         add("repository", [python, "scripts/check_repo.py"], 60)
         add("python-tests", [python, "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"], 120)
         add("build-oracle-tests", ["rustc", "--edition", "2024", "--test",
@@ -78,12 +82,16 @@ def plan(root, profile, output):
             name = Path(manifest).parent.name if "/" in manifest else "root"
             add("fmt-" + name, ["cargo", "fmt", "--manifest-path", manifest, "--", "--check"], 120)
         if profile == "quick":
+            failures = plan_failures(root, steps)
+            if failures:
+                raise ValueError("\n".join(failures))
             return steps
+    if profile == "cpu":
         audio = next(row for row in config["manifests"] if row["path"] == "crates/omni-rsi/Cargo.toml")
         add("verify-audio-cpu-context", [
             "cargo", "test", "--locked", "--manifest-path", audio["path"],
             "--no-default-features", "--features", audio["cpu_features"],
-            "--target-dir", cargo_target(audio["target"]), "--test", "audio_backend_fingerprint",
+            "--target-dir", output_dir(audio["path"]), "--test", "audio_backend_fingerprint",
             "prior_audio_checkpoints_without_patched_backend_identity_are_rejected", "--", "--exact",
         ])
         for row in config["manifests"]:
@@ -92,31 +100,41 @@ def plan(root, profile, output):
             manifest = row["path"]
             name = Path(manifest).parent.name if "/" in manifest else "root"
             flags = ["--locked", "--manifest-path", manifest, "--no-default-features",
-                     "--features", row["cpu_features"], "--target-dir", cargo_target(row["target"])]
+                     "--features", row["cpu_features"], "--target-dir", output_dir(row["path"])]
             add("clippy-" + name, ["cargo", "clippy", *flags, "--lib", "--tests"] +
                 (["--", "-D", "warnings"] if row.get("strict_clippy") else []))
             add("test-" + name, ["cargo", "test", *flags, "--lib", "--tests"])
     elif profile == "metal":
+        add("dependency-graphs", [python, "scripts/check_dependency_graphs.py",
+                                  "--report", str(output / "dependency-graphs.json")], 180)
         for row in config["manifests"]:
             if not row["metal"]:
                 continue
             name = Path(row["path"]).parent.name if "/" in row["path"] else "root"
-            flags = ["--locked", "--manifest-path", row["path"], "--target-dir", cargo_target(row["target"])]
+            flags = ["--locked", "--manifest-path", row["path"], "--target-dir", output_dir(row["path"])]
             if name == "burn-ane":
                 flags += ["--features", "metal-shared"]
             targets = ["--tests"] if name == "makepad" else ["--lib", "--tests"]
+            add("clippy-" + name, ["cargo", "clippy", *flags, *targets] +
+                (["--", "-D", "warnings"] if row.get("strict_clippy") else []))
             # These numerical tests are ignored by default solely because they need Metal.
             ignored = ["--include-ignored"] if name in ("breeze-tts", "omni-kernel") else []
-            add("test-" + name, ["cargo", "test", *flags, *targets, "--", "--test-threads=1", *ignored])
+            test_targets = targets
+            if row.get("cpu_only_tests"):
+                test_targets = ["--lib"]
+                for target in sorted(integration_tests(root, row) - row["cpu_only_tests"].keys()):
+                    test_targets += ["--test", target]
+            add("test-" + name, ["cargo", "test", *flags, *test_targets,
+                                  "--", "--test-threads=1", *ignored])
         add("attention-oracle", ["cargo", "run", "--locked", "--release", "--manifest-path",
-                                 "crates/qwen-image/Cargo.toml", "--target-dir", cargo_target("target/qwen-image"),
+                                 "crates/qwen-image/Cargo.toml", "--target-dir", output_dir("crates/qwen-image/Cargo.toml"),
                                  "--example", "attention-bench"], stdout=output / "attention.jsonl")
         add("attention-report", [python, "scripts/check_attention.py", str(output / "attention.jsonl")], 60)
     elif profile == "native":
         add("build-native", [python, "prototypes/makepad/build-native.py"])
         add("build-asr-regression", ["cargo", "build", "--locked", "--release", "--manifest-path",
                                     "prototypes/makepad/Cargo.toml", "--target-dir",
-                                    cargo_target("target/makepad-native"),
+                                    output_dir("prototypes/makepad/Cargo.toml"),
                                     "--example", "asr-regression"])
         for name, script in [("asr-matrix", "validate-asr.py"), ("pause", "validate-pause.py"),
                              ("lifecycle", "validate-lifecycle.py"),
@@ -124,6 +142,9 @@ def plan(root, profile, output):
                              ("workspaces", "validate-workspaces.py")]:
             flags = ["--device-output-muted", "--long-stream"] if name == "tts" else []
             add(name, [python, "prototypes/makepad/" + script, "--output", str(output / name), *flags], 3600)
+    failures = plan_failures(root, steps)
+    if failures:
+        raise ValueError("\n".join(failures))
     return steps
 
 
@@ -160,6 +181,7 @@ def run_steps(root, steps, output, profile, resume=None):
     output.mkdir(parents=True, exist_ok=False)
     report_path = output / "report.json"
     report = {"profile": profile, "source_sha256": source_hash, "environment": current_environment, "status": "running",
+              "artifact": {"owner": f"check:{profile}", "purpose": "local repository validation", "keep": "review"},
               "started_at": datetime.now(timezone.utc).isoformat(), "pid": os.getpid(),
               "resumed_from": str(resume) if resume else None, "steps": [],
               "resume_command": shlex.join([sys.executable, str(root / "scripts/check.py"),
@@ -172,7 +194,8 @@ def run_steps(root, steps, output, profile, resume=None):
         for step in steps:
             row = dict(step, status="running", log=str(output / (step["id"] + ".log")))
             # Cargo's actual parent and home must be revalidated on every run.
-            old = None if step["id"] == "verify-audio-cpu-context" else reusable.get(step["id"])
+            live_checks = {"target-layout", "build-policy", "local-hooks", "verify-audio-cpu-context"}
+            old = None if step["id"] in live_checks else reusable.get(step["id"])
             if old and old["command"] == step["command"] and Path(old["log"]).is_file() and \
                     old.get("stdout") == step.get("stdout") and \
                     (not old.get("stdout") or Path(old["stdout"]).is_file()):
@@ -184,6 +207,10 @@ def run_steps(root, steps, output, profile, resume=None):
             report["steps"].append(row)
             write_report(report_path, report)
             print(f"RUN   {step['id']}", flush=True)
+            row["free_bytes_before"] = shutil.disk_usage(root).free
+            if step["command"][0] == "cargo" and row["free_bytes_before"] < 8 * 2**30:
+                raise ValueError("Less than 8 GiB free before Cargo; preserve existing outputs "
+                                 "and review storage before continuing.")
             start = time.monotonic()
             with ExitStack() as stack:
                 log = stack.enter_context(Path(row["log"]).open("w"))
@@ -203,7 +230,8 @@ def run_steps(root, steps, output, profile, resume=None):
                 finally:
                     stop_process(process)
             row.update(status="passed" if code == 0 else "failed", exit_code=code,
-                       seconds=round(time.monotonic() - start, 3))
+                       seconds=round(time.monotonic() - start, 3),
+                       free_bytes_after=shutil.disk_usage(root).free)
             write_report(report_path, report)
             print(f"{row['status'].upper():6} {step['id']} ({row['seconds']}s)", flush=True)
             if code != 0:

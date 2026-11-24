@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from target_layout import apply_links, planned_links, primary_checkout
+from target_layout import apply_links, check_links, planned_links, primary_checkout
 
 
 def git(args, cwd):
@@ -63,6 +63,38 @@ class TargetLayoutTests(unittest.TestCase):
         targets = {row["path"]: row["target"] for row in registry["manifests"]}
         self.assertEqual(targets["crates/minicpm-v/Cargo.toml"], "target/minicpm-v-cpu")
         self.assertEqual(targets["crates/hy-mt/Cargo.toml"], targets["crates/omni-api/Cargo.toml"])
+
+    def test_live_check_rejects_real_wrong_and_dangling_entries_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "crates/demo/target").mkdir(parents=True)
+            sentinel = root / "crates/demo/target/keep"
+            sentinel.write_text("baseline")
+            rows = [{"path": "crates/demo/Cargo.toml", "target": "target/shared"}]
+            self.assertEqual(len(check_links(root, root, rows)), 1)
+            self.assertEqual(sentinel.read_text(), "baseline")
+            self.assertFalse((root / "target").exists())
+            sentinel.unlink()
+            sentinel.parent.rmdir()
+            sentinel.parent.symlink_to(root / "target/wrong")
+            self.assertEqual(len(check_links(root, root, rows)), 1)
+            sentinel.parent.unlink()
+            sentinel.parent.symlink_to(root / "target/shared")
+            self.assertEqual(len(check_links(root, root, rows)), 1)
+            (root / "target/shared").mkdir(parents=True)
+            self.assertEqual(check_links(root, root, rows), [])
+
+    def test_blocked_setup_does_not_partially_redirect_other_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "crates/first").mkdir(parents=True)
+            (root / "crates/blocked/target").mkdir(parents=True)
+            rows = [{"path": f"crates/{name}/Cargo.toml", "target": f"target/{name}"}
+                    for name in ("first", "blocked")]
+            with self.assertRaises(FileExistsError):
+                apply_links(root, root, rows)
+            self.assertFalse((root / "crates/first/target").exists())
+            self.assertFalse((root / "target").exists())
 
 
 if __name__ == "__main__":

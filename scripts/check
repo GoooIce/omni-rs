@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+export CARGO_HOME="${CARGO_HOME:-${HOME:?HOME or CARGO_HOME is required}/.cargo}"
 exec uv run --no-project --python 3.12 python scripts/check.py "$@"

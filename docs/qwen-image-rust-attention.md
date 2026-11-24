@@ -141,8 +141,8 @@ CFG 为 1.735 → 1.740 s。这里是累计 CPU 时间，不是 CPU 占用率。
 
 ```sh
 cargo build --release --locked --manifest-path crates/qwen-image/Cargo.toml \
-  --target-dir target/qwen-image --bin qwen-image --example attention-bench
-target/qwen-image/release/examples/attention-bench
+  --target-dir target/qwen-image-test --bin qwen-image --example attention-bench
+target/qwen-image-test/release/examples/attention-bench
 
 cargo build --release --locked --manifest-path prototypes/makepad/Cargo.toml \
   --target-dir target/makepad-image

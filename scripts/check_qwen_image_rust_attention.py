@@ -9,6 +9,7 @@ import statistics
 
 from check_qwen_image import metrics
 from check_attention import validate as validate_attention
+from target_layout import cargo_target
 from check_qwen_image_tensorops import benchmark, image_metrics
 
 
@@ -57,7 +58,8 @@ def main():
     report["attention"] = [json.loads(s) for s in (root / "attention-bench-final.jsonl").read_text().splitlines()]
     validate_attention(report["attention"])
     assert not (root / "attention-bench-final.log").read_text().strip(), "GPU worker/validation errors"
-    report["cli_sha256"] = hashlib.sha256(Path("target/qwen-image/release/qwen-image").read_bytes()).hexdigest()
+    cli = cargo_target(Path(__file__).resolve().parents[1], "crates/qwen-image/Cargo.toml") / "release/qwen-image"
+    report["cli_sha256"] = hashlib.sha256(cli.read_bytes()).hexdigest()
     if not args.cli_only:
         ui = json.loads((root / "ui-final/report.json").read_text())
         native_sha = hashlib.sha256(Path("target/makepad-image/release/r2t2-makepad").read_bytes()).hexdigest()

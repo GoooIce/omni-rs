@@ -152,7 +152,7 @@ cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen
   --no-default-features --features cpu
 cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen-image-test \
   --no-default-features --features cpu,rewrite
-cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen-image
+cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen-image-test
 cargo test --features rewrite --manifest-path crates/qwen-image/Cargo.toml \
   --target-dir target/qwen-image-rewrite
 ```

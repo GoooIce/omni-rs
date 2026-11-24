@@ -94,7 +94,7 @@ row-major 权重回退，以及独立 CPU FP64 点积对照。每个形状预热
 
 ```sh
 cargo run --release --locked --manifest-path crates/qwen-image/Cargo.toml \
-  --target-dir target/qwen-image --example tensorops-bench
+  --target-dir target/qwen-image-test --example tensorops-bench
 python3 prototypes/makepad/validate-image-guidance.py \
   --binary target/release/r2t2-makepad --output /tmp/qwen-tensorops-ui --large-benchmark
 .venv-qwen-image/bin/python scripts/check_qwen_image_tensorops.py

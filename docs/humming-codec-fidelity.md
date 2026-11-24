@@ -19,8 +19,8 @@
 从仓库根目录运行，完全离线且不访问设备：
 
 ```sh
-CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 \
-  cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
+CARGO_BUILD_JOBS=2 \
+  ./scripts/cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features cpu \
   --test humming_audio --test humming_codec --test humming_metrics
 ```
@@ -33,8 +33,8 @@ CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 \
 
 ```sh
 mkdir -p artifacts/humming-codec-runs
-CARGO_TARGET_DIR="$PWD/artifacts/private-target" CARGO_BUILD_JOBS=2 \
-  cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
+CARGO_BUILD_JOBS=2 \
+  ./scripts/cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features metal --example humming_codec -- \
   /absolute/path/to/LFM3-Omni-2B/audio_tokenizer \
   "$PWD/artifacts/humming-codec-runs/run-001"

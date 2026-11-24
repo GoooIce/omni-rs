@@ -23,7 +23,11 @@
       "path": "crates/minicpm-v/Cargo.toml",
       "cpu_features": "native,cpu",
       "target": "target/minicpm-v-cpu",
-      "metal": true
+      "metal": true,
+      "cpu_only_tests": {
+        "greedy_parity": "Full 1B NdArray text generation; explicit optional CPU diagnostic, not routine Metal acceptance",
+        "image_parity": "Full 1B NdArray image generation; Metal image parity is covered by metal_spot"
+      }
     },
     {
       "path": "crates/lfm3-omni/Cargo.toml",
@@ -33,7 +37,7 @@
     },
     {
       "path": "crates/omni-rsi/Cargo.toml",
-      "cpu_features": "native,cpu",
+      "cpu_features": "native,cpu,training",
       "target": "target/minicpm-v-cpu",
       "metal": true
     },
@@ -97,6 +101,56 @@
       "metal": true
     }
   ],
+  "profiles": {
+    "dev": {
+      "debug": "line-tables-only",
+      "incremental": false
+    },
+    "debug-full": {
+      "inherits": "dev",
+      "debug": 2,
+      "incremental": true
+    }
+  },
+  "target_variants": [
+    {
+      "manifest": "crates/qwen-image/Cargo.toml",
+      "target": "target/qwen-image-rewrite",
+      "reason": "Separate historical rewrite comparison from the production attention baseline"
+    },
+    {
+      "manifest": "prototypes/makepad/Cargo.toml",
+      "target": "target/makepad-image",
+      "reason": "Retained native image integration comparison build"
+    }
+  ],
+  "dependency_policy": {
+    "training_manifests": [
+      "crates/omni-rsi/Cargo.toml"
+    ],
+    "ndarray_fallbacks": {
+      "crates/burn-ane/Cargo.toml": "Experimental ANE host operations retain their supported NdArray fallback"
+    },
+    "aligned_versions": {
+      "serde_json": "1.0.154"
+    },
+    "vendored_paths": {
+      "burn": "vendor/burn",
+      "burn-cubecl": "vendor/burn-cubecl",
+      "burn-fusion": "vendor/burn-fusion",
+      "burn-router": "vendor/burn-router",
+      "cubecl-common": "vendor/cubecl-common",
+      "cubecl-cpp": "vendor/cubecl-cpp",
+      "cubecl-runtime": "vendor/cubecl-runtime",
+      "cubecl-wgpu": "vendor/cubecl-wgpu",
+      "cubek-matmul": "vendor/cubek-matmul"
+    },
+    "unsupported_features": [
+      "wasm",
+      "webgpu",
+      "vulkan"
+    ]
+  },
   "forbidden_runtime_packages": [
     "pyo3",
     "cpython",

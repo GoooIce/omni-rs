@@ -120,7 +120,7 @@ python3 scripts/analyze_breeze_paired.py /tmp/breeze-depth-compare \
   --output /tmp/breeze-depth-summary.json
 
 # 与性能测量分开运行。
-CARGO_TARGET_DIR=target/makepad-native cargo test --offline --locked \
+./scripts/cargo test --offline --locked \
   --manifest-path crates/breeze-tts/Cargo.toml --lib -- --include-ignored --test-threads=1
 python3 prototypes/makepad/validate-tts.py --device-output-muted --long-stream \
   --output /tmp/breeze-depth-ui

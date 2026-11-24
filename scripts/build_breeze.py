@@ -4,22 +4,32 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
+from target_layout import cargo_target
+
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = ROOT / "target/makepad-native"
-env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET))
-subprocess.run(["cargo", "build", "--release", "--locked", "--manifest-path",
-                str(ROOT / "prototypes/makepad/Cargo.toml"), "-p", "omni-breeze-tts",
-                "--bin", "breeze-tts"], cwd=ROOT, env=env, check=True)
-name = "breeze-tts.exe" if os.name == "nt" else "breeze-tts"
-destination = ROOT / "target/release" / name
-destination.parent.mkdir(parents=True, exist_ok=True)
-with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as file:
-    temporary = Path(file.name)
-try:
-    shutil.copy2(TARGET / "release" / name, temporary)
-    os.replace(temporary, destination)
-finally:
-    temporary.unlink(missing_ok=True)
-print(destination)
+
+
+def main(root=ROOT):
+    target = cargo_target(root, "prototypes/makepad/Cargo.toml")
+    args = [sys.executable, str(root / "scripts/cargo_run.py"), "build", "--release", "--locked",
+            "--manifest-path", str(root / "prototypes/makepad/Cargo.toml")]
+    args += ["-p", "omni-breeze-tts", "--bin", "breeze-tts"]
+    subprocess.run(args, cwd=root, check=True)
+    name = "breeze-tts.exe" if os.name == "nt" else "breeze-tts"
+    destination = root / "target/release" / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        shutil.copy2(target / "release" / name, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(destination)
+
+
+if __name__ == "__main__":
+    main()

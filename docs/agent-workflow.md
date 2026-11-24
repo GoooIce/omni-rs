@@ -1,34 +1,55 @@
 # Checks and recovery
 
-Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` selects Python 3.12 via uv and `.python-version`; CI can use Python 3.12 directly. Python dependencies for official model comparisons remain separate from the production runtime.
+Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` selects Python 3.12 via uv and `.python-version`. Python dependencies for official model comparisons remain separate from the production runtime. Supported runtime targets are Apple Silicon macOS with native Metal/ANE. CPU remains an explicit reference diagnostic and ANE fallback. WASM, browser WebGPU, Intel Mac and other desktop GPU backends are retired. Routine validation runs locally on the Apple Silicon GPU.
 
 | Command | Coverage | Requirements |
 | --- | --- | --- |
-| `./scripts/check quick` | Manifest coverage, explicit runtime dependencies, Python tests, attention negative controls, formatting of all 11 manifests | Rust with rustfmt; no weights or device |
-| `./scripts/check cpu` | Quick checks, Clippy and library/integration tests for all 7 CPU-capable manifests | Rust with rustfmt and clippy; no weights |
-| `./scripts/check metal` | Metal tests across 9 manifests; production attention benchmark against the independent CPU f64 oracle | Real Apple Silicon Mac |
+| `./scripts/check quick` | Live Cargo layout, profile policy, documented Cargo commands, manifest coverage, runtime boundaries, local-only workflow policy, Python tests, attention negative controls and formatting | Rust with rustfmt; no weights or device |
+| `./scripts/check metal` | Hook wiring, quick checks, Clippy and tests for registered Metal manifests; production attention benchmark against the independent CPU f64 oracle | Real Apple Silicon Mac with rustfmt and clippy |
 | `./scripts/check native` | Build native app and ASR harness; ASR matrix, native pause/resume, lifecycle, TTS and music checks, including long streams and muted device callbacks | Logged-in macOS desktop, local weights/recordings and an output device |
+| `./scripts/check cpu` | Optional CPU diagnostics: quick checks, Clippy and library/integration tests for registered CPU-capable manifests | Rust with rustfmt and clippy; no weights |
 | `./scripts/check status` | Latest five check reports and their resume commands | Existing reports |
 
-Use `--list` to inspect a profile without executing it. CPU checks run in GitHub Actions on pushes and pull requests once this directory is hosted in a GitHub repository. Metal and native checks run locally on real hardware; their output is not inferred from CI. The experimental `tts-gemv` prototype is formatted but is not part of the supported CPU/runtime matrix. The registry is `scripts/checks.json`; adding a crate without registering it fails the quick check. `scripts/pre-commit` (install into `.git/hooks/pre-commit`) runs `cargo check --locked` for every manifest with staged files plus the quick profile, keeping non-compiling commits out of history. The root manifest optionally depends on `omni-kernel`, so a dependency change in `crates/omni-kernel/Cargo.toml` refreshes both `crates/omni-kernel/Cargo.lock` and the root `Cargo.lock` in the same commit. The root `--locked` check fails until that root lock is current.
+Use `--list` to inspect a profile without executing it. The coverage source is `scripts/checks.json`; adding a crate without registering it fails the quick check. Remote CI is disabled; the repository gate rejects GitHub workflow YAML files. Run `metal` locally for routine GPU acceptance, and the affected `native` harness for desktop behavior. CPU checks remain an explicit diagnostic. The experimental `tts-gemv` prototype is formatted but is not part of the supported CPU/runtime matrix.
 
-The CPU profile includes audio checkpoint tests that require a verified Cargo invocation and Cargo home. On supported macOS and Linux hosts, set `CARGO_HOME` to the Cargo home that will actually be used **before** launching Cargo, for example `export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"`; the GitHub CPU job does this before starting the runner. The profile first runs the real audio checkpoint compatibility test as a context precondition. If the Cargo parent or home cannot be verified, that step fails with an explicit diagnostic instead of counting the checkpoint test as passed. Ordinary builds still work in an unverified context, while the audio identity API returns an error; a direct full `cargo test --lib --tests` in that context will fail identity-dependent tests. Unsupported platforms cannot run the identity-dependent CPU suite as verified; this is not a model or hardware test. To exercise the unverified API separately, run the `audio_identity_matches_the_build_context_availability` test using the direct toolchain Cargo with `CARGO_HOME` unset; that one test does not certify the CPU suite.
+Install local commit checks with `./scripts/install-hooks.py`, then verify them with `./scripts/install-hooks.py --check`. The installer preserves an existing hook under `artifacts/hooks/` and installs a forwarder that resolves the current checkout at invocation time, honoring `core.hooksPath`. Updates to `scripts/pre-commit` take effect immediately in every checkout using that hook. The Metal profile checks this wiring before running. Before compiling, the hook checks the live layout and repository policy. It then uses `./scripts/cargo check --locked` for staged source owners and their transitive dependents, followed by quick. The root manifest optionally depends on `omni-kernel`, so a dependency change in `crates/omni-kernel/Cargo.toml` refreshes both `crates/omni-kernel/Cargo.lock` and the root `Cargo.lock` in the same commit. The root `--locked` check fails until that root lock is current.
+
+Audio checkpoint tests require a verified Cargo invocation and Cargo home. `./scripts/check` preserves an explicit `CARGO_HOME` or exports the default `$HOME/.cargo` before launching Cargo. For direct Cargo commands, set it first, for example `export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"`. The optional CPU profile first runs the real audio checkpoint compatibility test as a context precondition. If the Cargo parent or home cannot be verified, that step fails with an explicit diagnostic instead of counting the checkpoint test as passed. Ordinary builds still work in an unverified context, while the audio identity API returns an error; a direct full `cargo test --lib --tests` in that context will fail identity-dependent tests. Unsupported platforms cannot run the identity-dependent CPU suite as verified; this is not a model or hardware test. To exercise the unverified API separately, run the `audio_identity_matches_the_build_context_availability` test using the direct toolchain Cargo with `CARGO_HOME` unset; that one test does not certify the CPU suite.
 
 ## Local artifacts
 
-`artifacts/` stays gitignored. A working tree holds check logs, waveforms, upstream checkouts and one-off measurements; this machine's tree is about 28 GB. Durable contracts and decisions go in `docs/`. A note that exists only under `artifacts/` is local evidence, not something the next checkout can read.
+`artifacts/` stays gitignored and holds check logs, waveforms, upstream checkouts and one-off measurements. Durable contracts and decisions go in `docs/`. A note that exists only under `artifacts/` is local evidence, not something the next checkout can read.
+
+Inspect storage on demand with `./scripts/storage-report`. It saves raw JSON and prints the largest groups, scan errors and observed open paths. `--path` selects directories, `--max-seconds` bounds traversal, and partial reports return exit 2. The scan skips symlinks and nested mounts and deduplicates hard links across the selection. Incremental bytes are part of their build group, and allocated bytes are not a promise of reclaimable disk space. An absent open-file observation does not establish that a path is unused.
+
+Record ownership when creating a long-lived experiment or pinned baseline:
+
+```sh
+./scripts/storage-report --record artifacts/run-001 --owner issue-123 \
+  --purpose "Development experiment" --keep active
+```
+
+Records live in the primary checkout's `artifacts/storage-retention.json`; `--keep pinned` marks a retained baseline, while `--keep review --review-after 2027-01-01` schedules a review date. Recording ownership and producing reports never delete files. Reconcile completed worktree contents, active processes, unique evidence and retained binaries before choosing old outputs for removal.
 
 ## Compilation directories
 
 Each manifest in `scripts/checks.json` has one `target` directory. Those directories live in the primary checkout, the parent of `git rev-parse --git-common-dir`. A linked worktree uses that same tree.
 
-`./scripts/check` passes the absolute path. Before any other Cargo command in a new worktree, run `python3 scripts/share-target.py` from that worktree. It points the worktree's `target` entry at the primary `target`, and points each manifest's default output directory at the registered path. The command finishes when every printed link resolves inside the primary checkout. A real directory already named `target` is left untouched; remove that directory by hand, then run the command again.
+`./scripts/check` and `./scripts/cargo` resolve absolute output paths from that registry. Use `./scripts/cargo` for builds, tests and runs; it checks the live layout before launching Cargo and keeps program arguments after `--` intact. Before the first build in a new worktree, run `uv run --no-project --python 3.12 python scripts/share-target.py`. It points the worktree's `target` entry at the primary `target`, and points each manifest's default output directory at the registered path. `--check` only inspects those links and is the first step of each check profile and the commit hook. Setup rejects all real-directory collisions before changing links; preserve and reconcile their contents before retrying.
 
-The Metal profile explicitly includes the normally ignored Breeze tensor and shared-kernel tests. Makepad's audible output-device unit test stays ignored there; the native profile exercises device timing, drain and cancellation through the existing muted TTS suite.
+Routine `dev` and inherited `test` builds use `debug = "line-tables-only"` and `incremental = false`. Existing optimization levels stay with each workspace. The policy in `scripts/checks.json` is checked against every independent manifest, including package/test overrides. Local Cargo configuration and environment overrides are checked before routine acceptance. Full variable/type debugging is an explicit, separately named output:
+
+```sh
+./scripts/cargo test --manifest-path crates/omni-kernel/Cargo.toml --profile debug-full
+```
+
+`debug-full` inherits the workspace's dev optimization, enables full debug information and incremental compilation, and writes under the registered target's `debug-full/`. Release settings are independent. Changing profiles prevents future heavy routine output; it does not remove existing debug caches. Every direct Cargo build command in the runner must select a registered output, including auxiliary oracles. Shell examples in README/docs are checked for unregistered target overrides; intentional comparison directories need a manifest and reason in `target_variants`. Select one with `./scripts/cargo build --manifest-path <manifest> --variant target/<registered-variant>`. The browser build entry point now refuses to run and the threaded Web output is no longer registered. Existing Web outputs and the old nightly toolchain are preserved until a separate storage cleanup.
+
+The Metal profile leaves the explicitly registered full-weight CPU-only integration tests in the optional CPU diagnostic; MiniCPM uses `metal_spot` for its GPU image parity. Every exclusion has an existing target and reason in `cpu_only_tests`, checked by the repository gate. Newly added integration targets are included automatically. The Metal profile explicitly includes the normally ignored Breeze tensor and shared-kernel tests. Makepad's audible output-device unit test stays ignored there; the native profile exercises device timing, drain and cancellation through the existing muted TTS suite.
 
 Clippy is strict for `hy-mt` and `omni-api`, whose existing checks enforce warning-free code. Other packages still have existing style warnings; those warnings remain visible in logs. `check_repo.py` catches named Python/MLX Cargo dependencies, aliases and literal subprocess launches in production source. It does not prove the absence of every possible FFI or indirect runtime path; review that boundary using `CODING_STANDARDS.md`.
 
-Changes to native streaming, pause/stop or playback require the affected native regression suite. These suites inject recorded PCM and automate production callbacks; physical microphone capture and subjective listening require separate evidence. For ASR variants, reference generation, browser/Wasm and model-specific performance gates, follow `VALIDATION.md` and the relevant module README. The common profiles do not replace those specialized checks.
+Changes to native streaming, pause/stop or playback require the affected native regression suite. These suites inject recorded PCM and automate production callbacks; physical microphone capture and subjective listening require separate evidence. For ASR variants, reference generation and model-specific performance gates, follow `VALIDATION.md` and the relevant module README. The common profiles do not replace those specialized checks.
 
 The native suite uses the existing ASR, translation, TTS, image and four music model directories, `artifacts/breeze-design/ui-initial/design-reused.wav`, `artifacts/music-validation/composition.wav`, the upstream `resources/test.wav` under `artifacts/Confucius4-R2T2-upstream/`, and the audio pinned by `docs/eval/mandarin-v1.json`. These local recordings and weights are prerequisites, not downloaded automatically by the runner. Missing inputs fail the relevant step. Music checks cover the native entry, real analysis/transcription/two generation modes, edit protection, stereo exports and muted playback, cancellation and recovery.
 
@@ -36,17 +57,38 @@ The pause validator checks each tail once processing reaches three seconds into 
 
 ## Vendored dependencies
 
+Burn backend and training dependency rules are recorded in
+[ADR-0005](adr/0005-burn-dependency-boundaries.md). Quick checks validate direct
+versions, explicit features, aliases and target-specific declarations. Metal
+checks also inspect locked normal/build dependency graphs for every registered
+manifest, selected GPU features, aligned shared-library versions and vendored
+patch routing. These graph checks do not compile or run CPU tests. Dev/test
+graphs deliberately retain numerical references; ANE's existing CPU fallback
+and RSI's default training graph are documented exceptions.
+
 Patches under `[patch.crates-io]` apply per workspace: the root `Cargo.toml` and each detached model-crate manifest (`crates/*/Cargo.toml`, `prototypes/*/Cargo.toml`) resolve dependencies independently. After adding or changing a crate under `vendor/`, register it in the root manifest and in every detached manifest whose code consumes it — a root-only registration silently leaves model crates on the registry version. Each vendored crate documents its delta in a `LOCAL-CHANGES.md` next to its sources.
+
+The text-condition backend migration has a full-checkpoint, cold-cache Metal
+gate. It exercises the public 1B loader at several prompt lengths against an
+independent CPU execution backend, including rejection controls for corrupted
+results. Run it separately in release mode with the local 1B checkpoint:
+
+```sh
+./scripts/cargo test --offline --locked --release --manifest-path crates/qwen-image/Cargo.toml \
+  --lib minicpm_1b_gpu_condition_matches_cpu_across_prompt_lengths -- --ignored --test-threads=1 --nocapture
+```
 
 ## Logs and interruptions
 
 Each run writes `artifacts/checks/<timestamp>-<profile>/report.json` atomically and a separate log per step. Reports include commands, exit status, elapsed time, source hash and toolchain. The runner stops at the first failing step and prints a bounded log tail. The attention benchmark saves JSON stdout separately from compiler diagnostics.
 
+Live layout, profile and hook preflights run again on resume, even when sources are unchanged. Reports record free space around each step; Cargo steps require at least 8 GiB free before launch. An interrupted or low-space run leaves existing outputs intact for inspection.
+
 After interruption, inspect `./scripts/check status`, then use the report's `resume_command`. Resume writes a new report. A CPU resume reruns every step, even if the source and recorded environment are unchanged: the runner cannot fully establish that external Cargo configuration, compiler inputs and backend identity are unchanged. A quick resume may reuse passed steps only with unchanged sources, recorded environment and commands; missing logs and failed/running steps run again. Hardware checks always run anew. Model weights and hardware state are external inputs and are never certified by a reused CPU result.
 
 The CPU audio context precondition is rerun on resume along with the rest of the CPU profile, and `CARGO_HOME` is part of the recorded environment. If sources or the recorded environment have changed, CPU resume still starts all steps from the beginning; it keeps the earlier report only as history. A resume for a different profile is rejected.
 
-The build-context tests run the direct-Cargo verified and failure-closed probes in the normal CPU suite. Two rustup-specific positive probes are marked ignored there, so a direct-Cargo installation does not need a rustup proxy. An ignored probe is **not verified coverage**. GitHub CI runs them separately after installing rustup; on a host with a rustup proxy at `$CARGO_HOME/bin/cargo` and a valid `RUSTUP_HOME` (or its default), run:
+The build-context tests run the direct-Cargo verified and failure-closed probes in the optional CPU suite. Two rustup-specific positive probes are marked ignored there, so a direct-Cargo installation does not need a rustup proxy. An ignored probe is **not verified coverage**. For an explicit local rustup diagnostic, use a host with a rustup proxy at `$CARGO_HOME/bin/cargo` and a valid `RUSTUP_HOME` (or its default), and run:
 
 ```sh
 CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
@@ -57,7 +99,7 @@ CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
 
 The explicit rustup command fails if the proxy, rustup home, inspectable Cargo parent or verified identity is unavailable; it does not turn those conditions into a passing probe. Set `CARGO_HOME` before launching Cargo. On systems without rustup, report the rustup-specific coverage as not run; the production audio identity remains fail-closed when Cargo's actual parent or home cannot be verified.
 
-Before a long operation, keep the current objective, approved scope, accepted decisions, changed paths, last report path and next command in `artifacts/task-checkpoint.json`. Refresh it when a phase completes or a blocker changes. On continuation, read it and the reports before repeating exploration or requesting another approval. A model/server streaming failure may prevent a final message even after files were written: inspect artifacts and running processes first. This repository's runner preserves local work; it cannot retry the hosting assistant's failed model stream.
+Before a long operation, keep the current objective, branch, approved scope, accepted decisions, changed paths, last report path and next command in `artifacts/task-checkpoint.json`. Keep its top-level fields about the current task; put older task records under `artifacts/` and link them from `history`. `NOTES.md` is a short human-readable summary pointing to that checkpoint and its history. Refresh both when a phase completes or a blocker changes. On continuation, read the current checkpoint and reports before opening historical records. A model/server streaming failure may prevent a final message even after files were written: inspect artifacts and running processes first. This repository's runner preserves local work; it cannot retry the hosting assistant's failed model stream.
 
 ## Performance measurement
 

@@ -53,7 +53,7 @@
 显式使用本地已授权数据运行，首次运行要求 `audio-conditioned-v1` 不存在；恢复必须带 `--resume`。`--epochs` 是希望达到的总 epoch，`--max-updates` 是本次调用最多更新数，可在恢复时调整；固定学习率、损失权重、掩码规则和初始化由实现指纹绑定。每次完整更新后保存参数、AdamW 状态和下一条记录的位置；中断时保留最后一个完整检查点。损坏、旧版或不匹配的音频检查点会报错，必须另选状态目录，不自动迁移或覆盖；原有自朗读检查点保持隔离。
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
+CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu,training \
   --bin omni-rsi-audio -- --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
   --data /path/to/authorized-training-data --state /path/to/rsi-state \
   --epochs 2 --max-updates 1
@@ -69,7 +69,7 @@ CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/
 ```sh
 uv run --no-project python scripts/share-target.py
 CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --offline --locked \
-  --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
+  --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu,training \
   --bin omni-rsi -- --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
   --state /path/to/rsi-state audio-watch --data /path/to/authorized-training-data \
   --fresh --epochs 2 --updates-per-round 1 --rounds 4
@@ -110,7 +110,7 @@ stdout 和等待提示采用有界、尽力交付：接收端长期不读取时�
 
 ```sh
 CARGO_TARGET_DIR=target/minicpm-v-cpu cargo test --manifest-path crates/omni-rsi/Cargo.toml \
-  --no-default-features --features native,cpu --bin omni-rsi mock_
+  --no-default-features --features native,cpu,training --bin omni-rsi mock_
 ```
 
 语音质量使用真实模型单独验证。`speech-once` 是前台、限量的训练入口，不依赖闲时信号；它使用同目录的前台和设备锁，训练完整 epoch 后对固定开发题分别生成基线和候选，保存 R2T2 转写、字符错误率与结束情况。可在独立状态目录执行：

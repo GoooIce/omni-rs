@@ -1,8 +1,7 @@
 #!/bin/sh
-# Pre-commit guardrail: staged sources must compile and the quick profile
-# must pass. Keeps non-compiling commits out of history (a broken commit is
-# invisible to CI until pushed). Install with:
-#   cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Pre-commit guardrail: affected sources must compile and the local quick
+# profile must pass. Install the forwarding hook with:
+#   ./scripts/install-hooks.py
 #
 # The check follows path dependencies: a crates/minicpm-v edit also checks the
 # manifests that depend on it, because a staged file's own manifest is not
@@ -10,6 +9,9 @@
 # check only the manifests that own the staged files.
 set -eu
 cd "$(git rev-parse --show-toplevel)"
+
+uv run --no-project --python 3.12 python scripts/share-target.py --check
+uv run --no-project --python 3.12 python scripts/check_repo.py
 
 staged=$(git diff --cached --name-only)
 
@@ -45,7 +47,7 @@ fi
 
 for m in $manifests; do
     echo "pre-commit: cargo check $m"
-    cargo check --quiet --locked --manifest-path "$m"
+    ./scripts/cargo check --quiet --locked --manifest-path "$m"
 done
 
 echo "pre-commit: ./scripts/check quick"

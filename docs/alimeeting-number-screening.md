@@ -6,7 +6,7 @@
 
 ```sh
 mkdir -p artifacts/alimeeting-screen
-CARGO_TARGET_DIR="$PWD/artifacts/alimeeting-target" CARGO_BUILD_JOBS=1 cargo run --locked --offline \
+CARGO_BUILD_JOBS=1 ./scripts/cargo run --locked --offline \
   --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
   --bin alimeeting-screen -- --textgrid-dir "$PWD/artifacts/ali-train/Train_Ali_near/textgrid_dir" \
   --output "$PWD/artifacts/alimeeting-screen/candidates-001.json"
