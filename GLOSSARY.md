@@ -101,6 +101,10 @@ _Avoid_: speech text, voice instruction
 The optional voice instruction and optional reference recording, with its reference transcript. It is fixed for one speech synthesis, and every speech synthesis of one speech script shares the same one.
 _Avoid_: speech text, enhancer prompt
 
+**Voice anchor**:
+The one reference recording and reference transcript that every speech synthesis of a speech script shares. It is the recording the speaker supplied, or the opening of the script's own audio when none was.
+_Avoid_: per-speech-text reference, anchor segment, voice drift
+
 **Enhancer prompt**:
 The standing instructions for rewriting a speech text and a voice instruction. It is neither the speech text nor the voice instruction.
 _Avoid_: speech text, voice instruction, prompt
