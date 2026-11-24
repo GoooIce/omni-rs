@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use omni_breeze_tts::{
-    CODEBOOKS, Model, Precision, ReferenceAudio, Result, SAMPLE_RATE, Sampling, SynthesisOptions,
+    CODEBOOKS, MAX_NEW_TOKENS, Model, Precision, ReferenceAudio, Result, SAMPLE_RATE, Sampling,
+    ScriptBudget, ScriptEvent, ScriptOptions, SynthesisOptions,
     codec::Codec,
     reference::{self, ReferenceEncoder},
+    script::TEXT_TOKENS,
 };
 use std::{
     path::PathBuf,
@@ -25,8 +27,12 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     Synthesize {
+        /// The speech script to speak. A long script is split into speech texts.
         #[arg(long)]
-        text: String,
+        text: Option<String>,
+        /// Read the speech script from a UTF-8 file instead of `--text`.
+        #[arg(long, conflicts_with = "text")]
+        text_file: Option<PathBuf>,
         #[arg(long, default_value = "")]
         instruction: String,
         #[arg(long, default_value = "4")]
@@ -35,8 +41,13 @@ enum Command {
         temperature: f32,
         #[arg(long, default_value = "42")]
         seed: u64,
-        #[arg(long, default_value = "750")]
+        /// Frame ceiling of each speech text. Above 1500 the speech synthesis
+        /// leaves upstream's limits and only the model's own context applies.
+        #[arg(long, default_value_t = MAX_NEW_TOKENS)]
         max_frames: usize,
+        /// Text tokens each speech text of a split script may hold.
+        #[arg(long, default_value_t = TEXT_TOKENS)]
+        segment_tokens: usize,
         #[arg(long, default_value = "2")]
         chunk_frames: usize,
         #[arg(long)]
@@ -228,46 +239,83 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) -> Resu
         }
         Command::Synthesize {
             text,
+            text_file,
             instruction,
             guidance,
             temperature,
             seed,
             max_frames,
+            segment_tokens,
             chunk_frames,
             cpu_depth_sampling,
             paged_attention,
             reference,
             output,
         } => {
+            let script = match (text, text_file) {
+                (Some(text), None) => text,
+                (None, Some(path)) => std::fs::read_to_string(&path)?,
+                _ => {
+                    return Err(omni_breeze_tts::Error::Config(
+                        "请用 --text 或 --text-file 之一提供要合成的文本".into(),
+                    ));
+                }
+            };
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = cancel.clone();
             ctrlc::set_handler(move || stop.store(true, std::sync::atomic::Ordering::Release))
                 .map_err(|e| omni_breeze_tts::Error::Inference(e.to_string()))?;
             let reference = load_reference::<B>(&reference, &args.model, &device, &cancel)?;
-            let options = SynthesisOptions {
-                text,
-                instruction,
-                guidance_scale: guidance,
-                sampling: Sampling {
-                    temperature,
-                    seed,
+            let options = ScriptOptions {
+                synthesis: SynthesisOptions {
+                    text: script,
+                    instruction,
+                    guidance_scale: guidance,
+                    sampling: Sampling {
+                        temperature,
+                        seed,
+                        ..Default::default()
+                    },
+                    max_frames,
+                    chunk_frames,
+                    cpu_depth_sampling,
+                    paged_attention,
+                    reference,
+                },
+                budget: ScriptBudget {
+                    rest: segment_tokens,
                     ..Default::default()
                 },
-                max_frames,
-                chunk_frames,
-                cpu_depth_sampling,
-                paged_attention,
-                reference,
+            };
+            let encoder = if model.script_needs_anchor(&options)? {
+                eprintln!("[anchor] 加载参考音频编码器");
+                Some(ReferenceEncoder::<B>::load(
+                    &args.model.join("audio_tokenizer"),
+                    &device,
+                )?)
+            } else {
+                None
             };
             let mut pcm = Vec::new();
             let start = Instant::now();
-            let report = model.synthesize(&options, &cancel, |chunk| {
-                eprintln!(
-                    "[audio] {:.3}s +{} samples",
-                    start.elapsed().as_secs_f64(),
-                    chunk.len()
-                );
-                pcm.extend_from_slice(chunk);
+            let report = model.synthesize_script(&options, &cancel, encoder.as_ref(), |event| {
+                match event {
+                    ScriptEvent::Audio(chunk) => {
+                        eprintln!(
+                            "[audio] {:.3}s +{} samples",
+                            start.elapsed().as_secs_f64(),
+                            chunk.len()
+                        );
+                        pcm.extend_from_slice(chunk);
+                    }
+                    ScriptEvent::SpeechText(index, report) => eprintln!(
+                        "[speech text {index}] {} frames, {:.3}s",
+                        report.frames, report.audio_seconds
+                    ),
+                    ScriptEvent::Anchor(count) => {
+                        eprintln!("[anchor] recorded from {count} speech texts")
+                    }
+                }
                 Ok(())
             })?;
             write_wav(&output, &pcm)?;
@@ -277,7 +325,7 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) -> Resu
             )?;
             println!(
                 "{}",
-                serde_json::json!({"audio_seconds":pcm.len() as f64/SAMPLE_RATE as f64,"first_audio_seconds":report.first_audio_seconds,"elapsed_seconds":report.elapsed_seconds,"rtf":report.elapsed_seconds/report.audio_seconds.max(0.001),"stopped":report.stopped,"reached_limit":report.reached_limit})
+                serde_json::json!({"audio_seconds":pcm.len() as f64/SAMPLE_RATE as f64,"speech_texts":report.speech_texts.len(),"first_audio_seconds":report.first_audio_seconds,"elapsed_seconds":report.elapsed_seconds,"rtf":report.elapsed_seconds/report.audio_seconds.max(0.001),"stopped":report.stopped,"reached_limit":report.reached_limit.is_some(),"reached_limit_speech_text":report.reached_limit,"anchor":report.anchor})
             );
         }
         Command::Codec { .. } | Command::Encode { .. } => unreachable!(),

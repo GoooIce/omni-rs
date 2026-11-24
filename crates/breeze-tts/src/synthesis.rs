@@ -145,9 +145,11 @@ impl<B: Backend> Synthesis<B> {
             codes: Vec::new(),
             pending: Vec::new(),
             delivery,
-            limit: options
-                .max_frames
-                .min(model.config.backbone_config.max_position_embeddings - prompt.ids.len()),
+            limit: frame_ceiling(
+                options.max_frames,
+                prompt.ids.len(),
+                model.config.backbone_config.max_position_embeddings,
+            )?,
             profiler,
             completed: false,
         })))

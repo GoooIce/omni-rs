@@ -10,17 +10,21 @@ pub mod profile;
 pub mod reference;
 mod routing;
 pub mod sampling;
-mod synthesis;
-mod transformer;
+pub mod script;
+mod script_run;
+pub mod synthesis;
+pub mod transformer;
 pub use batch::{BatchStats, RequestId, SynthesisBatch};
 
 use burn::tensor::{Bool, FloatDType, Int, Tensor, TensorData, backend::Backend};
-pub use config::{CODEBOOKS, SAMPLE_RATE, SAMPLES_PER_FRAME};
+pub use config::{CODEBOOKS, MAX_NEW_TOKENS, MAX_SEQ_LEN, SAMPLE_RATE, SAMPLES_PER_FRAME};
 use omni_r2t2::weights::Weights;
 pub use omni_r2t2::{Error, Precision, Result};
 use ops::*;
 pub use reference::ReferenceAudio;
 pub use sampling::Sampling;
+pub use script::{ScriptBudget, SpeechText, Splitter};
+pub use script_run::{AnchorOrigin, ScriptEvent, ScriptOptions, ScriptReport, ScriptRun};
 pub type TraceTensor = (String, Vec<usize>, Vec<f32>);
 use std::{
     path::Path,
@@ -74,7 +78,9 @@ pub struct SynthesisOptions {
     /// Official single CFG for instruction-following; 1 disables the second branch.
     pub guidance_scale: f32,
     pub sampling: Sampling,
-    /// Safety ceiling, measured in 80 ms frames; a ceiling hit is reported explicitly.
+    /// Safety ceiling in 80 ms frames; a ceiling hit is reported explicitly.
+    /// Upstream's `MAX_NEW_TOKENS` by default. A larger value also leaves
+    /// upstream's `MAX_SEQ_LEN` envelope; see `frame_ceiling`.
     pub max_frames: usize,
     /// Number of new codec frames per output callback; never re-decodes old audio.
     pub chunk_frames: usize,
@@ -92,7 +98,7 @@ impl Default for SynthesisOptions {
             instruction: String::new(),
             guidance_scale: 4.0,
             sampling: Sampling::default(),
-            max_frames: 750,
+            max_frames: MAX_NEW_TOKENS,
             chunk_frames: 2,
             cpu_depth_sampling: false,
             paged_attention: false,
@@ -112,6 +118,30 @@ impl SynthesisOptions {
         Ok(())
     }
 }
+
+/// Codec frames one speech synthesis may generate. Inside upstream's envelope
+/// the prompt and the frames share `MAX_SEQ_LEN` positions, and upstream stops
+/// before the frame that would reach the end of that budget. A `max_frames`
+/// above `MAX_NEW_TOKENS` leaves the envelope, and only the model's own context
+/// applies; upstream does not support such sequences.
+pub fn frame_ceiling(max_frames: usize, prompt: usize, context: usize) -> Result<usize> {
+    let (positions, reserved) = if max_frames > MAX_NEW_TOKENS {
+        (context, 0)
+    } else {
+        (MAX_SEQ_LEN, 1)
+    };
+    match positions
+        .checked_sub(reserved)
+        .and_then(|n| n.checked_sub(prompt))
+    {
+        Some(frames) if frames > 0 => Ok(max_frames.min(frames)),
+        _ => Err(Error::Config(format!(
+            "提示占 {prompt} 个位置，单次合成最多容纳 {} 个；请缩短文本或参考音频",
+            positions - reserved
+        ))),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct SynthesisReport {
     pub frames: usize,
@@ -304,6 +334,8 @@ impl<B: Backend> Model<B> {
 
     /// Match upstream templates.py: tokenize each text segment with special tokens,
     /// render it, then tokenize the assembled prompt without adding specials again.
+    /// Length is not checked here: `frame_ceiling` shares one sequence budget
+    /// between the prompt and the frames, as upstream's loop does.
     pub fn prompt_ids(&self, text: &str, instruction: &str) -> Result<Vec<u32>> {
         if text.trim().is_empty() {
             return Err(Error::Config("请输入要合成的文本".into()));
@@ -313,29 +345,16 @@ impl<B: Backend> Model<B> {
         } else {
             format!("[S0]<ins_bos>{instruction}<ins_eos>{text}")
         };
-        let encoded = self
-            .tokenizer
-            .encode(rendered, true)
-            .map_err(|e| Error::Tokenizer(e.to_string()))?;
-        let rendered = self
-            .tokenizer
-            .decode(encoded.get_ids(), false)
-            .map_err(|e| Error::Tokenizer(e.to_string()))?;
-        let ids = self
-            .tokenizer
-            .encode(rendered, false)
-            .map_err(|e| Error::Tokenizer(e.to_string()))?
-            .get_ids()
-            .to_vec();
-        if ids.is_empty() || ids.len() > 2048 {
-            return Err(Error::Config(
-                "文本和声音描述合计不得超过 2048 个 token，请分段合成".into(),
-            ));
-        }
+        let ids = script::render(&self.tokenizer, &rendered)?;
         if ids.iter().any(|id| matches!(id, 262144 | 262145)) {
             return Err(Error::Config("文本不能包含音频占位符".into()));
         }
         Ok(ids)
+    }
+
+    /// Split a speech script into speech texts; see [`script::Splitter`].
+    pub fn split_script(&self, script: &str, budget: ScriptBudget) -> Result<Vec<SpeechText>> {
+        script::Splitter::new(&self.tokenizer)?.split(script, budget)
     }
 
     fn text_input(&self, ids: &[u32]) -> Result<Tensor<B, 3>> {
@@ -373,11 +392,6 @@ impl<B: Backend> Model<B> {
         let reference_text = if let Some(reference) = reference {
             reference.validate()?;
             let tokens = self.prompt_ids(&reference.text, "")?;
-            if tokens.len() + target.len() > 2048 {
-                return Err(Error::Config(
-                    "参考文字、目标文字和声音描述合计不得超过 2048 个 token".into(),
-                ));
-            }
             ids.extend_from_slice(&tokens);
             ids.extend(std::iter::repeat_n(262144, reference.codes.len()));
             ids.push(262145);
@@ -642,5 +656,23 @@ impl<B: Backend> Model<B> {
             synthesis::Started::Running(request) => request.run_serial(self, cancel, &mut on_audio),
             synthesis::Started::Stopped(report) => Ok(report),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn inside_upstream_envelope_prompt_and_frames_share_the_sequence() {
+        assert_eq!(frame_ceiling(1500, 100, 40960).unwrap(), 1500);
+        assert_eq!(frame_ceiling(1500, 600, 40960).unwrap(), 1447);
+        assert_eq!(frame_ceiling(750, 600, 40960).unwrap(), 750);
+        assert!(frame_ceiling(1500, 2047, 40960).is_err());
+    }
+    #[test]
+    fn a_ceiling_above_upstream_leaves_its_envelope() {
+        assert_eq!(frame_ceiling(4000, 1000, 40960).unwrap(), 4000);
+        assert_eq!(frame_ceiling(50000, 1000, 40960).unwrap(), 39960);
+        assert!(frame_ceiling(1501, 40960, 40960).is_err());
     }
 }

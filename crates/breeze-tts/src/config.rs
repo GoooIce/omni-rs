@@ -84,3 +84,10 @@ pub const SAMPLE_RATE: u32 = 24_000;
 pub const SAMPLES_PER_FRAME: usize = 1920;
 pub const CODEBOOKS: usize = 16;
 pub const CODEBOOK_SIZE: usize = 2048;
+
+/// Upstream's ceiling on the codec frames of one speech synthesis, its
+/// `MAX_NEW_TOKENS` in `infer.py` at `58ec70c`: 120 s at 80 ms per frame.
+pub const MAX_NEW_TOKENS: usize = 1500;
+/// Upstream's `MAX_SEQ_LEN` at the same commit: the positions that the prompt
+/// and the generated frames of one speech synthesis share.
+pub const MAX_SEQ_LEN: usize = 2048;
