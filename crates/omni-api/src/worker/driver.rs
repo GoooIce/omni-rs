@@ -8,10 +8,21 @@ use std::{
 };
 
 pub(crate) enum Progress {
-    Loading { progress: f64, message: String },
-    Tensors { current: usize, total: usize },
+    Loading {
+        progress: f64,
+        message: String,
+    },
+    Tensors {
+        current: usize,
+        total: usize,
+    },
     Translation(omni_hy_mt::TranslationEvent),
     Transcription(omni_r2t2::TranscriptionEvent),
+    /// A speech script moved on to its next speech text.
+    Speech {
+        speech_text: usize,
+        speech_texts: usize,
+    },
     Image(omni_qwen_image::Progress),
     Music(omni_music::Progress),
 }
@@ -23,7 +34,7 @@ pub(crate) enum Update {
 impl Update {
     pub fn kind(&self) -> Option<Kind> {
         Some(match self {
-            Self::Audio(_) => Kind::Speech,
+            Self::Audio(_) | Self::Progress(Progress::Speech { .. }) => Kind::Speech,
             Self::Progress(Progress::Translation(_)) => Kind::Translation,
             Self::Progress(Progress::Transcription(_)) => Kind::Transcription,
             Self::Progress(Progress::Image(_)) => Kind::Image,
@@ -120,7 +131,7 @@ pub(crate) enum NativeLoaded {
     Music(Box<super::music::Music>),
     Translation(Box<omni_hy_mt::Translator<Backend>>),
     Transcription(Box<omni_r2t2::stream::TranscriptionBatch<Backend>>),
-    Speech(Box<omni_breeze_tts::SynthesisBatch<Backend>>),
+    Speech(Box<super::speech::Speech>),
     Image(Box<omni_qwen_image::ImageBatch<Backend>>),
 }
 impl NativeDriver {
@@ -222,7 +233,7 @@ impl Driver for NativeDriver {
                         })
                     },
                 )?;
-                NativeLoaded::Speech(Box::new(omni_breeze_tts::SynthesisBatch::new(
+                NativeLoaded::Speech(Box::new(super::speech::Speech::new(
                     model,
                     paths.tts_batch_size,
                 )?))
@@ -280,7 +291,13 @@ impl Driver for NativeDriver {
                     ..Default::default()
                 };
                 options.sampling.seed = request.seed;
-                engine.try_submit(&options, cancel)?
+                engine.admit(
+                    options,
+                    omni_breeze_tts::ScriptBudget::default(),
+                    &self.paths.tts,
+                    cancel,
+                    progress,
+                )?
             }
             (NativeLoaded::Image(engine), Command::Image(request)) => {
                 engine.try_submit(&request.options(), cancel, |event| {
@@ -335,24 +352,7 @@ impl Driver for NativeDriver {
                     })
                     .collect();
             }
-            NativeLoaded::Speech(engine) => {
-                let results = engine.step(|id, audio| {
-                    step.updates.push((id, Update::Audio(audio.to_vec())));
-                    Ok(())
-                });
-                let batch = engine.stats();
-                step.completed = results
-                    .into_iter()
-                    .map(|(id, result)| {
-                        (
-                            id,
-                            result
-                                .map(|report| Product::speech(report, batch))
-                                .map_err(Failure::from),
-                        )
-                    })
-                    .collect();
-            }
+            NativeLoaded::Speech(engine) => return engine.step(),
             NativeLoaded::Image(engine) => {
                 let results = engine.step(|id, event| {
                     step.updates

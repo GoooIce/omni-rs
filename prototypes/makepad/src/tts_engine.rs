@@ -8,7 +8,8 @@ use crate::{
 use omni_breeze_tts::{
     enhancement::{self, Consideration, Source},
     reference::{self, ReferenceEncoder},
-    Model, Precision, ReferenceAudio, SynthesisOptions, SAMPLE_RATE,
+    Model, Precision, ReferenceAudio, ScriptBudget, ScriptEvent, ScriptOptions, SynthesisOptions,
+    SAMPLE_RATE,
 };
 use std::{
     hash::{Hash, Hasher},
@@ -162,6 +163,26 @@ fn offset_playback(stats: Option<PlaybackStats>, offset: f64) -> Option<Playback
         stats.first_playback_seconds = stats.first_playback_seconds.map(|t| t + offset);
         stats
     })
+}
+fn running(
+    message: String,
+    audio_seconds: f64,
+    elapsed: f64,
+    first: Option<f64>,
+    playback: Option<PlaybackStats>,
+) -> Update {
+    let mut update = Update::status("audio", message);
+    update.audio_seconds = audio_seconds;
+    update.elapsed = elapsed;
+    update.first_audio = first;
+    update.playback = playback;
+    update
+}
+fn labelled(segment: &Option<String>, message: String) -> String {
+    match segment {
+        Some(segment) => format!("{segment}{message}"),
+        None => message,
+    }
 }
 
 pub fn check_files(directory: &Path) -> Result<(), String> {
@@ -449,6 +470,29 @@ impl crate::engine_harness::Adapter for Worker {
                         return Ok(Update::status("done", "已停止 · 尚未生成音频"));
                     }
                 }
+                // A long script is spoken as several speech texts. Without a
+                // reference recording they would each pick their own voice, so the
+                // encoder that records the opening as their shared reference is
+                // loaded before the first audio.
+                let speech_texts = model
+                    .split_script(&options.text, ScriptBudget::default())
+                    .map_err(Failure::from)?
+                    .len();
+                if options.reference.is_none() && speech_texts > 1 && reference_encoder.is_none() {
+                    sender.publish(Update::status("reference", "首次加载参考音频编码器…"));
+                    *reference_encoder = Some(
+                        ReferenceEncoder::load_cancellable(
+                            &model_path.join("audio_tokenizer"),
+                            device,
+                            stop,
+                        )
+                        .map_err(Failure::from)?,
+                    );
+                }
+                let script = ScriptOptions {
+                    synthesis: options.clone(),
+                    budget: ScriptBudget::default(),
+                };
                 // Keep synthesis/save usable on machines with no audio output.
                 let playback_offset = start.elapsed().as_secs_f64();
                 let voice = duration_voice(&options);
@@ -460,7 +504,7 @@ impl crate::engine_harness::Adapter for Worker {
                         Some(
                             duration_history
                                 .estimate(voice, &options.text)
-                                .min(options.max_frames as f64 * 0.08),
+                                .min(options.max_frames as f64 * 0.08 * speech_texts as f64),
                         ),
                     ) {
                         Ok(output) => Some(output),
@@ -473,42 +517,68 @@ impl crate::engine_harness::Adapter for Worker {
                         }
                     }
                 };
+                // Which speech text is running; a single one needs no label.
+                let mut segment = (speech_texts > 1).then(|| format!("第 1/{speech_texts} 段 · "));
                 let mut first = None;
                 let report = model
-                    .synthesize(&options, &stop, |audio| {
+                    .synthesize_script(&script, &stop, reference_encoder.as_ref(), |event| {
                         if stop.load(Ordering::Acquire) {
                             return Ok(());
                         }
                         first.get_or_insert(start.elapsed().as_secs_f64());
-                        pcm.extend_from_slice(audio);
-                        if let Some(output) = &mut playback {
-                            output.push(audio).map_err(omni_breeze_tts::Error::Audio)?;
-                        }
-                        let stats = playback.as_ref().and_then(|p| p.stats());
-                        let mut u = Update::status(
-                            "audio",
-                            if let Some(stats) = &stats {
-                                if stats.buffering {
-                                    format!(
-                                        "正在缓冲 · 已准备 {:.1} 秒音频 · 可以随时停止",
-                                        stats.buffered_seconds
-                                    )
-                                } else {
-                                    "正在合成并播放 · 可以随时停止".into()
+                        let seconds = pcm.len() as f64 / SAMPLE_RATE as f64;
+                        match event {
+                            ScriptEvent::Audio(audio) => {
+                                pcm.extend_from_slice(audio);
+                                if let Some(output) = &mut playback {
+                                    output.push(audio).map_err(omni_breeze_tts::Error::Audio)?;
                                 }
-                            } else if hold {
-                                "正在合成待选音频 · 可以随时停止".into()
-                            } else if playback.is_some() {
-                                "正在生成音频 · 可以随时停止".into()
-                            } else {
-                                "正在合成 · 无可用扬声器，完成后可保存 WAV".into()
-                            },
-                        );
-                        u.audio_seconds = pcm.len() as f64 / SAMPLE_RATE as f64;
-                        u.elapsed = start.elapsed().as_secs_f64();
-                        u.first_audio = first;
-                        u.playback = offset_playback(stats, playback_offset);
-                        sender.publish(u);
+                                let stats = playback.as_ref().and_then(|p| p.stats());
+                                let message = if let Some(stats) = &stats {
+                                    if stats.buffering {
+                                        format!(
+                                            "正在缓冲 · 已准备 {:.1} 秒音频 · 可以随时停止",
+                                            stats.buffered_seconds
+                                        )
+                                    } else {
+                                        "正在合成并播放 · 可以随时停止".into()
+                                    }
+                                } else if hold {
+                                    "正在合成待选音频 · 可以随时停止".into()
+                                } else if playback.is_some() {
+                                    "正在生成音频 · 可以随时停止".into()
+                                } else {
+                                    "正在合成 · 无可用扬声器，完成后可保存 WAV".into()
+                                };
+                                let update = running(
+                                    labelled(&segment, message),
+                                    pcm.len() as f64 / SAMPLE_RATE as f64,
+                                    start.elapsed().as_secs_f64(),
+                                    first,
+                                    offset_playback(stats, playback_offset),
+                                );
+                                sender.publish(update);
+                            }
+                            ScriptEvent::SpeechText(index, _) => {
+                                segment = Some(format!("第 {}/{speech_texts} 段 · ", index + 2));
+                            }
+                            ScriptEvent::Anchor(count) => {
+                                let stats = playback.as_ref().and_then(|p| p.stats());
+                                let update = running(
+                                    labelled(
+                                        &segment,
+                                        format!(
+                                            "已从开头 {count} 段录下参考 · 后续各段沿用同一音色"
+                                        ),
+                                    ),
+                                    seconds,
+                                    start.elapsed().as_secs_f64(),
+                                    first,
+                                    offset_playback(stats, playback_offset),
+                                );
+                                sender.publish(update);
+                            }
+                        }
                         Ok(())
                     })
                     .map_err(Failure::from)?;
@@ -516,7 +586,7 @@ impl crate::engine_harness::Adapter for Worker {
                 if hold {
                     let end = if stop.load(Ordering::Acquire) || report.stopped {
                         enhancement::CandidateEnd::Stopped
-                    } else if report.reached_limit {
+                    } else if report.reached_limit.is_some() {
                         enhancement::CandidateEnd::ReachedLimit
                     } else {
                         enhancement::CandidateEnd::Normal {
@@ -547,7 +617,7 @@ impl crate::engine_harness::Adapter for Worker {
                 generated.audio_seconds = report.audio_seconds;
                 context.release_inference();
                 sender.publish(generated);
-                if !report.stopped && !report.reached_limit {
+                if !report.stopped && report.reached_limit.is_none() {
                     duration_history.observe(voice, &options.text, report.audio_seconds);
                 }
                 if let Some(output) = &mut playback {
@@ -567,14 +637,25 @@ impl crate::engine_harness::Adapter for Worker {
                     "done",
                     if stop.load(Ordering::Acquire) || report.stopped {
                         if pcm.is_empty() {
-                            "已停止 · 尚未生成音频"
+                            "已停止 · 尚未生成音频".into()
                         } else {
-                            "已停止 · 可保存已生成音频"
+                            "已停止 · 可保存已生成音频".into()
                         }
-                    } else if report.reached_limit {
-                        "已达到本段 60 秒生成上限 · 请将剩余文本分段合成"
+                    } else if let Some(index) = report.reached_limit {
+                        // A speech text that reaches the ceiling leaves its unread
+                        // words unlocatable, so the script stops there.
+                        let seconds = options.max_frames * 8 / 100;
+                        if speech_texts > 1 {
+                            format!(
+                                "第 {} 段达到单段 {seconds} 秒生成上限 · 其后 {} 段未合成 · 可保存已生成音频",
+                                index + 1,
+                                speech_texts - index - 1
+                            )
+                        } else {
+                            format!("已达到单段 {seconds} 秒生成上限 · 请缩短文本后重试")
+                        }
                     } else {
-                        "合成完成 · 可保存 WAV"
+                        "合成完成 · 可保存 WAV".into()
                     },
                 );
                 u.audio_seconds = pcm.len() as f64 / SAMPLE_RATE as f64;
@@ -586,7 +667,7 @@ impl crate::engine_harness::Adapter for Worker {
                 if design
                     && !stop.load(Ordering::Acquire)
                     && !report.stopped
-                    && !report.reached_limit
+                    && report.reached_limit.is_none()
                     && !pcm.is_empty()
                 {
                     // Snapshot the text used for this waveform, rather than

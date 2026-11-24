@@ -194,15 +194,26 @@ fn image() -> Command {
 }
 fn speech_product(samples: usize, cancelled: bool) -> Product {
     Product::speech(
-        omni_breeze_tts::SynthesisReport {
+        omni_breeze_tts::ScriptReport {
+            texts: vec![],
+            speech_texts: vec![omni_breeze_tts::SynthesisReport {
+                frames: 1,
+                codes: vec![[0; 16]],
+                audio_seconds: samples as f64 / 24000.0,
+                elapsed_seconds: 0.125,
+                first_audio_seconds: Some(0.025),
+                stopped: cancelled,
+                reached_limit: !cancelled,
+                profile: None,
+            }],
             frames: 1,
-            codes: vec![[0; 16]],
             audio_seconds: samples as f64 / 24000.0,
             elapsed_seconds: 0.125,
             first_audio_seconds: Some(0.025),
             stopped: cancelled,
-            reached_limit: !cancelled,
-            profile: None,
+            reached_limit: (!cancelled).then_some(0),
+            anchor: omni_breeze_tts::AnchorOrigin::None,
+            anchor_speech_texts: 0,
         },
         Default::default(),
     )

@@ -60,7 +60,7 @@ impl Default for Speech {
             text: String::new(),
             instruction: String::new(),
             seed: 42,
-            max_frames: 750,
+            max_frames: omni_breeze_tts::MAX_NEW_TOKENS,
             guidance_scale: 1.0,
         }
     }
@@ -70,7 +70,7 @@ impl Speech {
         if self.text.trim().is_empty()
             || self.text.len() > 32768
             || self.instruction.len() > 8192
-            || !(1..=1500).contains(&self.max_frames)
+            || !(1..=omni_breeze_tts::MAX_NEW_TOKENS).contains(&self.max_frames)
             || !self.guidance_scale.is_finite()
             || !(1.0..=10.0).contains(&self.guidance_scale)
         {
@@ -144,7 +144,8 @@ impl From<std::io::Error> for Failure {
 mod driver;
 mod music;
 pub(crate) mod omni;
-use driver::{Driver, NativeDriver, Step, Update};
+mod speech;
+use driver::{Driver, NativeDriver, Progress, Step, Update};
 
 impl driver::Progress {
     pub fn value(self) -> serde_json::Value {
@@ -161,6 +162,12 @@ impl driver::Progress {
             }
             Self::Transcription(e) => {
                 json!({"stage":"transcription","text":e.event.text,"audio_seconds":e.event.audio_seconds})
+            }
+            Self::Speech {
+                speech_text,
+                speech_texts,
+            } => {
+                json!({"stage":"speech","speech_text":speech_text,"speech_texts":speech_texts})
             }
             Self::Image(e) => json!(e),
             Self::Music(e) => json!(e),
@@ -257,6 +264,16 @@ impl<D: Driver> Models<D> {
         for (id, update) in step.updates {
             let job = active.members.get_mut(&id).unwrap();
             match update {
+                // Which speech text is running is an event; the audio update
+                // below keeps reporting the seconds handed off so far.
+                Update::Progress(Progress::Speech {
+                    speech_text,
+                    speech_texts,
+                }) => {
+                    job.context.event(
+                        json!({"stage":"speech","speech_text":speech_text,"speech_texts":speech_texts}),
+                    );
+                }
                 Update::Progress(progress) => job.context.progress(progress.value()),
                 Update::Audio(audio) => {
                     job.audio.extend(audio);
@@ -454,7 +471,7 @@ fn music_output(job: &Context, product: omni_music::pipeline::Product) -> Result
 fn speech_output(
     job: &Context,
     samples: Vec<f32>,
-    report: omni_breeze_tts::SynthesisReport,
+    report: omni_breeze_tts::ScriptReport,
     batch: omni_breeze_tts::BatchStats,
 ) -> Result<Output, Failure> {
     let filename = format!("{}.wav", job.id());
@@ -477,9 +494,20 @@ fn speech_output(
             .map_err(|e| Failure::Error(e.to_string()))?;
         Ok(())
     })?;
+    // The codes of each speech text stay out of the response; the WAV carries them.
+    let speech_texts: Vec<_> = report
+        .speech_texts
+        .iter()
+        .map(|text| {
+            json!({"frames":text.frames,"audio_seconds":text.audio_seconds,"elapsed_seconds":text.elapsed_seconds,
+                "first_audio_seconds":text.first_audio_seconds,"stopped":text.stopped,"reached_limit":text.reached_limit})
+        })
+        .collect();
     let mut output = Output::new(
         json!({"audio_url":format!("/v1/files/{filename}"),"audio_seconds":report.audio_seconds,
-        "cancelled":report.stopped,"reached_limit":report.reached_limit,"compute_seconds":report.elapsed_seconds,"first_audio_seconds":report.first_audio_seconds,"batch":batch}),
+        "cancelled":report.stopped,"reached_limit":report.reached_limit.is_some(),"reached_limit_speech_text":report.reached_limit,
+        "compute_seconds":report.elapsed_seconds,"first_audio_seconds":report.first_audio_seconds,
+        "speech_texts":speech_texts,"anchor":report.anchor,"anchor_speech_texts":report.anchor_speech_texts,"batch":batch}),
         report.stopped,
     );
     output.file = Some(file);
@@ -510,7 +538,7 @@ impl driver::Product {
         })
     }
     pub(crate) fn speech(
-        report: omni_breeze_tts::SynthesisReport,
+        report: omni_breeze_tts::ScriptReport,
         batch: omni_breeze_tts::BatchStats,
     ) -> Self {
         Self::new(Kind::Speech, move |context, audio| {
