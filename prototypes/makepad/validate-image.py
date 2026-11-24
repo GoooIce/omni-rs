@@ -65,7 +65,9 @@ def main():
             app.click("image_choose")
             app.wait(lambda: "尚未选择模型" in app.widget("image_status")["t"], 30)
             assert app.widget("image_choose")["enabled"]
-            assert not app.widget("image_generate")["enabled"]
+            load_button = app.widget("image_generate")
+            assert load_button["enabled"] and load_button["t"] == "载入图像模型"
+            assert not any(e["kind"] == "progress" for e in app.events("qwen-image"))
             checks.append("lazy load, missing-model picker, cancelled picker recovery")
             app.click("image_choose")
             app.wait(lambda: any(e["kind"] == "loading" for e in app.events("qwen-image")), 90)
@@ -130,7 +132,9 @@ def main():
             offset = len(app.events())
             app.click("transcribe")
             result = app.wait(lambda: next((e for e in app.events()[offset:] if e["kind"] in ["done", "error", "fatal"]), None), 180)
-            assert result["kind"] == "done" and result["text"] == "之前有顾客自己带酒水也没加收钱或者不让喝。", result
+            assert result["kind"] == "done", result
+            # Match the workspace recovery gate; keep every spoken character exact.
+            assert result["text"].removesuffix("。") == "之前有顾客自己带酒水也没加收钱或者不让喝", result
             checks.append("switch back to ASR and transcribe official WAV after image generation")
             report["asr_text"] = result["text"]
             report["png_sha256"] = hashlib.sha256(original).hexdigest()

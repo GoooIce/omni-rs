@@ -102,6 +102,16 @@ fn audio_watch_refuses_pre_idle_implementation_checkpoints_without_rewriting() {
             include_bytes!("fixtures/audio-idle-scheduler-v3.json").as_slice(),
         ),
     ] {
+        // Keep the old implementation hash, but use this build's enabled backend
+        // so the captured CPU fixture reaches the implementation identity guard.
+        let mut checkpoint: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        checkpoint["protocol"]["backend"] = if cfg!(feature = "metal") {
+            "autodiff<cubecl<wgpu<msl>>>"
+        } else {
+            "autodiff<ndarray>"
+        }
+        .into();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let namespace = if v3 {
@@ -112,10 +122,10 @@ fn audio_watch_refuses_pre_idle_implementation_checkpoints_without_rewriting() {
         let directory = namespace.join("audio-conditioned-v1");
         let checkpoints = directory.join("checkpoints");
         fs::create_dir_all(&checkpoints).unwrap();
-        let id = format!("{:x}", Sha256::digest(bytes));
+        let id = format!("{:x}", Sha256::digest(&bytes));
         let pointer = directory.join("latest.json");
         let file = checkpoints.join(format!("{id}.json"));
-        fs::write(&file, bytes).unwrap();
+        fs::write(&file, &bytes).unwrap();
         fs::write(
             &pointer,
             serde_json::to_vec(&serde_json::json!({"sha256":id})).unwrap(),

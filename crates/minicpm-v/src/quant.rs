@@ -104,14 +104,14 @@ pub trait ExpertResidence {
     fn load_mode() -> LoadMode;
 }
 
-#[cfg(any(feature = "cpu", feature = "metal", feature = "webgpu"))]
+#[cfg(any(feature = "cpu", test))]
 impl ExpertResidence for burn::backend::NdArray {
     fn load_mode() -> LoadMode {
         LoadMode::Dequantize
     }
 }
 
-#[cfg(any(feature = "metal", feature = "webgpu"))]
+#[cfg(feature = "metal")]
 mod cube_residence {
     use super::{ExpertResidence, LoadMode};
     use burn::backend::wgpu::{CubeBackend, WgpuRuntime};

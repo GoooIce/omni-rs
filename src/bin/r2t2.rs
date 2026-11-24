@@ -88,7 +88,6 @@ enum DeviceKind {
     Auto,
     Metal,
     Ane,
-    Webgpu,
     Cpu,
 }
 #[derive(Clone, Copy, ValueEnum)]
@@ -206,10 +205,12 @@ fn main() -> AnyResult<()> {
         {
             DeviceKind::Ane
         }
-        DeviceKind::Auto if cfg!(feature = "webgpu") => DeviceKind::Webgpu,
         DeviceKind::Auto if cfg!(feature = "cpu") => DeviceKind::Cpu,
         DeviceKind::Auto => {
-            return Err("No backend enabled. Build with metal, ane, webgpu or cpu.".into());
+            return Err(
+                "No backend enabled. Build with metal or ane; cpu is for reference diagnostics."
+                    .into(),
+            );
         }
         selected => selected,
     };
@@ -305,20 +306,6 @@ fn main() -> AnyResult<()> {
             }
             #[cfg(not(all(target_os = "macos", feature = "metal")))]
             Err("Metal needs macOS and the metal feature".into())
-        }
-        DeviceKind::Webgpu => {
-            #[cfg(feature = "webgpu")]
-            {
-                use burn::backend::wgpu::{WgpuDevice, graphics, init_setup};
-                let device = WgpuDevice::default();
-                // Native WGSL uses the platform graphics API through wgpu. Browser
-                // builds initialize graphics::WebGpu asynchronously in wasm.rs.
-                let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
-                eprintln!("WGPU/WGSL: {:?}", setup.adapter.get_info());
-                return run::<burn::backend::wgpu::WebGpu>(&args.command, precision, &device, None);
-            }
-            #[cfg(not(feature = "webgpu"))]
-            Err("Build with --no-default-features --features native,webgpu".into())
         }
         DeviceKind::Cpu => {
             #[cfg(feature = "cpu")]

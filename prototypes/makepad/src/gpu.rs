@@ -2,15 +2,9 @@ use burn::backend::wgpu::{graphics, init_setup, WgpuDevice};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub type Backend = burn::backend::Ane<burn::backend::wgpu::Metal>;
-#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
-pub type Backend = burn::backend::wgpu::Metal;
-#[cfg(not(target_os = "macos"))]
-pub type Backend = burn::backend::wgpu::WebGpu;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub type Device = burn_ane::AneDevice<burn::backend::wgpu::Metal>;
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub type Device = WgpuDevice;
 
 /// Both workers use one synchronized ANE session and Metal device. They share
 /// the bounded program-slot pool, so an idle engine cannot reserve half the ANE.
@@ -46,10 +40,6 @@ pub fn device() -> Device {
                 )
             })
             .clone()
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        WgpuDevice::default()
     }
 }
 
@@ -87,13 +77,7 @@ fn native_cache_budget() -> usize {
 }
 
 pub fn backend_label() -> &'static str {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "ANE + Metal · FP16"
-    } else if cfg!(target_os = "macos") {
-        "Metal · 本机推理"
-    } else {
-        "WGPU · 本机推理"
-    }
+    "ANE + Metal · FP16"
 }
 
 pub fn log_stats(device: &Device, engine: &str) {
@@ -113,8 +97,6 @@ pub fn initialize() {
         let device = WgpuDevice::default();
         #[cfg(target_os = "macos")]
         let setup = init_setup::<graphics::Metal>(&device, Default::default());
-        #[cfg(not(target_os = "macos"))]
-        let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
         eprintln!("[engine] {:?}", setup.adapter.get_info());
     });
 }

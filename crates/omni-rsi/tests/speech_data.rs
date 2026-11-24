@@ -356,7 +356,7 @@ fn real_verified_dataset_passes_native_admission() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu"))]
 #[test]
 #[ignore = "requires the local LFM3 checkpoint; R2T2 is a deterministic fixture"]
 fn real_codec_and_native_queue_admit_speech_without_python() {

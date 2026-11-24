@@ -6,7 +6,6 @@ use crate::{
 };
 use burn::tensor::{Tensor, backend::Backend};
 use serde::Serialize;
-#[cfg(not(feature = "wasm"))]
 use std::time::Instant;
 use std::{
     collections::VecDeque,
@@ -15,9 +14,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-#[cfg(feature = "wasm")]
-use web_time::Instant;
-
 #[derive(Clone, Debug, Serialize)]
 pub struct StreamEvent {
     /// Newly committed text. Concatenating deltas is always the final transcript.

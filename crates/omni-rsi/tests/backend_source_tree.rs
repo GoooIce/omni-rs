@@ -50,9 +50,13 @@ fn source_identity_binds_changes_additions_deletions_and_native_build_files() {
 
 #[test]
 fn independent_self_reading_implementation_identity_is_unchanged() {
+    // Pinned after the idle-runner changes, local numerical patch routing and
+    // aligned dependency locks (ADR-0005). Independently audited input changes
+    // are limited to the three included lockfiles; the identity algorithm and
+    // checkpoint rejection guards are unchanged.
     assert_eq!(
         omni_rsi::speech_checkpoint::implementation_hash(),
-        "a568757885a24df1a6666287c6d418f180243b98c7f494413d1a481cf30de6c1"
+        "425b2d350d3d112a7f2c8813d621de24813c5e6af0c609eab0cd943d14b2711e"
     );
 }
 

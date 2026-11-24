@@ -182,10 +182,8 @@ mod tests {
     fn fusion_registration_executes_the_same_lazy_inputs() {
         use burn::tensor::ops::FloatTensorOps;
         let gpu = WgpuDevice::default();
-        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
-            &gpu,
-            Default::default(),
-        );
+        // A caller may have initialized the default device before this adapter.
+        let _existing_client = <WgpuRuntime as cubecl::Runtime>::client(&gpu);
         let x = Tensor::<Metal, 1>::from_data(TensorData::new(vec![1., 2., 3.], [3]), &gpu) * 2.0;
         let result = dispatch::<Metal, 1>(
             "adapter_double",

@@ -18,6 +18,7 @@
 //!   --test tree_best_parity -- --ignored --nocapture
 //! ```
 use burn::tensor::{Tensor, backend::Backend};
+#[cfg(feature = "cpu")]
 use omni_minicpm_v::dspark::TreeSpec;
 
 fn repo_root() -> std::path::PathBuf {
@@ -47,6 +48,7 @@ fn argmax(row: &[f32]) -> u32 {
         .expect("finite logit")
 }
 
+#[cfg(feature = "cpu")]
 fn max_abs(actual: &[f32], expected: &[f32]) -> f32 {
     actual
         .iter()
@@ -57,10 +59,12 @@ fn max_abs(actual: &[f32], expected: &[f32]) -> f32 {
 
 /// The default config's first target layer is 0, so capture every layer the
 /// tree forward records hidden states for (the caller only needs one).
+#[cfg(feature = "cpu")]
 const CAPTURE: [usize; 1] = [0];
 
 /// 1B checkpoint on CPU: an irregular best-first layout (5 live nodes, one
 /// depth-3 path) verifies exactly like per-path sequential forwards.
+#[cfg(feature = "cpu")]
 #[test]
 #[ignore = "needs models/MiniCPM-V-4.7-1B"]
 fn best_first_layout_matches_sequential_1b_cpu() {

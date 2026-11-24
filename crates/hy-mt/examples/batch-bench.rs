@@ -21,21 +21,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     #[cfg(feature = "metal")]
     type B = burn::backend::wgpu::Metal;
-    #[cfg(all(not(feature = "metal"), feature = "webgpu"))]
-    type B = burn::backend::wgpu::WebGpu;
-    #[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
+    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
     type B = burn::backend::NdArray;
     #[cfg(feature = "metal")]
     burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
         &Default::default(),
         Default::default(),
     );
-    let precision =
-        if cfg!(feature = "cpu") && !cfg!(feature = "metal") && !cfg!(feature = "webgpu") {
-            Precision::F32
-        } else {
-            Precision::F16
-        };
+    let precision = if cfg!(feature = "cpu") && !cfg!(feature = "metal") {
+        Precision::F32
+    } else {
+        Precision::F16
+    };
     let stop = AtomicBool::new(false);
     let load = Instant::now();
     let model = Model::<B>::from_directory(

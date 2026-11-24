@@ -37,11 +37,13 @@ fn argmax(row: &[f32]) -> usize {
         .expect("finite logit")
 }
 
+#[cfg(feature = "cpu")]
 fn row<B: Backend>(tensor: &Tensor<B, 2>, index: usize) -> Vec<f32> {
     let width = tensor.dims()[1];
     values(tensor.clone().slice([index..index + 1, 0..width]))
 }
 
+#[cfg(feature = "cpu")]
 fn max_abs(actual: &[f32], expected: &[f32]) -> f32 {
     actual
         .iter()
@@ -181,6 +183,7 @@ fn assert_multi_matches<B: Backend>(
 /// runs the same per-row ops in both routes, so the bound is tight.
 #[test]
 #[ignore = "needs models/MiniCPM-V-4.7-1B"]
+#[cfg(feature = "cpu")]
 fn multi_verify_matches_per_sequence_1b_cpu() {
     use burn::backend::NdArray;
     use omni_minicpm_v::config::ModelDirectory;
@@ -216,6 +219,7 @@ fn multi_verify_matches_per_sequence_1b_cpu() {
 /// the same token history forwarded sequentially.
 #[test]
 #[ignore = "needs models/MiniCPM-V-4.7-1B"]
+#[cfg(feature = "cpu")]
 fn multi_verify_tree_blocks_match_sequential_paths_1b_cpu() {
     use burn::backend::NdArray;
     use omni_minicpm_v::config::ModelDirectory;

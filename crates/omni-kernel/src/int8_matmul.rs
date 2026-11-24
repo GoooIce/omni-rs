@@ -750,10 +750,6 @@ mod tests {
     #[ignore = "requires a Metal device"]
     fn int8_gemm_matches_dequantized_weights_on_scalar_and_tile64() {
         let device = cubecl::wgpu::WgpuDevice::default();
-        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
-            &device,
-            Default::default(),
-        );
         // Hand value: codes 32, -64, 16, 127 against weights 1, -2, 3, -4, zero 1.
         let x = vec![1.0, -2.0, 0.5, 4.0];
         let weights = vec![1i8, -2, 3, -4];

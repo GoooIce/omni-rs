@@ -2,7 +2,7 @@
      width="1200" height="440" viewBox="0 0 1200 440"
      role="img" aria-labelledby="pipe-title pipe-desc">
   <title id="pipe-title">omni-rs 四条本地推理流水线</title>
-  <desc id="pipe-desc">语音链：WAV 或麦克风经 Confucius4-R2T2 转写、Hy-MT2-7B 翻译、Breeze-TTS-2 合成后播放。音乐链：录音经 MERT2 提特征、SheetSage2 转谱、YuE2 生成歌曲。图像链：提示词或参考图经 Qwen-Image-2.1-Turbo 生成 PNG。理解链：图片加提问经 MiniCPM-V-4.7 流式描述。四条链共用同一 Rust/Burn 运行时与 GPU 内核，后端覆盖 Metal、ANE、WebGPU、CPU 与 Wasm。</desc>
+  <desc id="pipe-desc">语音链：WAV 或麦克风经 Confucius4-R2T2 转写、Hy-MT2-7B 翻译、Breeze-TTS-2 合成后播放。音乐链：录音经 MERT2 提特征、SheetSage2 转谱、YuE2 生成歌曲。图像链：提示词或参考图经 Qwen-Image-2.1-Turbo 生成 PNG。理解链：图片加提问经 MiniCPM-V-4.7 流式描述。四条链共用同一 Rust/Burn 运行时与 GPU 内核，运行于 Apple Silicon 原生 Metal/ANE。</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
@@ -121,6 +121,6 @@
   <g id="runtime-footer">
     <rect x="64" y="392" width="1072" height="36" rx="10" fill="#16221D"/>
     <text x="600" y="416" text-anchor="middle" font-family="ui-monospace, 'SF Mono', Menlo, monospace"
-          font-size="17" fill="#C6DACF">同一运行时：Burn 0.21 + omni-kernel 自定义 GPU 核 · Metal FP16 默认 · ANE 实验 · WebGPU · CPU · Wasm</text>
+          font-size="17" fill="#C6DACF">同一运行时：Burn 0.21 + omni-kernel 自定义 GPU 核 · Apple Silicon · Metal FP16 默认 · ANE 实验</text>
   </g>
 </svg>

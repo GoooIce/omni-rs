@@ -4,6 +4,7 @@
 #![cfg(feature = "metal")]
 
 use burn::backend::wgpu::{Metal, WgpuDevice};
+use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
 use omni_minicpm_v::{
     chat::{Message, Part, Role},
     config::ModelDirectory,
@@ -15,7 +16,10 @@ use omni_minicpm_v::{
 };
 mod common;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 #[test]
 fn metal_f16_image_stream_matches_official() {
@@ -25,6 +29,22 @@ fn metal_f16_image_stream_matches_official() {
     ) else {
         return;
     };
+    // A warm cache hides invalid candidates that panic during their first tune.
+    let autotune_cache = tempfile::tempdir().unwrap();
+    let mut runtime_config = CubeClRuntimeConfig::default();
+    runtime_config.autotune.cache = CacheConfig::File(autotune_cache.path().to_path_buf());
+    CubeClRuntimeConfig::set(runtime_config);
+
+    // Keep the normal panic output while detecting panics caught by autotuning.
+    type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync;
+    let previous_hook: Arc<PanicHook> = std::panic::take_hook().into();
+    let original_hook = Arc::clone(&previous_hook);
+    let panics = Arc::new(AtomicUsize::new(0));
+    let observed_panics = Arc::clone(&panics);
+    std::panic::set_hook(Box::new(move |info| {
+        observed_panics.fetch_add(1, Ordering::SeqCst);
+        original_hook(info);
+    }));
     let key = "small.png|Describe this image in one sentence.";
     let case = &cases[key];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -82,8 +102,18 @@ fn metal_f16_image_stream_matches_official() {
         |ids| tokenizer.decode(ids),
     )
     .unwrap();
+    std::panic::set_hook(Box::new(move |info| previous_hook(info)));
     // FP16 storage with FP32 accumulation keeps this case's greedy stream
     // token-identical to the official fp32 run; a flip here means the GPU
     // dtype path regressed.
     assert_eq!(outcome.tokens, expected, "Metal FP16 stream");
+    assert_eq!(
+        panics.load(Ordering::SeqCst),
+        0,
+        "Metal autotuning panicked"
+    );
+    eprintln!(
+        "Metal image parity: {} official tokens, zero autotune panics",
+        expected.len()
+    );
 }

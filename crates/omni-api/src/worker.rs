@@ -6,14 +6,12 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 #[cfg(feature = "metal")]
 type Backend = burn::backend::wgpu::Metal;
-#[cfg(all(not(feature = "metal"), feature = "webgpu"))]
-type Backend = burn::backend::wgpu::WebGpu;
-#[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
+#[cfg(all(not(feature = "metal"), feature = "cpu"))]
 type Backend = burn::backend::NdArray;
 
-#[cfg(any(feature = "metal", feature = "webgpu"))]
+#[cfg(feature = "metal")]
 type OmniBackend = omni_lfm3::NativeGpu;
-#[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
+#[cfg(all(not(feature = "metal"), feature = "cpu"))]
 type OmniBackend = burn::backend::NdArray;
 
 #[derive(Clone)]

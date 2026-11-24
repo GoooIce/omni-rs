@@ -22,7 +22,7 @@ use std::{
 fn shared_backend<B: BackendIr>() -> bool {
     #[cfg(all(feature = "metal-shared", target_os = "macos", target_arch = "aarch64"))]
     {
-        return crate::shared::enabled::<B>();
+        crate::shared::enabled::<B>()
     }
     #[cfg(not(all(feature = "metal-shared", target_os = "macos", target_arch = "aarch64")))]
     {

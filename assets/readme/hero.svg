@@ -79,6 +79,6 @@
 
   <g id="meta" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="16" fill="#8BA79B">
     <text x="1136" y="66" text-anchor="end">知音 · 本地创作工作台</text>
-    <text x="1136" y="92" text-anchor="end">Metal FP16 · ANE · WebGPU · CPU · Wasm</text>
+    <text x="1136" y="92" text-anchor="end">Apple Silicon · Metal FP16 · ANE</text>
   </g>
 </svg>

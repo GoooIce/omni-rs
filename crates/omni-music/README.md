@@ -67,9 +67,10 @@ crates/omni-music/target/release/music generate request.json --output song
 
 The default backend is Metal FP16; use `--precision f32` before the subcommand for
 reference comparisons. `--models` changes the parent checkpoint directory.
-Use `--no-default-features --features cpu` for NdArray, or `--features webgpu`
-instead of CPU for native WebGPU. CPU builds/tests are covered; full-model
-numerical validation uses Metal. This crate is not a browser/Wasm bundle.
+Apple Silicon macOS is the supported runtime platform. Use
+`--no-default-features --features cpu` for explicit NdArray reference diagnostics;
+full-model numerical validation uses Metal. Browser/Wasm and WebGPU backends
+are no longer supported.
 Output directories for transcription/generation must be new. Ctrl-C cancels at
 the next model boundary; the CLI retains already-written intermediate artifacts.
 

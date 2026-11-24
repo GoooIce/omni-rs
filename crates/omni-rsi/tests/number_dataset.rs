@@ -3,6 +3,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path, sync::atomic::AtomicBool};
 
+#[cfg(feature = "metal")]
+type EvaluationBackend = burn::backend::Autodiff<omni_lfm3::NativeGpu>;
+#[cfg(all(not(feature = "metal"), feature = "cpu"))]
+type EvaluationBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+
 fn fixture() -> (tempfile::TempDir, Value) {
     let root = tempfile::tempdir().unwrap();
     let mut records = Vec::new();
@@ -521,9 +526,9 @@ fn swapped_audio_is_scored_against_the_audio_not_the_prompt_case() {
     assert_eq!(invalid_summary["baseline"]["valid"], 5);
 }
 
+#[cfg(any(feature = "metal", feature = "cpu"))]
 #[test]
 fn development_comparison_rejects_generic_training_data_before_loading_a_model() {
-    use burn::backend::{Autodiff, NdArray};
     use omni_rsi::speech_number_evaluation::{DevelopmentOptions, evaluate_development};
 
     let (root, mut manifest) = fixture();
@@ -538,7 +543,7 @@ fn development_comparison_rejects_generic_training_data_before_loading_a_model()
         asr_model: None,
         asr_binary: None,
     };
-    let error = evaluate_development::<Autodiff<NdArray<f32>>>(
+    let error = evaluate_development::<EvaluationBackend>(
         &options,
         &Default::default(),
         &AtomicBool::new(false),
@@ -548,9 +553,9 @@ fn development_comparison_rejects_generic_training_data_before_loading_a_model()
     assert!(error.contains("rule"), "{error}");
 }
 
+#[cfg(any(feature = "metal", feature = "cpu"))]
 #[test]
 fn speech_comparison_requires_both_local_asr_model_and_binary() {
-    use burn::backend::{Autodiff, NdArray};
     use omni_rsi::speech_number_evaluation::{DevelopmentOptions, evaluate_development};
     let (root, manifest) = fixture();
     write_manifest(root.path(), &manifest);
@@ -562,7 +567,7 @@ fn speech_comparison_requires_both_local_asr_model_and_binary() {
         asr_model: Some(root.path()),
         asr_binary: None,
     };
-    let error = evaluate_development::<Autodiff<NdArray<f32>>>(
+    let error = evaluate_development::<EvaluationBackend>(
         &options,
         &Default::default(),
         &AtomicBool::new(false),

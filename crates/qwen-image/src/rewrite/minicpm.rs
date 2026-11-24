@@ -47,7 +47,7 @@ pub const DEFAULT_MODEL_DIR: &str = "models/MiniCPM-V-4.7-35B-A3B-int4";
 
 /// Concrete backend the rewriter runs on inside this crate.
 ///
-/// qwen-image's `metal`/`webgpu` features enable `burn/fusion` for the
+/// qwen-image's `metal` feature enable `burn/fusion` for the
 /// diffusion model, which turns `burn::backend::wgpu::Metal` into
 /// `Fusion<CubeBackend<..>>`. burn-fusion's IR builder requires exact dtype
 /// equality on binary ops, and it records the in-kernel-dequantized int4
@@ -58,10 +58,10 @@ pub const DEFAULT_MODEL_DIR: &str = "models/MiniCPM-V-4.7-35B-A3B-int4";
 /// CLI and GPU tests verify, so the rewriter instantiates that raw backend
 /// for itself instead of sharing the diffusion model's fusion wrapper. The
 /// two runtimes coexist as separate wgpu devices in one process.
-#[cfg(any(feature = "metal", feature = "webgpu"))]
+#[cfg(feature = "metal")]
 pub type Native = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
 /// CPU builds never wrap NdArray in fusion; use it directly.
-#[cfg(all(not(feature = "metal"), not(feature = "webgpu")))]
+#[cfg(not(feature = "metal"))]
 pub type Native = burn::backend::NdArray;
 
 /// Local prompt rewriter on a MiniCPM-V-4.7 checkpoint. Owns the text model,

@@ -27,5 +27,5 @@ pub use text::{TextCache, TextModel};
 
 /// The eager GPU backend avoids a Burn fusion-graph failure when FP16 token
 /// embeddings feed the FP32 reduction in LFM3's first RMS normalization.
-#[cfg(any(feature = "metal", feature = "webgpu"))]
+#[cfg(feature = "metal")]
 pub type NativeGpu = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;

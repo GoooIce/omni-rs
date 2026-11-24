@@ -544,8 +544,6 @@ fn main() -> Result<()> {
     match args.backend.as_str() {
         #[cfg(feature = "metal")]
         "metal" => run::<burn::backend::wgpu::Metal>(args, Default::default(), cancel),
-        #[cfg(feature = "webgpu")]
-        "webgpu" => run::<burn::backend::wgpu::WebGpu>(args, Default::default(), cancel),
         #[cfg(feature = "cpu")]
         "cpu" => run::<burn::backend::NdArray>(args, Default::default(), cancel),
         _ => Err(Error::Config("所选后端未编译到此程序中".into())),

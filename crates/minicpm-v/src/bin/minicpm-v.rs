@@ -148,9 +148,7 @@ fn doctor_command(model: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 fn generate_command(options: &GenerateOptions) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "metal")]
     type B = burn::backend::wgpu::Metal;
-    #[cfg(all(not(feature = "metal"), feature = "webgpu"))]
-    type B = burn::backend::wgpu::WebGpu;
-    #[cfg(all(not(feature = "metal"), not(feature = "webgpu"), feature = "cpu"))]
+    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
     type B = burn::backend::NdArray;
 
     #[cfg(feature = "metal")]
@@ -166,6 +164,8 @@ fn generate_command(options: &GenerateOptions) -> Result<(), Box<dyn std::error:
         let device = burn::backend::ndarray::NdArrayDevice::default();
         run_generate::<B>(options, &device)
     }
+    #[cfg(not(any(feature = "metal", feature = "cpu")))]
+    Err("No backend enabled. Build with metal (or cpu for reference diagnostics).".into())
 }
 
 fn run_generate<B: burn::tensor::backend::Backend + omni_minicpm_v::quant::ExpertResidence>(
@@ -866,23 +866,13 @@ fn check_backend() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Metal: {:?}", setup.adapter.get_info());
         probe::<burn::backend::wgpu::Metal>(&device)
     }
-    #[cfg(all(
-        not(all(target_os = "macos", feature = "metal")),
-        any(feature = "webgpu", feature = "cpu")
-    ))]
+    #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cpu"))]
     {
-        #[cfg(feature = "webgpu")]
-        type B = burn::backend::wgpu::WebGpu;
-        #[cfg(all(not(feature = "webgpu"), feature = "cpu"))]
         type B = burn::backend::NdArray;
         probe::<B>(&Default::default())
     }
-    #[cfg(not(any(
-        all(target_os = "macos", feature = "metal"),
-        feature = "webgpu",
-        feature = "cpu"
-    )))]
-    Err("No backend enabled. Build with metal, webgpu or cpu.".into())
+    #[cfg(not(any(all(target_os = "macos", feature = "metal"), feature = "cpu")))]
+    Err("No backend enabled. Build with metal (or cpu for reference diagnostics).".into())
 }
 
 fn probe<B: burn::tensor::backend::Backend>(

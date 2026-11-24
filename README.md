@@ -4,7 +4,7 @@
   <img src="assets/readme/hero.svg" width="100%" alt="omni-rs：纯 Rust / Burn 实现的多模态本地推理套件，覆盖语音转写、翻译、语音合成、图像理解、文生图与音乐生成，推理全程在本机 GPU 上">
 </p>
 
-在一台 Mac 的 GPU 上跑完语音转写、翻译、语音合成、图像理解、文生图和音乐生成。核心 crate 是 `omni-r2t2`，推理用纯 Rust / [Burn 0.21.0](https://github.com/tracel-ai/burn/tree/v0.21.0)，不调用 Python、PyTorch、llama.cpp 或远程服务。默认后端是 Apple Silicon 的 Metal；实验性 ANE、WGPU/WGSL 和浏览器 WebGPU 是同一套模型的其它入口。
+在一台 Mac 的 GPU 上跑完语音转写、翻译、语音合成、图像理解、文生图和音乐生成。核心 crate 是 `omni-r2t2`，推理用纯 Rust / [Burn 0.21.0](https://github.com/tracel-ai/burn/tree/v0.21.0)，不调用 Python、PyTorch、llama.cpp 或远程服务。运行平台收敛为 Apple Silicon macOS，默认使用原生 Metal，保留实验性 ANE。CPU 仅用于参考诊断和 ANE fallback；不再支持 WASM、浏览器 WebGPU 或其它桌面 GPU 后端。
 
 每个模块都用官方完整权重在本机 M5 Max 上跑通，并与官方 PyTorch / transformers 做了数值对照。条件、性能和范围见 [VALIDATION.md](VALIDATION.md)。
 
@@ -30,7 +30,7 @@
 
 ## 快速开始
 
-需要 Rust 1.92+。Cargo 不在 PATH 时先加载 `~/.cargo/env`。
+需要 Apple Silicon Mac 和 Rust 1.92+。Cargo 不在 PATH 时先加载 `~/.cargo/env`。
 
 ```sh
 git clone https://github.com/GoooIce/omni-rs && cd omni-rs
@@ -52,14 +52,14 @@ python3 prototypes/makepad/build-native.py && ./target/release/r2t2-makepad
 ## 流水线
 
 <p align="center">
-  <img src="assets/readme/pipeline.svg" width="100%" alt="四条本地推理流水线：语音链（WAV 或麦克风 → Confucius4-R2T2 转写 → Hy-MT2-7B 翻译 → Breeze-TTS-2 合成 → 边生成边播放）、音乐链（录音 → MERT2 → SheetSage2 → YuE2 → 48 kHz 双声道）、图像链（提示词或参考图 → Qwen-Image-2.1-Turbo → 可透明 PNG）、理解链（图片加提问 → MiniCPM-V-4.7 → 逐 token 文字）；四条链共用同一 Rust/Burn 运行时，后端覆盖 Metal、ANE、WebGPU、CPU 与 Wasm">
+  <img src="assets/readme/pipeline.svg" width="100%" alt="四条本地推理流水线：语音链（WAV 或麦克风 → Confucius4-R2T2 转写 → Hy-MT2-7B 翻译 → Breeze-TTS-2 合成 → 边生成边播放）、音乐链（录音 → MERT2 → SheetSage2 → YuE2 → 48 kHz 双声道）、图像链（提示词或参考图 → Qwen-Image-2.1-Turbo → 可透明 PNG）、理解链（图片加提问 → MiniCPM-V-4.7 → 逐 token 文字）；四条链共用同一 Rust/Burn 运行时，在 Apple Silicon 原生 Metal/ANE 上执行">
 </p>
 
 ## 模块
 
 ### 流式语音识别 · Confucius4-R2T2
 
-WAV、16 kHz PCM 管道、可选麦克风，或浏览器 module worker。`--realtime` 按音频时钟喂入；不加时则尽快跑完，用来测速。官方 6.74 秒样本 **RTF 0.379、每步 p95 82.4 ms**（纯 Metal FP16，不含加载与预热）。跟不上输入会报错，不静默丢音频。
+WAV、16 kHz PCM 管道或可选麦克风。`--realtime` 按音频时钟喂入；不加时则尽快跑完，用来测速。官方 6.74 秒样本 **RTF 0.379、每步 p95 82.4 ms**（纯 Metal FP16，不含加载与预热）。跟不上输入会报错，不静默丢音频。
 
 ```sh
 cargo run --release -- transcribe \
@@ -172,27 +172,11 @@ curl -s http://127.0.0.1:8848/v1/translations \
 | --- | --- | --- |
 | Metal | 原生界面的默认路径 | `--backend metal` |
 | ANE | 实验。长流未过验收 | `--features ane -- --backend ane` |
-| WebGPU | 其它桌面 GPU，或浏览器 | `--features native,webgpu` / Wasm |
 | CPU | 正确性对照，不承诺实时 | `--features native,cpu -- --backend cpu` |
 
 ANE 把 Burn 子图编译成 Core ML，再由 Swift 桥执行。无 ANE 分配或编译失败会按原因回退。2026-10-11 的固定 96 条中文集热态一轮 RTF 0.7708，但 40 秒连续输入 RTF 0.9951，30 分钟复测约 1.017，**长流验收未通过**。原生界面因此仍用 Metal。选择与对照见 [优化目标](docs/ane-optimization-goal.md) 和 [后端说明](crates/burn-ane/README.md)。
 
-```sh
-# WGPU/WGSL
-cargo run --release --no-default-features --features native,webgpu -- \
-  --backend webgpu transcribe --model models/Confucius4-R2T2 --audio speech.wav
-
-# 浏览器：Wasm release 与完整权重已在本机 Chromium 实测
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.129 --locked
-cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
-wasm-bindgen target/wasm32-unknown-unknown/release/omni_r2t2.wasm --target web --out-dir pkg
-python3 scripts/pack_web.py models/Confucius4-R2T2 models/web
-python3 -m http.server 8765
-# 打开 http://localhost:8765/web/demo.html
-```
-
-浏览器输入是指定采样率的单声道 `Float32Array`，每次 `push` 都要 await。加载接口见 [web/load-model.js](web/load-model.js)。WebGPU 默认 160 ms 配置在本机仍慢于实时；Makepad 的 960 ms 快速档在 20 秒采集上 RTF 约 0.75。Windows/Linux 硬件未实测。
+2026-11-12 起停止 WASM、WebGPU/WGSL、Intel Mac、Windows 和 Linux 的运行支持。原生 Metal 仍使用 Burn/CubeCL 的 wgpu 运行时及内部 WGSL 支持；不提供可选择的 WebGPU/WGSL 后端。本地 HTTP API 与其浏览器客户端继续可用，推理在 Apple Silicon 原生进程执行。已有浏览器验证只作为历史记录，旧构建缓存不自动删除。
 
 ## Rust 接口
 
@@ -222,14 +206,14 @@ for event in run.finish().await? {
 ## 验证
 
 ```sh
+./scripts/install-hooks.py
 ./scripts/check quick   # 约束、验证器反例、全部子项目格式
-./scripts/check cpu     # 再跑 CPU Clippy 与测试
-./scripts/check metal   # Apple Silicon 上的 Metal 与注意力数值对照
+./scripts/check metal   # 本机 GPU 验收：quick、Metal Clippy/测试与注意力数值对照
 ./scripts/check native  # 本机权重下的 ASR、生命周期和 TTS 回归
 ./scripts/check status
 ```
 
-检查范围与中断恢复见 [开发工作流](docs/agent-workflow.md)。FP32/FP16、长流和浏览器结果在 [VALIDATION.md](VALIDATION.md)；这些是回归，不是完整语料的 WER/CER。别的 agent 调本机 HTTP 的约定在 [llms.txt](llms.txt)。
+日常验收使用本机 Apple Silicon GPU，远程 CI 已停用；`./scripts/check cpu` 保留为按需运行的本地诊断。检查范围以 `scripts/checks.json` 为准，可用 `./scripts/check metal --list` 查看实际命令。检查范围与中断恢复见 [开发工作流](docs/agent-workflow.md)。FP32/FP16、长流与历史浏览器结果在 [VALIDATION.md](VALIDATION.md)；这些是回归，不是完整语料的 WER/CER。别的 agent 调本机 HTTP 的约定在 [llms.txt](llms.txt)。
 
 官方小模型对照需要 Python 3.12+ 与 `scripts/requirements-reference.txt`，推理本身不依赖它们：
 
