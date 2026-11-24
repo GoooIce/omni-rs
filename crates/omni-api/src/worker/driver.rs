@@ -285,7 +285,7 @@ impl Driver for NativeDriver {
                 let mut options = omni_breeze_tts::SynthesisOptions {
                     text: request.text.clone(),
                     instruction: request.instruction.clone(),
-                    max_frames: request.max_frames,
+                    max_frames: request.ceiling(),
                     guidance_scale: request.guidance_scale,
                     paged_attention: self.paths.tts_paged_attention,
                     ..Default::default()

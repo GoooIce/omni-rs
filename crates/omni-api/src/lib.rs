@@ -526,11 +526,7 @@ mod tests {
                 r#"{"text":"","target_language":"English"}"#,
                 "application/json",
             ),
-            (
-                "/v1/audio/speech",
-                r#"{"text":"hello","max_frames":0}"#,
-                "application/json",
-            ),
+            ("/v1/audio/speech", r#"{"text":"   "}"#, "application/json"),
             (
                 "/v1/images/generations",
                 r#"{"prompt":""}"#,

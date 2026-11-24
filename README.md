@@ -153,7 +153,7 @@ curl -s http://127.0.0.1:8848/v1/translations \
 | `DELETE /v1/omni/sessions/{id}` | 排队释放 Omni 会话缓存 |
 | `POST /v1/translations` | JSON：`text`、`target_language`，可选 `options` |
 | `POST /v1/audio/transcriptions` | WAV 字节；可选查询参数 `language`、`context` |
-| `POST /v1/audio/speech` | JSON：`text`，可选 `instruction`、`seed`、`max_frames`、`guidance_scale` |
+| `POST /v1/audio/speech` | JSON：`text`，可选 `instruction`、`seed`、`max_frames`（越界时夹到 1–1500）、`guidance_scale` |
 | `POST /v1/images/generations` | JSON：`prompt`，可选 `width`、`height`、`seed`、`negative_prompt`、`true_cfg_scale` |
 | `POST /v1/music/analyses` | WAV 字节，返回 MERT2 特征 |
 | `POST /v1/music/scores` | WAV 字节，可选 `melody_only`；返回事件、MIDI 与 ABC |

@@ -66,11 +66,15 @@ impl Default for Speech {
     }
 }
 impl Speech {
+    /// Frame ceiling of each speech text. Upstream clamps `max_new_tokens`
+    /// into `1..=MAX_NEW_TOKENS` instead of rejecting the request.
+    pub fn ceiling(&self) -> usize {
+        self.max_frames.clamp(1, omni_breeze_tts::MAX_NEW_TOKENS)
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.text.trim().is_empty()
             || self.text.len() > 32768
             || self.instruction.len() > 8192
-            || !(1..=omni_breeze_tts::MAX_NEW_TOKENS).contains(&self.max_frames)
             || !self.guidance_scale.is_finite()
             || !(1.0..=10.0).contains(&self.guidance_scale)
         {

@@ -180,6 +180,27 @@ fn speech() -> Command {
         ..Default::default()
     })
 }
+#[test]
+fn speech_frames_outside_upstream_range_are_clamped_not_rejected() {
+    let request = |max_frames| Speech {
+        text: "你好".into(),
+        max_frames,
+        ..Default::default()
+    };
+    assert_eq!(request(0).ceiling(), 1);
+    assert_eq!(request(9_999).ceiling(), omni_breeze_tts::MAX_NEW_TOKENS);
+    assert_eq!(request(64).ceiling(), 64);
+    assert!(request(0).validate().is_ok());
+    assert!(request(9_999).validate().is_ok());
+    assert!(
+        Speech {
+            text: "   ".into(),
+            ..Default::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
 fn asr() -> Command {
     Command::Transcribe {
         audio: Vec::new(),
