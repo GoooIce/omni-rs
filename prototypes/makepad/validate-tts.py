@@ -279,6 +279,53 @@ def validate_long_stream(app, out, saved, report):
     report["checks"].append("30–60 second held-out utterance starts during synthesis, plays every sample and drains without underruns")
 
 
+def validate_long_script(app, out, saved, report):
+    # A script the model splits into several speech texts plays in two steps:
+    # the opening as it arrives, then the rest once enough is banked to run
+    # without stopping. Either step must render every sample it was given.
+    app.wait(lambda: app.widget("tts_synthesize")["enabled"])
+    if "●" not in app.widget("tts_speech_mode")["t"]:
+        app.click("tts_speech_mode")
+    if app.widget("tts_reference_clear")["enabled"]:
+        app.click("tts_reference_clear")
+    fill(app, "tts_instruction", "")
+    text = ("清晨五点半，巷口的菜场已经亮了灯。卖鱼的把碎冰铲进铁盘，带鱼和黄鱼并排躺着，鳞片上还挂着水。"
+            "隔壁摊主把豆腐切成方块，用井水冲掉边角的碎渣。一个穿校服的孩子挤进来买两根油条，油条刚出锅，"
+            "纸袋很快被油浸透。老板娘一边找零一边提醒他把书包拉链拉上。"
+            "洗衣机甩干到一半忽然停住，面板只剩一个闪烁的水龙头图标。客服让用户先确认进水管没有打折，"
+            "再把过滤器逆时针拧下来，用软毛刷清掉硬币和头发。用户说网里有一枚游戏币，取出来之后程序仍停在同一格。"
+            "客服于是改口让他断电十分钟，把排水管放低到地面，听泵是否重新启动。"
+            "整个对话没有人提高音量，但两个人都把步骤重复了一遍。")
+    fill(app, "tts_text", text)
+    offset = len(app.events("breeze"))
+    app.click("tts_synthesize")
+    app.wait(lambda: any(u["kind"] in ("done", "error", "fatal")
+                        for u in app.events("breeze")[offset:]), 900)
+    events = app.events("breeze")[offset:]
+    final = events[-1]
+    assert final["kind"] == "done" and final["message"].startswith("合成完成"), final
+    labels = sorted({u["message"].split(" · ")[0] for u in events
+                     if u["kind"] == "audio" and u["message"].startswith("第 ")})
+    assert len(labels) >= 2, labels
+    assert 60 <= final["audio_seconds"] <= 150, final
+    stats, opening = final["playback"], final["opening_playback"]
+    for step in (stats, opening):
+        assert step["underruns"] == step["gap_seconds"] == step["buffered_seconds"] == 0, final
+    assert abs(stats["rendered_seconds"] - final["audio_seconds"]) <= 1 / stats["output_rate"], final
+    # The opening ends where the status moves on to the second speech text.
+    handover = next(u for u in events if u["kind"] == "audio" and u["message"].startswith("第 2/"))
+    assert abs(opening["rendered_seconds"] - handover["audio_seconds"]) <= 1 / stats["output_rate"], (opening, handover)
+    assert opening["first_playback_seconds"] is not None, opening
+    assert stats["first_playback_seconds"] == opening["first_playback_seconds"], final
+    app.wait(lambda: app.widget("tts_save")["enabled"])
+    app.click("tts_save")
+    app.wait(lambda: "已保存" in app.widget("tts_status")["t"])
+    shutil.copy2(saved, out / "long-script.wav")
+    report["long_script"] = dict(final, text=text, speech_text_labels=labels,
+                                 handover={k: handover[k] for k in ("audio_seconds", "elapsed", "message")})
+    report["checks"].append("a script split into several speech texts plays the opening first, then the rest without underruns, and renders every sample")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -288,7 +335,7 @@ def main():
     parser.add_argument("--device-output-muted", action="store_true",
                         help="Exercise actual CPAL timing and buffers while outputting digital silence")
     parser.add_argument("--long-stream", action="store_true",
-                        help="Also validate a complete 30–60 second device playback")
+                        help="Also validate complete long device playbacks, including a script split into several speech texts")
     parser.add_argument("--playback-only", action="store_true",
                         help="Run device stop/replay/drain and ASR-switch checks after loading")
     args = parser.parse_args()
@@ -492,6 +539,7 @@ def main():
                 validate_playback(app, report, minimum_completed=0 if args.playback_only else 7)
                 if args.long_stream:
                     validate_long_stream(app, out, saved, report)
+                    validate_long_script(app, out, saved, report)
 
             # A worker log precedes SignalToUI delivery. Wait for the UI state
             # to consume the final replay/drain update before navigating.

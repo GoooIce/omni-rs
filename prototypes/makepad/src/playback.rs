@@ -15,9 +15,21 @@ use std::{
 };
 
 const RATE: u32 = 24_000;
-// The native synthesizer emits at most 60 seconds. This bounded ring also lets
-// slow generation build sufficient lead; a full ring always releases playback.
+// The ring is also the lead that uninterrupted playback needs. A short
+// utterance gets a minute; a longer script gets its estimated duration, so slow
+// generation can bank enough before playback starts. A full ring always
+// releases playback.
 const CAPACITY_SECONDS: usize = 60;
+// Ceiling on the ring, so a very long script cannot take all memory.
+const MAX_CAPACITY_BYTES: usize = 256 << 20;
+
+/// Ring size in seconds for an utterance estimated at `estimate` seconds, at
+/// `rate` device samples per second. The ring holds one word per sample.
+fn capacity_seconds(rate: usize, estimate: Option<f64>) -> usize {
+    let wanted = estimate.map_or(0, |estimate| estimate.clamp(0.0, 1.0e9).ceil() as usize + 2);
+    let by_bytes = (MAX_CAPACITY_BYTES / 4 / rate).max(CAPACITY_SECONDS);
+    CAPACITY_SECONDS.max(wanted).min(by_bytes)
+}
 
 struct Shared {
     buffer: Arc<Buffer>,
@@ -76,7 +88,7 @@ impl Playback {
         let shared = Arc::new(Shared {
             buffer: Arc::new(Buffer::new(
                 config.sample_rate.0 as usize,
-                CAPACITY_SECONDS,
+                capacity_seconds(config.sample_rate.0 as usize, estimate),
                 cancel.clone(),
                 estimate.is_some(),
             )),
@@ -299,6 +311,21 @@ fn build<T: SizedSample + FromSample<f32>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_grows_with_the_estimate_up_to_a_memory_ceiling() {
+        let ceiling = |rate: usize| (256 << 20) / 4 / rate;
+        assert_eq!(capacity_seconds(48_000, None), 60);
+        assert_eq!(capacity_seconds(48_000, Some(5.0)), 60);
+        assert_eq!(capacity_seconds(48_000, Some(600.0)), 602);
+        assert_eq!(capacity_seconds(48_000, Some(5000.0)), ceiling(48_000));
+        assert_eq!(capacity_seconds(192_000, Some(5000.0)), ceiling(192_000));
+        assert_eq!(capacity_seconds(48_000, Some(f64::NAN)), 60);
+        assert_eq!(
+            capacity_seconds(48_000, Some(f64::INFINITY)),
+            ceiling(48_000)
+        );
+    }
 
     #[test]
     fn output_resampling_preserves_duration_and_packet_boundaries() {
