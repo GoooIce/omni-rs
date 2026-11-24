@@ -491,6 +491,13 @@ script_mod! {
                                         tts_details := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 9
                                             tts_enhance := QuietButton{text: "提示词增强" height: 32}
+                                            SpeechLabel{text: "填充方式"}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                tts_prefill_dense := SpeechButton{text: "● 稠密 KV" width: Fill height: 30}
+                                                tts_prefill_latent := SpeechButton{text: "隐向量" width: Fill height: 30}
+                                            }
+                                            MutedLabel{text: "隐向量缩短 35B 长提示的预填充，需要已拟合的因子文件。"}
                                             tts_instruction_title := SpeechLabel{text: "声音描述（可选）"}
                                             tts_instruction := SpeechInput{
                                                 width: Fill height: 66 is_multiline: true

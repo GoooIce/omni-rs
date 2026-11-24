@@ -52,7 +52,7 @@ pub struct State {
     design: bool,
     reusable: bool,
     candidate: u64,
-    controls: Option<[bool; 17]>,
+    controls: Option<[bool; 18]>,
     session: omni_breeze_tts::enhancement::Session,
     checkpoint: PathBuf,
     enhancement_settings: Option<PathBuf>,
@@ -316,6 +316,7 @@ impl App {
             !t.session.choices().is_empty(),
             t.session.draft().is_some(),
             t.session.previous_prompt().is_some(),
+            t.session.prefill() == omni_breeze_tts::enhancement::Prefill::Latent,
             t.hearing_audio[0].is_some(),
             t.hearing_audio[1].is_some(),
             t.hearing_audio[2].is_some(),
@@ -394,6 +395,19 @@ impl App {
                 "提示词增强"
             },
         );
+        let latent = t.session.prefill() == omni_breeze_tts::enhancement::Prefill::Latent;
+        self.ui
+            .button(cx, ids!(tts_prefill_dense))
+            .set_text(cx, if latent { "稠密 KV" } else { "● 稠密 KV" });
+        self.ui
+            .button(cx, ids!(tts_prefill_latent))
+            .set_text(cx, if latent { "● 隐向量" } else { "隐向量" });
+        self.ui
+            .button(cx, ids!(tts_prefill_dense))
+            .set_action_enabled(cx, idle);
+        self.ui
+            .button(cx, ids!(tts_prefill_latent))
+            .set_action_enabled(cx, idle);
         self.ui
             .button(cx, ids!(tts_enhance))
             .set_action_enabled(cx, idle);
@@ -879,6 +893,34 @@ impl App {
             );
             return;
         }
+        if self.ui.button(cx, ids!(tts_prefill_dense)).clicked(actions) {
+            if t.session.prefill() != omni_breeze_tts::enhancement::Prefill::Dense {
+                t.session
+                    .set_prefill(omni_breeze_tts::enhancement::Prefill::Dense);
+                t.controls = None;
+                self.remember_enhancement();
+                self.tts_status(cx, "填充方式已改为稠密 KV");
+            }
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(tts_prefill_latent))
+            .clicked(actions)
+        {
+            if t.session.prefill() != omni_breeze_tts::enhancement::Prefill::Latent {
+                if let Err(error) = crate::speech_enhancer::factors_available(&t.checkpoint) {
+                    self.tts_status(cx, &error);
+                    return;
+                }
+                t.session
+                    .set_prefill(omni_breeze_tts::enhancement::Prefill::Latent);
+                t.controls = None;
+                self.remember_enhancement();
+                self.tts_status(cx, "填充方式已改为隐向量。35B 增强会用拟合因子做预填充");
+            }
+            return;
+        }
         for (index, id) in [ids!(tts_hear_0), ids!(tts_hear_1), ids!(tts_hear_2)]
             .into_iter()
             .enumerate()
@@ -952,6 +994,7 @@ impl App {
                         request,
                         seed,
                         checkpoint,
+                        prefill: t.session.prefill(),
                     }) {
                         self.tts_error(cx, &error.to_string(), false);
                     } else {
@@ -1077,6 +1120,7 @@ impl App {
                     prompt,
                     seeds,
                     checkpoint,
+                    prefill: t.session.prefill(),
                 })
             } else {
                 t.engine.submit(Command::Synthesize {

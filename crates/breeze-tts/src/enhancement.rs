@@ -74,6 +74,14 @@ struct Hearing {
     enhancer_prompt: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Prefill {
+    #[default]
+    Dense,
+    Latent,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
@@ -88,6 +96,8 @@ pub struct Session {
     draft: Option<String>,
     #[serde(default)]
     sample_cursor: u64,
+    #[serde(default)]
+    prefill: Prefill,
     #[serde(skip)]
     hearing: Option<Hearing>,
 }
@@ -127,6 +137,7 @@ impl Session {
             choices: Vec::new(),
             draft: None,
             sample_cursor: 0,
+            prefill: Prefill::Dense,
             hearing: None,
         }
     }
@@ -145,6 +156,14 @@ impl Session {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    pub fn prefill(&self) -> Prefill {
+        self.prefill
+    }
+
+    pub fn set_prefill(&mut self, prefill: Prefill) {
+        self.prefill = prefill;
     }
 
     pub fn enhancer_prompt(&self) -> &str {
@@ -602,8 +621,10 @@ mod tests {
         let mut session = Session::new();
         assert!(!session.enabled());
         session.set_enabled(true);
+        session.set_prefill(Prefill::Latent);
         let restored = Session::load(&session.store());
         assert!(restored.enabled());
+        assert_eq!(restored.prefill(), Prefill::Latent);
         assert_eq!(restored.enhancer_prompt(), session.enhancer_prompt());
     }
 
