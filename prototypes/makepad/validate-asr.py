@@ -127,6 +127,7 @@ def prepare(out, suite):
     add("no-cache", SHORT, WELCOME, reuse_cache=False)
     add("auto-language", SHORT, WELCOME, language="auto")
     add("official", OFFICIAL, OFFICIAL_TEXT)
+    add("official-auto", OFFICIAL, OFFICIAL_TEXT, language="auto", exact=True)
     long_audio = fixture("official-repeated", sample * 3, sample_rate)
     add("rolling-speech", long_audio, OFFICIAL_TEXT * 3)
     for mode in (0, 1):
@@ -180,6 +181,8 @@ def summarize(cases, records):
                        reference_characters=len(normalize(reference)))
             if "expected" in case and row["edits"]:
                 failures.append(case["id"] + ": transcript")
+            if case.get("exact") and final["text"] != case["expected"]:
+                failures.append(case["id"] + ": exact transcript")
         if "pause_check" in case:
             p = case["pause_check"]
             for turn in (1, 2):

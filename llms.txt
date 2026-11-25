@@ -45,15 +45,24 @@ JSON 请求拒绝未知字段。不要多送键。
 
 ## 语音合成
 
-`POST /v1/audio/speech`，JSON。
+`POST /v1/audio/speech`，`Content-Type: application/json`。长稿一次提交，所有分段共用一个任务 ID。
 
 ```json
 {"text":"你好，欢迎使用本地语音合成。"}
 ```
 
-`text` 必填，最长 32768。可选 `instruction`（最长 8192，默认空）、`seed`（42）、`max_frames`（1–1500，默认 750）、`guidance_scale`（1–10，默认 1）。
+`text` 必填，须含非空白字符，最多 32768 个 UTF-8 字节。可选 `instruction` 描述音色或语气（最多 8192 个 UTF-8 字节，默认空串），`seed` 默认 42，`guidance_scale` 范围为 1–10，默认 1。
 
-完成后 `result.audio_url` 指向 WAV。`result.cancelled` 为真表示提前停下但已有音频；`result.reached_limit` 为真表示碰到帧数上限。这个端点不能做参考声音克隆。
+整稿在 128 个文本 token 以内时直接合成一段。超过时优先按句末标点切分，每段最多 128 个 token。首段以 24 个 token 为目标，首句较长且在 128 个 token 以内时会保留整句。开头一段或几段的音频累计满 3 秒后，后续各段共用这段开头录音作为音色参考。
+
+`max_frames` 是每段可生成的帧数上限，默认 1500。接受非负整数，传 0 按 1 帧处理，超过 1500 按 1500 帧处理。每帧 80 毫秒，单段最多 120 秒。每段的提示和生成帧共用 2048 个上下文位置，其中预留 1 个，因此最多能生成 `2047 − 提示占用的位置数` 帧。音色参考也占用提示位置。
+
+运行中，`progress.audio_seconds` 是累计已生成的音频秒数。要看换段进度，从 `GET /v1/jobs/{id}/events?after=0` 开始轮询，再把返回的 `next` 用作下一次的 `after`。例如 `events` 中的 `{"stage":"speech","speech_text":1,"speech_texts":3}` 表示进入三段中的第二段。
+
+- `result.audio_url` 指向各段按顺序拼成的一个 WAV（24 kHz、单声道、16 位 PCM）。`result.speech_texts` 按顺序列出已运行各段的帧数、时长等统计。
+- `result.anchor` 为 `opening` 时，`result.anchor_speech_texts` 是用作音色参考的开头段数。未建立参考时，`result.anchor` 为 `none`。
+- 即使 `status` 为 `done`，也要检查 `result.reached_limit`。它为 `true` 表示整稿在触及帧数上限的那一段停止，WAV 保留截至该段已生成的音频。`result.reached_limit_speech_text` 是该段从 0 开始的下标，未触顶时为 `null`。
+- 取消后若 `result.cancelled` 为 `true`，可从 `result.audio_url` 下载已生成的部分。排队时取消的任务 `result` 为 `null`。
 
 ## 文生图
 
@@ -87,4 +96,4 @@ JSON 请求拒绝未知字段。不要多送键。
 
 ## 不要调用的能力
 
-HTTP 没有麦克风、声音克隆、参考图编辑、WebSocket，也没有逐词时间戳。这些在原生界面里，不在这组路由上。
+麦克风采集、使用自备参考录音克隆声音和参考图编辑请使用原生界面。HTTP 任务通过轮询读取进度，不提供 WebSocket 或逐词时间戳。

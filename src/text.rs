@@ -305,6 +305,30 @@ pub(crate) struct StableTail {
     candidate: Option<(String, usize)>,
 }
 
+/// Withholds a `language None` answer while the model may still name a language.
+/// Committing it fixes the prompt prefix, and the model then keeps decoding in
+/// the no-language mode that omits punctuation. Audio sample time bounds the
+/// wait once speech text appears, so a model that never leaves `None` is
+/// still committed.
+#[derive(Default)]
+pub(crate) struct LanguagePatience {
+    speech_since: Option<usize>,
+}
+
+impl LanguagePatience {
+    pub fn clear(&mut self) {
+        self.speech_since = None;
+    }
+
+    pub fn waiting(&mut self, text: &str, samples: usize, maximum_samples: usize) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let since = *self.speech_since.get_or_insert(samples);
+        samples.saturating_sub(since) < maximum_samples
+    }
+}
+
 impl StableTail {
     pub fn clear(&mut self) {
         self.candidate = None;
@@ -385,6 +409,21 @@ pub(crate) fn official_candidate(
 #[cfg(test)]
 mod official_tests {
     use super::*;
+
+    #[test]
+    fn unknown_language_waits_for_speech_then_gives_up_after_the_patience() {
+        let patience = 128_000;
+        let mut wait = LanguagePatience::default();
+        assert!(wait.waiting("", 0, patience));
+        assert!(wait.waiting("", 500_000, patience));
+        assert!(wait.waiting("之前", 520_000, patience));
+        assert!(wait.waiting("之前有顾客", 520_000 + patience - 1, patience));
+        assert!(!wait.waiting("之前有顾客自己", 520_000 + patience, patience));
+        assert!(wait.waiting("", 900_000, patience));
+        wait.clear();
+        assert!(wait.waiting("之前", 1_000_000, patience));
+        assert!(wait.waiting("之前有", 1_000_000 + patience - 1, patience));
+    }
 
     #[test]
     fn tail_needs_complete_unchanged_hypotheses_across_new_audio() {

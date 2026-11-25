@@ -2,7 +2,10 @@ use crate::{
     Error, Model, Result, StreamConfig, TextPostprocess,
     audio::{MelFrontend, SAMPLE_RATE},
     model::{decoder::DecoderCache, encoder::EncoderCache},
-    text::{StableTail, normalize, official_candidate, official_stable_text, parse_output},
+    text::{
+        LanguagePatience, StableTail, normalize, official_candidate, official_stable_text,
+        parse_output,
+    },
 };
 use burn::tensor::{Tensor, backend::Backend};
 use serde::Serialize;
@@ -29,6 +32,10 @@ pub struct StreamEvent {
     pub token_limit_reached: bool,
 }
 
+/// Audio after the first speech text that the model may keep answering
+/// `language None` before that answer is committed anyway.
+const UNKNOWN_LANGUAGE_PATIENCE_MS: usize = 8000;
+
 struct Span {
     end_sample: usize,
     text: String,
@@ -54,6 +61,7 @@ pub struct Session<B: Backend> {
     local_text: String,
     text: String,
     language: String,
+    language_patience: LanguagePatience,
     stable_tail: StableTail,
     spans: VecDeque<Span>,
     stop: Arc<AtomicBool>,
@@ -82,6 +90,7 @@ impl<B: Backend> Session<B> {
             local_text: String::new(),
             text: String::new(),
             language: String::new(),
+            language_patience: LanguagePatience::default(),
             stable_tail: StableTail::default(),
             spans: VecDeque::new(),
             stop: Arc::new(AtomicBool::new(false)),
@@ -319,6 +328,18 @@ impl<B: Backend> Session<B> {
             || !official
             || self.config.language.is_some()
             || stable.contains("<asr_text>");
+        let unknown_language = !final_chunk
+            && official
+            && self.config.language.is_none()
+            && stable.contains("<asr_text>")
+            && language.is_empty();
+        let have_metadata = have_metadata
+            && !(unknown_language
+                && self.language_patience.waiting(
+                    &stable_text,
+                    self.consumed,
+                    UNKNOWN_LANGUAGE_PATIENCE_MS * (SAMPLE_RATE / 1000),
+                ));
         let delta = if !have_metadata {
             // Match the no-reset Python path: partial language metadata is not
             // committed as a prompt prefix for the next chunk.
@@ -339,6 +360,7 @@ impl<B: Backend> Session<B> {
         };
         if !language.is_empty() {
             self.language = language;
+            self.language_patience.clear();
         }
         if !delta.is_empty() {
             self.text.push_str(&delta);

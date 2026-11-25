@@ -256,6 +256,41 @@ UI 中 3 次主动停止分别约 59/54/60 ms 返回，最后一轮在采集 17.
 已更新 `target/release/r2t2-makepad`；旧进程需重启。交付索引见
 [`artifacts/asr-tail/delivery.json`](../artifacts/asr-tail/delivery.json)。
 
+## 后续修复：自动语言下丢句号
+
+2026-11-25。桌面应用默认语言是“自动”（`language: None`），官方示例 `resources/test.wav` 转写成
+“之前有顾客自己带酒水也没加收钱或者不让喝”，少了句号；显式选“中文”则有。库默认语言和 CLI 的
+`--language` 默认值都是 `Chinese`（CLI 传 `--language auto` 会遇到同一问题），`asr-regression` 在用例
+不写 `language` 时也是 `Chinese`，所以这个差异一直没有被回归套件看到。上文的补尾静音不是原因：自动语言
+下 0–1000 ms 的补零、四档速度、缓存开关和分包大小结果相同。
+
+原因是语言元数据过早提交。自动语言下前缀由模型自己写，第一块只有约 0.48 s、还没有语音，模型答
+`language None<asr_text>`（上游把它当作“空音频”），`commit_decode` 把它记进 `fixed_raw` 作为之后每一轮
+的 prompt 前缀。此后模型一直在“无语言”条件下续写，不写句号（`lead3s` 对照里连句中的逗号也没有）。
+最终回合 `fixed_raw` 以“…不让”结尾，模型生成“喝”就 EOS；强制中文时前缀是 `language Chinese`，同一位置
+生成“。”。上游 `init_streaming_state` 的 `unfixed_chunk_num` 就是为此让前几块不使用之前的输出做前缀，
+这里没有等价机制。
+
+修复：自动语言、非最终回合、解析出的语言为空（`None`）时，不提交这段元数据，下一轮仍从空前缀重新
+解码，直到模型改口成真正的语言。`None` 下第一次出现文字起计，最多等 `UNKNOWN_LANGUAGE_PATIENCE_MS`
+（8 s 音频，按采样数计，与 GPU 速度无关）；之后按原行为提交，避免模型一直说 `None` 时整场会话不出字。
+最终回合不受影响。代价是自动语言下首个文字更晚出现：官方示例从 1.76 s 到 5.92 s，因为空前缀下模型约在
+5.9 s 才改口成 `Chinese`；显式选语言不受影响，首字仍是 1.76 s。
+
+| 实模型（`Confucius4-R2T2`，F16，应用同款参数） | 修复前 | 修复后 |
+| --- | --- | --- |
+| 官方示例，自动语言 | 缺句号，首字 1.76 s | 含句号，首字 5.92 s |
+| 前导 3 s 静音，自动语言 | 缺句号 | 含句号（缺句中逗号，显式中文有） |
+| 官方示例，显式中文 | 含句号，首字 1.76 s | 不变 |
+| 4 s 截断音频，自动/中文 | 相同 | 相同 |
+
+回归检查：`validate-asr.py` 的 `official-auto` 用例逐字比较（新增 `exact` 选项）。原来的 `expected` 比较
+先剥掉标点，丢句号查不出来。库测试 `unknown_language_waits_for_speech_then_gives_up_after_the_patience`
+覆盖等待逻辑。原始记录在 `artifacts/asr-period/`（本地，不入库）。
+
+未解决：把官方示例拼成 3 句（20 s，超过滚动窗口）时，自动语言和显式中文**都**丢最后的句号，句间用逗号
+连接；这条与 `language None` 无关，是另一个问题，尚未诊断。
+
 ## IMK 系统日志排查
 
 用户报告的 `IMKCFRunLoopWakeUpReliable` 消息在本机统一日志中定位到了

@@ -130,7 +130,7 @@ _Avoid_: a separate image request
 One admitted HTTP request with its own progress, result and cancellation handle. Execution returns the result value and any files still to be written; it does not mark the job terminal. The terminal state is published once, after execution releases request resources and any result file is published. A cancellation can retain completed partial output; an execution or publication failure remains an error.
 
 **Published result**:
-A completed audio or image file made available for download. Its link remains valid while the file is retained, independently of inference-job history and application restarts.
+A completed audio or image file whose download link remains valid while the file is retained, independently of inference-job history and application restarts. For a cancelled speech inference job, a published result requires at least one handed-off audio sample and contains every sample handed off before the interruption.
 
 ## 执行位置
 
