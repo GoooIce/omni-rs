@@ -287,7 +287,8 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) -> Resu
                     ..Default::default()
                 },
             };
-            let encoder = if model.script_needs_anchor(&options)? {
+            let prepared = model.prepare_script(&options)?;
+            let encoder = if prepared.needs_voice_anchor {
                 eprintln!("[anchor] 加载参考音频编码器");
                 Some(ReferenceEncoder::<B>::load(
                     &args.model.join("audio_tokenizer"),
@@ -298,7 +299,7 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) -> Resu
             };
             let mut pcm = Vec::new();
             let start = Instant::now();
-            let report = model.synthesize_script(&options, &cancel, encoder.as_ref(), |event| {
+            let report = model.speak_prepared(prepared, &cancel, encoder.as_ref(), |event| {
                 match event {
                     ScriptEvent::Audio(chunk) => {
                         eprintln!(

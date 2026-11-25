@@ -2,10 +2,14 @@
 //! ID until its script is over: when one speech text ends, the next is submitted
 //! to the shared engine under the same job. Job ownership and result publication
 //! stay in Models / Jobs.
+//! A speech script is prepared once, and only once a synthesis slot admits it:
+//! while the batch is full the request stays queued untouched, and a waiting
+//! request that is cancelled is never split nor loads the reference encoder.
 use super::driver::{Product, Progress, Step, Update};
 use super::{Backend, Failure};
 use omni_breeze_tts::{
-    ScriptBudget, ScriptRun, SynthesisBatch, SynthesisOptions, reference::ReferenceEncoder,
+    PreparedScript, ScriptBudget, ScriptRun, SynthesisBatch, SynthesisOptions,
+    reference::ReferenceEncoder,
 };
 use std::{
     collections::BTreeMap,
@@ -49,9 +53,11 @@ impl Speech {
         cancel: Arc<AtomicBool>,
         progress: &dyn Fn(Progress),
     ) -> Result<Option<u64>, Failure> {
-        let texts = self.engine.model().split_script(&options.text, budget)?;
-        let derive = options.reference.is_none() && texts.len() > 1;
-        if derive && self.encoder.is_none() {
+        if self.engine.is_full() {
+            return Ok(None);
+        }
+        let prepared = self.prepare(&options, budget)?;
+        if prepared.needs_voice_anchor && self.encoder.is_none() {
             progress(Progress::Loading {
                 progress: 0.0,
                 message: "载入参考音频编码器".into(),
@@ -62,13 +68,18 @@ impl Speech {
                 &cancel,
             )?);
         }
-        let mut run = ScriptRun::new(texts, options, derive);
+        let mut run = ScriptRun::new(
+            prepared.texts,
+            prepared.synthesis,
+            prepared.needs_voice_anchor,
+        );
         let first = run
             .next_options()
             .ok_or_else(|| Failure::Error("empty speech script".into()))?;
-        let Some(request) = self.engine.try_submit(&first, cancel.clone())? else {
-            return Ok(None);
-        };
+        let request = self
+            .engine
+            .try_submit(&first, cancel.clone())?
+            .ok_or_else(|| Failure::Error("the speech engine freed no slot".into()))?;
         self.jobs.insert(
             request,
             Job {
@@ -78,6 +89,22 @@ impl Speech {
             },
         );
         Ok(Some(request))
+    }
+
+    /// Split the speech script and settle its voice-conditioning once, after a
+    /// synthesis slot is known to be free.
+    fn prepare(
+        &self,
+        options: &SynthesisOptions,
+        budget: ScriptBudget,
+    ) -> Result<PreparedScript, Failure> {
+        Ok(self
+            .engine
+            .model()
+            .prepare_script(&omni_breeze_tts::ScriptOptions {
+                synthesis: options.clone(),
+                budget,
+            })?)
     }
 
     pub(super) fn step(&mut self) -> Step {
@@ -124,17 +151,28 @@ impl Speech {
                         .push((id, Ok(Product::speech(run.report(), batch))));
                 }
                 Ok(Some(_)) => {
-                    step.updates.push((
-                        id,
-                        Update::Progress(Progress::Speech {
-                            speech_text: run.completed(),
-                            speech_texts: run.speech_texts(),
-                        }),
-                    ));
                     let next = run.next_options().expect("unfinished script");
                     match engine.try_submit(&next, cancel.clone()) {
                         Ok(Some(request)) => {
+                            // Report the next speech text only once it is
+                            // admitted under this job; a failed submission
+                            // leaves no trace of a speech text that never ran.
+                            step.updates.push((
+                                id,
+                                Update::Progress(Progress::Speech {
+                                    speech_text: run.completed(),
+                                    speech_texts: run.speech_texts(),
+                                }),
+                            ));
                             jobs.insert(request, Job { id, cancel, run });
+                        }
+                        Ok(None) if cancel.load(std::sync::atomic::Ordering::Acquire) => {
+                            // Capacity backpressure during shutdown reads as
+                            // cancellation: keep what this job already spoke.
+                            run.stop();
+                            let batch = engine.stats();
+                            step.completed
+                                .push((id, Ok(Product::speech(run.report(), batch))));
                         }
                         Ok(None) => step.completed.push((
                             id,
