@@ -367,7 +367,7 @@ fn enclosed(chars: &[(usize, char)], i: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn characters(text: &str) -> Result<usize> {
@@ -554,7 +554,7 @@ mod tests {
     }
 
     /// `models/Breeze-TTS-2/tokenizer.json`, relative to the crate directory.
-    fn checkpoint_tokenizer() -> Option<tokenizers::Tokenizer> {
+    pub(crate) fn checkpoint_tokenizer() -> Option<tokenizers::Tokenizer> {
         tokenizers::Tokenizer::from_file("../../models/Breeze-TTS-2/tokenizer.json").ok()
     }
 

@@ -51,6 +51,10 @@ impl<B: Backend> SynthesisBatch<B> {
     pub fn is_idle(&self) -> bool {
         self.active.is_empty()
     }
+    /// A full batch admits no more requests until a running one completes.
+    pub fn is_full(&self) -> bool {
+        self.active.len() == self.capacity
+    }
     pub fn try_submit(
         &mut self,
         options: &SynthesisOptions,

@@ -6,6 +6,96 @@ use crate::reference::ReferenceEncoder;
 use crate::*;
 use std::time::Instant;
 
+/// A speech script prepared once: its ordered speech texts, the shared
+/// sampling options and whether its voice anchor comes from the opening audio.
+/// Splitting and that decision happen here, before any synthesis slot or
+/// playback estimate asks for them; preparation leaves the position limits of
+/// each speech text to the synthesis that runs it.
+#[derive(Clone, Debug)]
+pub struct PreparedScript {
+    /// The script's speech texts in order.
+    pub texts: Vec<SpeechText>,
+    /// Sampling, limits and voice-conditioning shared by every speech text.
+    /// `synthesis.text` stays the whole speech script; the run gives each
+    /// speech text its own text.
+    pub synthesis: SynthesisOptions,
+    /// Record the voice anchor from the opening audio: the script has several
+    /// speech texts and no supplied reference recording.
+    pub needs_voice_anchor: bool,
+}
+
+impl PreparedScript {
+    /// The prepared script of already-split speech texts: the same sampling
+    /// options, and the anchor decision of their count and reference.
+    pub fn new(texts: Vec<SpeechText>, synthesis: SynthesisOptions) -> Self {
+        let needs_voice_anchor = synthesis.reference.is_none() && texts.len() > 1;
+        Self {
+            texts,
+            synthesis,
+            needs_voice_anchor,
+        }
+    }
+}
+
+impl<B: Backend> Model<B> {
+    /// Split a speech script and settle its voice-conditioning once, for every
+    /// way the script can be spoken afterwards.
+    pub fn prepare_script(&self, options: &ScriptOptions) -> Result<PreparedScript> {
+        let texts = self.split_script(&options.synthesis.text, options.budget)?;
+        Ok(PreparedScript::new(texts, options.synthesis.clone()))
+    }
+
+    /// Speak a prepared speech script. Its speech texts run in the prepared
+    /// order with the prepared voice-conditioning; nothing is split again.
+    /// Pass the reference encoder whenever `needs_voice_anchor` holds; without
+    /// it such a script is refused, because its speech texts would each pick
+    /// their own voice.
+    pub fn speak_prepared(
+        &self,
+        prepared: PreparedScript,
+        cancel: &AtomicBool,
+        encoder: Option<&ReferenceEncoder<B>>,
+        mut on_event: impl FnMut(ScriptEvent<'_>) -> Result<()>,
+    ) -> Result<ScriptReport> {
+        if prepared.needs_voice_anchor && encoder.is_none() {
+            return Err(Error::Config(
+                "长文本分段合成需要参考音频编码器来固定音色".into(),
+            ));
+        }
+        let mut run = ScriptRun::new(
+            prepared.texts,
+            prepared.synthesis,
+            prepared.needs_voice_anchor,
+        );
+        while !run.is_finished() {
+            if cancel.load(Ordering::Acquire) {
+                run.stop();
+                break;
+            }
+            let synthesis = run.next_options().expect("unfinished script");
+            let index = run.completed();
+            let report = self.synthesize(&synthesis, cancel, |pcm| {
+                run.record(pcm);
+                on_event(ScriptEvent::Audio(pcm))
+            })?;
+            let recorded = run.complete(report, cancel, |pcm, cancel| match encoder {
+                Some(encoder) => encoder
+                    .encode(pcm, cancel, |_| {})
+                    .map(|encoded| encoded.map(|encoded| encoded.codes)),
+                None => Ok(None),
+            })?;
+            on_event(ScriptEvent::SpeechText(
+                index,
+                run.last_report().expect("pushed"),
+            ))?;
+            if let Some(recorded @ 1..) = recorded {
+                on_event(ScriptEvent::Anchor(recorded))?;
+            }
+        }
+        Ok(run.report())
+    }
+}
+
 /// Opening audio needed before it becomes the voice anchor: the shortest
 /// reference `docs/breeze-tts.md` recommends, three seconds.
 pub const ANCHOR_SAMPLES: usize = 3 * SAMPLE_RATE as usize;
@@ -211,62 +301,19 @@ fn transcript(texts: &[SpeechText]) -> String {
 }
 
 impl<B: Backend> Model<B> {
-    /// Whether speaking this script needs the reference encoder: it has several
-    /// speech texts and no supplied reference recording, so its voice anchor
-    /// has to be recorded from the opening audio.
-    pub fn script_needs_anchor(&self, options: &ScriptOptions) -> Result<bool> {
-        Ok(options.synthesis.reference.is_none()
-            && self
-                .split_script(&options.synthesis.text, options.budget)?
-                .len()
-                > 1)
-    }
-
     /// Speak a speech script. Each speech text is one speech synthesis whose PCM
     /// is handed off before the next speech text starts. Pass the reference
-    /// encoder whenever `script_needs_anchor` is true; without it such a script
-    /// is refused, because its speech texts would each pick their own voice.
+    /// encoder whenever the prepared script needs a voice anchor; without it
+    /// such a script is refused, because its speech texts would each pick
+    /// their own voice.
     pub fn synthesize_script(
         &self,
         options: &ScriptOptions,
         cancel: &AtomicBool,
         encoder: Option<&ReferenceEncoder<B>>,
-        mut on_event: impl FnMut(ScriptEvent<'_>) -> Result<()>,
+        on_event: impl FnMut(ScriptEvent<'_>) -> Result<()>,
     ) -> Result<ScriptReport> {
-        let texts = self.split_script(&options.synthesis.text, options.budget)?;
-        let derive = options.synthesis.reference.is_none() && texts.len() > 1;
-        if derive && encoder.is_none() {
-            return Err(Error::Config(
-                "长文本分段合成需要参考音频编码器来固定音色".into(),
-            ));
-        }
-        let mut run = ScriptRun::new(texts, options.synthesis.clone(), derive);
-        while !run.is_finished() {
-            if cancel.load(Ordering::Acquire) {
-                run.stop();
-                break;
-            }
-            let synthesis = run.next_options().expect("unfinished script");
-            let index = run.completed();
-            let report = self.synthesize(&synthesis, cancel, |pcm| {
-                run.record(pcm);
-                on_event(ScriptEvent::Audio(pcm))
-            })?;
-            let recorded = run.complete(report, cancel, |pcm, cancel| match encoder {
-                Some(encoder) => encoder
-                    .encode(pcm, cancel, |_| {})
-                    .map(|encoded| encoded.map(|encoded| encoded.codes)),
-                None => Ok(None),
-            })?;
-            on_event(ScriptEvent::SpeechText(
-                index,
-                run.last_report().expect("pushed"),
-            ))?;
-            if let Some(recorded @ 1..) = recorded {
-                on_event(ScriptEvent::Anchor(recorded))?;
-            }
-        }
-        Ok(run.report())
+        self.speak_prepared(self.prepare_script(options)?, cancel, encoder, on_event)
     }
 }
 
@@ -495,5 +542,66 @@ mod tests {
             transcript(&texts(&["One 是一。", "Two 是二。"])),
             "One 是一。Two 是二。"
         );
+    }
+
+    #[test]
+    fn a_prepared_script_keeps_the_ordered_texts_and_the_anchor_decision() {
+        let long = speech_texts(3);
+        let base = SynthesisOptions::default();
+        let prepared = PreparedScript::new(long.clone(), base.clone());
+        assert_eq!(prepared.texts, long);
+        assert_eq!(prepared.synthesis.text, base.text);
+        assert!(prepared.needs_voice_anchor);
+
+        let short = PreparedScript::new(speech_texts(1), base.clone());
+        assert!(!short.needs_voice_anchor);
+
+        let reference = ReferenceAudio {
+            text: "参考。".into(),
+            codes: vec![[1; CODEBOOKS]; 3],
+        };
+        let mut supplied = base.clone();
+        supplied.reference = Some(reference);
+        let supplied = PreparedScript::new(long, supplied);
+        assert!(!supplied.needs_voice_anchor);
+    }
+
+    #[test]
+    #[ignore = "needs the Breeze-TTS-2 tokenizer; skips when it is absent"]
+    fn preparation_splits_the_real_tokenizer_way_for_every_script_kind() {
+        let Some(tokenizer) = crate::script::tests::checkpoint_tokenizer() else {
+            eprintln!("skipped: models/Breeze-TTS-2/tokenizer.json is absent");
+            return;
+        };
+        let splitter = crate::script::Splitter::new(&tokenizer).unwrap();
+        let short = "你好，今天天气很好。";
+        let paragraph = "人工智能正在改变我们的工作方式。它可以帮助医生更快地阅读影像，也可以帮助工程师检查代码。当然，新的工具也带来新的问题。例如，我们如何确认答案是对的？又如何保护每个人的隐私？这些问题没有简单的答案。我们需要更多的讨论，也需要更清楚的规则。让我们从一个小例子开始。假设你要写一封邮件，说明项目推迟了三天。你希望语气礼貌，但不啰嗦。模型可以给出三个版本，你再挑选最合适的那个。它不会替你承担责任。决定仍然是你做的。";
+        let long = paragraph.repeat(6);
+        let reference = ReferenceAudio {
+            text: "参考。".into(),
+            codes: vec![[1; CODEBOOKS]; 3],
+        };
+        for (script, reference) in [
+            (short, None),
+            (long.as_str(), None),
+            (short, Some(reference.clone())),
+            (long.as_str(), Some(reference)),
+        ] {
+            let mut synthesis = SynthesisOptions {
+                text: script.to_string(),
+                reference,
+                ..Default::default()
+            };
+            let texts = splitter.split(script, ScriptBudget::default()).unwrap();
+            let prepared = PreparedScript::new(texts.clone(), synthesis.clone());
+            assert_eq!(prepared.texts, texts);
+            assert_eq!(prepared.synthesis.text, script);
+            assert_eq!(
+                prepared.needs_voice_anchor,
+                synthesis.reference.is_none() && texts.len() > 1
+            );
+            synthesis.text = texts[0].text.clone();
+            assert_eq!(prepared.texts[0], texts[0]);
+        }
     }
 }
