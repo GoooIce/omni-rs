@@ -165,21 +165,29 @@ mod tests {
     fn finish_first_speech_text(
         rest_follows: bool,
         stop_in_drain: bool,
-    ) -> (bool, Option<String>, Vec<String>) {
+        rest_opens: bool,
+    ) -> (bool, Option<String>, Vec<String>, Vec<String>) {
         let stop = Arc::new(AtomicBool::new(false));
-        let mut playback = Some(ScriptOutput::without_device(stop.clone(), 0.0));
+        let mut playback = Some(ScriptOutput::without_device(stop.clone(), 0.0, rest_opens));
         let mut segment = Some("第 1/2 段 · ".to_owned());
-        let messages = std::sync::Mutex::new(Vec::new());
-        let mut rest_started = None;
+        let mut progress = SpeechProgress {
+            speech_texts: 2,
+            index: 0,
+            seconds: 0.04,
+            started: Instant::now(),
+            first: Some(0.0),
+            hold: false,
+            rest_started: None,
+            generated: 1920,
+        };
+        let updates = std::sync::Mutex::new(Vec::new());
         let mut publish = |update: Update| {
-            let message = update.message.clone();
-            let mut seen = messages.lock().unwrap();
-            seen.push(message.clone());
             // The stop arrives while the opening drains: the draining notice
             // has just been published, so the drain itself is next.
-            if stop_in_drain && message.contains("正在听完") {
+            if stop_in_drain && update.message.contains("正在听完") {
                 stop.store(true, Ordering::Release);
             }
+            updates.lock().unwrap().push((update.kind, update.message));
         };
         let rest_opened = speech_text_finished(
             &mut playback,
@@ -188,24 +196,27 @@ mod tests {
             rest_follows,
             1.0,
             &mut segment,
-            2,
-            0,
-            0.04,
-            Instant::now(),
-            Some(0.0),
-            false,
-            &mut rest_started,
-            1920,
+            &mut progress,
         )
         .unwrap();
-        let messages = messages.into_inner().unwrap();
-        (rest_opened, segment, messages)
+        let updates = updates.into_inner().unwrap();
+        let messages: Vec<String> = updates
+            .iter()
+            .filter(|(kind, _)| *kind == "audio")
+            .map(|(_, message)| message.clone())
+            .collect();
+        let statuses: Vec<String> = updates
+            .iter()
+            .filter(|(kind, _)| *kind == "notice")
+            .map(|(_, message)| message.clone())
+            .collect();
+        (rest_opened, segment, messages, statuses)
     }
 
     #[test]
     fn the_rest_stream_waits_for_the_script_to_actually_continue() {
         // Normal handover: the second stream opens and the label moves on.
-        let (rest_opened, segment, messages) = finish_first_speech_text(true, false);
+        let (rest_opened, segment, messages, _) = finish_first_speech_text(true, false, true);
         assert!(rest_opened);
         assert_eq!(segment.as_deref(), Some("第 2/2 段 · "));
         assert!(
@@ -216,7 +227,7 @@ mod tests {
         // The opening reached its frame ceiling: the script is over, so it
         // keeps playing on its own stream, its label stays, and no second
         // segment is announced.
-        let (rest_opened, segment, messages) = finish_first_speech_text(false, false);
+        let (rest_opened, segment, messages, _) = finish_first_speech_text(false, false, true);
         assert!(!rest_opened);
         assert_eq!(segment.as_deref(), Some("第 1/2 段 · "));
         assert!(
@@ -225,7 +236,7 @@ mod tests {
         );
 
         // Stop arrives while the opening drains: same single-stream ending.
-        let (rest_opened, segment, messages) = finish_first_speech_text(true, true);
+        let (rest_opened, segment, messages, _) = finish_first_speech_text(true, true, true);
         assert!(!rest_opened);
         assert_eq!(segment.as_deref(), Some("第 1/2 段 · "));
         assert!(
@@ -235,6 +246,21 @@ mod tests {
         assert!(
             messages.iter().any(|m| m.contains("正在听完")),
             "{messages:?}"
+        );
+
+        // The rest's stream fails to open: a notice keeps synthesis and saving
+        // usable, but no second segment is announced without its output.
+        let (rest_opened, segment, messages, statuses) =
+            finish_first_speech_text(true, false, false);
+        assert!(!rest_opened);
+        assert_eq!(segment.as_deref(), Some("第 1/2 段 · "));
+        assert!(
+            !messages.iter().any(|m| m.starts_with("第 2/")),
+            "{messages:?}"
+        );
+        assert!(
+            statuses.iter().any(|m| m.contains("仍可合成并保存 WAV")),
+            "{statuses:?}"
         );
     }
 }
@@ -371,6 +397,9 @@ struct ScriptOutput {
     offsets: (f64, f64),
     /// Final numbers of the opening stream, on the job's clock.
     opening_stats: Option<PlaybackStats>,
+    /// Tests can force the rest's stream to fail opening.
+    #[cfg(test)]
+    rest_opens: bool,
 }
 
 /// How switching from the opening's stream to the rest's went.
@@ -391,16 +420,19 @@ impl ScriptOutput {
             rest: None,
             offsets: (offset, offset),
             opening_stats: None,
+            #[cfg(test)]
+            rest_opens: true,
         })
     }
     #[cfg(test)]
-    fn without_device(stop: Arc<AtomicBool>, offset: f64) -> Self {
+    fn without_device(stop: Arc<AtomicBool>, offset: f64, rest_opens: bool) -> Self {
         let _ = stop;
         Self {
-            opening: None,
+            opening: Some(Playback::stub(stop.clone())),
             rest: None,
             offsets: (offset, offset),
             opening_stats: None,
+            rest_opens,
         }
     }
     /// The opening speech text is complete: let it finish playing and close
@@ -425,6 +457,10 @@ impl ScriptOutput {
         }
         if stop.load(Ordering::Acquire) {
             return Ok(RestStart::Stopped);
+        }
+        #[cfg(test)]
+        if !self.rest_opens {
+            return Ok(RestStart::Failed("测试扬声器打开失败".into()));
         }
         self.rest = match Playback::open(stop, Some(estimate)) {
             Ok(rest) => Some(rest),
@@ -506,9 +542,27 @@ fn join_playback(mut rest: PlaybackStats, opening: &PlaybackStats) -> PlaybackSt
     rest
 }
 
+/// Where a finished speech text leaves the job: the next label is published
+/// only once the rest's stream actually opened.
+struct SpeechProgress {
+    speech_texts: usize,
+    index: usize,
+    seconds: f64,
+    started: Instant,
+    first: Option<f64>,
+    hold: bool,
+    /// When the rest began to be generated: its clock zero and the audio
+    /// banked by then, for the wait estimate in the status. Tracked only
+    /// while the rest has a stream to wait on.
+    rest_started: Option<(Instant, usize)>,
+    generated: usize,
+}
+
 /// A speech synthesis ended. Synthesis decides whether another speech text
-/// follows (`rest_follows`); playback switches streams only then. Returns the
-/// label of the speech text that is next, when the script has several.
+/// follows (`rest_follows`); playback switches streams only then, and the
+/// segment label advances only when that switch succeeds — a failed or
+/// stopped rest announces no next speech text. Returns whether the rest's
+/// stream opened.
 fn speech_text_finished(
     playback: &mut Option<ScriptOutput>,
     publish: &mut dyn FnMut(Update),
@@ -516,14 +570,7 @@ fn speech_text_finished(
     rest_follows: bool,
     rest_estimate: f64,
     segment: &mut Option<String>,
-    speech_texts: usize,
-    index: usize,
-    seconds: f64,
-    started: Instant,
-    first: Option<f64>,
-    hold: bool,
-    rest_started: &mut Option<(Instant, usize)>,
-    generated: usize,
+    progress: &mut SpeechProgress,
 ) -> Result<bool, omni_breeze_tts::Error> {
     let continues = rest_follows && !stop.load(Ordering::Acquire);
     let mut rest_opened = false;
@@ -535,50 +582,57 @@ fn speech_text_finished(
             );
             publish(running(
                 label.clone(),
-                seconds,
-                started.elapsed().as_secs_f64(),
-                first,
+                progress.seconds,
+                progress.started.elapsed().as_secs_f64(),
+                progress.first,
                 output.stats(),
             ));
             let rest = output
-                .start_rest(stop.clone(), rest_estimate, started, |stats| {
+                .start_rest(stop.clone(), rest_estimate, progress.started, |stats| {
                     publish(running(
                         label.clone(),
-                        seconds,
-                        started.elapsed().as_secs_f64(),
-                        first,
+                        progress.seconds,
+                        progress.started.elapsed().as_secs_f64(),
+                        progress.first,
                         Some(stats),
                     ));
                 })
                 .map_err(omni_breeze_tts::Error::Audio)?;
-            if let RestStart::Failed(notice) = &rest {
-                publish(Update::status(
-                    "notice",
-                    format!("{notice} · 仍可合成并保存 WAV"),
-                ));
-            }
-            if matches!(rest, RestStart::Opened | RestStart::Failed(_)) {
-                *rest_started = Some((Instant::now(), generated));
-            }
-            rest_opened = matches!(rest, RestStart::Opened);
-            // A stop that arrived while the opening drained keeps the rest's
-            // stream closed; the script ends on the opening stream alone.
-            if matches!(rest, RestStart::Stopped) {
-                return Ok(false);
+            match rest {
+                RestStart::Opened => {
+                    rest_opened = true;
+                    progress.rest_started = Some((Instant::now(), progress.generated));
+                }
+                RestStart::Failed(notice) => {
+                    // No second stream, so the segment label stays on the
+                    // opening; synthesis still goes on and saves its WAV.
+                    publish(Update::status(
+                        "notice",
+                        format!("{notice} · 仍可合成并保存 WAV"),
+                    ));
+                    return Ok(false);
+                }
+                // A stop that arrived while the opening drained keeps the rest's
+                // stream closed; the script ends on the opening stream alone.
+                RestStart::Stopped => return Ok(false),
             }
         }
     }
     if continues {
-        *segment = Some(format!("第 {}/{speech_texts} 段 · ", index + 2));
+        *segment = Some(format!(
+            "第 {}/{} 段 · ",
+            progress.index + 2,
+            progress.speech_texts
+        ));
         // First look at the rest. No audio of it has arrived yet, so the
         // policy has no lead to name.
         let stats = playback.as_ref().and_then(ScriptOutput::stats);
-        let message = progress_message(stats.as_ref(), None, hold, rest_opened);
+        let message = progress_message(stats.as_ref(), None, progress.hold, rest_opened);
         publish(running(
             labelled(segment, message),
-            seconds,
-            started.elapsed().as_secs_f64(),
-            first,
+            progress.seconds,
+            progress.started.elapsed().as_secs_f64(),
+            progress.first,
             stats,
         ));
     }
@@ -980,21 +1034,33 @@ impl crate::engine_harness::Adapter for Worker {
                         }
                     }
                 };
-                // When the rest began to be generated: its clock zero and the
-                // audio banked by then, for the wait estimate in the status.
-                let mut rest_started = None;
                 // Which speech text is running; a single one needs no label.
                 let mut segment = (speech_texts > 1).then(|| format!("第 1/{speech_texts} 段 · "));
                 let mut first = None;
+                let mut progress = SpeechProgress {
+                    speech_texts,
+                    index: 0,
+                    seconds: 0.0,
+                    started: start,
+                    first: None,
+                    hold,
+                    rest_started: None,
+                    generated: 0,
+                };
                 let report = model
                     .speak_prepared(prepared, &stop, reference_encoder.as_ref(), |event| {
                         if stop.load(Ordering::Acquire) {
                             return Ok(());
                         }
                         first.get_or_insert(start.elapsed().as_secs_f64());
+                        progress.first = first;
                         let seconds = pcm.len() as f64 / SAMPLE_RATE as f64;
-                        let waiting =
-                            waiting_line(playback.as_ref(), rest_estimate, rest_started, pcm.len());
+                        let waiting = waiting_line(
+                            playback.as_ref(),
+                            rest_estimate,
+                            progress.rest_started,
+                            pcm.len(),
+                        );
                         match event {
                             ScriptEvent::Audio(audio) => {
                                 pcm.extend_from_slice(audio);
@@ -1023,6 +1089,9 @@ impl crate::engine_harness::Adapter for Worker {
                                 // but only when the script actually goes on.
                                 let rest_follows = index == 0 && continues;
                                 let mut publish = |update: Update| sender.publish(update);
+                                progress.index = index;
+                                progress.seconds = seconds;
+                                progress.generated = pcm.len();
                                 speech_text_finished(
                                     &mut playback,
                                     &mut publish,
@@ -1030,14 +1099,7 @@ impl crate::engine_harness::Adapter for Worker {
                                     rest_follows,
                                     rest_estimate,
                                     &mut segment,
-                                    speech_texts,
-                                    index,
-                                    seconds,
-                                    start,
-                                    first,
-                                    hold,
-                                    &mut rest_started,
-                                    pcm.len(),
+                                    &mut progress,
                                 )?;
                             }
                             ScriptEvent::Anchor(count) => {

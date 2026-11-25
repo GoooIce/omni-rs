@@ -63,6 +63,19 @@ pub struct Playback {
     cancel: Arc<AtomicBool>,
 }
 impl Playback {
+    /// A device-less playback for tests: stats-less, drained on demand.
+    #[cfg(test)]
+    pub fn stub(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            _stream: None,
+            shared: None,
+            resampler: None,
+            policy: None,
+            finished: false,
+            cancel,
+        }
+    }
+
     /// None is pre-generated replay; Some(duration) enables adaptive streaming.
     pub fn open(cancel: Arc<AtomicBool>, estimate: Option<f64>) -> Result<Self, String> {
         let origin = Instant::now();

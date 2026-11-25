@@ -607,6 +607,61 @@ fn speech_cancelled_before_first_sample_publishes_no_wav() {
 }
 
 #[test]
+fn speech_cancelled_while_queued_publishes_no_wav() {
+    let dir = Directory::new();
+    let h = Harness::new(&dir);
+    let first = h.jobs.submit(speech()).unwrap().id;
+    h.load(Kind::Speech);
+    h.admit(Kind::Speech, 1);
+    h.step(Kind::Speech, &[1]);
+    // The batch is full, so the second script stays queued untouched: the
+    // worker never asks the engine to admit it while the first has not
+    // finished, and a cancellation finds no WAV to publish.
+    let queued = h.jobs.submit(speech()).unwrap().id;
+    h.jobs.cancel(&queued);
+    h.reply(Reply::Step(done(1, speech_product(1, false))));
+    let view = h.terminal(&queued);
+    assert_eq!(view.status, "cancelled");
+    // A job cancelled before it ran has no result and publishes no file; it
+    // is dropped without ever reaching the engine, so no admission follows.
+    assert_eq!(view.result, None);
+    assert!(h.jobs.read_file(&format!("{queued}.wav")).is_err());
+    let first_view = h.terminal(&first);
+    assert_eq!(first_view.status, "done");
+}
+
+#[test]
+fn a_full_batch_keeps_the_queue_fifo() {
+    let dir = Directory::new();
+    let h = Harness::new(&dir);
+    let running = h.jobs.submit(speech()).unwrap().id;
+    h.load(Kind::Speech);
+    h.admit(Kind::Speech, 1);
+    h.step(Kind::Speech, &[1]);
+    let head = h.jobs.submit(speech()).unwrap().id;
+    let later = h.jobs.submit(speech()).unwrap().id;
+    // While the batch is full neither queued script is admitted; once the
+    // running job finishes, the head of the queue is admitted before the
+    // later arrival, one admission attempt each.
+    h.reply(Reply::Step(done(1, speech_product(0, false))));
+    assert_eq!(h.terminal(&running).status, "done");
+    h.expect(Call::Admit(Kind::Speech));
+    h.reply(Reply::Admit(Ok(Some(2))));
+    h.expect(Call::Admit(Kind::Speech));
+    h.reply(Reply::Admit(Ok(None)));
+    h.step(Kind::Speech, &[2]);
+    assert_eq!(h.jobs.get(&head).unwrap().status, "running");
+    assert_eq!(h.jobs.get(&later).unwrap().status, "queued");
+    h.reply(Reply::Step(done(2, speech_product(0, false))));
+    assert_eq!(h.terminal(&head).status, "done");
+    h.expect(Call::Admit(Kind::Speech));
+    h.reply(Reply::Admit(Ok(Some(3))));
+    h.step(Kind::Speech, &[3]);
+    h.reply(Reply::Step(done(3, speech_product(0, false))));
+    assert_eq!(h.terminal(&later).status, "done");
+}
+
+#[test]
 fn speech_cancelled_between_speech_texts_keeps_delivered_audio_and_skips_event() {
     let dir = Directory::new();
     let h = Harness::new(&dir);
