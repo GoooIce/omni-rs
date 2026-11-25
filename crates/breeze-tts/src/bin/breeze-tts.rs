@@ -309,7 +309,7 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) -> Resu
                         );
                         pcm.extend_from_slice(chunk);
                     }
-                    ScriptEvent::SpeechText(index, report) => eprintln!(
+                    ScriptEvent::SpeechText(index, report, _) => eprintln!(
                         "[speech text {index}] {} frames, {:.3}s",
                         report.frames, report.audio_seconds
                     ),
