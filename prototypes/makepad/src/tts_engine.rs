@@ -748,15 +748,18 @@ impl crate::engine_harness::Adapter for Worker {
                         return Ok(Update::status("done", "已停止 · 尚未生成音频"));
                     }
                 }
-                // A long script is spoken as several speech texts. Without a
-                // reference recording they would each pick their own voice, so the
-                // encoder that records the opening as their shared reference is
-                // loaded before the first audio.
-                let texts = model
-                    .split_script(&options.text, ScriptBudget::default())
-                    .map_err(Failure::from)?;
-                let speech_texts = texts.len();
-                if options.reference.is_none() && speech_texts > 1 && reference_encoder.is_none() {
+                // A long script is spoken as several speech texts, prepared
+                // once: the estimate below and the synthesis share this split.
+                // Without a reference recording they would each pick their own
+                // voice, so the encoder that records the opening as their
+                // shared reference is loaded before the first audio.
+                let script = ScriptOptions {
+                    synthesis: options.clone(),
+                    budget: ScriptBudget::default(),
+                };
+                let prepared = model.prepare_script(&script).map_err(Failure::from)?;
+                let speech_texts = prepared.texts.len();
+                if prepared.needs_voice_anchor && reference_encoder.is_none() {
                     sender.publish(Update::status("reference", "首次加载参考音频编码器…"));
                     *reference_encoder = Some(
                         ReferenceEncoder::load_cancellable(
@@ -767,10 +770,6 @@ impl crate::engine_harness::Adapter for Worker {
                         .map_err(Failure::from)?,
                     );
                 }
-                let script = ScriptOptions {
-                    synthesis: options.clone(),
-                    budget: ScriptBudget::default(),
-                };
                 // Keep synthesis/save usable on machines with no audio output.
                 let playback_offset = start.elapsed().as_secs_f64();
                 let voice = duration_voice(&options);
@@ -780,7 +779,7 @@ impl crate::engine_harness::Adapter for Worker {
                         .estimate(voice, text)
                         .min(ceiling * speech_texts as f64)
                 };
-                let opening_estimate = estimate(&texts[0].text, 1);
+                let opening_estimate = estimate(&prepared.texts[0].text, 1);
                 let rest_estimate =
                     (estimate(&options.text, speech_texts) - opening_estimate).max(1.0);
                 // The opening speech text plays as it arrives. The rest waits on
@@ -806,7 +805,7 @@ impl crate::engine_harness::Adapter for Worker {
                 let mut segment = (speech_texts > 1).then(|| format!("第 1/{speech_texts} 段 · "));
                 let mut first = None;
                 let report = model
-                    .synthesize_script(&script, &stop, reference_encoder.as_ref(), |event| {
+                    .speak_prepared(prepared, &stop, reference_encoder.as_ref(), |event| {
                         if stop.load(Ordering::Acquire) {
                             return Ok(());
                         }

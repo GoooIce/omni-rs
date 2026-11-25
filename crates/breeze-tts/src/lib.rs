@@ -24,7 +24,9 @@ use ops::*;
 pub use reference::ReferenceAudio;
 pub use sampling::Sampling;
 pub use script::{ScriptBudget, SpeechText, Splitter};
-pub use script_run::{AnchorOrigin, ScriptEvent, ScriptOptions, ScriptReport, ScriptRun};
+pub use script_run::{
+    AnchorOrigin, PreparedScript, ScriptEvent, ScriptOptions, ScriptReport, ScriptRun,
+};
 pub type TraceTensor = (String, Vec<usize>, Vec<f32>);
 use std::{
     path::Path,
