@@ -584,6 +584,90 @@ fn image_encoding_uses_staging_and_failed_encoding_cleans_up_before_retry() {
     }
 }
 #[test]
+fn speech_cancelled_before_first_sample_publishes_no_wav() {
+    let dir = Directory::new();
+    let h = Harness::new(&dir);
+    let id = h.jobs.submit(speech()).unwrap().id;
+    h.load(Kind::Speech);
+    h.admit(Kind::Speech, 1);
+    h.step(Kind::Speech, &[1]);
+    h.jobs.cancel(&id);
+    // The driver reports a stopped synthesis that never delivered PCM.
+    h.reply(Reply::Step(Step {
+        completed: vec![(1, Ok(speech_product(0, true)))],
+        ..Default::default()
+    }));
+    let view = h.terminal(&id);
+    assert_eq!(view.status, "cancelled");
+    let result = view.result.unwrap();
+    assert_eq!(result["cancelled"], true);
+    assert_eq!(result["audio_url"], serde_json::Value::Null);
+    assert_eq!(result["audio_seconds"], 0.0);
+    assert!(h.jobs.read_file(&format!("{id}.wav")).is_err());
+}
+
+#[test]
+fn speech_cancelled_between_speech_texts_keeps_delivered_audio_and_skips_event() {
+    let dir = Directory::new();
+    let h = Harness::new(&dir);
+    let id = h.jobs.submit(speech()).unwrap().id;
+    h.load(Kind::Speech);
+    h.admit(Kind::Speech, 1);
+    h.step(Kind::Speech, &[1]);
+    // First speech text delivers its PCM and ends.
+    h.reply(Reply::Step(Step {
+        updates: vec![(1, Update::Audio(vec![0.25, -0.5]))],
+        ..Default::default()
+    }));
+    h.step(Kind::Speech, &[1]);
+    h.jobs.cancel(&id);
+    // Cancelling while the next speech text is submitted must not strand the
+    // delivered audio or emit a start event for a speech text that never ran:
+    // the job completes with the product of the audio it already spoke.
+    h.reply(Reply::Step(Step {
+        completed: vec![(1, Ok(speech_product(2, true)))],
+        ..Default::default()
+    }));
+    let view = h.terminal(&id);
+    assert_eq!(view.status, "cancelled");
+    let result = view.result.unwrap();
+    assert_eq!(result["cancelled"], true);
+    assert_eq!(result["audio_seconds"], 2.0 / 24000.0);
+    assert!(result["audio_url"].is_string());
+    assert_eq!(wav(&h, &id), vec![8192, -16384]);
+    assert!(h.jobs.events(&id, 0).unwrap().is_empty());
+    // Exactly one terminal snapshot: the job never reports a second ending.
+    assert_eq!(h.terminal(&id).status, "cancelled");
+}
+
+#[test]
+fn interleaved_speech_jobs_keep_their_own_partial_audio() {
+    let dir = Directory::new();
+    let h = Harness::new(&dir);
+    let a = h.jobs.submit(speech()).unwrap().id;
+    h.load(Kind::Speech);
+    h.admit(Kind::Speech, 1);
+    let b = h.jobs.submit(speech()).unwrap().id;
+    h.admit(Kind::Speech, 2);
+    h.step(Kind::Speech, &[1, 2]);
+    h.jobs.cancel(&a);
+    h.reply(Reply::Step(Step {
+        updates: vec![
+            (2, Update::Audio(vec![-0.5, -0.25])),
+            (1, Update::Audio(vec![0.5])),
+        ],
+        completed: vec![
+            (2, Ok(speech_product(2, false))),
+            (1, Ok(speech_product(1, true))),
+        ],
+    }));
+    assert_eq!(h.terminal(&a).status, "cancelled");
+    assert_eq!(h.terminal(&b).status, "done");
+    assert_eq!(wav(&h, &a), vec![16384]);
+    assert_eq!(wav(&h, &b), vec![-16384, -8192]);
+}
+
+#[test]
 fn translation_preserves_partial_text_progress_cache_and_batch_metadata() {
     let dir = Directory::new();
     let h = Harness::new(&dir);

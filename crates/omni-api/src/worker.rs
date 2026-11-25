@@ -479,25 +479,32 @@ fn speech_output(
     batch: omni_breeze_tts::BatchStats,
 ) -> Result<Output, Failure> {
     let filename = format!("{}.wav", job.id());
-    let file = job.file("wav", |path| {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: omni_breeze_tts::SAMPLE_RATE,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer =
-            hound::WavWriter::create(path, spec).map_err(|e| Failure::Error(e.to_string()))?;
-        for value in samples {
+    // A job cancelled before its first delivered sample publishes no WAV at
+    // all: there is nothing to listen to, and an empty file would claim there
+    // is. A non-empty cancellation keeps every delivered sample.
+    let file = if samples.is_empty() && report.stopped {
+        None
+    } else {
+        Some(job.file("wav", |path| {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: omni_breeze_tts::SAMPLE_RATE,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer =
+                hound::WavWriter::create(path, spec).map_err(|e| Failure::Error(e.to_string()))?;
+            for value in samples {
+                writer
+                    .write_sample((value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+                    .map_err(|e| Failure::Error(e.to_string()))?;
+            }
             writer
-                .write_sample((value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+                .finalize()
                 .map_err(|e| Failure::Error(e.to_string()))?;
-        }
-        writer
-            .finalize()
-            .map_err(|e| Failure::Error(e.to_string()))?;
-        Ok(())
-    })?;
+            Ok(())
+        })?)
+    };
     // The codes of each speech text stay out of the response; the WAV carries them.
     let speech_texts: Vec<_> = report
         .speech_texts
@@ -507,14 +514,19 @@ fn speech_output(
                 "first_audio_seconds":text.first_audio_seconds,"stopped":text.stopped,"reached_limit":text.reached_limit})
         })
         .collect();
+    let audio_url = if file.is_some() {
+        json!(format!("/v1/files/{filename}"))
+    } else {
+        json!(null)
+    };
     let mut output = Output::new(
-        json!({"audio_url":format!("/v1/files/{filename}"),"audio_seconds":report.audio_seconds,
+        json!({"audio_url":audio_url,"audio_seconds":report.audio_seconds,
         "cancelled":report.stopped,"reached_limit":report.reached_limit.is_some(),"reached_limit_speech_text":report.reached_limit,
         "compute_seconds":report.elapsed_seconds,"first_audio_seconds":report.first_audio_seconds,
         "speech_texts":speech_texts,"anchor":report.anchor,"anchor_speech_texts":report.anchor_speech_texts,"batch":batch}),
         report.stopped,
     );
-    output.file = Some(file);
+    output.file = file;
     Ok(output)
 }
 
