@@ -151,17 +151,28 @@ impl Speech {
                         .push((id, Ok(Product::speech(run.report(), batch))));
                 }
                 Ok(Some(_)) => {
-                    step.updates.push((
-                        id,
-                        Update::Progress(Progress::Speech {
-                            speech_text: run.completed(),
-                            speech_texts: run.speech_texts(),
-                        }),
-                    ));
                     let next = run.next_options().expect("unfinished script");
                     match engine.try_submit(&next, cancel.clone()) {
                         Ok(Some(request)) => {
+                            // Report the next speech text only once it is
+                            // admitted under this job; a failed submission
+                            // leaves no trace of a speech text that never ran.
+                            step.updates.push((
+                                id,
+                                Update::Progress(Progress::Speech {
+                                    speech_text: run.completed(),
+                                    speech_texts: run.speech_texts(),
+                                }),
+                            ));
                             jobs.insert(request, Job { id, cancel, run });
+                        }
+                        Ok(None) if cancel.load(std::sync::atomic::Ordering::Acquire) => {
+                            // Capacity backpressure during shutdown reads as
+                            // cancellation: keep what this job already spoke.
+                            run.stop();
+                            let batch = engine.stats();
+                            step.completed
+                                .push((id, Ok(Product::speech(run.report(), batch))));
                         }
                         Ok(None) => step.completed.push((
                             id,
