@@ -63,8 +63,11 @@ pub struct ScriptReport {
 pub enum ScriptEvent<'a> {
     /// PCM of the speech text now running.
     Audio(&'a [f32]),
-    /// A speech synthesis ended, after all of its audio was handed off.
-    SpeechText(usize, &'a SynthesisReport),
+    /// A speech synthesis ended, after all of its audio was handed off. The
+    /// third field says whether the script actually continues with a next
+    /// speech text; it is false once the script ends here, was stopped, or the
+    /// speech text reached its frame ceiling.
+    SpeechText(usize, &'a SynthesisReport, bool),
     /// The script now has its voice anchor, recorded from the first `n` speech texts.
     Anchor(usize),
 }
@@ -261,6 +264,7 @@ impl<B: Backend> Model<B> {
             on_event(ScriptEvent::SpeechText(
                 index,
                 run.last_report().expect("pushed"),
+                !run.is_finished(),
             ))?;
             if let Some(recorded @ 1..) = recorded {
                 on_event(ScriptEvent::Anchor(recorded))?;
