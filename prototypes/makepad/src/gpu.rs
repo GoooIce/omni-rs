@@ -10,13 +10,30 @@
 //!   backend used by LFM3 Omni and the MiniCPM-V speech enhancer (or NdArray on
 //!   CPU builds), avoiding burn-fusion dtype-mix panics on int4 / FP16+FP32 ops.
 
-#[cfg(any(feature = "wgpu", feature = "metal"))]
-use burn::backend::wgpu::{graphics, init_setup, WgpuDevice};
-
 #[cfg(not(any(feature = "wgpu", feature = "metal", feature = "cpu")))]
 compile_error!("r2t2-makepad requires at least one compute backend feature: metal, wgpu, or cpu");
 
-// --- Role 1: Primary speech backend (ASR, TTS) ---
+#[cfg(any(feature = "wgpu", feature = "metal"))]
+mod wgpu_common {
+    use burn::backend::wgpu::{graphics, init_setup, WgpuDevice};
+
+    pub type EagerBackend = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
+    pub type GpuDevice = WgpuDevice;
+    pub type EagerDevice = WgpuDevice;
+
+    pub const fn default_precision() -> omni_r2t2::Precision {
+        omni_r2t2::Precision::F16
+    }
+
+    pub fn initialize<G: graphics::GraphicsApi>() {
+        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INITIALIZED.get_or_init(|| {
+            let device = WgpuDevice::default();
+            let setup = init_setup::<G>(&device, Default::default());
+            eprintln!("[engine] {:?}", setup.adapter.get_info());
+        });
+    }
+}
 
 #[cfg(all(
     feature = "ane",
@@ -24,93 +41,18 @@ compile_error!("r2t2-makepad requires at least one compute backend feature: meta
     target_os = "macos",
     target_arch = "aarch64"
 ))]
-pub type Backend = burn::backend::Ane<burn::backend::wgpu::Metal>;
+mod imp {
+    use super::wgpu_common;
+    use burn::backend::wgpu::{graphics, WgpuDevice};
 
-#[cfg(all(
-    feature = "ane",
-    feature = "metal",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
-pub type Device = burn_ane::AneDevice<burn::backend::wgpu::Metal>;
+    pub type Backend = burn::backend::Ane<burn::backend::wgpu::Metal>;
+    pub type Device = burn_ane::AneDevice<burn::backend::wgpu::Metal>;
+    pub type GpuBackend = burn::backend::wgpu::Metal;
+    pub use wgpu_common::{default_precision, EagerBackend, EagerDevice, GpuDevice};
 
-#[cfg(all(
-    feature = "metal",
-    target_os = "macos",
-    not(all(feature = "ane", target_arch = "aarch64"))
-))]
-pub type Backend = burn::backend::wgpu::Metal;
-
-#[cfg(all(
-    feature = "metal",
-    target_os = "macos",
-    not(all(feature = "ane", target_arch = "aarch64"))
-))]
-pub type Device = WgpuDevice;
-
-#[cfg(all(
-    any(feature = "wgpu", feature = "metal"),
-    not(all(feature = "metal", target_os = "macos"))
-))]
-pub type Backend = burn::backend::wgpu::Wgpu;
-
-#[cfg(all(
-    any(feature = "wgpu", feature = "metal"),
-    not(all(feature = "metal", target_os = "macos"))
-))]
-pub type Device = WgpuDevice;
-
-#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-pub type Backend = burn::backend::NdArray;
-
-#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-pub type Device = burn::backend::ndarray::NdArrayDevice;
-
-// --- Role 2: Non-ANE fused GPU backend (translation, image, music) ---
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub type GpuBackend = burn::backend::wgpu::Metal;
-
-#[cfg(all(
-    any(feature = "wgpu", feature = "metal"),
-    not(all(feature = "metal", target_os = "macos"))
-))]
-pub type GpuBackend = burn::backend::wgpu::Wgpu;
-
-#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-pub type GpuBackend = burn::backend::NdArray;
-
-#[cfg(any(feature = "wgpu", feature = "metal"))]
-pub type GpuDevice = WgpuDevice;
-
-#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-pub type GpuDevice = burn::backend::ndarray::NdArrayDevice;
-
-// --- Role 3: Eager non-fusion backend (LFM3 Omni, MiniCPM-V speech enhancer) ---
-
-#[cfg(any(feature = "wgpu", feature = "metal"))]
-pub type EagerBackend = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
-
-#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-pub type EagerBackend = burn::backend::NdArray;
-
-#[cfg(any(feature = "wgpu", feature = "metal"))]
-pub type EagerDevice = WgpuDevice;
-
-#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-pub type EagerDevice = burn::backend::ndarray::NdArrayDevice;
-
-/// Both speech workers use one synchronized ANE session and Metal device on
-/// Apple Silicon defaults, sharing the bounded program-slot pool. Portable
-/// builds return the configured WGPU or CPU device.
-pub fn device() -> Device {
-    #[cfg(all(
-        feature = "ane",
-        feature = "metal",
-        target_os = "macos",
-        target_arch = "aarch64"
-    ))]
-    {
+    /// Both speech workers use one synchronized ANE session and Metal device on
+    /// Apple Silicon defaults, sharing the bounded program-slot pool.
+    pub fn device() -> Device {
         static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
         DEVICE
             .get_or_init(|| {
@@ -141,16 +83,159 @@ pub fn device() -> Device {
             })
             .clone()
     }
-    #[cfg(not(all(
-        feature = "ane",
-        feature = "metal",
-        target_os = "macos",
-        target_arch = "aarch64"
-    )))]
-    {
-        Device::default()
+
+    fn native_cache_budget() -> usize {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                old_len: *mut usize,
+                new: *mut std::ffi::c_void,
+                new_len: usize,
+            ) -> i32;
+        }
+        let mut memory = 0u64;
+        let mut len = std::mem::size_of_val(&memory);
+        // The descriptor and packed-weight budgets together use at most one quarter
+        // of physical RAM. GPU model tensors/native runtime allocations
+        // are additional; this is a cache bound, not a total-process memory limit.
+        let ok = unsafe {
+            sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&mut memory as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        let gib = 1024 * 1024 * 1024;
+        if ok && len == 8 {
+            (memory as usize / 8).clamp(gib, 16 * gib)
+        } else {
+            2 * gib
+        }
+    }
+
+    pub const fn backend_label() -> &'static str {
+        "ANE + Metal · FP16"
+    }
+
+    pub const fn initial_backend_label() -> &'static str {
+        "Metal · 本机推理"
+    }
+
+    pub fn log_stats(device: &Device, engine: &str) {
+        eprintln!(
+            "[accelerator:{engine}] {}",
+            serde_json::to_string(&device.stats()).unwrap()
+        );
+    }
+
+    pub fn initialize() {
+        wgpu_common::initialize::<graphics::Metal>();
     }
 }
+
+#[cfg(all(
+    feature = "metal",
+    target_os = "macos",
+    not(all(feature = "ane", target_arch = "aarch64"))
+))]
+mod imp {
+    use super::wgpu_common;
+    use burn::backend::wgpu::{graphics, WgpuDevice};
+
+    pub type Backend = burn::backend::wgpu::Metal;
+    pub type Device = WgpuDevice;
+    pub type GpuBackend = burn::backend::wgpu::Metal;
+    pub use wgpu_common::{default_precision, EagerBackend, EagerDevice, GpuDevice};
+
+    pub fn device() -> Device {
+        Device::default()
+    }
+
+    pub const fn backend_label() -> &'static str {
+        "Metal · FP16"
+    }
+
+    pub const fn initial_backend_label() -> &'static str {
+        "Metal · 本机推理"
+    }
+
+    pub fn log_stats(_device: &Device, _engine: &str) {}
+
+    pub fn initialize() {
+        wgpu_common::initialize::<graphics::Metal>();
+    }
+}
+
+#[cfg(all(
+    any(feature = "wgpu", feature = "metal"),
+    not(all(feature = "metal", target_os = "macos"))
+))]
+mod imp {
+    use super::wgpu_common;
+    use burn::backend::wgpu::{graphics, WgpuDevice};
+
+    pub type Backend = burn::backend::wgpu::Wgpu;
+    pub type Device = WgpuDevice;
+    pub type GpuBackend = burn::backend::wgpu::Wgpu;
+    pub use wgpu_common::{default_precision, EagerBackend, EagerDevice, GpuDevice};
+
+    pub fn device() -> Device {
+        Device::default()
+    }
+
+    pub const fn backend_label() -> &'static str {
+        "WGPU · FP16"
+    }
+
+    pub const fn initial_backend_label() -> &'static str {
+        "WGPU · 本机推理"
+    }
+
+    pub fn log_stats(_device: &Device, _engine: &str) {}
+
+    pub fn initialize() {
+        wgpu_common::initialize::<graphics::AutoGraphicsApi>();
+    }
+}
+
+#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
+mod imp {
+    pub type Backend = burn::backend::NdArray;
+    pub type Device = burn::backend::ndarray::NdArrayDevice;
+    pub type GpuBackend = burn::backend::NdArray;
+    pub type GpuDevice = burn::backend::ndarray::NdArrayDevice;
+    pub type EagerBackend = burn::backend::NdArray;
+    pub type EagerDevice = burn::backend::ndarray::NdArrayDevice;
+
+    pub fn device() -> Device {
+        Device::default()
+    }
+
+    pub const fn default_precision() -> omni_r2t2::Precision {
+        omni_r2t2::Precision::F32
+    }
+
+    pub const fn backend_label() -> &'static str {
+        "CPU · FP32"
+    }
+
+    pub const fn initial_backend_label() -> &'static str {
+        "CPU · 本机推理"
+    }
+
+    pub fn log_stats(_device: &Device, _engine: &str) {}
+
+    pub fn initialize() {}
+}
+
+#[allow(unused_imports)]
+pub use imp::{
+    backend_label, default_precision, device, initial_backend_label, initialize, log_stats,
+    Backend, Device, EagerBackend, EagerDevice, GpuBackend, GpuDevice,
+};
 
 pub fn gpu_device() -> GpuDevice {
     GpuDevice::default()
@@ -158,140 +243,6 @@ pub fn gpu_device() -> GpuDevice {
 
 pub fn eager_device() -> EagerDevice {
     EagerDevice::default()
-}
-
-pub const fn default_precision() -> omni_r2t2::Precision {
-    #[cfg(any(feature = "wgpu", feature = "metal"))]
-    {
-        omni_r2t2::Precision::F16
-    }
-    #[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-    {
-        omni_r2t2::Precision::F32
-    }
-}
-
-#[cfg(all(
-    feature = "ane",
-    feature = "metal",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
-fn native_cache_budget() -> usize {
-    unsafe extern "C" {
-        fn sysctlbyname(
-            name: *const std::ffi::c_char,
-            old: *mut std::ffi::c_void,
-            old_len: *mut usize,
-            new: *mut std::ffi::c_void,
-            new_len: usize,
-        ) -> i32;
-    }
-    let mut memory = 0u64;
-    let mut len = std::mem::size_of_val(&memory);
-    // The descriptor and packed-weight budgets together use at most one quarter
-    // of physical RAM. GPU model tensors/native runtime allocations
-    // are additional; this is a cache bound, not a total-process memory limit.
-    let ok = unsafe {
-        sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut memory as *mut u64).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    } == 0;
-    let gib = 1024 * 1024 * 1024;
-    if ok && len == 8 {
-        (memory as usize / 8).clamp(gib, 16 * gib)
-    } else {
-        2 * gib
-    }
-}
-
-pub const fn backend_label() -> &'static str {
-    #[cfg(all(
-        feature = "ane",
-        feature = "metal",
-        target_os = "macos",
-        target_arch = "aarch64"
-    ))]
-    {
-        "ANE + Metal · FP16"
-    }
-    #[cfg(all(
-        feature = "metal",
-        target_os = "macos",
-        not(all(feature = "ane", target_arch = "aarch64"))
-    ))]
-    {
-        "Metal · FP16"
-    }
-    #[cfg(all(
-        any(feature = "wgpu", feature = "metal"),
-        not(all(feature = "metal", target_os = "macos"))
-    ))]
-    {
-        "WGPU · FP16"
-    }
-    #[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-    {
-        "CPU · FP32"
-    }
-}
-
-pub const fn initial_backend_label() -> &'static str {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    {
-        "Metal · 本机推理"
-    }
-    #[cfg(all(
-        any(feature = "wgpu", feature = "metal"),
-        not(all(feature = "metal", target_os = "macos"))
-    ))]
-    {
-        "WGPU · 本机推理"
-    }
-    #[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
-    {
-        "CPU · 本机推理"
-    }
-}
-
-pub fn log_stats(device: &Device, engine: &str) {
-    #[cfg(all(
-        feature = "ane",
-        feature = "metal",
-        target_os = "macos",
-        target_arch = "aarch64"
-    ))]
-    eprintln!(
-        "[accelerator:{engine}] {}",
-        serde_json::to_string(&device.stats()).unwrap()
-    );
-    #[cfg(not(all(
-        feature = "ane",
-        feature = "metal",
-        target_os = "macos",
-        target_arch = "aarch64"
-    )))]
-    let _ = (device, engine);
-}
-
-/// Workers share the same Burn device registration.
-pub fn initialize() {
-    #[cfg(any(feature = "wgpu", feature = "metal"))]
-    {
-        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        INITIALIZED.get_or_init(|| {
-            let device = WgpuDevice::default();
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            let setup = init_setup::<graphics::Metal>(&device, Default::default());
-            #[cfg(not(all(feature = "metal", target_os = "macos")))]
-            let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
-            eprintln!("[engine] {:?}", setup.adapter.get_info());
-        });
-    }
 }
 
 #[cfg(test)]

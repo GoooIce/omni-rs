@@ -20,6 +20,7 @@ enum Pending {
         design: bool,
         speech_seed: u64,
     },
+    Drafting,
     Holding {
         next: usize,
         pairs: [omni_breeze_tts::enhancement::Pair; 3],
@@ -27,6 +28,55 @@ enum Pending {
         design: bool,
         speech_seed: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalErrorOrigin {
+    TtsSynthesize,
+    PromptEnhance,
+    PromptDraft,
+}
+
+impl ExternalErrorOrigin {
+    fn slot(self) -> CapabilitySlot {
+        match self {
+            Self::TtsSynthesize => CapabilitySlot::Tts,
+            Self::PromptEnhance | Self::PromptDraft => CapabilitySlot::PromptEnhancement,
+        }
+    }
+
+    fn retry_button_label(self) -> &'static str {
+        match self {
+            Self::TtsSynthesize => "重试合成",
+            Self::PromptEnhance => "重试增强",
+            Self::PromptDraft => "重试起草",
+        }
+    }
+}
+
+fn classify_external_error_origin(
+    tts_external: bool,
+    enhance_external: bool,
+    pending: &Pending,
+) -> Option<ExternalErrorOrigin> {
+    if tts_external {
+        return Some(ExternalErrorOrigin::TtsSynthesize);
+    }
+    if enhance_external {
+        return match pending {
+            Pending::Sampling { .. } => Some(ExternalErrorOrigin::PromptEnhance),
+            Pending::Drafting => Some(ExternalErrorOrigin::PromptDraft),
+            Pending::Idle | Pending::Holding { .. } => None,
+        };
+    }
+    None
+}
+
+fn external_error_banner_text(origin: ExternalErrorOrigin, error: &str) -> String {
+    format!(
+        "{}外部请求失败（不会静默回退本地）：{error}",
+        origin.slot().display_name()
+    )
 }
 
 pub struct State {
@@ -60,7 +110,7 @@ pub struct State {
     pending: Pending,
     hearing_audio: [Option<std::sync::Arc<[f32]>>; 3],
     hearing_play: Option<usize>,
-    external_error_slot: Option<CapabilitySlot>,
+    external_error_origin: Option<ExternalErrorOrigin>,
 }
 impl State {
     pub fn playing(&self) -> bool {
@@ -141,7 +191,7 @@ impl State {
             pending: Pending::Idle,
             hearing_audio: [None, None, None],
             hearing_play: None,
-            external_error_slot: None,
+            external_error_origin: None,
         }
     }
 }
@@ -149,7 +199,7 @@ impl App {
     pub fn on_tts_provider_changed(&mut self, cx: &mut Cx) {
         if let Some(t) = self.tts.as_mut() {
             t.controls = None;
-            t.external_error_slot = None;
+            t.external_error_origin = None;
         }
         self.ui
             .view(cx, ids!(tts_external_error))
@@ -324,11 +374,10 @@ impl App {
     fn tts_error(&mut self, cx: &mut Cx, error: &str, fatal: bool) {
         let tts_external = self.slot_is_external(CapabilitySlot::Tts);
         let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
-        let is_sampling_external = enhance_external
-            && self
-                .tts
-                .as_ref()
-                .is_some_and(|t| matches!(t.pending, Pending::Sampling { .. }));
+        let origin = self.tts.as_ref().and_then(|t| {
+            classify_external_error_origin(tts_external, enhance_external, &t.pending)
+        });
+        self.drop_unfinished_hearing(cx);
         let Some(t) = self.tts.as_mut() else {
             return;
         };
@@ -339,22 +388,17 @@ impl App {
         t.loading = false;
         t.stopping = false;
         t.playing = false;
+        t.controls = None;
         self.ui.view(cx, ids!(tts_progress)).set_visible(cx, false);
-        if tts_external || is_sampling_external {
-            let slot = if tts_external {
-                CapabilitySlot::Tts
-            } else {
-                CapabilitySlot::PromptEnhancement
-            };
-            t.external_error_slot = Some(slot);
+        if let Some(origin) = origin {
+            t.external_error_origin = Some(origin);
             self.ui.view(cx, ids!(tts_recovery)).set_visible(cx, false);
-            self.ui.label(cx, ids!(tts_ext_error_info)).set_text(
-                cx,
-                &format!(
-                    "{}外部请求失败（不会静默回退本地）：{error}",
-                    slot.display_name()
-                ),
-            );
+            self.ui
+                .label(cx, ids!(tts_ext_error_info))
+                .set_text(cx, &external_error_banner_text(origin, error));
+            self.ui
+                .button(cx, ids!(tts_ext_retry))
+                .set_text(cx, origin.retry_button_label());
             self.ui
                 .view(cx, ids!(tts_external_error))
                 .set_visible(cx, true);
@@ -586,10 +630,15 @@ impl App {
                 if let Some(text) = update.draft_text.take() {
                     if let Some(t) = self.tts.as_mut() {
                         t.session.stage_draft(text.clone());
+                        t.pending = Pending::Idle;
+                        t.external_error_origin = None;
                         t.busy = false;
                         t.stopping = false;
                         t.controls = None;
                     }
+                    self.ui
+                        .view(cx, ids!(tts_external_error))
+                        .set_visible(cx, false);
                     self.ui
                         .text_input(cx, ids!(tts_draft_text))
                         .set_text(cx, &text);
@@ -781,11 +830,20 @@ impl App {
                 }
                 "load_cancelled" | "cancelled" => {
                     self.drop_unfinished_hearing(cx);
-                    self.tts_error(cx, &update.message, false);
+                    if let Some(t) = self.tts.as_mut() {
+                        if t.loading {
+                            t.ready = false;
+                        }
+                        t.busy = false;
+                        t.loading = false;
+                        t.stopping = false;
+                        t.playing = false;
+                        t.controls = None;
+                    }
+                    self.ui.view(cx, ids!(tts_progress)).set_visible(cx, false);
                     self.tts_status(cx, &update.message);
                 }
                 "error" | "fatal" => {
-                    self.drop_unfinished_hearing(cx);
                     self.tts_error(cx, &update.message, update.kind == "fatal");
                 }
                 _ => self.tts_status(cx, &update.message),
@@ -928,7 +986,8 @@ impl App {
             let slot = self
                 .tts
                 .as_ref()
-                .and_then(|t| t.external_error_slot)
+                .and_then(|t| t.external_error_origin)
+                .map(ExternalErrorOrigin::slot)
                 .unwrap_or(CapabilitySlot::Tts);
             self.switch_slot_to_local(cx, slot);
             return;
@@ -942,6 +1001,9 @@ impl App {
             return;
         }
         let ext_retry_clicked = self.ui.button(cx, ids!(tts_ext_retry)).clicked(actions);
+        let ext_retry_origin = ext_retry_clicked
+            .then(|| self.tts.as_ref().and_then(|t| t.external_error_origin))
+            .flatten();
         let tts_external = self.slot_is_external(CapabilitySlot::Tts);
         let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
         if tts_external
@@ -967,7 +1029,7 @@ impl App {
                 m.stop_playback();
             }
             let t = self.tts.as_mut().unwrap();
-            t.external_error_slot = None;
+            t.external_error_origin = None;
             t.busy = true;
             t.reusable = false;
             t.stopping = false;
@@ -1175,7 +1237,16 @@ impl App {
                 return;
             }
         }
-        if self.ui.button(cx, ids!(tts_draft)).clicked(actions) {
+        if self.ui.button(cx, ids!(tts_draft)).clicked(actions)
+            || ext_retry_origin == Some(ExternalErrorOrigin::PromptDraft)
+        {
+            if let Some(t) = self.tts.as_mut() {
+                t.pending = Pending::Drafting;
+                t.external_error_origin = None;
+            }
+            self.ui
+                .view(cx, ids!(tts_external_error))
+                .set_visible(cx, false);
             let backend = if enhance_external {
                 match self.resolve_slot_external(CapabilitySlot::PromptEnhancement) {
                     Ok(Some(target)) => EnhancementTarget::External(target),
@@ -1195,6 +1266,7 @@ impl App {
                     prefill: t.session.prefill(),
                 }
             };
+            let enhance_badge = self.slot_badge(CapabilitySlot::PromptEnhancement);
             let t = self.tts.as_mut().unwrap();
             match t.session.draft_request() {
                 Ok(request) => {
@@ -1209,10 +1281,20 @@ impl App {
                     }) {
                         self.tts_error(cx, &error.to_string(), false);
                     } else {
-                        self.tts_status(cx, "正在根据语音选择起草增强提示");
+                        self.tts_status(
+                            cx,
+                            &if enhance_external {
+                                format!("正在通过 {enhance_badge} 起草增强提示…")
+                            } else {
+                                "正在根据语音选择起草增强提示".to_owned()
+                            },
+                        );
                     }
                 }
-                Err(error) => self.tts_status(cx, error),
+                Err(error) => {
+                    t.pending = Pending::Idle;
+                    self.tts_status(cx, error);
+                }
             }
             return;
         }
@@ -1250,9 +1332,10 @@ impl App {
         }
 
         let next_candidate = t.design && self.ui.button(cx, ids!(tts_design_next)).clicked(actions);
+        let retry_enhance = ext_retry_origin == Some(ExternalErrorOrigin::PromptEnhance);
         if (self.ui.button(cx, ids!(tts_synthesize)).clicked(actions)
             || next_candidate
-            || ext_retry_clicked)
+            || retry_enhance)
             && t.ready
         {
             let text = self.ui.text_input(cx, ids!(tts_text)).text();
@@ -1315,6 +1398,7 @@ impl App {
                 };
                 self.ui.view(cx, ids!(tts_hearing)).set_visible(cx, false);
             }
+            t.external_error_origin = None;
             t.busy = true;
             t.reusable = false;
             t.stopping = false;
@@ -1586,5 +1670,130 @@ impl App {
         }) {
             self.tts_error(cx, &error.to_string(), false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models_state::ModelsController;
+    use omni_hub::credentials::{CredentialStore, FileCredentialStore, MapEnv};
+    use omni_hub::download::DownloadOptions;
+    use std::sync::Arc;
+
+    fn temp_controller(tag: &str) -> (PathBuf, ModelsController) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "makepad-tts-ui-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::with_env(
+            dir.join("credentials.json"),
+            MapEnv::default(),
+        ));
+        let ctrl = ModelsController::with_dependencies(
+            dir.clone(),
+            dir.join("app-settings.json"),
+            store,
+            DownloadOptions::default(),
+            || {},
+        );
+        (dir, ctrl)
+    }
+
+    #[test]
+    fn external_enhance_error_surfaces_banner_retry_and_switch_prompt_enhancement_to_local() {
+        let (dir, mut ctrl) = temp_controller("enhance-err");
+        ctrl.apply_magpie_preset();
+        ctrl.save_provider_draft().unwrap();
+        ctrl.set_slot_model(CapabilitySlot::PromptEnhancement, "qwen-pe".to_owned());
+        ctrl.set_slot_mode(CapabilitySlot::PromptEnhancement, true)
+            .unwrap();
+
+        let pending = Pending::Sampling {
+            reference: None,
+            design: false,
+            speech_seed: 42,
+        };
+        let origin = classify_external_error_origin(
+            ctrl.is_slot_external(CapabilitySlot::Tts),
+            ctrl.is_slot_external(CapabilitySlot::PromptEnhancement),
+            &pending,
+        )
+        .expect("async external Enhance failure must classify before hearing reset");
+        assert_eq!(origin, ExternalErrorOrigin::PromptEnhance);
+        assert_eq!(origin.slot(), CapabilitySlot::PromptEnhancement);
+        assert_eq!(origin.retry_button_label(), "重试增强");
+
+        let banner = external_error_banner_text(origin, "HTTP 502 Bad Gateway");
+        assert!(banner.contains("提示词增强"));
+        assert!(banner.contains("不会静默回退本地"));
+        assert!(banner.contains("HTTP 502 Bad Gateway"));
+
+        // Clicking "切回本地模型" switches PromptEnhancement (not Tts) back to Local.
+        ctrl.switch_slot_to_local(origin.slot());
+        assert!(!ctrl.is_slot_external(CapabilitySlot::PromptEnhancement));
+        assert_eq!(
+            ctrl.slot_badge(CapabilitySlot::PromptEnhancement),
+            "本地模型"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn external_draft_error_surfaces_banner_retry_and_switch_prompt_enhancement_to_local() {
+        let (dir, mut ctrl) = temp_controller("draft-err");
+        ctrl.apply_magpie_preset();
+        ctrl.save_provider_draft().unwrap();
+        ctrl.set_slot_model(CapabilitySlot::PromptEnhancement, "qwen-pe".to_owned());
+        ctrl.set_slot_mode(CapabilitySlot::PromptEnhancement, true)
+            .unwrap();
+
+        let origin = classify_external_error_origin(
+            ctrl.is_slot_external(CapabilitySlot::Tts),
+            ctrl.is_slot_external(CapabilitySlot::PromptEnhancement),
+            &Pending::Drafting,
+        )
+        .expect("async external Draft failure must classify via Pending::Drafting");
+        assert_eq!(origin, ExternalErrorOrigin::PromptDraft);
+        assert_eq!(origin.slot(), CapabilitySlot::PromptEnhancement);
+        assert_eq!(origin.retry_button_label(), "重试起草");
+
+        let banner = external_error_banner_text(origin, "HTTP 401 Unauthorized");
+        assert!(banner.contains("提示词增强"));
+        assert!(banner.contains("不会静默回退本地"));
+
+        ctrl.switch_slot_to_local(origin.slot());
+        assert!(!ctrl.is_slot_external(CapabilitySlot::PromptEnhancement));
+
+        // Local enhance/draft failures must not surface the external error banner.
+        assert_eq!(
+            classify_external_error_origin(false, false, &Pending::Drafting),
+            None
+        );
+        assert_eq!(
+            classify_external_error_origin(
+                false,
+                false,
+                &Pending::Sampling {
+                    reference: None,
+                    design: false,
+                    speech_seed: 1,
+                }
+            ),
+            None
+        );
+
+        // External TTS failure attributes to CapabilitySlot::Tts.
+        let tts_origin = classify_external_error_origin(true, false, &Pending::Idle).unwrap();
+        assert_eq!(tts_origin, ExternalErrorOrigin::TtsSynthesize);
+        assert_eq!(tts_origin.slot(), CapabilitySlot::Tts);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

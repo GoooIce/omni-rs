@@ -258,32 +258,11 @@ impl AppSettings {
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         self.download.validate()?;
         self.providers.validate()?;
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).map_err(|e| ConfigError::Write {
-                path: path.to_path_buf(),
-                message: e.to_string(),
-            })?;
-        }
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| ConfigError::Write {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
-        let tmp = path.with_extension(format!(
-            "{}.{}.tmp",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let res = (|| {
-            fs::write(&tmp, bytes)?;
-            fs::rename(&tmp, path)
-        })();
-        if res.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        res.map_err(|e| ConfigError::Write {
+        crate::atomic_file::write_atomic(path, &bytes, false).map_err(|e| ConfigError::Write {
             path: path.to_path_buf(),
             message: e.to_string(),
         })

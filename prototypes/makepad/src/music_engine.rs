@@ -34,6 +34,8 @@ pub struct Update {
     pub progress: f64,
     #[serde(skip)]
     pub output: Option<Output>,
+    #[serde(skip)]
+    pub missing_checkpoint: Option<omni_hub::catalog::CheckpointId>,
 }
 impl Update {
     fn status(kind: &'static str, message: impl Into<String>) -> Self {
@@ -42,6 +44,7 @@ impl Update {
             message: message.into(),
             progress: 0.0,
             output: None,
+            missing_checkpoint: None,
         }
     }
 }
@@ -118,7 +121,11 @@ impl Adapter for Worker {
                 pipeline::Request::Generate(request)
             }
         };
-        check_models(&root, &request).map_err(Error::Config)?;
+        if let Err((checkpoint, message)) = check_models(&root, &request) {
+            let mut update = Update::status("missing", message);
+            update.missing_checkpoint = Some(checkpoint);
+            return Ok(update);
+        }
         Self::initialize();
         let result = pipeline::run::<Backend>(
             &root,
@@ -198,6 +205,7 @@ impl Adapter for Worker {
             message,
             progress: 1.0,
             output: Some(output),
+            missing_checkpoint: None,
         })
     }
 }
@@ -205,18 +213,28 @@ impl Adapter for Worker {
 fn read_audio(path: &Path, limit: usize) -> omni_music::Result<Vec<f32>> {
     omni_music::audio::read_wav(std::fs::File::open(path)?, limit)
 }
-fn check_models(root: &Path, request: &pipeline::Request) -> Result<(), String> {
-    let names: &[&str] = match request {
-        pipeline::Request::Analyze(_) => &["MERT-v2-FullSong"],
-        pipeline::Request::Transcribe { .. } => &["MERT-v2-FullSong", "SheetSage2"],
-        pipeline::Request::Generate(_) => &["YuE2-3B", "YuE2-Vae"],
+fn check_models(
+    root: &Path,
+    request: &pipeline::Request,
+) -> Result<(), (omni_hub::catalog::CheckpointId, String)> {
+    use omni_hub::catalog::CheckpointId;
+    let required: &[(CheckpointId, &str)] = match request {
+        pipeline::Request::Analyze(_) => &[(CheckpointId::MertV2FullSong, "MERT-v2-FullSong")],
+        pipeline::Request::Transcribe { .. } => &[
+            (CheckpointId::MertV2FullSong, "MERT-v2-FullSong"),
+            (CheckpointId::SheetSage2, "SheetSage2"),
+        ],
+        pipeline::Request::Generate(_) => &[
+            (CheckpointId::Yue2_3b, "YuE2-3B"),
+            (CheckpointId::Yue2Vae, "YuE2-Vae"),
+        ],
     };
-    for name in names {
+    for &(id, name) in required {
         let dir = root.join(name);
-        crate::model_location::require_files(&dir, &["config.json"])?;
-        crate::model_location::check_weights(&dir, "model")?;
-        if *name == "YuE2-3B" {
-            crate::model_location::require_files(&dir, &["qwen.tiktoken"])?;
+        crate::model_location::require_files(&dir, &["config.json"]).map_err(|e| (id, e))?;
+        crate::model_location::check_weights(&dir, "model").map_err(|e| (id, e))?;
+        if id == CheckpointId::Yue2_3b {
+            crate::model_location::require_files(&dir, &["qwen.tiktoken"]).map_err(|e| (id, e))?;
         }
     }
     Ok(())

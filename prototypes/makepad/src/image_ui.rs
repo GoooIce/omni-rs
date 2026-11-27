@@ -9,6 +9,22 @@ use omni_hub::providers::CapabilitySlot;
 use omni_qwen_image::{dimensions, Options};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImageControls {
+    busy: bool,
+    loading: bool,
+    stopping: bool,
+    ready: bool,
+    has_image: bool,
+    other_busy: bool,
+    dialog_busy: bool,
+    creative_active: bool,
+    language_active: bool,
+    dialog_open: bool,
+    observation: bool,
+    enhance_external: bool,
+}
+
 pub struct State {
     engine: Engine,
     dialog: Option<crate::desktop_runtime::Dialog>,
@@ -34,20 +50,7 @@ pub struct State {
     observation: bool,
     rewriting: bool,
     observation_board: ObservationBoard,
-    controls: Option<(
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-    )>,
+    controls: Option<ImageControls>,
 }
 impl State {
     pub fn needs_model(&self) -> bool {
@@ -239,20 +242,20 @@ impl App {
         let Some(i) = self.image.as_mut() else {
             return;
         };
-        let state = (
-            i.busy,
-            i.loading,
-            i.stopping,
-            i.ready,
-            i.has_image,
+        let state = ImageControls {
+            busy: i.busy,
+            loading: i.loading,
+            stopping: i.stopping,
+            ready: i.ready,
+            has_image: i.has_image,
             other_busy,
             dialog_busy,
-            self.workspace.creative(),
-            self.workspace.language(),
-            i.picking || i.saving || i.picking_reference,
-            i.observation,
+            creative_active: self.workspace.creative(),
+            language_active: self.workspace.language(),
+            dialog_open: i.picking || i.saving || i.picking_reference,
+            observation: i.observation,
             enhance_external,
-        );
+        };
         if i.controls == Some(state) {
             return;
         }

@@ -3,14 +3,89 @@
 
 use crate::models_state::{
     slot_index, CheckpointLifecycle, FallbackPreset, ModelsController, RecoveryCardModel,
-    RoutePreset, SettingsTab,
+    RoutePreset, SettingsTab, TokenFieldState,
 };
 use crate::{ActionButtonState, App};
 use makepad_widgets::*;
 use omni_hub::catalog::CheckpointId;
-use omni_hub::credentials::CredentialKey;
+use omni_hub::credentials::CredentialStore;
 use omni_hub::providers::{CapabilitySlot, ExternalProviderTarget};
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy)]
+enum TokenTarget {
+    Hf,
+    ModelScope,
+    ProviderApiKey,
+}
+
+struct TokenFieldIds {
+    target: TokenTarget,
+    input: &'static [LiveId],
+    toggle: &'static [LiveId],
+    save: &'static [LiveId],
+    clear: &'static [LiveId],
+}
+
+struct RecoveryCardIds {
+    container: &'static [LiveId],
+    info: &'static [LiveId],
+    hint: &'static [LiveId],
+    download: &'static [LiveId],
+    pause: Option<&'static [LiveId]>,
+    cancel: Option<&'static [LiveId]>,
+}
+
+struct SlotRowIds {
+    slot: CapabilitySlot,
+    badge: &'static [LiveId],
+    local: &'static [LiveId],
+    external: &'static [LiveId],
+    provider: &'static [LiveId],
+    model: &'static [LiveId],
+    use_first: &'static [LiveId],
+}
+
+fn slot_rows() -> [SlotRowIds; 4] {
+    [
+        SlotRowIds {
+            slot: CapabilitySlot::PromptEnhancement,
+            badge: ids!(slot_enhance_badge),
+            local: ids!(slot_enhance_local),
+            external: ids!(slot_enhance_external),
+            provider: ids!(slot_enhance_provider),
+            model: ids!(slot_enhance_model),
+            use_first: ids!(slot_enhance_use_first),
+        },
+        SlotRowIds {
+            slot: CapabilitySlot::Asr,
+            badge: ids!(slot_asr_badge),
+            local: ids!(slot_asr_local),
+            external: ids!(slot_asr_external),
+            provider: ids!(slot_asr_provider),
+            model: ids!(slot_asr_model),
+            use_first: ids!(slot_asr_use_first),
+        },
+        SlotRowIds {
+            slot: CapabilitySlot::Tts,
+            badge: ids!(slot_tts_badge),
+            local: ids!(slot_tts_local),
+            external: ids!(slot_tts_external),
+            provider: ids!(slot_tts_provider),
+            model: ids!(slot_tts_model),
+            use_first: ids!(slot_tts_use_first),
+        },
+        SlotRowIds {
+            slot: CapabilitySlot::Translation,
+            badge: ids!(slot_translation_badge),
+            local: ids!(slot_translation_local),
+            external: ids!(slot_translation_external),
+            provider: ids!(slot_translation_provider),
+            model: ids!(slot_translation_model),
+            use_first: ids!(slot_translation_use_first),
+        },
+    ]
+}
 
 struct RowIds {
     id: CheckpointId,
@@ -243,34 +318,38 @@ impl App {
             .text_input(cx, ids!(proxy_url_input))
             .set_text(cx, &state.ctrl.route_draft.proxy_url);
 
-        let (hf_text, hf_ro) = state
-            .ctrl
-            .hf_token
-            .rendered_input(state.ctrl.credentials.as_ref());
-        self.ui
-            .text_input(cx, ids!(hf_token_input))
-            .set_text(cx, &hf_text);
-        self.ui
-            .text_input(cx, ids!(hf_token_input))
-            .set_is_read_only(cx, hf_ro);
-        state.last_hf_rendered = hf_text;
-
-        let (ms_text, ms_ro) = state
-            .ctrl
-            .ms_token
-            .rendered_input(state.ctrl.credentials.as_ref());
-        self.ui
-            .text_input(cx, ids!(ms_token_input))
-            .set_text(cx, &ms_text);
-        self.ui
-            .text_input(cx, ids!(ms_token_input))
-            .set_is_read_only(cx, ms_ro);
-        state.last_ms_rendered = ms_text;
+        state.last_hf_rendered = self.apply_token_input(
+            cx,
+            ids!(hf_token_input),
+            &state.ctrl.hf_token,
+            state.ctrl.credentials.as_ref(),
+        );
+        state.last_ms_rendered = self.apply_token_input(
+            cx,
+            ids!(ms_token_input),
+            &state.ctrl.ms_token,
+            state.ctrl.credentials.as_ref(),
+        );
 
         self.seed_provider_inputs_from_state(cx, &mut state);
 
         self.downloads = Some(state);
         self.refresh_download_controls(cx);
+    }
+
+    fn apply_token_input(
+        &self,
+        cx: &mut Cx,
+        input_id: &[LiveId],
+        field: &TokenFieldState,
+        store: &dyn CredentialStore,
+    ) -> String {
+        let (text, ro) = field.rendered_input(store);
+        let input = self.ui.text_input(cx, input_id);
+        input.set_is_password(cx, field.is_masked());
+        input.set_text(cx, &text);
+        input.set_is_read_only(cx, ro);
+        text
     }
 
     pub fn sync_transcription_download_directory(&mut self, cx: &mut Cx) {
@@ -285,6 +364,9 @@ impl App {
     fn seed_provider_inputs_from_state(&self, cx: &mut Cx, state: &mut UiState) {
         let draft = &state.ctrl.provider_draft;
         self.ui
+            .text_input(cx, ids!(provider_id_input))
+            .set_text(cx, &draft.id);
+        self.ui
             .text_input(cx, ids!(provider_name_input))
             .set_text(cx, &draft.name);
         self.ui
@@ -296,41 +378,26 @@ impl App {
         self.ui
             .text_input(cx, ids!(provider_api_key_env_input))
             .set_text(cx, &draft.api_key_env);
-
-        let (key_text, key_ro) = state
-            .ctrl
-            .provider_api_key
-            .rendered_input(state.ctrl.credentials.as_ref());
         self.ui
-            .text_input(cx, ids!(provider_api_key_input))
-            .set_text(cx, &key_text);
-        self.ui
-            .text_input(cx, ids!(provider_api_key_input))
-            .set_is_read_only(cx, key_ro);
-        state.last_provider_key_rendered = key_text;
+            .text_input(cx, ids!(provider_custom_headers_input))
+            .set_text(cx, &draft.custom_headers);
 
-        self.ui.text_input(cx, ids!(slot_enhance_model)).set_text(
+        state.last_provider_key_rendered = self.apply_token_input(
             cx,
-            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::PromptEnhancement)].model,
+            ids!(provider_api_key_input),
+            &state.ctrl.provider_api_key,
+            state.ctrl.credentials.as_ref(),
         );
-        self.ui.text_input(cx, ids!(slot_asr_model)).set_text(
-            cx,
-            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Asr)].model,
-        );
-        self.ui.text_input(cx, ids!(slot_tts_model)).set_text(
-            cx,
-            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Tts)].model,
-        );
+
+        for row in slot_rows() {
+            self.ui
+                .text_input(cx, row.model)
+                .set_text(cx, &state.ctrl.slot_drafts[slot_index(row.slot)].model);
+        }
         self.ui.text_input(cx, ids!(slot_tts_voice)).set_text(
             cx,
             &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Tts)].voice,
         );
-        self.ui
-            .text_input(cx, ids!(slot_translation_model))
-            .set_text(
-                cx,
-                &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Translation)].model,
-            );
     }
 
     pub fn slot_is_external(&self, slot: CapabilitySlot) -> bool {
@@ -1031,20 +1098,24 @@ impl App {
         self.handle_token_buttons(
             cx,
             actions,
-            CredentialKey::HfToken,
-            ids!(hf_token_input),
-            ids!(hf_token_toggle),
-            ids!(hf_token_save),
-            ids!(hf_token_clear),
+            &TokenFieldIds {
+                target: TokenTarget::Hf,
+                input: ids!(hf_token_input),
+                toggle: ids!(hf_token_toggle),
+                save: ids!(hf_token_save),
+                clear: ids!(hf_token_clear),
+            },
         );
         self.handle_token_buttons(
             cx,
             actions,
-            CredentialKey::ModelScopeToken,
-            ids!(ms_token_input),
-            ids!(ms_token_toggle),
-            ids!(ms_token_save),
-            ids!(ms_token_clear),
+            &TokenFieldIds {
+                target: TokenTarget::ModelScope,
+                input: ids!(ms_token_input),
+                toggle: ids!(ms_token_toggle),
+                save: ids!(ms_token_save),
+                clear: ids!(ms_token_clear),
+            },
         );
 
         // Per-checkpoint download/pause/cancel/choose actions in Settings list.
@@ -1066,6 +1137,53 @@ impl App {
     }
 
     fn handle_provider_settings_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        // Saved profile switcher & deletion.
+        if self
+            .ui
+            .button(cx, ids!(provider_profile_prev))
+            .clicked(actions)
+        {
+            if let Some(mut state) = self.downloads.take() {
+                if state.ctrl.step_provider_profile(-1).is_some() {
+                    self.seed_provider_inputs_from_state(cx, &mut state);
+                }
+                self.downloads = Some(state);
+            }
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(provider_profile_next))
+            .clicked(actions)
+        {
+            if let Some(mut state) = self.downloads.take() {
+                if state.ctrl.step_provider_profile(1).is_some() {
+                    self.seed_provider_inputs_from_state(cx, &mut state);
+                }
+                self.downloads = Some(state);
+            }
+            return;
+        }
+        if self.ui.button(cx, ids!(provider_delete)).clicked(actions) {
+            let mut reset_slots = Vec::new();
+            if let Some(mut state) = self.downloads.take() {
+                match state.ctrl.delete_current_provider_profile() {
+                    Ok(slots) => {
+                        reset_slots = slots;
+                        self.seed_provider_inputs_from_state(cx, &mut state);
+                    }
+                    Err(err) => {
+                        state.ctrl.provider_feedback = err;
+                    }
+                }
+                self.downloads = Some(state);
+            }
+            for slot in reset_slots {
+                self.on_slot_routing_changed(cx, slot);
+            }
+            return;
+        }
+
         // Provider preset buttons.
         if self
             .ui
@@ -1093,6 +1211,24 @@ impl App {
         }
 
         // Provider text inputs.
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(provider_id_input))
+            .changed(actions)
+        {
+            if let Some(mut state) = self.downloads.take() {
+                state.ctrl.provider_draft.id = text;
+                state.ctrl.provider_draft.dirty = true;
+                state.ctrl.sync_provider_api_key_state();
+                state.last_provider_key_rendered = self.apply_token_input(
+                    cx,
+                    ids!(provider_api_key_input),
+                    &state.ctrl.provider_api_key,
+                    state.ctrl.credentials.as_ref(),
+                );
+                self.downloads = Some(state);
+            }
+        }
         if let Some(text) = self
             .ui
             .text_input(cx, ids!(provider_name_input))
@@ -1136,6 +1272,16 @@ impl App {
         }
         if let Some(text) = self
             .ui
+            .text_input(cx, ids!(provider_custom_headers_input))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.provider_draft.custom_headers = text;
+                d.ctrl.provider_draft.dirty = true;
+            }
+        }
+        if let Some(text) = self
+            .ui
             .text_input(cx, ids!(provider_api_key_input))
             .changed(actions)
         {
@@ -1145,44 +1291,18 @@ impl App {
             }
         }
 
-        // Provider API key reveal / save / clear (reusing 0600 CredentialStore).
-        let toggle = self
-            .ui
-            .button(cx, ids!(provider_api_key_toggle))
-            .clicked(actions);
-        let save_key = self
-            .ui
-            .button(cx, ids!(provider_api_key_save))
-            .clicked(actions);
-        let clear_key = self
-            .ui
-            .button(cx, ids!(provider_api_key_clear))
-            .clicked(actions);
-        if toggle || save_key || clear_key {
-            let d = self.downloads.as_mut().unwrap();
-            let store = d.ctrl.credentials.clone();
-            if toggle {
-                d.ctrl.provider_api_key.toggle_reveal(store.as_ref());
-            } else if save_key {
-                match d.ctrl.provider_api_key.save(store.as_ref()) {
-                    Ok(msg) => d.ctrl.provider_feedback = msg,
-                    Err(err) => d.ctrl.provider_feedback = err,
-                }
-            } else if clear_key {
-                match d.ctrl.provider_api_key.clear(store.as_ref()) {
-                    Ok(msg) => d.ctrl.provider_feedback = msg,
-                    Err(err) => d.ctrl.provider_feedback = err,
-                }
-            }
-            let (rendered, ro) = d.ctrl.provider_api_key.rendered_input(store.as_ref());
-            self.ui
-                .text_input(cx, ids!(provider_api_key_input))
-                .set_text(cx, &rendered);
-            self.ui
-                .text_input(cx, ids!(provider_api_key_input))
-                .set_is_read_only(cx, ro);
-            d.last_provider_key_rendered = rendered;
-        }
+        // Provider API key reveal / save / clear (reusing 0600 CredentialStore & handle_token_buttons).
+        self.handle_token_buttons(
+            cx,
+            actions,
+            &TokenFieldIds {
+                target: TokenTarget::ProviderApiKey,
+                input: ids!(provider_api_key_input),
+                toggle: ids!(provider_api_key_toggle),
+                save: ids!(provider_api_key_save),
+                clear: ids!(provider_api_key_clear),
+            },
+        );
 
         // Save provider profile / fetch /v1/models.
         if self.ui.button(cx, ids!(provider_save)).clicked(actions) {
@@ -1201,15 +1321,10 @@ impl App {
         }
 
         // Per-slot model & voice text inputs.
-        for (slot, input_id) in [
-            (CapabilitySlot::PromptEnhancement, ids!(slot_enhance_model)),
-            (CapabilitySlot::Asr, ids!(slot_asr_model)),
-            (CapabilitySlot::Tts, ids!(slot_tts_model)),
-            (CapabilitySlot::Translation, ids!(slot_translation_model)),
-        ] {
-            if let Some(text) = self.ui.text_input(cx, input_id).changed(actions) {
+        for row in slot_rows() {
+            if let Some(text) = self.ui.text_input(cx, row.model).changed(actions) {
                 if let Some(d) = self.downloads.as_mut() {
-                    d.ctrl.set_slot_model(slot, text);
+                    d.ctrl.set_slot_model(row.slot, text);
                 }
             }
         }
@@ -1223,64 +1338,48 @@ impl App {
             }
         }
 
-        // Per-slot Local / External toggles and quick-fill buttons.
-        let slot_rows = [
-            (
-                CapabilitySlot::PromptEnhancement,
-                ids!(slot_enhance_local),
-                ids!(slot_enhance_external),
-                ids!(slot_enhance_model),
-                ids!(slot_enhance_use_first),
-            ),
-            (
-                CapabilitySlot::Asr,
-                ids!(slot_asr_local),
-                ids!(slot_asr_external),
-                ids!(slot_asr_model),
-                ids!(slot_asr_use_first),
-            ),
-            (
-                CapabilitySlot::Tts,
-                ids!(slot_tts_local),
-                ids!(slot_tts_external),
-                ids!(slot_tts_model),
-                ids!(slot_tts_use_first),
-            ),
-            (
-                CapabilitySlot::Translation,
-                ids!(slot_translation_local),
-                ids!(slot_translation_external),
-                ids!(slot_translation_model),
-                ids!(slot_translation_use_first),
-            ),
-        ];
-        for (slot, local_btn, ext_btn, model_input, use_first_btn) in slot_rows {
-            if self.ui.button(cx, local_btn).clicked(actions) {
+        // Per-slot Local / External toggles, provider profile selector, and quick-fill buttons.
+        for row in slot_rows() {
+            if self.ui.button(cx, row.local).clicked(actions) {
                 if let Some(d) = self.downloads.as_mut() {
-                    let _ = d.ctrl.set_slot_mode(slot, false);
+                    let _ = d.ctrl.set_slot_mode(row.slot, false);
                 }
-                self.on_slot_routing_changed(cx, slot);
-            } else if self.ui.button(cx, ext_btn).clicked(actions) {
+                self.on_slot_routing_changed(cx, row.slot);
+            } else if self.ui.button(cx, row.external).clicked(actions) {
                 let filled_model = {
                     let d = self.downloads.as_mut().unwrap();
-                    if let Err(err) = d.ctrl.set_slot_mode(slot, true) {
+                    if let Err(err) = d.ctrl.set_slot_mode(row.slot, true) {
                         d.ctrl.slot_feedback = format!("切换失败：{err}");
                         None
                     } else {
-                        Some(d.ctrl.slot_drafts[slot_index(slot)].model.clone())
+                        Some(d.ctrl.slot_drafts[slot_index(row.slot)].model.clone())
                     }
                 };
                 if let Some(model) = filled_model {
-                    self.ui.text_input(cx, model_input).set_text(cx, &model);
-                    self.on_slot_routing_changed(cx, slot);
+                    self.ui.text_input(cx, row.model).set_text(cx, &model);
+                    self.on_slot_routing_changed(cx, row.slot);
                 }
-            } else if self.ui.button(cx, use_first_btn).clicked(actions) {
+            } else if self.ui.button(cx, row.provider).clicked(actions) {
+                let changed_external = {
+                    let d = self.downloads.as_mut().unwrap();
+                    match d.ctrl.cycle_slot_provider(row.slot) {
+                        Ok(_) => d.ctrl.is_slot_external(row.slot),
+                        Err(err) => {
+                            d.ctrl.slot_feedback = err;
+                            false
+                        }
+                    }
+                };
+                if changed_external {
+                    self.on_slot_routing_changed(cx, row.slot);
+                }
+            } else if self.ui.button(cx, row.use_first).clicked(actions) {
                 let picked = self
                     .downloads
                     .as_mut()
-                    .and_then(|d| d.ctrl.use_first_discovered_model(slot));
+                    .and_then(|d| d.ctrl.use_first_discovered_model(row.slot));
                 if let Some(model) = picked {
-                    self.ui.text_input(cx, model_input).set_text(cx, &model);
+                    self.ui.text_input(cx, row.model).set_text(cx, &model);
                 } else if let Some(d) = self.downloads.as_mut() {
                     d.ctrl.slot_feedback =
                         "尚未拉取到可用模型，请先点击「拉取模型 / 测试连接」".to_owned();
@@ -1300,46 +1399,49 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn handle_token_buttons(
-        &mut self,
-        cx: &mut Cx,
-        actions: &Actions,
-        key: CredentialKey,
-        input_id: &[LiveId],
-        toggle_id: &[LiveId],
-        save_id: &[LiveId],
-        clear_id: &[LiveId],
-    ) {
-        let toggle_clicked = self.ui.button(cx, toggle_id).clicked(actions);
-        let save_clicked = self.ui.button(cx, save_id).clicked(actions);
-        let clear_clicked = self.ui.button(cx, clear_id).clicked(actions);
+    fn handle_token_buttons(&mut self, cx: &mut Cx, actions: &Actions, ids: &TokenFieldIds) {
+        let toggle_clicked = self.ui.button(cx, ids.toggle).clicked(actions);
+        let save_clicked = self.ui.button(cx, ids.save).clicked(actions);
+        let clear_clicked = self.ui.button(cx, ids.clear).clicked(actions);
         if !toggle_clicked && !save_clicked && !clear_clicked {
             return;
         }
-        let d = self.downloads.as_mut().unwrap();
-        let store = d.ctrl.credentials.clone();
-        let (field, last_rendered) = match key {
-            CredentialKey::HfToken => (&mut d.ctrl.hf_token, &mut d.last_hf_rendered),
-            _ => (&mut d.ctrl.ms_token, &mut d.last_ms_rendered),
+        let Some(mut state) = self.downloads.take() else {
+            return;
+        };
+        let store = state.ctrl.credentials.clone();
+        let (field, feedback, last_rendered) = match ids.target {
+            TokenTarget::Hf => (
+                &mut state.ctrl.hf_token,
+                &mut state.ctrl.token_feedback,
+                &mut state.last_hf_rendered,
+            ),
+            TokenTarget::ModelScope => (
+                &mut state.ctrl.ms_token,
+                &mut state.ctrl.token_feedback,
+                &mut state.last_ms_rendered,
+            ),
+            TokenTarget::ProviderApiKey => (
+                &mut state.ctrl.provider_api_key,
+                &mut state.ctrl.provider_feedback,
+                &mut state.last_provider_key_rendered,
+            ),
         };
         if toggle_clicked {
             field.toggle_reveal(store.as_ref());
         } else if save_clicked {
             match field.save(store.as_ref()) {
-                Ok(msg) => d.ctrl.token_feedback = msg,
-                Err(err) => d.ctrl.token_feedback = err,
+                Ok(msg) => *feedback = msg,
+                Err(err) => *feedback = err,
             }
         } else if clear_clicked {
             match field.clear(store.as_ref()) {
-                Ok(msg) => d.ctrl.token_feedback = msg,
-                Err(err) => d.ctrl.token_feedback = err,
+                Ok(msg) => *feedback = msg,
+                Err(err) => *feedback = err,
             }
         }
-        let (rendered, ro) = field.rendered_input(store.as_ref());
-        self.ui.text_input(cx, input_id).set_text(cx, &rendered);
-        self.ui.text_input(cx, input_id).set_is_read_only(cx, ro);
-        *last_rendered = rendered;
+        *last_rendered = self.apply_token_input(cx, ids.input, field, store.as_ref());
+        self.downloads = Some(state);
     }
 
     pub fn refresh_download_controls(&mut self, cx: &mut Cx) {
@@ -1416,12 +1518,14 @@ impl App {
         self.paint_inline_recovery(
             cx,
             &asr_card,
-            ids!(model_recovery),
-            ids!(asr_recovery_info),
-            ids!(asr_recovery_hint),
-            ids!(asr_download_model),
-            Some(ids!(asr_download_pause)),
-            Some(ids!(asr_download_cancel)),
+            &RecoveryCardIds {
+                container: ids!(model_recovery),
+                info: ids!(asr_recovery_info),
+                hint: ids!(asr_recovery_hint),
+                download: ids!(asr_download_model),
+                pause: Some(ids!(asr_download_pause)),
+                cancel: Some(ids!(asr_download_cancel)),
+            },
             !self.transcription.busy(),
         );
 
@@ -1439,12 +1543,14 @@ impl App {
         self.paint_inline_recovery(
             cx,
             &tts_card,
-            ids!(tts_recovery),
-            ids!(tts_recovery_info),
-            ids!(tts_recovery_hint),
-            ids!(tts_download_model),
-            Some(ids!(tts_download_pause)),
-            Some(ids!(tts_download_cancel)),
+            &RecoveryCardIds {
+                container: ids!(tts_recovery),
+                info: ids!(tts_recovery_info),
+                hint: ids!(tts_recovery_hint),
+                download: ids!(tts_download_model),
+                pause: Some(ids!(tts_download_pause)),
+                cancel: Some(ids!(tts_download_cancel)),
+            },
             true,
         );
 
@@ -1459,12 +1565,14 @@ impl App {
         self.paint_inline_recovery(
             cx,
             &tr_card,
-            ids!(translation_recovery),
-            ids!(translation_recovery_info),
-            ids!(translation_recovery_hint),
-            ids!(translation_download_model),
-            Some(ids!(translation_download_pause)),
-            Some(ids!(translation_download_cancel)),
+            &RecoveryCardIds {
+                container: ids!(translation_recovery),
+                info: ids!(translation_recovery_info),
+                hint: ids!(translation_recovery_hint),
+                download: ids!(translation_download_model),
+                pause: Some(ids!(translation_download_pause)),
+                cancel: Some(ids!(translation_download_cancel)),
+            },
             true,
         );
 
@@ -1476,12 +1584,14 @@ impl App {
         self.paint_inline_recovery(
             cx,
             &image_card,
-            ids!(image_recovery),
-            ids!(image_recovery_info),
-            ids!(image_recovery_hint),
-            ids!(image_download_model),
-            Some(ids!(image_download_pause)),
-            Some(ids!(image_download_cancel)),
+            &RecoveryCardIds {
+                container: ids!(image_recovery),
+                info: ids!(image_recovery_info),
+                hint: ids!(image_recovery_hint),
+                download: ids!(image_download_model),
+                pause: Some(ids!(image_download_pause)),
+                cancel: Some(ids!(image_download_cancel)),
+            },
             true,
         );
 
@@ -1492,12 +1602,14 @@ impl App {
         self.paint_inline_recovery(
             cx,
             &music_card,
-            ids!(music_recovery),
-            ids!(music_recovery_info),
-            ids!(music_recovery_hint),
-            ids!(music_download_model),
-            Some(ids!(music_download_pause)),
-            Some(ids!(music_download_cancel)),
+            &RecoveryCardIds {
+                container: ids!(music_recovery),
+                info: ids!(music_recovery_info),
+                hint: ids!(music_recovery_hint),
+                download: ids!(music_download_model),
+                pause: Some(ids!(music_download_pause)),
+                cancel: Some(ids!(music_download_cancel)),
+            },
             true,
         );
 
@@ -1506,12 +1618,14 @@ impl App {
         self.paint_inline_recovery(
             cx,
             &omni_card,
-            ids!(omni_recovery),
-            ids!(omni_recovery_info),
-            ids!(omni_recovery_hint),
-            ids!(omni_download_model),
-            None,
-            None,
+            &RecoveryCardIds {
+                container: ids!(omni_recovery),
+                info: ids!(omni_recovery_info),
+                hint: ids!(omni_recovery_hint),
+                download: ids!(omni_download_model),
+                pause: None,
+                cancel: None,
+            },
             true,
         );
 
@@ -1752,38 +1866,34 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn paint_inline_recovery(
         &self,
         cx: &mut Cx,
         card: &RecoveryCardModel,
-        container: &[LiveId],
-        info_id: &[LiveId],
-        hint_id: &[LiveId],
-        download_btn: &[LiveId],
-        pause_btn: Option<&[LiveId]>,
-        cancel_btn: Option<&[LiveId]>,
+        ids: &RecoveryCardIds,
         extra_allow_download: bool,
     ) {
-        self.ui.view(cx, container).set_visible(cx, card.visible);
+        self.ui
+            .view(cx, ids.container)
+            .set_visible(cx, card.visible);
         if !card.visible {
             return;
         }
-        self.ui.label(cx, info_id).set_text(cx, &card.info_text);
-        self.ui.label(cx, hint_id).set_text(cx, &card.hint_text);
+        self.ui.label(cx, ids.info).set_text(cx, &card.info_text);
+        self.ui.label(cx, ids.hint).set_text(cx, &card.hint_text);
         self.ui
-            .button(cx, download_btn)
+            .button(cx, ids.download)
             .set_text(cx, &card.download_button_text);
         self.ui
-            .button(cx, download_btn)
+            .button(cx, ids.download)
             .set_action_enabled(cx, card.download_enabled && extra_allow_download);
-        if let Some(pause) = pause_btn {
+        if let Some(pause) = ids.pause {
             self.ui.button(cx, pause).set_visible(cx, card.can_pause);
             self.ui
                 .button(cx, pause)
                 .set_action_enabled(cx, card.can_pause);
         }
-        if let Some(cancel) = cancel_btn {
+        if let Some(cancel) = ids.cancel {
             self.ui.button(cx, cancel).set_visible(cx, card.can_cancel);
             self.ui
                 .button(cx, cancel)
@@ -1793,6 +1903,22 @@ impl App {
 
     fn paint_provider_settings(&self, cx: &mut Cx, d: &UiState) {
         let draft = &d.ctrl.provider_draft;
+        let saved_count = d.ctrl.settings.providers.profiles.len();
+        let current_is_saved = d.ctrl.settings.providers.profile(draft.id.trim()).is_some();
+        let can_switch_profile = saved_count > 1 || (saved_count > 0 && !current_is_saved);
+        self.ui
+            .label(cx, ids!(provider_profile_summary))
+            .set_text(cx, &d.ctrl.provider_profile_summary());
+        self.ui
+            .button(cx, ids!(provider_profile_prev))
+            .set_action_enabled(cx, can_switch_profile);
+        self.ui
+            .button(cx, ids!(provider_profile_next))
+            .set_action_enabled(cx, can_switch_profile);
+        self.ui
+            .button(cx, ids!(provider_delete))
+            .set_action_enabled(cx, current_is_saved);
+
         let url_hint = draft.url_validation_hint().unwrap_or_else(|| {
             "默认 Magpie 本地网关为 http://127.0.0.1:3425/v1（允许空 API Key），也可填写任意 OpenAI 兼容网关。".to_owned()
         });
@@ -1885,42 +2011,19 @@ impl App {
             .label(cx, ids!(provider_models_summary))
             .set_text(cx, &models_summary);
 
-        let has_models = !draft.discovered_models.is_empty();
-        for (slot, badge_id, local_btn, ext_btn, use_first_btn) in [
-            (
-                CapabilitySlot::PromptEnhancement,
-                ids!(slot_enhance_badge),
-                ids!(slot_enhance_local),
-                ids!(slot_enhance_external),
-                ids!(slot_enhance_use_first),
-            ),
-            (
-                CapabilitySlot::Asr,
-                ids!(slot_asr_badge),
-                ids!(slot_asr_local),
-                ids!(slot_asr_external),
-                ids!(slot_asr_use_first),
-            ),
-            (
-                CapabilitySlot::Tts,
-                ids!(slot_tts_badge),
-                ids!(slot_tts_local),
-                ids!(slot_tts_external),
-                ids!(slot_tts_use_first),
-            ),
-            (
-                CapabilitySlot::Translation,
-                ids!(slot_translation_badge),
-                ids!(slot_translation_local),
-                ids!(slot_translation_external),
-                ids!(slot_translation_use_first),
-            ),
-        ] {
-            let ext = d.ctrl.is_slot_external(slot);
+        let any_models = !draft.discovered_models.is_empty()
+            || d.ctrl
+                .settings
+                .providers
+                .profiles
+                .iter()
+                .any(|p| !p.discovered_models.is_empty());
+        for row in slot_rows() {
+            let ext = d.ctrl.is_slot_external(row.slot);
             self.ui
-                .label(cx, badge_id)
-                .set_text(cx, &d.ctrl.slot_badge(slot));
-            self.ui.button(cx, local_btn).set_text(
+                .label(cx, row.badge)
+                .set_text(cx, &d.ctrl.slot_badge(row.slot));
+            self.ui.button(cx, row.local).set_text(
                 cx,
                 if ext {
                     "本地模型"
@@ -1928,7 +2031,7 @@ impl App {
                     "● 本地模型"
                 },
             );
-            self.ui.button(cx, ext_btn).set_text(
+            self.ui.button(cx, row.external).set_text(
                 cx,
                 if ext {
                     "● 外部网关"
@@ -1937,8 +2040,14 @@ impl App {
                 },
             );
             self.ui
-                .button(cx, use_first_btn)
-                .set_action_enabled(cx, has_models);
+                .button(cx, row.provider)
+                .set_text(cx, &d.ctrl.slot_provider_label(row.slot));
+            self.ui
+                .button(cx, row.provider)
+                .set_action_enabled(cx, saved_count > 1);
+            self.ui
+                .button(cx, row.use_first)
+                .set_action_enabled(cx, any_models);
         }
 
         let slot_status = if d.ctrl.slot_feedback.is_empty() {

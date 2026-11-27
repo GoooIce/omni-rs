@@ -17,14 +17,14 @@ cpu = ["burn/ndarray", "omni-r2t2/cpu", "omni-minicpm-v/cpu"]
 # Prompt-rewrite backend on local MiniCPM-V checkpoints (see
 # docs/qwen-image-rewrite.md). Without it, `--rewrite` reports a clear
 # "no backend" error. The 1B observation loader uses the same crate either way.
-rewrite = []
+rewrite = ["dep:omni-hub", "dep:base64"]
 
 [dependencies]
 omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
 omni-kernel = { path = "../omni-kernel", default-features = false }
 omni-minicpm-v = { path = "../minicpm-v", default-features = false }
-omni-hub = { path = "../omni-hub", default-features = false }
-base64 = "0.22"
+omni-hub = { path = "../omni-hub", default-features = false, optional = true }
+base64 = { version = "0.22", optional = true }
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"], optional = true }

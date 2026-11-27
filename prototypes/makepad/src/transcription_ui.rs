@@ -1,11 +1,33 @@
 use crate::protocol::{self, Update};
-use crate::{ActionButtonState, App};
+use crate::{engine, model_location, ActionButtonState, App};
 use makepad_widgets::*;
 
-#[cfg(target_arch = "wasm32")]
-use crate::web_bridge;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{engine, model_location};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalAsrAction {
+    Transcribe,
+    Microphone,
+}
+
+impl ExternalAsrAction {
+    fn as_command(self) -> &'static str {
+        match self {
+            Self::Transcribe => "transcribe",
+            Self::Microphone => "microphone",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TranscriptionControls {
+    busy: bool,
+    loading: bool,
+    effective_ready: bool,
+    transcript_empty: bool,
+    stopping: bool,
+    inference_busy: bool,
+    external: bool,
+    uploading: bool,
+}
 
 #[derive(Default)]
 pub struct State {
@@ -17,36 +39,23 @@ pub struct State {
     stopping: bool,
     mode: usize,
     language_choice: String,
-    controls: Option<(bool, bool, bool, bool, bool, bool, bool, bool)>,
+    controls: Option<TranscriptionControls>,
     directory: String,
-    #[cfg(not(target_arch = "wasm32"))]
     engine: Option<engine::Engine>,
-    #[cfg(not(target_arch = "wasm32"))]
     model_dialog: Option<crate::desktop_runtime::Dialog>,
-    #[cfg(not(target_arch = "wasm32"))]
     needs_directory: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     pending_model_load: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     picking_model: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     picking_audio: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     remember_model: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     settings_path: Option<std::path::PathBuf>,
-    #[cfg(not(target_arch = "wasm32"))]
     finish_recording: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    #[cfg(not(target_arch = "wasm32"))]
     external_uploading: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     external_error: Option<String>,
-    #[cfg(not(target_arch = "wasm32"))]
-    last_external_action: Option<&'static str>,
+    last_external_action: Option<ExternalAsrAction>,
 }
 
 impl State {
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn transcript(&self) -> &str {
         &self.transcript
     }
@@ -55,20 +64,17 @@ impl State {
         self.busy
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn choosing_model(&self) -> bool {
         self.picking_model
     }
 }
 
 impl App {
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn transcription_directory(&self) -> Option<std::path::PathBuf> {
         (!self.transcription.directory.is_empty())
             .then(|| std::path::PathBuf::from(&self.transcription.directory))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn apply_downloaded_asr_directory(&mut self, cx: &mut Cx, dir: &std::path::Path) {
         self.transcription.directory = dir.to_string_lossy().into_owned();
         self.ui
@@ -86,7 +92,7 @@ impl App {
             self.start_model_load(cx);
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
+
     pub fn open_transcription(&mut self, cx: &mut Cx, root: &std::path::Path) {
         self.transcription.settings_path = model_location::settings_path();
         let directory =
@@ -129,7 +135,6 @@ impl App {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_asr_provider_changed(&mut self, cx: &mut Cx) {
         self.transcription.controls = None;
         self.transcription.external_error = None;
@@ -159,31 +164,6 @@ impl App {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub fn open_transcription(&mut self, cx: &mut Cx) {
-        self.transcription.mode = 1;
-        self.transcription.directory = "/models/web/manifest.json".to_owned();
-        self.ui
-            .button(cx, ids!(speed_balanced))
-            .set_visible(cx, false);
-        self.ui
-            .text_input(cx, ids!(model_path))
-            .set_text(cx, &self.transcription.directory);
-        self.set_audio_path_text(cx, "/artifacts/Confucius4-R2T2-upstream/resources/test.wav");
-        self.ui
-            .label(cx, ids!(backend))
-            .set_text(cx, "WebGPU · 浏览器推理");
-        self.ui.button(cx, ids!(sample)).set_text(cx, "选择音频");
-        self.ui
-            .button(cx, ids!(choose_audio))
-            .set_visible(cx, false);
-        self.refresh_audio_file(cx);
-        self.transcription.language_choice = "自动".to_owned();
-        self.refresh_language_choices(cx);
-        self.refresh_speed_choices(cx);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn resume_transcription_model(&mut self, cx: &mut Cx) {
         if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
             return;
@@ -199,7 +179,6 @@ impl App {
         if !self.transcription.busy || self.transcription.stopping {
             return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
         if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr)
             && self.transcription.microphone
             && !self.transcription.external_uploading
@@ -217,62 +196,34 @@ impl App {
         self.status(cx, "正在打断识别 · 保留已确认文字…");
     }
 
-    pub fn poll_transcription(&mut self, cx: &mut Cx, event: &Event) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = event;
-            let updates: Vec<_> = self
-                .transcription
-                .engine
-                .as_ref()
-                .map(|engine| engine.updates.try_iter().collect())
-                .unwrap_or_default();
-            for update in updates {
-                self.apply_update(cx, update);
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        if let Event::ToWasmMsg(message) = event {
-            use makepad_widgets::makepad_platform::makepad_wasm_bridge::ToWasm;
-            if message.id == web_bridge::ToWasmUpdate::live_id() {
-                let message = web_bridge::ToWasmUpdate::read_to_wasm(&mut message.as_ref());
-                match serde_json::from_str::<Update>(&message.json) {
-                    Ok(update) if update.kind == "file" => {
-                        self.set_audio_path_text(cx, &update.text);
-                        self.refresh_audio_file(cx);
-                    }
-                    Ok(update) => self.apply_update(cx, update),
-                    Err(error) => self.apply_update(
-                        cx,
-                        Update::status("error", format!("消息解析失败：{error}")),
-                    ),
-                }
-            }
+    pub fn poll_transcription(&mut self, cx: &mut Cx, _event: &Event) {
+        let updates: Vec<_> = self
+            .transcription
+            .engine
+            .as_ref()
+            .map(|engine| engine.updates.try_iter().collect())
+            .unwrap_or_default();
+        for update in updates {
+            self.apply_update(cx, update);
         }
     }
 
     pub fn refresh_transcription_controls(&mut self, cx: &mut Cx) {
         let busy = self.transcription.busy || self.inference_busy();
-        #[cfg(not(target_arch = "wasm32"))]
         let external = self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
-        #[cfg(target_arch = "wasm32")]
-        let external = false;
-        #[cfg(not(target_arch = "wasm32"))]
         let uploading = self.transcription.external_uploading;
-        #[cfg(target_arch = "wasm32")]
-        let uploading = false;
 
         let effective_ready = external || self.transcription.ready;
-        let state = (
-            self.transcription.busy,
-            self.transcription.loading,
+        let state = TranscriptionControls {
+            busy: self.transcription.busy,
+            loading: self.transcription.loading,
             effective_ready,
-            self.transcription.transcript.is_empty(),
-            self.transcription.stopping,
-            self.inference_busy(),
+            transcript_empty: self.transcription.transcript.is_empty(),
+            stopping: self.transcription.stopping,
+            inference_busy: self.inference_busy(),
             external,
             uploading,
-        );
+        };
         if self.transcription.controls == Some(state) {
             return;
         }
@@ -280,15 +231,12 @@ impl App {
         self.ui
             .button(cx, ids!(load))
             .set_action_enabled(cx, !busy && !external);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.ui
-                .button(cx, ids!(choose_model))
-                .set_action_enabled(cx, !busy && !external);
-            self.ui
-                .button(cx, ids!(retry_model))
-                .set_action_enabled(cx, !busy && !external);
-        }
+        self.ui
+            .button(cx, ids!(choose_model))
+            .set_action_enabled(cx, !busy && !external);
+        self.ui
+            .button(cx, ids!(retry_model))
+            .set_action_enabled(cx, !busy && !external);
         self.ui
             .button(cx, ids!(transcribe))
             .set_action_enabled(cx, effective_ready && !busy);
@@ -405,18 +353,11 @@ impl App {
     }
 
     fn refresh_speed_choices(&self, cx: &mut Cx) {
-        #[cfg(not(target_arch = "wasm32"))]
         let choices = [
             (ids!(speed_balanced), 0usize),
             (ids!(speed_low), 1),
             (ids!(speed_fast), 2),
             (ids!(speed_save), 3),
-        ];
-        #[cfg(target_arch = "wasm32")]
-        let choices = [
-            (ids!(speed_low), 0usize),
-            (ids!(speed_fast), 1),
-            (ids!(speed_save), 2),
         ];
         for (id, mode) in choices {
             let name = protocol::mode_label(mode);
@@ -427,14 +368,11 @@ impl App {
             };
             self.ui.button(cx, id).set_text(cx, &label);
         }
-        #[cfg(not(target_arch = "wasm32"))]
         let speed_text = if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
             "外部 ASR 仅支持文件整段与录音后批处理转写，本地低延迟流式速度档位已禁用。".to_owned()
         } else {
             protocol::mode_hint(self.transcription.mode)
         };
-        #[cfg(target_arch = "wasm32")]
-        let speed_text = protocol::mode_hint(self.transcription.mode);
         self.ui
             .label(cx, ids!(speed_hint))
             .set_text(cx, &speed_text);
@@ -503,7 +441,6 @@ impl App {
             .set_text(cx, &title);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn set_model_progress(&self, cx: &mut Cx, progress: f64) {
         crate::engine_ui::set_progress(
             &self.ui,
@@ -514,7 +451,6 @@ impl App {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn start_model_load(&mut self, cx: &mut Cx) {
         if self.runtime.busy() {
             self.transcription.pending_model_load = true;
@@ -536,7 +472,6 @@ impl App {
         self.submit_transcription(cx, "load");
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn choose_audio(&mut self, cx: &mut Cx) {
         if self.transcription.picking_model || self.transcription.picking_audio {
             return;
@@ -557,7 +492,6 @@ impl App {
         cx.open_select_file_dialog(dialog);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn choose_model(&mut self, cx: &mut Cx) {
         if self.transcription.picking_model || self.transcription.picking_audio {
             return;
@@ -581,11 +515,7 @@ impl App {
     fn apply_update(&mut self, cx: &mut Cx, update: Update) {
         match update.kind.as_str() {
             "ready" => {
-                #[cfg(not(target_arch = "wasm32"))]
-                let asr_visible = self.workspace.language();
-                #[cfg(target_arch = "wasm32")]
-                let asr_visible = true;
-                if asr_visible && !update.backend.is_empty() {
+                if self.workspace.language() && !update.backend.is_empty() {
                     self.ui
                         .label(cx, ids!(backend))
                         .set_text(cx, &update.backend);
@@ -594,43 +524,35 @@ impl App {
                 self.transcription.busy = false;
                 self.transcription.loading = false;
                 self.status(cx, &update.message);
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.clear_panel_load_error(
-                        cx,
-                        omni_hub::catalog::CheckpointId::Confucius4R2t2,
-                    );
-                    self.ui
-                        .view(cx, ids!(model_progress))
-                        .set_visible(cx, false);
-                    self.ui
-                        .view(cx, ids!(model_recovery))
-                        .set_visible(cx, false);
-                    if self.transcription.remember_model {
-                        self.transcription.remember_model = false;
-                        let path = self.ui.text_input(cx, ids!(model_path)).text();
-                        let result = self
-                            .transcription
-                            .settings_path
-                            .as_deref()
-                            .ok_or_else(|| "找不到用户设置目录".to_owned())
-                            .and_then(|settings| {
-                                model_location::remember(settings, std::path::Path::new(&path))
-                            });
-                        if let Err(error) = result {
-                            self.status(cx, &format!("模型已就绪 · 目录未能保存：{error}"));
-                        }
+                self.clear_panel_load_error(cx, omni_hub::catalog::CheckpointId::Confucius4R2t2);
+                self.ui
+                    .view(cx, ids!(model_progress))
+                    .set_visible(cx, false);
+                self.ui
+                    .view(cx, ids!(model_recovery))
+                    .set_visible(cx, false);
+                if self.transcription.remember_model {
+                    self.transcription.remember_model = false;
+                    let path = self.ui.text_input(cx, ids!(model_path)).text();
+                    let result = self
+                        .transcription
+                        .settings_path
+                        .as_deref()
+                        .ok_or_else(|| "找不到用户设置目录".to_owned())
+                        .and_then(|settings| {
+                            model_location::remember(settings, std::path::Path::new(&path))
+                        });
+                    if let Err(error) = result {
+                        self.status(cx, &format!("模型已就绪 · 目录未能保存：{error}"));
                     }
                 }
             }
             "loading" | "progress" | "notice" => {
                 self.status(cx, &update.message);
-                #[cfg(not(target_arch = "wasm32"))]
                 if update.kind == "loading" {
                     self.set_model_progress(cx, update.progress);
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
             "missing" => {
                 self.transcription.ready = false;
                 self.status(cx, &update.message);
@@ -662,7 +584,7 @@ impl App {
             "event" | "done" => {
                 // Avoid relaying out the full transcript on empty deltas.
                 // Engine messages still preserve every committed delta.
-                if cfg!(target_arch = "wasm32") || self.transcription.transcript != update.text {
+                if self.transcription.transcript != update.text {
                     self.transcription.transcript = update.text;
                     self.ui
                         .text_input(cx, ids!(transcript))
@@ -685,15 +607,12 @@ impl App {
                 if update.kind == "done" {
                     self.transcription.busy = false;
                     self.transcription.stopping = false;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        self.transcription.finish_recording = None;
-                        self.transcription.external_uploading = false;
-                        self.transcription.external_error = None;
-                        self.ui
-                            .view(cx, ids!(asr_external_error))
-                            .set_visible(cx, false);
-                    }
+                    self.transcription.finish_recording = None;
+                    self.transcription.external_uploading = false;
+                    self.transcription.external_error = None;
+                    self.ui
+                        .view(cx, ids!(asr_external_error))
+                        .set_visible(cx, false);
                     if self.transcription.microphone {
                         self.show_input_status(
                             cx,
@@ -735,18 +654,14 @@ impl App {
                     self.show_input_status(cx, "麦克风已关闭");
                 }
                 self.transcription.microphone = false;
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.transcription.finish_recording = None;
-                    self.transcription.external_uploading = false;
-                }
+                self.transcription.finish_recording = None;
+                self.transcription.external_uploading = false;
                 let status_text = if update.kind == "cancelled" {
                     update.message.clone()
                 } else {
                     format!("错误：{}", update.message)
                 };
                 self.status(cx, &status_text);
-                #[cfg(not(target_arch = "wasm32"))]
                 if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
                     if update.kind != "cancelled" {
                         self.transcription.external_error = Some(update.message.clone());
@@ -792,211 +707,186 @@ impl App {
         } else {
             None
         };
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let Some(engine) = &self.transcription.engine else {
-                return;
-            };
-            if command == "stop" {
-                engine.cancel();
-                return;
-            }
-            let request = if command == "load" {
-                engine::Command::Load(path)
-            } else if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
-                let target =
-                    match self.resolve_slot_external(omni_hub::providers::CapabilitySlot::Asr) {
-                        Ok(Some(t)) => t,
-                        Ok(None) => return,
-                        Err(err) => {
-                            self.apply_update(cx, Update::status("error", err));
-                            return;
-                        }
-                    };
-                self.transcription.external_error = None;
-                self.ui
-                    .view(cx, ids!(asr_external_error))
-                    .set_visible(cx, false);
-                if command == "microphone" {
-                    let finish_flag =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    self.transcription.finish_recording = Some(finish_flag.clone());
-                    self.transcription.external_uploading = false;
-                    self.transcription.last_external_action = Some("microphone");
-                    engine::Command::MicrophoneExternal {
-                        context,
-                        language,
-                        target,
-                        finish_recording: finish_flag,
-                    }
-                } else {
-                    self.transcription.last_external_action = Some("transcribe");
-                    engine::Command::TranscribeExternal {
-                        path: audio,
-                        context,
-                        language,
-                        target,
-                    }
+        let Some(engine) = &self.transcription.engine else {
+            return;
+        };
+        if command == "stop" {
+            engine.cancel();
+            return;
+        }
+        let request = if command == "load" {
+            engine::Command::Load(path)
+        } else if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+            let target = match self.resolve_slot_external(omni_hub::providers::CapabilitySlot::Asr)
+            {
+                Ok(Some(t)) => t,
+                Ok(None) => return,
+                Err(err) => {
+                    self.apply_update(cx, Update::status("error", err));
+                    return;
                 }
-            } else if command == "microphone" {
-                engine::Command::Microphone {
+            };
+            self.transcription.external_error = None;
+            self.ui
+                .view(cx, ids!(asr_external_error))
+                .set_visible(cx, false);
+            if command == "microphone" {
+                let finish_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.transcription.finish_recording = Some(finish_flag.clone());
+                self.transcription.external_uploading = false;
+                self.transcription.last_external_action = Some(ExternalAsrAction::Microphone);
+                engine::Command::MicrophoneExternal {
                     context,
-                    mode: self.transcription.mode,
                     language,
+                    target,
+                    finish_recording: finish_flag,
                 }
             } else {
-                engine::Command::Transcribe {
+                self.transcription.last_external_action = Some(ExternalAsrAction::Transcribe);
+                engine::Command::TranscribeExternal {
                     path: audio,
                     context,
-                    mode: self.transcription.mode,
                     language,
+                    target,
                 }
-            };
-            if let Err(error) = engine.submit(request) {
-                self.apply_update(
-                    cx,
-                    Update::status("error", format!("推理线程不可用：{error}")),
-                );
             }
+        } else if command == "microphone" {
+            engine::Command::Microphone {
+                context,
+                mode: self.transcription.mode,
+                language,
+            }
+        } else {
+            engine::Command::Transcribe {
+                path: audio,
+                context,
+                mode: self.transcription.mode,
+                language,
+            }
+        };
+        if let Err(error) = engine.submit(request) {
+            self.apply_update(
+                cx,
+                Update::status("error", format!("推理线程不可用：{error}")),
+            );
         }
-        #[cfg(target_arch = "wasm32")]
-        cx.os.from_wasm(web_bridge::FromWasmCommand {
-            json: serde_json::json!({
-                "type": command, "url": path, "audio": audio, "context": context,
-                "config": protocol::decode_options(self.transcription.mode),
-                "language": language,
-            })
-            .to_string(),
-        });
     }
 
     pub fn handle_transcription_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            for action in actions {
-                if !self.transcription.picking_model && !self.transcription.picking_audio {
-                    continue;
-                }
-                match action.downcast_ref::<FileDialogAction>() {
-                    Some(FileDialogAction::FileSelected { paths, .. })
-                        if self.transcription.picking_audio =>
-                    {
-                        self.transcription.model_dialog.take();
-                        self.transcription.picking_audio = false;
-                        self.transcription.busy = false;
-                        if let Some(path) = paths.first() {
-                            self.set_audio_path_text(cx, &path.to_string_lossy());
-                            self.refresh_audio_file(cx);
-                            self.status(
-                                cx,
-                                &format!(
-                                    "已选择 {} · 可以开始转写",
-                                    self.ui.label(cx, ids!(audio_file)).text()
-                                ),
-                            );
-                        }
-                    }
-                    Some(FileDialogAction::FileCancelled { .. })
-                        if self.transcription.picking_audio =>
-                    {
-                        self.transcription.model_dialog.take();
-                        self.transcription.picking_audio = false;
-                        self.transcription.busy = false;
-                    }
-                    Some(FileDialogAction::FolderSelected(path))
-                        if self.transcription.picking_model =>
-                    {
-                        self.transcription.model_dialog.take();
-                        self.transcription.picking_model = false;
-                        let directory = model_location::selected_directory(path);
-                        self.transcription.directory = directory.to_string_lossy().into_owned();
-                        self.ui
-                            .text_input(cx, ids!(model_path))
-                            .set_text(cx, &self.transcription.directory);
-                        self.transcription.remember_model = true;
-                        self.transcription.ready = false;
-                        self.transcription.busy = false;
-                        self.transcription.loading = false;
-                        self.transcription.pending_model_load = true;
-                        self.sync_checkpoint_directory(
+        for action in actions {
+            if !self.transcription.picking_model && !self.transcription.picking_audio {
+                continue;
+            }
+            match action.downcast_ref::<FileDialogAction>() {
+                Some(FileDialogAction::FileSelected { paths, .. })
+                    if self.transcription.picking_audio =>
+                {
+                    self.transcription.model_dialog.take();
+                    self.transcription.picking_audio = false;
+                    self.transcription.busy = false;
+                    if let Some(path) = paths.first() {
+                        self.set_audio_path_text(cx, &path.to_string_lossy());
+                        self.refresh_audio_file(cx);
+                        self.status(
                             cx,
-                            omni_hub::catalog::CheckpointId::Confucius4R2t2,
-                            directory,
+                            &format!(
+                                "已选择 {} · 可以开始转写",
+                                self.ui.label(cx, ids!(audio_file)).text()
+                            ),
                         );
-                        if self.workspace.language() && !self.inference_busy() {
-                            self.start_model_load(cx);
-                        }
                     }
-                    Some(FileDialogAction::FolderCancelled) if self.transcription.picking_model => {
-                        self.transcription.model_dialog.take();
-                        self.transcription.picking_model = false;
-                        self.transcription.busy = false;
-                        self.transcription.loading = false;
-                        self.status(cx, "尚未选择模型 · 选择模型目录后自动加载");
-                    }
-                    _ => (),
                 }
+                Some(FileDialogAction::FileCancelled { .. })
+                    if self.transcription.picking_audio =>
+                {
+                    self.transcription.model_dialog.take();
+                    self.transcription.picking_audio = false;
+                    self.transcription.busy = false;
+                }
+                Some(FileDialogAction::FolderSelected(path))
+                    if self.transcription.picking_model =>
+                {
+                    self.transcription.model_dialog.take();
+                    self.transcription.picking_model = false;
+                    let directory = model_location::selected_directory(path);
+                    self.transcription.directory = directory.to_string_lossy().into_owned();
+                    self.ui
+                        .text_input(cx, ids!(model_path))
+                        .set_text(cx, &self.transcription.directory);
+                    self.transcription.remember_model = true;
+                    self.transcription.ready = false;
+                    self.transcription.busy = false;
+                    self.transcription.loading = false;
+                    self.transcription.pending_model_load = true;
+                    self.sync_checkpoint_directory(
+                        cx,
+                        omni_hub::catalog::CheckpointId::Confucius4R2t2,
+                        directory,
+                    );
+                    if self.workspace.language() && !self.inference_busy() {
+                        self.start_model_load(cx);
+                    }
+                }
+                Some(FileDialogAction::FolderCancelled) if self.transcription.picking_model => {
+                    self.transcription.model_dialog.take();
+                    self.transcription.picking_model = false;
+                    self.transcription.busy = false;
+                    self.transcription.loading = false;
+                    self.status(cx, "尚未选择模型 · 选择模型目录后自动加载");
+                }
+                _ => (),
             }
-            if !self.workspace.language() {
-                return;
-            }
-            if self.ui.button(cx, ids!(choose_audio)).clicked(actions) && !self.transcription.busy {
-                self.choose_audio(cx);
-            }
-            if self.ui.button(cx, ids!(choose_model)).clicked(actions) && !self.transcription.busy {
-                self.choose_model(cx);
-            }
-            if self.ui.button(cx, ids!(retry_model)).clicked(actions) && !self.transcription.busy {
-                self.start_model_load(cx);
-            }
-            if self
-                .ui
-                .button(cx, ids!(asr_ext_switch_local))
-                .clicked(actions)
-                && !self.transcription.busy
-            {
-                self.switch_slot_to_local(cx, omni_hub::providers::CapabilitySlot::Asr);
-                return;
-            }
-            if self
-                .ui
-                .button(cx, ids!(asr_ext_open_settings))
-                .clicked(actions)
-            {
-                self.open_providers_settings(cx);
-                return;
-            }
-            if self.ui.button(cx, ids!(asr_ext_retry)).clicked(actions)
-                && !self.transcription.busy
-                && !self.inference_busy()
-            {
-                let action = self
-                    .transcription
-                    .last_external_action
-                    .unwrap_or("transcribe");
-                self.transcription.busy = true;
-                self.transcription.microphone = action == "microphone";
-                self.transcription.stopping = false;
-                self.transcription.transcript.clear();
-                self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
-                self.submit_transcription(cx, action);
-                return;
-            }
+        }
+        if !self.workspace.language() {
+            return;
+        }
+        if self.ui.button(cx, ids!(choose_audio)).clicked(actions) && !self.transcription.busy {
+            self.choose_audio(cx);
+        }
+        if self.ui.button(cx, ids!(choose_model)).clicked(actions) && !self.transcription.busy {
+            self.choose_model(cx);
+        }
+        if self.ui.button(cx, ids!(retry_model)).clicked(actions) && !self.transcription.busy {
+            self.start_model_load(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(asr_ext_switch_local))
+            .clicked(actions)
+            && !self.transcription.busy
+        {
+            self.switch_slot_to_local(cx, omni_hub::providers::CapabilitySlot::Asr);
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(asr_ext_open_settings))
+            .clicked(actions)
+        {
+            self.open_providers_settings(cx);
+            return;
+        }
+        if self.ui.button(cx, ids!(asr_ext_retry)).clicked(actions)
+            && !self.transcription.busy
+            && !self.inference_busy()
+        {
+            let action = self
+                .transcription
+                .last_external_action
+                .unwrap_or(ExternalAsrAction::Transcribe);
+            self.transcription.busy = true;
+            self.transcription.microphone = action == ExternalAsrAction::Microphone;
+            self.transcription.stopping = false;
+            self.transcription.transcript.clear();
+            self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
+            self.submit_transcription(cx, action.as_command());
+            return;
         }
         let speed_choice = [
             (ids!(speed_balanced), 0usize),
-            (
-                ids!(speed_low),
-                if cfg!(target_arch = "wasm32") { 0 } else { 1 },
-            ),
-            (
-                ids!(speed_fast),
-                if cfg!(target_arch = "wasm32") { 1 } else { 2 },
-            ),
-            (
-                ids!(speed_save),
-                if cfg!(target_arch = "wasm32") { 2 } else { 3 },
-            ),
+            (ids!(speed_low), 1),
+            (ids!(speed_fast), 2),
+            (ids!(speed_save), 3),
         ];
         for (id, mode) in speed_choice {
             if self.ui.button(cx, id).clicked(actions)
@@ -1017,14 +907,7 @@ impl App {
             );
         }
         if self.ui.button(cx, ids!(copy)).clicked(actions) {
-            #[cfg(not(target_arch = "wasm32"))]
             cx.copy_to_clipboard(&self.transcription.transcript);
-            // The pinned upstream Web backend leaves CopyToClipboard unhandled.
-            #[cfg(target_arch = "wasm32")]
-            cx.os.from_wasm(web_bridge::FromWasmCommand {
-                json: serde_json::json!({"type": "copy", "text": self.transcription.transcript})
-                    .to_string(),
-            });
         }
         if self.ui.button(cx, ids!(stop)).clicked(actions) {
             self.cancel_transcription(cx);
@@ -1073,34 +956,18 @@ impl App {
             }
         }
         if self.ui.button(cx, ids!(sample)).clicked(actions) && !self.transcription.busy {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../artifacts/Confucius4-R2T2-upstream/resources/test.wav");
-                let sample = std::fs::canonicalize(&sample).unwrap_or(sample);
-                self.set_audio_path_text(cx, &sample.to_string_lossy());
-                self.refresh_audio_file(cx);
-                self.status(cx, "已填入官方示例 · 可以开始转写");
-            }
-            #[cfg(target_arch = "wasm32")]
-            self.submit_transcription(cx, "choose");
-        }
-        #[cfg(target_arch = "wasm32")]
-        if self.ui.button(cx, ids!(load)).clicked(actions) && !self.transcription.busy {
-            self.transcription.busy = true;
-            self.transcription.loading = true;
-            self.transcription.ready = false;
-            self.status(cx, "正在载入模型…");
-            self.submit_transcription(cx, "load");
+            let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../artifacts/Confucius4-R2T2-upstream/resources/test.wav");
+            let sample = std::fs::canonicalize(&sample).unwrap_or(sample);
+            self.set_audio_path_text(cx, &sample.to_string_lossy());
+            self.refresh_audio_file(cx);
+            self.status(cx, "已填入官方示例 · 可以开始转写");
         }
         if self.ui.button(cx, ids!(transcribe)).clicked(actions)
             && !self.transcription.busy
             && !self.inference_busy()
         {
-            #[cfg(not(target_arch = "wasm32"))]
             let external = self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
-            #[cfg(target_arch = "wasm32")]
-            let external = false;
             if !external && !self.transcription.ready {
                 self.status(cx, "请先载入模型");
                 return;
@@ -1123,11 +990,8 @@ impl App {
             );
             self.submit_transcription(cx, "transcribe");
         }
-        #[cfg(not(target_arch = "wasm32"))]
         let mic_ready = self.transcription.ready
             || self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
-        #[cfg(target_arch = "wasm32")]
-        let mic_ready = self.transcription.ready;
         if self.ui.button(cx, ids!(microphone)).clicked(actions)
             && !self.transcription.busy
             && !self.inference_busy()
@@ -1144,10 +1008,7 @@ impl App {
             self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
             self.set_transcript_language(cx, "");
             self.show_input_status(cx, "正在打开默认输入设备…");
-            #[cfg(not(target_arch = "wasm32"))]
             let ext_mic = self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
-            #[cfg(target_arch = "wasm32")]
-            let ext_mic = false;
             self.status(
                 cx,
                 if ext_mic {

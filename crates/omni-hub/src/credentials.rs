@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -197,77 +196,19 @@ impl<E: EnvLookup> FileCredentialStore<E> {
     }
 
     fn write_map(&self, map: &BTreeMap<String, String>) -> Result<(), CredentialError> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).map_err(|e| CredentialError::Write {
-                path: self.path.clone(),
-                message: e.to_string(),
-            })?;
-        }
-        let encoded = serde_json::to_vec_pretty(map).map_err(|e| CredentialError::Write {
+        let mut encoded = serde_json::to_vec_pretty(map).map_err(|e| CredentialError::Write {
             path: self.path.clone(),
             message: e.to_string(),
         })?;
+        encoded.push(b'\n');
 
-        let tmp = self.path.with_extension(format!(
-            "{}.{}.tmp",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-
-        let write_result = (|| -> std::io::Result<()> {
-            let mut file = open_restricted_file(&tmp)?;
-            file.write_all(&encoded)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            enforce_restricted_permissions(&tmp)?;
-            fs::rename(&tmp, &self.path)?;
-            enforce_restricted_permissions(&self.path)?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-
-        write_result.map_err(|e| CredentialError::Write {
-            path: self.path.clone(),
-            message: e.to_string(),
+        crate::atomic_file::write_atomic(&self.path, &encoded, true).map_err(|e| {
+            CredentialError::Write {
+                path: self.path.clone(),
+                message: e.to_string(),
+            }
         })
     }
-}
-
-#[cfg(unix)]
-fn open_restricted_file(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_restricted_file(path: &Path) -> std::io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-}
-
-#[cfg(unix)]
-fn enforce_restricted_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn enforce_restricted_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 impl<E: EnvLookup> CredentialStore for FileCredentialStore<E> {

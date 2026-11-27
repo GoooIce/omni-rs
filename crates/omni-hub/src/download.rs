@@ -788,32 +788,44 @@ fn encode_repo_path(path: &str) -> String {
         .join("/")
 }
 
-fn list_remote_files(
-    agent: &ureq::Agent,
-    desc: &CheckpointDescriptor,
-    route: &ResolvedRoute,
-    token: Option<&SecretString>,
+struct TransferContext<'a> {
+    agent: ureq::Agent,
+    route: &'a ResolvedRoute,
+    token: Option<&'a SecretString>,
     proxy_configured: bool,
-    secrets: &[SecretString],
+    secrets: &'a [SecretString],
+}
+
+struct TransferState<'a> {
+    root: &'a Path,
+    control: &'a DownloadControl,
+    progress: &'a SharedProgress,
+    active_parts: &'a Mutex<Vec<PathBuf>>,
+    emit: &'a (dyn Fn(DownloadEvent) + Send + Sync),
+}
+
+fn list_remote_files(
+    ctx: &TransferContext<'_>,
+    desc: &CheckpointDescriptor,
 ) -> Result<Vec<RemoteFile>, DownloadError> {
-    let encoded_rev = utf8_percent_encode(&route.revision, PATH_SEGMENT_ENCODE_SET).to_string();
-    let list_url = match route.source {
+    let encoded_rev = utf8_percent_encode(&ctx.route.revision, PATH_SEGMENT_ENCODE_SET).to_string();
+    let list_url = match ctx.route.source {
         DownloadSource::ModelScope => format!(
             "{}/api/v1/models/{}/repo/files?Revision={}&Recursive=true",
-            route.base_url, route.repository, encoded_rev
+            ctx.route.base_url, ctx.route.repository, encoded_rev
         ),
         DownloadSource::HuggingFace => format!(
             "{}/api/models/{}/revision/{}?blobs=true",
-            route.base_url, route.repository, encoded_rev
+            ctx.route.base_url, ctx.route.repository, encoded_rev
         ),
     };
 
-    let resp = apply_common_headers(agent.get(&list_url), token)
+    let resp = apply_common_headers(ctx.agent.get(&list_url), ctx.token)
         .call()
-        .map_err(|e| classify_ureq_error(e, route.source, proxy_configured, secrets))?;
+        .map_err(|e| classify_ureq_error(e, ctx.route.source, ctx.proxy_configured, ctx.secrets))?;
 
     let mut files = Vec::new();
-    match route.source {
+    match ctx.route.source {
         DownloadSource::ModelScope => {
             #[derive(Deserialize)]
             struct MsResp {
@@ -841,16 +853,16 @@ fn list_remote_files(
                 sha256: Option<String>,
             }
             let parsed: MsResp = resp.into_json().map_err(|e| DownloadError::Network {
-                detail: redact_secrets(&format!("魔搭目录解析失败：{e}"), secrets),
-                proxy_configured,
+                detail: redact_secrets(&format!("魔搭目录解析失败：{e}"), ctx.secrets),
+                proxy_configured: ctx.proxy_configured,
             })?;
             if !parsed.success {
                 return Err(DownloadError::Network {
                     detail: redact_secrets(
                         parsed.message.as_deref().unwrap_or("魔搭目录接口返回失败"),
-                        secrets,
+                        ctx.secrets,
                     ),
-                    proxy_configured,
+                    proxy_configured: ctx.proxy_configured,
                 });
             }
             if let Some(data) = parsed.data {
@@ -885,18 +897,21 @@ fn list_remote_files(
                 size: Option<u64>,
             }
             let parsed: HfResp = resp.into_json().map_err(|e| DownloadError::Network {
-                detail: redact_secrets(&format!("Hugging Face 目录解析失败：{e}"), secrets),
-                proxy_configured,
+                detail: redact_secrets(&format!("Hugging Face 目录解析失败：{e}"), ctx.secrets),
+                proxy_configured: ctx.proxy_configured,
             })?;
             if let Some(sha) = &parsed.sha {
                 // Only assert exact SHA match when pinned to a 40-char commit hash.
-                if route.revision.len() == 40
-                    && route.revision.chars().all(|c| c.is_ascii_hexdigit())
-                    && sha != &route.revision
+                if ctx.route.revision.len() == 40
+                    && ctx.route.revision.chars().all(|c| c.is_ascii_hexdigit())
+                    && sha != &ctx.route.revision
                 {
                     return Err(DownloadError::Network {
-                        detail: format!("远端修订版本不匹配：预期 {}，收到 {sha}", route.revision),
-                        proxy_configured,
+                        detail: format!(
+                            "远端修订版本不匹配：预期 {}，收到 {sha}",
+                            ctx.route.revision
+                        ),
+                        proxy_configured: ctx.proxy_configured,
                     });
                 }
             }
@@ -1076,22 +1091,13 @@ impl SharedProgress {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn download_single_file(
-    agent: &ureq::Agent,
-    route: &ResolvedRoute,
-    root: &Path,
+    ctx: &TransferContext<'_>,
+    state: &TransferState<'_>,
     file: &RemoteFile,
-    token: Option<&SecretString>,
-    proxy_configured: bool,
-    secrets: &[SecretString],
-    control: &DownloadControl,
-    progress: &SharedProgress,
-    active_parts: &Mutex<Vec<PathBuf>>,
-    emit: &(dyn Fn(DownloadEvent) + Send + Sync),
 ) -> Result<String, DownloadError> {
-    control.check()?;
-    let destination = root.join(&file.path);
+    state.control.check()?;
+    let destination = state.root.join(&file.path);
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|e| DownloadError::Io {
             detail: e.to_string(),
@@ -1107,11 +1113,15 @@ fn download_single_file(
         if file.size == 0 || existing_len == file.size {
             let actual = file_sha256(&destination)?;
             if file.sha256.as_deref().is_none_or(|exp| exp == actual) {
-                progress
+                state
+                    .progress
                     .downloaded_bytes
                     .fetch_add(existing_len, Ordering::AcqRel);
-                progress.completed_files.fetch_add(1, Ordering::AcqRel);
-                progress.emit(&file.path, true, emit);
+                state
+                    .progress
+                    .completed_files
+                    .fetch_add(1, Ordering::AcqRel);
+                state.progress.emit(&file.path, true, state.emit);
                 return Ok(actual);
             }
         }
@@ -1119,13 +1129,13 @@ fn download_single_file(
 
     let part_path = part_path_for(&destination);
     {
-        let mut parts = active_parts.lock().unwrap();
+        let mut parts = state.active_parts.lock().unwrap();
         if !parts.contains(&part_path) {
             parts.push(part_path.clone());
         }
     }
 
-    let url = file_resolve_url(route, &file.path);
+    let url = file_resolve_url(ctx.route, &file.path);
     let mut initial_offset = if part_path.exists() {
         fs::metadata(&part_path)
             .map_err(|e| DownloadError::Io {
@@ -1144,14 +1154,15 @@ fn download_single_file(
         });
     }
     if initial_offset > 0 {
-        progress
+        state
+            .progress
             .downloaded_bytes
             .fetch_add(initial_offset, Ordering::AcqRel);
-        progress.emit(&file.path, true, emit);
+        state.progress.emit(&file.path, true, state.emit);
     }
 
     for attempt in 0..MAX_ATTEMPTS {
-        control.check()?;
+        state.control.check()?;
         let mut offset = if part_path.exists() {
             fs::metadata(&part_path)
                 .map_err(|e| DownloadError::Io {
@@ -1165,7 +1176,7 @@ fn download_single_file(
             break;
         }
 
-        let mut req = apply_common_headers(agent.get(&url), token);
+        let mut req = apply_common_headers(ctx.agent.get(&url), ctx.token);
         if offset > 0 {
             req = req.set("Range", &format!("bytes={offset}-"));
         }
@@ -1173,7 +1184,8 @@ fn download_single_file(
         let resp = match req.call() {
             Ok(resp) => resp,
             Err(err) => {
-                let classified = classify_ureq_error(err, route.source, proxy_configured, secrets);
+                let classified =
+                    classify_ureq_error(err, ctx.route.source, ctx.proxy_configured, ctx.secrets);
                 if matches!(classified.category(), ErrorCategory::Network)
                     && attempt + 1 < MAX_ATTEMPTS
                 {
@@ -1197,14 +1209,15 @@ fn download_single_file(
                         "断点续传范围异常（{}）：收到 Content-Range={content_range}",
                         file.path
                     ),
-                    proxy_configured,
+                    proxy_configured: ctx.proxy_configured,
                 });
             }
             true
         } else {
             if offset > 0 {
                 // Server ignored Range and returned 200 full body; reset offset cleanly.
-                progress
+                state
+                    .progress
                     .downloaded_bytes
                     .fetch_sub(offset, Ordering::AcqRel);
                 offset = 0;
@@ -1238,7 +1251,7 @@ fn download_single_file(
         let mut buf = [0u8; CHUNK_SIZE];
         let mut io_truncated = false;
         loop {
-            if let Err(ctrl_err) = control.check() {
+            if let Err(ctrl_err) = state.control.check() {
                 let _ = out.flush();
                 if matches!(ctrl_err, DownloadError::Cancelled) {
                     drop(out);
@@ -1253,7 +1266,8 @@ fn download_single_file(
                         detail: e.to_string(),
                     })?;
                     offset += n as u64;
-                    progress
+                    state
+                        .progress
                         .downloaded_bytes
                         .fetch_add(n as u64, Ordering::AcqRel);
                     if let Some(exp) = expected_total
@@ -1266,7 +1280,7 @@ fn download_single_file(
                             part_path,
                         });
                     }
-                    progress.emit(&file.path, false, emit);
+                    state.progress.emit(&file.path, false, state.emit);
                 }
                 Err(_) => {
                     io_truncated = true;
@@ -1301,9 +1315,9 @@ fn download_single_file(
         break;
     }
 
-    control.check()?;
-    emit(DownloadEvent::Verifying {
-        checkpoint: progress.checkpoint,
+    state.control.check()?;
+    (state.emit)(DownloadEvent::Verifying {
+        checkpoint: state.progress.checkpoint,
         file: file.path.clone(),
     });
 
@@ -1336,8 +1350,11 @@ fn download_single_file(
     fs::rename(&part_path, &destination).map_err(|e| DownloadError::Io {
         detail: e.to_string(),
     })?;
-    progress.completed_files.fetch_add(1, Ordering::AcqRel);
-    progress.emit(&file.path, true, emit);
+    state
+        .progress
+        .completed_files
+        .fetch_add(1, Ordering::AcqRel);
+    state.progress.emit(&file.path, true, state.emit);
     Ok(actual_sha)
 }
 
@@ -1372,14 +1389,14 @@ pub fn download_checkpoint(
     let (token, secrets) = resolve_token(store, route.source);
     let proxy_configured = settings.normalized_proxy_url().is_some();
     let agent = build_agent(settings, options)?;
-    let files = list_remote_files(
-        &agent,
-        desc,
-        &route,
-        token.as_ref(),
+    let transfer_ctx = TransferContext {
+        agent,
+        route: &route,
+        token: token.as_ref(),
         proxy_configured,
-        &secrets,
-    )?;
+        secrets: &secrets,
+    };
+    let files = list_remote_files(&transfer_ctx, desc)?;
 
     if files.is_empty() {
         return Err(DownloadError::Network {
@@ -1441,18 +1458,21 @@ pub fn download_checkpoint(
 
     let concurrency = settings.effective_max_concurrency().min(files.len().max(1));
     let queue = Arc::new(Mutex::new(files.into_iter()));
+    let transfer_state = TransferState {
+        root: target_dir,
+        control,
+        progress: &progress,
+        active_parts: &active_parts,
+        emit,
+    };
 
     std::thread::scope(|scope| {
         for _ in 0..concurrency {
             let queue = Arc::clone(&queue);
-            let progress = Arc::clone(&progress);
-            let active_parts = Arc::clone(&active_parts);
             let results = Arc::clone(&results);
             let first_error = Arc::clone(&first_error);
-            let agent = agent.clone();
-            let route_ref = &route;
-            let token_ref = token.as_ref();
-            let secrets_ref = &secrets;
+            let ctx_ref = &transfer_ctx;
+            let state_ref = &transfer_state;
 
             scope.spawn(move || {
                 loop {
@@ -1463,19 +1483,7 @@ pub fn download_checkpoint(
                     let Some(file) = next_file else {
                         break;
                     };
-                    match download_single_file(
-                        &agent,
-                        route_ref,
-                        target_dir,
-                        &file,
-                        token_ref,
-                        proxy_configured,
-                        secrets_ref,
-                        control,
-                        &progress,
-                        &active_parts,
-                        emit,
-                    ) {
+                    match download_single_file(ctx_ref, state_ref, &file) {
                         Ok(sha) => {
                             results.lock().unwrap().insert(file.path, sha);
                         }

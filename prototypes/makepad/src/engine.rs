@@ -245,57 +245,30 @@ fn run_external_file(
     target: &ExternalProviderTarget,
     job: &Context<Update>,
 ) -> Result<Update, Failure> {
-    let start = Instant::now();
     let pcm = read_wav(path)?;
     let audio_seconds = pcm.len() as f64 / 16_000.0;
-    let wav_bytes = encode_mono_wav_16k(&pcm).map_err(|e| Failure::Error(e.to_string()))?;
     let filename = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "audio.wav".to_owned());
 
-    job.updates.publish(Update::status(
-        "progress",
-        format!(
-            "正在上传整段音频（{audio_seconds:.1} s）至 {} 转写…",
-            target.display_badge()
-        ),
-    ));
-
-    let client = target.client().map_err(|e| Failure::Error(e.to_string()))?;
-    let resp = client
-        .transcribe_wav(
-            &TranscriptionRequest {
-                model: target.model.clone(),
-                wav_bytes,
-                filename,
-                language_iso: language
-                    .and_then(map_asr_language_to_iso)
-                    .map(str::to_owned),
-                prompt: (!context.trim().is_empty()).then(|| context.trim().to_owned()),
-            },
-            &job.stop,
-        )
-        .map_err(map_provider_error)?;
-
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    Ok(Update {
-        kind: "done".into(),
-        text: resp.text,
-        message: format!("外部整段转写完成 · {}", target.display_badge()),
-        compute_ms: elapsed_ms,
-        total_compute_ms: elapsed_ms,
-        audio_seconds,
-        rtf: if audio_seconds > 0.0 {
-            (elapsed_ms / 1000.0) / audio_seconds
-        } else {
-            0.0
+    upload_external_pcm(
+        ExternalUpload {
+            pcm: &pcm,
+            filename,
+            context,
+            language,
+            target,
+            captured_seconds: 0.0,
+            progress_message: format!(
+                "正在上传整段音频（{audio_seconds:.1} s）至 {} 转写…",
+                target.display_badge()
+            ),
+            done_message: format!("外部整段转写完成 · {}", target.display_badge()),
         },
-        event_count: 1,
-        language: resp.language.unwrap_or_default(),
-        ..Default::default()
-    })
+        job,
+    )
 }
 
 fn run_external_microphone(
@@ -360,16 +333,59 @@ fn run_external_microphone(
     }
 
     let audio_seconds = recorded_pcm.len() as f64 / 16_000.0;
-    let wav_bytes =
-        encode_mono_wav_16k(&recorded_pcm).map_err(|e| Failure::Error(e.to_string()))?;
+    let done_message = if warning.is_empty() {
+        format!("录音批处理转写完成 · {}", target.display_badge())
+    } else {
+        format!("{warning} · 外部转写完成")
+    };
+    upload_external_pcm(
+        ExternalUpload {
+            pcm: &recorded_pcm,
+            filename: "microphone.wav".to_owned(),
+            context,
+            language,
+            target,
+            captured_seconds,
+            progress_message: format!(
+                "录音结束（{audio_seconds:.1} s）· 正在上传至 {} 批处理转写…",
+                target.display_badge()
+            ),
+            done_message,
+        },
+        job,
+    )
+}
 
-    job.updates.publish(Update::status(
-        "progress",
-        format!(
-            "录音结束（{audio_seconds:.1} s）· 正在上传至 {} 批处理转写…",
-            target.display_badge()
-        ),
-    ));
+struct ExternalUpload<'a> {
+    pcm: &'a [f32],
+    filename: String,
+    context: &'a str,
+    language: Option<&'a str>,
+    target: &'a ExternalProviderTarget,
+    captured_seconds: f64,
+    progress_message: String,
+    done_message: String,
+}
+
+fn upload_external_pcm(
+    upload: ExternalUpload<'_>,
+    job: &Context<Update>,
+) -> Result<Update, Failure> {
+    let ExternalUpload {
+        pcm,
+        filename,
+        context,
+        language,
+        target,
+        captured_seconds,
+        progress_message,
+        done_message,
+    } = upload;
+    let audio_seconds = pcm.len() as f64 / 16_000.0;
+    let wav_bytes = encode_mono_wav_16k(pcm).map_err(|e| Failure::Error(e.to_string()))?;
+
+    job.updates
+        .publish(Update::status("progress", progress_message));
 
     let upload_start = Instant::now();
     let client = target.client().map_err(|e| Failure::Error(e.to_string()))?;
@@ -378,7 +394,7 @@ fn run_external_microphone(
             &TranscriptionRequest {
                 model: target.model.clone(),
                 wav_bytes,
-                filename: "microphone.wav".to_owned(),
+                filename,
                 language_iso: language
                     .and_then(map_asr_language_to_iso)
                     .map(str::to_owned),
@@ -389,15 +405,10 @@ fn run_external_microphone(
         .map_err(map_provider_error)?;
 
     let elapsed_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
-    let message = if warning.is_empty() {
-        format!("录音批处理转写完成 · {}", target.display_badge())
-    } else {
-        format!("{warning} · 外部转写完成")
-    };
     Ok(Update {
         kind: "done".into(),
         text: resp.text,
-        message,
+        message: done_message,
         compute_ms: elapsed_ms,
         total_compute_ms: elapsed_ms,
         audio_seconds,

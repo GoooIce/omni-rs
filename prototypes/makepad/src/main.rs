@@ -1,74 +1,39 @@
 use makepad_widgets::*;
-#[cfg(not(target_arch = "wasm32"))]
 mod asr;
-#[cfg(not(target_arch = "wasm32"))]
 mod audio_spool;
-#[cfg(not(target_arch = "wasm32"))]
 mod capture_buffer;
-#[cfg(not(target_arch = "wasm32"))]
 mod clip_playback;
-#[cfg(not(target_arch = "wasm32"))]
 mod desktop_runtime;
-#[cfg(not(target_arch = "wasm32"))]
 mod download_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod engine;
-#[cfg(not(target_arch = "wasm32"))]
 mod engine_harness;
-#[cfg(not(target_arch = "wasm32"))]
 mod engine_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod export;
-#[cfg(not(target_arch = "wasm32"))]
 mod gpu;
-#[cfg(not(target_arch = "wasm32"))]
 mod image_engine;
-#[cfg(not(target_arch = "wasm32"))]
 mod image_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod microphone;
-#[cfg(not(target_arch = "wasm32"))]
 mod model_loader;
-#[cfg(not(target_arch = "wasm32"))]
 mod model_location;
-#[cfg(not(target_arch = "wasm32"))]
 mod models_state;
-#[cfg(not(target_arch = "wasm32"))]
 mod music_engine;
-#[cfg(not(target_arch = "wasm32"))]
 mod music_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod omni_engine;
-#[cfg(not(target_arch = "wasm32"))]
 mod omni_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod playback;
-#[cfg(not(target_arch = "wasm32"))]
 mod playback_buffer;
 mod protocol;
-#[cfg(not(target_arch = "wasm32"))]
 mod resampler;
-#[cfg(not(target_arch = "wasm32"))]
 mod speech_enhancer;
-#[cfg(not(target_arch = "wasm32"))]
 mod transcription_start;
 mod transcription_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod translation_engine;
-#[cfg(not(target_arch = "wasm32"))]
 mod translation_ui;
-#[cfg(not(target_arch = "wasm32"))]
 mod tts_engine;
-#[cfg(not(target_arch = "wasm32"))]
 mod tts_ui;
-#[cfg(target_arch = "wasm32")]
-mod web_bridge;
-#[cfg(not(target_arch = "wasm32"))]
 mod workspace_ui;
-#[cfg(not(target_arch = "wasm32"))]
 use desktop_runtime::Runtime;
 use transcription_ui::State as TranscriptionState;
-#[cfg(not(target_arch = "wasm32"))]
 use workspace_ui::State as WorkspaceState;
 
 app_main!(App, font_set: International);
@@ -311,7 +276,7 @@ script_mod! {
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
-                                            hf_token_input := SpeechInput{width: Fill height: 34 empty_text: "输入 hf_...（默认掩码）"}
+                                            hf_token_input := SpeechInput{width: Fill height: 34 is_password: true empty_text: "输入 hf_...（默认掩码）"}
                                             hf_token_toggle := QuietButton{text: "显示" height: 34}
                                             hf_token_save := SpeechButton{text: "保存" height: 34}
                                             hf_token_clear := QuietButton{text: "清除" height: 34}
@@ -326,7 +291,7 @@ script_mod! {
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
-                                            ms_token_input := SpeechInput{width: Fill height: 34 empty_text: "输入 ModelScope API Token（默认掩码）"}
+                                            ms_token_input := SpeechInput{width: Fill height: 34 is_password: true empty_text: "输入 ModelScope API Token（默认掩码）"}
                                             ms_token_toggle := QuietButton{text: "显示" height: 34}
                                             ms_token_save := SpeechButton{text: "保存" height: 34}
                                             ms_token_clear := QuietButton{text: "清除" height: 34}
@@ -421,13 +386,22 @@ script_mod! {
                                         SpeechLabel{text: "外部 OpenAI 兼容网关（含 Magpie 本地网关预设）"}
                                         MutedLabel{text: "默认不发起任何网络请求；仅当某个能力槽位显式切到「外部网关」时才会调用对应接口，失败时绝不静默回退。"}
                                         View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            provider_profile_summary := MutedLabel{width: Fill text: "尚未保存任何外部提供方" draw_text.color: #b7dfc7}
+                                            provider_profile_prev := QuietButton{text: "← 上一个" height: 30}
+                                            provider_profile_next := QuietButton{text: "下一个 →" height: 30}
+                                            provider_delete := QuietButton{text: "删除当前" height: 30}
+                                        }
+                                        View{
                                             width: Fill height: Fit flow: Right spacing: 8
                                             provider_preset_magpie := SpeechButton{text: "Magpie 本地网关预设" height: 32}
-                                            provider_preset_custom := QuietButton{text: "自定义 OpenAI 兼容" height: 32}
+                                            provider_preset_custom := QuietButton{text: "新增自定义 OpenAI 兼容" height: 32}
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                            SpeechLabel{width: Fit text: "提供方名称"}
+                                            SpeechLabel{width: Fit text: "提供方 ID"}
+                                            provider_id_input := SpeechInput{width: 170 height: 34 empty_text: "magpie-local"}
+                                            SpeechLabel{width: Fit text: "名称"}
                                             provider_name_input := SpeechInput{width: Fill height: 34 empty_text: "Magpie 本地网关"}
                                             SpeechLabel{width: Fit text: "超时(秒)"}
                                             provider_timeout_input := SpeechInput{width: 72 height: 34 text: "60"}
@@ -437,6 +411,8 @@ script_mod! {
                                         provider_url_hint := MutedLabel{text: ""}
                                         SpeechLabel{text: "可选环境变量覆盖（例如 OPENAI_API_KEY / MAGPIE_API_KEY）"}
                                         provider_api_key_env_input := SpeechInput{width: Fill height: 34 empty_text: "留空则仅读取本地 0600 凭据文件"}
+                                        SpeechLabel{text: "自定义请求头（可选，每行一条 Header-Name: value）"}
+                                        provider_custom_headers_input := SpeechInput{width: Fill height: 56 is_multiline: true empty_text: "例如：X-Title: Omni RS"}
                                         View{
                                             width: Fill height: Fit flow: Down spacing: 6
                                             View{
@@ -446,7 +422,7 @@ script_mod! {
                                             }
                                             View{
                                                 width: Fill height: Fit flow: Right spacing: 8
-                                                provider_api_key_input := SpeechInput{width: Fill height: 34 empty_text: "本地 Magpie 网关可留空；远程 API 填写 sk-..."}
+                                                provider_api_key_input := SpeechInput{width: Fill height: 34 is_password: true empty_text: "本地 Magpie 网关可留空；远程 API 填写 sk-..."}
                                                 provider_api_key_toggle := QuietButton{text: "显示" height: 34}
                                                 provider_api_key_save := SpeechButton{text: "保存 Key" height: 34}
                                                 provider_api_key_clear := QuietButton{text: "清除" height: 34}
@@ -473,6 +449,7 @@ script_mod! {
                                                 width: Fill height: Fit flow: Right spacing: 8
                                                 slot_enhance_local := SpeechButton{text: "● 本地模型" height: 30}
                                                 slot_enhance_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_enhance_provider := QuietButton{text: "提供方：未保存" height: 30}
                                                 slot_enhance_model := SpeechInput{width: Fill height: 30 empty_text: "外部模型 ID（如 gpt-4o / qwen-pe）"}
                                                 slot_enhance_use_first := QuietButton{text: "填入首个模型" height: 30}
                                             }
@@ -487,6 +464,7 @@ script_mod! {
                                                 width: Fill height: Fit flow: Right spacing: 8
                                                 slot_asr_local := SpeechButton{text: "● 本地模型" height: 30}
                                                 slot_asr_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_asr_provider := QuietButton{text: "提供方：未保存" height: 30}
                                                 slot_asr_model := SpeechInput{width: Fill height: 30 empty_text: "外部 ASR 模型 ID（如 whisper-1）"}
                                                 slot_asr_use_first := QuietButton{text: "填入首个模型" height: 30}
                                             }
@@ -502,6 +480,7 @@ script_mod! {
                                                 width: Fill height: Fit flow: Right spacing: 8
                                                 slot_tts_local := SpeechButton{text: "● 本地模型" height: 30}
                                                 slot_tts_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_tts_provider := QuietButton{text: "提供方：未保存" height: 30}
                                                 slot_tts_model := SpeechInput{width: Fill height: 30 empty_text: "外部 TTS 模型 ID（如 tts-1）"}
                                                 slot_tts_voice := SpeechInput{width: 110 height: 30 text: "alloy" empty_text: "音色"}
                                                 slot_tts_use_first := QuietButton{text: "填入首个模型" height: 30}
@@ -518,6 +497,7 @@ script_mod! {
                                                 width: Fill height: Fit flow: Right spacing: 8
                                                 slot_translation_local := SpeechButton{text: "● 本地模型" height: 30}
                                                 slot_translation_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_translation_provider := QuietButton{text: "提供方：未保存" height: 30}
                                                 slot_translation_model := SpeechInput{width: Fill height: 30 empty_text: "外部翻译模型 ID（如 gpt-4o-mini）"}
                                                 slot_translation_use_first := QuietButton{text: "填入首个模型" height: 30}
                                             }
@@ -1275,41 +1255,29 @@ pub struct App {
     pings: usize,
     #[rust]
     transcription: TranscriptionState,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     runtime: Runtime,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     tts: Option<tts_ui::State>,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     workspace: WorkspaceState,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     image: Option<image_ui::State>,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     music: Option<music_ui::State>,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     omni: Option<omni_ui::State>,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     translation: Option<translation_ui::State>,
-    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     downloads: Option<download_ui::UiState>,
 }
 
 impl App {
     fn inference_busy(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
         // A cold translation retains its accepted request across load -> run.
-        return self.runtime.busy() || self.translation.as_ref().is_some_and(|s| s.busy);
-        #[cfg(target_arch = "wasm32")]
-        self.transcription.busy()
+        self.runtime.busy() || self.translation.as_ref().is_some_and(|s| s.busy)
     }
-    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_running(&mut self, cx: &mut Cx) {
         let active = self.runtime.snapshot().or_else(|| {
             self.translation
@@ -1356,7 +1324,6 @@ impl App {
             .unwrap_or_else(|| "音频播放中 · 可继续使用其他模型".into());
         self.ui.label(cx, ids!(running_status)).set_text(cx, &label);
     }
-    #[cfg(not(target_arch = "wasm32"))]
     fn activate_current_page(&mut self, cx: &mut Cx) {
         // Sharing a workspace never starts the neighboring tool's model.
         // ASR keeps its existing startup/recovery continuation; TTS and image
@@ -1375,80 +1342,54 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.timer = cx.start_interval(0.25);
-            // The browser prototype remains ASR-only, with its manual model
-            // form available even though native settings start collapsed.
-            self.ui.view(cx, ids!(tts_page)).set_visible(cx, false);
-            self.ui.view(cx, ids!(asr_details)).set_visible(cx, true);
-            self.ui
-                .button(cx, ids!(asr_details_toggle))
-                .set_visible(cx, false);
-            self.ui.button(cx, ids!(asr_to_tts)).set_visible(cx, false);
-            self.ui.button(cx, ids!(omni_toggle)).set_visible(cx, false);
-            self.ui
-                .label(cx, ids!(app_subtitle))
-                .set_text(cx, "浏览器内语音转写");
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-            self.tts = Some(tts_ui::State::new(&root, self.runtime.clone()));
-            self.image = Some(image_ui::State::new(&root, self.runtime.clone()));
-            self.initialize_music(cx, &root);
-            self.initialize_omni(cx, &root);
-            self.refresh_workspace_layout(cx, 1000.0);
-            self.translation = Some(translation_ui::State::new(&root, self.runtime.clone()));
-            self.ui
-                .view(cx, ids!(asr_translation_group))
-                .set_visible(cx, true);
-            self.ui.view(cx, ids!(app_heading)).set_visible(cx, false);
-            self.ui.view(cx, ids!(nav_group)).set_visible(cx, true);
-            self.ui.view(cx, ids!(navigation)).set_visible(cx, true);
-            self.ui
-                .button(cx, ids!(settings_toggle))
-                .set_visible(cx, true);
-            self.ui.label(cx, ids!(app_title)).set_text(cx, "知音");
-            self.ui
-                .label(cx, ids!(app_subtitle))
-                .set_text(cx, "声音、文字、图像与音乐");
-            self.initialize_downloads(cx, &root);
-            self.open_transcription(cx, &root);
-            self.sync_transcription_download_directory(cx);
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.open_transcription(cx);
-        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        self.tts = Some(tts_ui::State::new(&root, self.runtime.clone()));
+        self.image = Some(image_ui::State::new(&root, self.runtime.clone()));
+        self.initialize_music(cx, &root);
+        self.initialize_omni(cx, &root);
+        self.refresh_workspace_layout(cx, 1000.0);
+        self.translation = Some(translation_ui::State::new(&root, self.runtime.clone()));
+        self.ui
+            .view(cx, ids!(asr_translation_group))
+            .set_visible(cx, true);
+        self.ui.view(cx, ids!(app_heading)).set_visible(cx, false);
+        self.ui.view(cx, ids!(nav_group)).set_visible(cx, true);
+        self.ui.view(cx, ids!(navigation)).set_visible(cx, true);
+        self.ui
+            .button(cx, ids!(settings_toggle))
+            .set_visible(cx, true);
+        self.ui.label(cx, ids!(app_title)).set_text(cx, "知音");
+        self.ui
+            .label(cx, ids!(app_subtitle))
+            .set_text(cx, "声音、文字、图像与音乐");
+        self.initialize_downloads(cx, &root);
+        self.open_transcription(cx, &root);
+        self.sync_transcription_download_directory(cx);
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if self.ui.button(cx, ids!(running_stop)).clicked(actions) {
-                self.runtime.stop();
-                self.stop_translation(cx);
-            }
-            if self.ui.button(cx, ids!(playback_stop)).clicked(actions) {
-                if let Some(t) = &mut self.tts {
-                    t.stop_playback();
-                }
-                if let Some(m) = &mut self.music {
-                    m.stop_playback();
-                }
-                if let Some(o) = &mut self.omni {
-                    o.stop_playback();
-                }
-            }
-            self.handle_workspace_actions(cx, actions);
-            self.handle_download_actions(cx, actions);
-            self.handle_translation_actions(cx, actions);
-            self.handle_image_actions(cx, actions);
-            self.handle_tts_actions(cx, actions);
-            self.handle_music_actions(cx, actions);
-            self.handle_omni_actions(cx, actions);
+        if self.ui.button(cx, ids!(running_stop)).clicked(actions) {
+            self.runtime.stop();
+            self.stop_translation(cx);
         }
+        if self.ui.button(cx, ids!(playback_stop)).clicked(actions) {
+            if let Some(t) = &mut self.tts {
+                t.stop_playback();
+            }
+            if let Some(m) = &mut self.music {
+                m.stop_playback();
+            }
+            if let Some(o) = &mut self.omni {
+                o.stop_playback();
+            }
+        }
+        self.handle_workspace_actions(cx, actions);
+        self.handle_download_actions(cx, actions);
+        self.handle_translation_actions(cx, actions);
+        self.handle_image_actions(cx, actions);
+        self.handle_tts_actions(cx, actions);
+        self.handle_music_actions(cx, actions);
+        self.handle_omni_actions(cx, actions);
         self.handle_transcription_actions(cx, actions);
     }
 }
@@ -1462,55 +1403,30 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if self.timer.is_event(event).is_some() {
             self.ticks += 1;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                self.settle_asr_clip(cx);
-                if !self.asr_clip_pending() {
-                    cx.stop_timer(self.timer);
-                }
+            self.settle_asr_clip(cx);
+            if !self.asr_clip_pending() {
+                cx.stop_timer(self.timer);
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
         self.step_workspace_slide(cx, event);
-        // The pinned Makepad version caches TextInput layout before web fonts
-        // arrive. Re-layout the prefilled paths when resource loading completes.
-        #[cfg(target_arch = "wasm32")]
-        if matches!(event, Event::NetworkResponses(_)) {
-            for path in [ids!(model_path), ids!(audio_path)] {
-                let input = self.ui.text_input(cx, path);
-                input.set_text(cx, &input.text());
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.poll_downloads(cx);
-            self.poll_tts(cx);
-            self.poll_image(cx);
-            self.poll_translation(cx);
-            self.poll_music(cx);
-            self.poll_omni(cx);
-        }
+        self.poll_downloads(cx);
+        self.poll_tts(cx);
+        self.poll_image(cx);
+        self.poll_translation(cx);
+        self.poll_music(cx);
+        self.poll_omni(cx);
         self.poll_transcription(cx, event);
         self.match_event(cx, event);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.activate_current_page(cx);
-            self.refresh_running(cx);
-            self.refresh_workspace_controls(cx);
-            self.place_workspace_indicator(cx, event);
-        }
+        self.activate_current_page(cx);
+        self.refresh_running(cx);
+        self.refresh_workspace_controls(cx);
+        self.place_workspace_indicator(cx, event);
         self.refresh_transcription_controls(cx);
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh_tts_controls(cx);
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh_image_controls(cx);
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh_translation_controls(cx);
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh_music_controls(cx);
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh_omni_controls(cx);
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh_download_controls(cx);
         self.ui.handle_event(cx, event, &mut Scope::empty());
     }

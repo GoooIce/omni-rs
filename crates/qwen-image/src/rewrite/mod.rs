@@ -43,6 +43,7 @@ use std::sync::atomic::AtomicBool;
 
 #[cfg(feature = "rewrite")]
 pub mod minicpm;
+#[cfg(feature = "rewrite")]
 pub mod openai;
 
 /// Pinned upstream commit of the prompt assets and this port's reference.

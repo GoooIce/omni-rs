@@ -33,7 +33,7 @@ Records live in the primary checkout's `artifacts/storage-retention.json`; `--ke
 
 ## Compilation directories
 
-All 16 manifests in `scripts/checks.json` belong to the unified root Cargo workspace (`resolver = "3"`, see [ADR-0006](adr/0006-unified-cargo-workspace-and-artifact-lifecycle.md)) and share one workspace `Cargo.lock`, one `[patch.crates-io]`, one `[profile.*]` and one checkout-local `target/`. Linked worktrees keep their own local `target/` instead of symlinking into the primary checkout so Cargo's absolute-path hashing never pollutes the primary `target/`.
+All 17 manifests in `scripts/checks.json` belong to the unified root Cargo workspace (`resolver = "3"`, see [ADR-0006](adr/0006-unified-cargo-workspace-and-artifact-lifecycle.md)) and share one workspace `Cargo.lock`, one `[patch.crates-io]`, one `[profile.*]` and one checkout-local `target/`. Linked worktrees keep their own local `target/` instead of symlinking into the primary checkout so Cargo's absolute-path hashing never pollutes the primary `target/`.
 
 `./scripts/check` and `./scripts/cargo` resolve output paths from `scripts/checks.json`. Use `./scripts/cargo` for builds, tests and runs; it checks the live layout before launching Cargo and keeps program arguments after `--` intact. Run `uv run --no-project --python 3.12 python scripts/share-target.py` to remove any obsolete member or cross-worktree `target` symlinks (`--check` is read-only and is the first step of each check profile and the commit hook). Setup rejects real member `target/` directories so their contents are reconciled before removal.
 

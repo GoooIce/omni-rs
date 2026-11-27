@@ -98,6 +98,7 @@ def mock_openai_gateway():
                     "method": "POST",
                     "path": self.path,
                     "auth": self.headers.get("Authorization"),
+                    "custom_header": self.headers.get("X-Omni-Test"),
                     "content_type": self.headers.get("Content-Type"),
                     "body": body,
                 }
@@ -271,6 +272,24 @@ def main():
                 app.screenshot("02-models-fetched")
                 check("Magpie preset populates http://127.0.0.1:3425/v1, 0600 key masking works, and /v1/models fetches models")
 
+                # 2b. Add a custom OpenAI-compatible profile with custom_headers, switch profiles,
+                #     and confirm custom_headers survive save + profile switching.
+                app.reveal("provider_preset_custom")
+                app.click("provider_preset_custom")
+                app.wait(lambda: app.widget("provider_id_input")["val"] == "custom-openai", 10)
+                music_helper.fill(app, "provider_name_input", "自定义路由网关")
+                music_helper.fill(app, "provider_base_url_input", base_url)
+                music_helper.fill(app, "provider_custom_headers_input", "X-Omni-Test: custom-header-ok")
+                app.click("provider_save")
+                app.wait(lambda: "自定义路由网关" in app.widget("provider_save_status")["t"], 10)
+                app.click("provider_profile_prev")
+                app.wait(lambda: app.widget("provider_id_input")["val"] == "magpie-local", 10)
+                assert app.widget("provider_custom_headers_input")["val"] == ""
+                app.click("provider_profile_next")
+                app.wait(lambda: app.widget("provider_id_input")["val"] == "custom-openai", 10)
+                assert "X-Omni-Test: custom-header-ok" in app.widget("provider_custom_headers_input")["val"]
+                check("custom profile creation, saved-profile switcher, and custom_headers preservation verified")
+
                 # 3. Independently switch ASR slot only -> verify other slots remain Local.
                 app.reveal("slot_asr_model")
                 music_helper.fill(app, "slot_asr_model", "whisper-large")
@@ -318,19 +337,25 @@ def main():
 
                 app.reveal("slot_translation_model")
                 music_helper.fill(app, "slot_translation_model", "qwen-mt")
+                app.click("slot_translation_provider")
+                app.wait(lambda: "自定义路由网关" in app.widget("slot_translation_provider")["t"], 10)
                 app.click("slot_translation_external")
-                app.wait(lambda: "Magpie 本地网关 / qwen-mt" in app.widget("slot_translation_badge")["t"], 10)
+                app.wait(lambda: "自定义路由网关 / qwen-mt" in app.widget("slot_translation_badge")["t"], 10)
 
                 click_fixed("settings_toggle")
                 app.wait(lambda: (w := app.widget("tts_provider_badge")) and w["r"][3] > 0, 15)
 
-                # Verify Translation external flow (no local Hy-MT load).
-                assert "Magpie 本地网关 / qwen-mt" in app.widget("translation_provider_badge")["t"]
+                # Verify Translation external flow (no local Hy-MT load) routed via custom profile + custom header.
+                assert "自定义路由网关 / qwen-mt" in app.widget("translation_provider_badge")["t"]
                 assert app.widget("asr_translate")["t"] == "翻译"
                 app.reveal("asr_translate")
                 app.click("asr_translate")
                 app.wait(lambda: "External gateway transcription succeeded" in app.widget("asr_translation")["val"], 15)
-                check("Translation external slot translated via /v1/chat/completions without local model load")
+                assert any(
+                    r["path"] == "/v1/chat/completions" and r.get("custom_header") == "custom-header-ok"
+                    for r in recorded
+                ), f"expected X-Omni-Test header on custom profile request: {recorded}"
+                check("Translation external slot bound to custom profile and transmitted custom_headers via /v1/chat/completions")
 
                 # Verify TTS external flow + disabled Breeze-only controls + explanation.
                 app.reveal("tts_provider_badge")
@@ -379,9 +404,13 @@ def main():
                 app.click("language_tab")
                 app.wait(lambda: "●" in app.widget("language_tab")["t"], 10)
                 app.wait(lambda: (w := app.widget("tts_synthesize")) and w["r"][3] > 0, 15)
-                # Save a secret so redaction is tested end-to-end through the native UI.
+                # Save a secret under magpie-local so redaction is tested end-to-end through the native UI.
                 click_fixed("settings_toggle")
-                app.wait(lambda: (w := app.widget("provider_api_key_input")) and w["r"][3] > 0, 15)
+                app.wait(lambda: (w := app.widget("settings_tab_providers")) and w["r"][3] > 0, 15)
+                app.reveal("provider_profile_prev")
+                if app.widget("provider_id_input")["val"] != "magpie-local":
+                    app.click("provider_profile_prev")
+                    app.wait(lambda: app.widget("provider_id_input")["val"] == "magpie-local", 10)
                 app.reveal("provider_api_key_input")
                 music_helper.fill(app, "provider_api_key_input", secret)
                 app.click("provider_api_key_save")

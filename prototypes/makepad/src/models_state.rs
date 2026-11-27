@@ -57,9 +57,41 @@ pub struct ProviderFormDraft {
     pub preset: ProviderPreset,
     pub base_url: String,
     pub api_key_env: String,
+    pub custom_headers: String,
     pub timeout_secs: String,
     pub discovered_models: Vec<String>,
     pub dirty: bool,
+}
+
+pub fn format_custom_headers(headers: &BTreeMap<String, String>) -> String {
+    headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn parse_custom_headers(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = trimmed.split_once(':') else {
+            return Err(format!(
+                "自定义请求头第 {} 行缺少冒号分隔符（请使用 Header-Name: value 格式）",
+                idx + 1
+            ));
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || name.contains(['\r', '\n', ':']) {
+            return Err(format!("自定义请求头第 {} 行名称无效", idx + 1));
+        }
+        out.insert(name.to_owned(), value.to_owned());
+    }
+    Ok(out)
 }
 
 impl ProviderFormDraft {
@@ -70,6 +102,7 @@ impl ProviderFormDraft {
             preset: profile.preset,
             base_url: profile.base_url.clone(),
             api_key_env: profile.api_key_env.clone().unwrap_or_default(),
+            custom_headers: format_custom_headers(&profile.custom_headers),
             timeout_secs: profile.timeout_secs.to_string(),
             discovered_models: profile.discovered_models.clone(),
             dirty: false,
@@ -82,9 +115,9 @@ impl ProviderFormDraft {
         draft
     }
 
-    pub fn custom_preset() -> Self {
+    pub fn custom_preset_with_id(id: impl Into<String>) -> Self {
         let mut draft = Self::from_profile(&ProviderProfile::custom(
-            "custom-openai",
+            id,
             "自定义 OpenAI 兼容",
             "https://api.openai.com/v1",
         ));
@@ -119,6 +152,7 @@ impl ProviderFormDraft {
             .trim()
             .parse()
             .map_err(|_| "请求超时须为 1–600 的整数秒".to_owned())?;
+        let custom_headers = parse_custom_headers(&self.custom_headers)?;
         let profile = ProviderProfile {
             id: self.id.trim().to_owned(),
             name: self.name.trim().to_owned(),
@@ -128,7 +162,7 @@ impl ProviderFormDraft {
                 let t = self.api_key_env.trim();
                 (!t.is_empty()).then(|| t.to_owned())
             },
-            custom_headers: BTreeMap::new(),
+            custom_headers,
             timeout_secs,
             discovered_models: self.discovered_models.clone(),
         };
@@ -468,6 +502,11 @@ impl TokenFieldState {
         }
     }
 
+    /// Whether the widget should mask typed characters (`TextInput::is_password`).
+    pub fn is_masked(&self) -> bool {
+        !self.revealed
+    }
+
     /// Returns `(rendered_input_text, is_read_only)`. Never leaks a saved
     /// token while `revealed == false`.
     pub fn rendered_input(&self, store: &dyn CredentialStore) -> (String, bool) {
@@ -653,6 +692,7 @@ impl ModelsController {
                 preset: ProviderPreset::MagpieLocal,
                 base_url: MAGPIE_LOCAL_BASE_URL.to_owned(),
                 api_key_env: String::new(),
+                custom_headers: String::new(),
                 timeout_secs: DEFAULT_TIMEOUT_SECS.to_string(),
                 discovered_models: Vec::new(),
                 dirty: false,
@@ -1184,6 +1224,19 @@ impl ModelsController {
 
     // --- External capability provider & slot routing (#97) ---
 
+    fn next_custom_profile_id(&self) -> String {
+        if self.settings.providers.profile("custom-openai").is_none() {
+            return "custom-openai".to_owned();
+        }
+        for n in 2..=999 {
+            let candidate = format!("custom-openai-{n}");
+            if self.settings.providers.profile(&candidate).is_none() {
+                return candidate;
+            }
+        }
+        "custom-openai-extra".to_owned()
+    }
+
     pub fn apply_magpie_preset(&mut self) {
         self.provider_draft = ProviderFormDraft::magpie_preset();
         self.sync_provider_api_key_state();
@@ -1192,20 +1245,136 @@ impl ModelsController {
     }
 
     pub fn apply_custom_preset(&mut self) {
-        self.provider_draft = ProviderFormDraft::custom_preset();
+        let next_id = self.next_custom_profile_id();
+        self.provider_draft = ProviderFormDraft::custom_preset_with_id(next_id);
         self.sync_provider_api_key_state();
         self.provider_feedback =
-            "已填入自定义 OpenAI 兼容模板 · 请修改名称、Base URL 并按需保存 API Key".to_owned();
+            "已填入新的自定义 OpenAI 兼容模板 · 可修改 ID、名称、Base URL 与自定义请求头并保存"
+                .to_owned();
     }
 
-    #[allow(dead_code)]
     pub fn select_provider_profile(&mut self, id: &str) -> bool {
         let Some(profile) = self.settings.providers.profile(id).cloned() else {
             return false;
         };
         self.provider_draft = ProviderFormDraft::from_profile(&profile);
         self.sync_provider_api_key_state();
+        self.provider_feedback =
+            format!("正在编辑已保存提供方：{}（{}）", profile.name, profile.id);
         true
+    }
+
+    pub fn step_provider_profile(&mut self, delta: isize) -> Option<String> {
+        let profiles = &self.settings.providers.profiles;
+        if profiles.is_empty() {
+            return None;
+        }
+        let current_idx = profiles
+            .iter()
+            .position(|p| p.id == self.provider_draft.id.trim());
+        let target_idx = match current_idx {
+            Some(idx) => {
+                let len = profiles.len() as isize;
+                ((idx as isize + delta).rem_euclid(len)) as usize
+            }
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    profiles.len() - 1
+                }
+            }
+        };
+        let target_id = profiles[target_idx].id.clone();
+        self.select_provider_profile(&target_id)
+            .then_some(target_id)
+    }
+
+    pub fn delete_current_provider_profile(&mut self) -> Result<Vec<CapabilitySlot>, String> {
+        let id = self.provider_draft.id.trim().to_owned();
+        if self.settings.providers.profile(&id).is_none() {
+            return Err("当前配置尚未保存，无需删除".to_owned());
+        }
+        let mut reset_slots = Vec::new();
+        for slot in CapabilitySlot::ALL {
+            if let SlotProvider::External { provider_id, .. } =
+                self.settings.providers.slots.get(slot)
+            {
+                if provider_id == &id {
+                    reset_slots.push(slot);
+                }
+            }
+        }
+        self.settings.providers.remove_profile(&id);
+        self.settings
+            .save(&self.settings_path)
+            .map_err(|e| e.to_string())?;
+
+        let fallback_id = self
+            .settings
+            .providers
+            .profiles
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| MAGPIE_LOCAL_ID.to_owned());
+        for slot in CapabilitySlot::ALL {
+            let idx = slot_index(slot);
+            if self.slot_drafts[idx].provider_id == id {
+                self.slot_drafts[idx].provider_id = fallback_id.clone();
+            }
+            if reset_slots.contains(&slot) {
+                self.slot_drafts[idx].external = false;
+            }
+        }
+        if let Some(first_id) = self
+            .settings
+            .providers
+            .profiles
+            .first()
+            .map(|p| p.id.clone())
+        {
+            self.select_provider_profile(&first_id);
+        } else {
+            self.provider_draft = ProviderFormDraft::magpie_preset();
+            self.provider_draft.dirty = false;
+            self.sync_provider_api_key_state();
+        }
+        self.provider_feedback = if reset_slots.is_empty() {
+            format!("已删除外部提供方「{id}」")
+        } else {
+            format!("已删除外部提供方「{id}」，已将关联槽位切回本地模型")
+        };
+        Ok(reset_slots)
+    }
+
+    pub fn provider_profile_summary(&self) -> String {
+        let profiles = &self.settings.providers.profiles;
+        if profiles.is_empty() {
+            return format!(
+                "尚未保存任何外部提供方 · 当前草稿：{}",
+                self.provider_draft.id.trim()
+            );
+        }
+        match profiles
+            .iter()
+            .position(|p| p.id == self.provider_draft.id.trim())
+        {
+            Some(idx) => {
+                let p = &profiles[idx];
+                format!(
+                    "已保存提供方 [{}/{}]：{}（{}）",
+                    idx + 1,
+                    profiles.len(),
+                    p.name,
+                    p.id
+                )
+            }
+            None => format!(
+                "新建未保存草稿（{}）· 已有 {} 个已保存配置",
+                self.provider_draft.id.trim(),
+                profiles.len()
+            ),
+        }
     }
 
     pub fn sync_provider_api_key_state(&mut self) {
@@ -1290,10 +1459,65 @@ impl ModelsController {
         true
     }
 
+    pub fn slot_provider_label(&self, slot: CapabilitySlot) -> String {
+        let idx = slot_index(slot);
+        let pid = self.slot_drafts[idx].provider_id.trim();
+        if let Some(profile) = self.settings.providers.profile(pid) {
+            format!("提供方：{}", profile.name)
+        } else if let Some(first) = self.settings.providers.profiles.first() {
+            format!("提供方：{}", first.name)
+        } else {
+            "提供方：未保存".to_owned()
+        }
+    }
+
+    pub fn set_slot_provider(
+        &mut self,
+        slot: CapabilitySlot,
+        provider_id: impl Into<String>,
+    ) -> Result<(), String> {
+        let pid = provider_id.into();
+        let pid_trimmed = pid.trim().to_owned();
+        if self.settings.providers.profile(&pid_trimmed).is_none() {
+            return Err(format!("找不到已保存的外部提供方「{pid_trimmed}」"));
+        }
+        let idx = slot_index(slot);
+        self.slot_drafts[idx].provider_id = pid_trimmed.clone();
+        if self.slot_drafts[idx].external {
+            self.commit_slot(slot)?;
+        } else if let Some(profile) = self.settings.providers.profile(&pid_trimmed) {
+            self.slot_feedback = format!(
+                "{}已绑定外部提供方：{}（切至「外部网关」后生效）",
+                slot.display_name(),
+                profile.name
+            );
+        }
+        Ok(())
+    }
+
+    pub fn cycle_slot_provider(&mut self, slot: CapabilitySlot) -> Result<String, String> {
+        let profiles = &self.settings.providers.profiles;
+        if profiles.is_empty() {
+            return Err("请先保存至少一个外部提供方配置".to_owned());
+        }
+        let idx = slot_index(slot);
+        let current = self.slot_drafts[idx].provider_id.trim();
+        let next_pos = profiles
+            .iter()
+            .position(|p| p.id == current)
+            .map(|pos| (pos + 1) % profiles.len())
+            .unwrap_or(0);
+        let next_id = profiles[next_pos].id.clone();
+        self.set_slot_provider(slot, next_id.clone())?;
+        Ok(next_id)
+    }
+
     pub fn set_slot_mode(&mut self, slot: CapabilitySlot, external: bool) -> Result<(), String> {
         let idx = slot_index(slot);
         if external {
-            // Ensure the active provider draft is persisted if no profile exists yet.
+            // Honor the slot's explicitly selected saved profile first; fall back to
+            // the currently edited saved profile, then the first saved profile, or
+            // persist the current draft if none exist yet.
             let target_provider_id = if self
                 .settings
                 .providers
@@ -1301,16 +1525,29 @@ impl ModelsController {
                 .is_some()
             {
                 self.slot_drafts[idx].provider_id.clone()
+            } else if self
+                .settings
+                .providers
+                .profile(self.provider_draft.id.trim())
+                .is_some()
+            {
+                self.provider_draft.id.trim().to_owned()
             } else if let Some(first) = self.settings.providers.profiles.first() {
                 first.id.clone()
             } else {
                 let saved = self.save_provider_draft()?;
                 saved.id
             };
-            self.slot_drafts[idx].provider_id = target_provider_id;
+            self.slot_drafts[idx].provider_id = target_provider_id.clone();
             if self.slot_drafts[idx].model.trim().is_empty() {
-                if let Some(first_model) = self.provider_draft.discovered_models.first() {
-                    self.slot_drafts[idx].model = first_model.clone();
+                let first_model = self
+                    .settings
+                    .providers
+                    .profile(&target_provider_id)
+                    .and_then(|p| p.discovered_models.first().cloned())
+                    .or_else(|| self.provider_draft.discovered_models.first().cloned());
+                if let Some(first_model) = first_model {
+                    self.slot_drafts[idx].model = first_model;
                 }
             }
         }
@@ -1335,11 +1572,14 @@ impl ModelsController {
     }
 
     pub fn use_first_discovered_model(&mut self, slot: CapabilitySlot) -> Option<String> {
+        let idx = slot_index(slot);
+        let bound_id = self.slot_drafts[idx].provider_id.clone();
         let first = self
-            .provider_draft
-            .discovered_models
-            .first()
-            .cloned()
+            .settings
+            .providers
+            .profile(&bound_id)
+            .and_then(|p| p.discovered_models.first().cloned())
+            .or_else(|| self.provider_draft.discovered_models.first().cloned())
             .or_else(|| {
                 self.settings
                     .providers
@@ -1347,7 +1587,6 @@ impl ModelsController {
                     .iter()
                     .find_map(|p| p.discovered_models.first().cloned())
             })?;
-        let idx = slot_index(slot);
         self.slot_drafts[idx].model = first.clone();
         if self.slot_drafts[idx].external {
             let _ = self.commit_slot(slot);
@@ -1635,23 +1874,37 @@ mod tests {
         assert!(ctrl.route_draft.dirty, "unsaved draft must remain intact");
         assert_eq!(ctrl.route_draft.mirror_url, base_url);
 
-        // Token masking -> save -> masked display -> reveal -> clear.
+        // Token masking -> while typing (is_masked == true) -> save -> reveal -> hide -> clear.
+        assert!(
+            ctrl.hf_token.is_masked(),
+            "new token input must be masked by default"
+        );
         ctrl.hf_token.set_draft("hf_ui_test_secret_42".to_owned());
+        assert!(
+            ctrl.hf_token.is_masked(),
+            "typing draft must remain masked while revealed == false"
+        );
         ctrl.hf_token.save(store.as_ref()).unwrap();
         let (masked, ro) = ctrl.hf_token.rendered_input(store.as_ref());
         assert_eq!(masked, "••••••••");
         assert!(ro);
+        assert!(ctrl.hf_token.is_masked());
         assert!(!masked.contains("hf_ui_test_secret"));
 
         ctrl.hf_token.toggle_reveal(store.as_ref());
         let (revealed, ro) = ctrl.hf_token.rendered_input(store.as_ref());
         assert_eq!(revealed, "hf_ui_test_secret_42");
         assert!(!ro);
+        assert!(!ctrl.hf_token.is_masked());
 
         ctrl.hf_token.clear(store.as_ref()).unwrap();
         let (after_clear, ro) = ctrl.hf_token.rendered_input(store.as_ref());
         assert_eq!(after_clear, "");
         assert!(!ro);
+        assert!(
+            ctrl.hf_token.is_masked(),
+            "cleared input must stay masked for next typing"
+        );
 
         stop.store(true, Ordering::Release);
         std::fs::remove_dir_all(root).unwrap();
@@ -1760,6 +2013,144 @@ mod tests {
         assert_eq!(ctrl.slot_badge(CapabilitySlot::Asr), "本地模型");
 
         stop.store(true, Ordering::Release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_profile_creation_per_slot_binding_profile_switching_and_custom_headers_preserve() {
+        let root = temp_workspace("custom-profiles-headers");
+        let settings_path = root.join("app-settings.json");
+        let store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::with_env(
+            root.join("credentials.json"),
+            MapEnv::default(),
+        ));
+        let mut ctrl = ModelsController::with_dependencies(
+            root.clone(),
+            settings_path.clone(),
+            Arc::clone(&store),
+            DownloadOptions::default(),
+            || {},
+        );
+
+        // 1) Save Magpie profile first.
+        ctrl.apply_magpie_preset();
+        ctrl.save_provider_draft().unwrap();
+        assert_eq!(ctrl.settings.providers.profiles.len(), 1);
+
+        // 2) Create a custom OpenAI-compatible profile with custom_headers.
+        ctrl.apply_custom_preset();
+        assert_eq!(ctrl.provider_draft.id, "custom-openai");
+        ctrl.provider_draft.name = "OpenRouter 网关".to_owned();
+        ctrl.provider_draft.base_url = "https://openrouter.ai/api/v1".to_owned();
+        ctrl.provider_draft.custom_headers =
+            "HTTP-Referer: https://omni-rs.local\nX-Title: Omni RS\n".to_owned();
+        ctrl.provider_draft.dirty = true;
+        let saved_custom = ctrl.save_provider_draft().unwrap();
+        assert_eq!(saved_custom.id, "custom-openai");
+        assert_eq!(
+            saved_custom
+                .custom_headers
+                .get("HTTP-Referer")
+                .map(String::as_str),
+            Some("https://omni-rs.local")
+        );
+        assert_eq!(
+            saved_custom
+                .custom_headers
+                .get("X-Title")
+                .map(String::as_str),
+            Some("Omni RS")
+        );
+        assert_eq!(ctrl.settings.providers.profiles.len(), 2);
+
+        // Invalid custom header syntax is rejected cleanly before saving.
+        ctrl.provider_draft.custom_headers = "MalformedHeaderWithoutColon".to_owned();
+        assert!(ctrl.save_provider_draft().is_err());
+
+        // 3) Switch between saved profiles using select_provider_profile and step_provider_profile.
+        assert!(ctrl.select_provider_profile(MAGPIE_LOCAL_ID));
+        assert_eq!(ctrl.provider_draft.id, MAGPIE_LOCAL_ID);
+        assert_eq!(ctrl.provider_draft.custom_headers, "");
+
+        assert_eq!(
+            ctrl.step_provider_profile(1).as_deref(),
+            Some("custom-openai")
+        );
+        assert_eq!(ctrl.provider_draft.name, "OpenRouter 网关");
+        assert!(ctrl
+            .provider_draft
+            .custom_headers
+            .contains("HTTP-Referer: https://omni-rs.local"));
+        assert!(ctrl
+            .provider_draft
+            .custom_headers
+            .contains("X-Title: Omni RS"));
+
+        // 4) Bind Translation slot to custom-openai even though magpie-local exists,
+        //    while ASR binds to magpie-local.
+        ctrl.set_slot_provider(CapabilitySlot::Translation, "custom-openai")
+            .unwrap();
+        ctrl.set_slot_model(CapabilitySlot::Translation, "openai/gpt-4o-mini".to_owned());
+        ctrl.set_slot_mode(CapabilitySlot::Translation, true)
+            .unwrap();
+
+        ctrl.set_slot_provider(CapabilitySlot::Asr, MAGPIE_LOCAL_ID)
+            .unwrap();
+        ctrl.set_slot_model(CapabilitySlot::Asr, "whisper-large".to_owned());
+        ctrl.set_slot_mode(CapabilitySlot::Asr, true).unwrap();
+
+        let tr_target = ctrl
+            .resolve_slot_external(CapabilitySlot::Translation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tr_target.profile.id, "custom-openai");
+        assert_eq!(
+            tr_target
+                .profile
+                .custom_headers
+                .get("X-Title")
+                .map(String::as_str),
+            Some("Omni RS")
+        );
+        let asr_target = ctrl
+            .resolve_slot_external(CapabilitySlot::Asr)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asr_target.profile.id, MAGPIE_LOCAL_ID);
+
+        // 5) Reload from disk and verify custom_headers + per-slot bindings persisted intact.
+        let mut reloaded = ModelsController::with_dependencies(
+            root.clone(),
+            settings_path.clone(),
+            Arc::clone(&store),
+            DownloadOptions::default(),
+            || {},
+        );
+        assert_eq!(reloaded.settings.providers.profiles.len(), 2);
+        assert!(reloaded.select_provider_profile("custom-openai"));
+        assert!(reloaded
+            .provider_draft
+            .custom_headers
+            .contains("HTTP-Referer: https://omni-rs.local"));
+        assert!(reloaded
+            .provider_draft
+            .custom_headers
+            .contains("X-Title: Omni RS"));
+        // Re-saving without touching custom_headers preserves them.
+        reloaded.save_provider_draft().unwrap();
+        let reloaded_target = reloaded
+            .resolve_slot_external(CapabilitySlot::Translation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded_target.profile.id, "custom-openai");
+        assert_eq!(reloaded_target.profile.custom_headers.len(), 2);
+
+        // 6) Deleting custom-openai resets Translation back to Local while keeping ASR on Magpie.
+        let reset = reloaded.delete_current_provider_profile().unwrap();
+        assert_eq!(reset, vec![CapabilitySlot::Translation]);
+        assert!(!reloaded.is_slot_external(CapabilitySlot::Translation));
+        assert!(reloaded.is_slot_external(CapabilitySlot::Asr));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

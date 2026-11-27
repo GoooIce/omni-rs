@@ -935,6 +935,20 @@ pub fn check_files(directory: &Path) -> Result<(), String> {
 
 pub type Engine = crate::engine_harness::Engine<Worker>;
 
+fn ensure_local_enhancer<'a>(
+    enhancer: &'a mut Option<crate::speech_enhancer::SpeechEnhancer>,
+    checkpoint: &Path,
+    sender: &crate::engine_harness::Publisher<Update>,
+) -> Result<&'a mut crate::speech_enhancer::SpeechEnhancer, Failure> {
+    enhancement::checkpoint_available(checkpoint)?;
+    if enhancer.is_none() {
+        sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
+        *enhancer =
+            Some(crate::speech_enhancer::SpeechEnhancer::load(checkpoint).map_err(Failure::from)?);
+    }
+    Ok(enhancer.as_mut().unwrap())
+}
+
 pub struct Worker {
     device: Option<gpu::Device>,
     model: Option<Model<Backend>>,
@@ -1071,21 +1085,9 @@ impl crate::engine_harness::Adapter for Worker {
                         checkpoint,
                         prefill,
                     } => {
-                        enhancement::checkpoint_available(&checkpoint)?;
-                        if enhancer.is_none() {
-                            sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
-                            *enhancer = Some(
-                                crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
-                                    .map_err(Failure::from)?,
-                            );
-                        }
+                        let local = ensure_local_enhancer(enhancer, &checkpoint, sender)?;
                         crate::speech_enhancer::sample_three(
-                            enhancer.as_mut().unwrap(),
-                            &prompt,
-                            &source,
-                            seeds,
-                            prefill,
-                            stop,
+                            local, &prompt, &source, seeds, prefill, stop,
                         )?
                     }
                     EnhancementTarget::External(target) => {
@@ -1129,21 +1131,8 @@ impl crate::engine_harness::Adapter for Worker {
                         checkpoint,
                         prefill,
                     } => {
-                        enhancement::checkpoint_available(&checkpoint)?;
-                        if enhancer.is_none() {
-                            sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
-                            *enhancer = Some(
-                                crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
-                                    .map_err(Failure::from)?,
-                            );
-                        }
-                        enhancer.as_mut().unwrap().complete(
-                            &request.system,
-                            &request.user,
-                            seed,
-                            prefill,
-                            stop,
-                        )?
+                        let local = ensure_local_enhancer(enhancer, &checkpoint, sender)?;
+                        local.complete(&request.system, &request.user, seed, prefill, stop)?
                     }
                     EnhancementTarget::External(target) => {
                         sender.publish(Update::status(

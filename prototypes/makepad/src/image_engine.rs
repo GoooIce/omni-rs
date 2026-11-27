@@ -89,10 +89,7 @@ pub type Engine = crate::engine_harness::Engine<Worker>;
 pub struct Worker {
     device: Option<gpu::GpuDevice>,
     model: Option<Model<Backend>>,
-    local_rewriter: Option<(
-        PathBuf,
-        MinicpmRewriter<omni_qwen_image::rewrite::minicpm::Native>,
-    )>,
+    local_rewriter: Option<(PathBuf, MinicpmRewriter<gpu::EagerBackend>)>,
 }
 
 impl crate::engine_harness::Adapter for Worker {

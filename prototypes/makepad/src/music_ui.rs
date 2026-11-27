@@ -22,6 +22,20 @@ struct Draft {
     melody_only: bool,
     use_score: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MusicControls {
+    idle: bool,
+    busy: bool,
+    stopping: bool,
+    saving: bool,
+    abc: bool,
+    source: bool,
+    has_analysis: bool,
+    has_score: bool,
+    has_song: bool,
+    playing: bool,
+}
+
 pub struct State {
     engine: Engine,
     settings: Option<PathBuf>,
@@ -39,7 +53,7 @@ pub struct State {
     analysis: Option<Arc<[u8]>>,
     score: Option<omni_music::score::Score>,
     song: Option<Song>,
-    controls: Option<[bool; 10]>,
+    controls: Option<MusicControls>,
 }
 impl State {
     pub fn new(runtime: crate::desktop_runtime::Runtime) -> Self {
@@ -120,18 +134,18 @@ impl App {
         };
         let idle = !m.busy && !inference_busy && !dialog_busy;
         let saving = m.exporting.is_some() || dialog_busy;
-        let state = [
+        let state = MusicControls {
             idle,
-            m.busy,
-            m.stopping,
+            busy: m.busy,
+            stopping: m.stopping,
             saving,
             abc,
             source,
-            m.analysis.is_some(),
-            m.score.is_some(),
-            m.song.is_some(),
-            m.playing,
-        ];
+            has_analysis: m.analysis.is_some(),
+            has_score: m.score.is_some(),
+            has_song: m.song.is_some(),
+            playing: m.playing,
+        };
         if m.controls == Some(state) {
             return;
         }
@@ -325,18 +339,7 @@ impl App {
                 m.submitted_root = None;
             }
             self.music_mode_labels(cx);
-            if update.kind == "missing"
-                || (update.kind == "error" && update.message.contains("模型目录缺少"))
-            {
-                let missing_id = if update.message.contains("MERT-v2-FullSong") {
-                    omni_hub::catalog::CheckpointId::MertV2FullSong
-                } else if update.message.contains("SheetSage2") {
-                    omni_hub::catalog::CheckpointId::SheetSage2
-                } else if update.message.contains("YuE2-Vae") {
-                    omni_hub::catalog::CheckpointId::Yue2Vae
-                } else {
-                    omni_hub::catalog::CheckpointId::Yue2_3b
-                };
+            if let Some(missing_id) = update.missing_checkpoint {
                 self.notify_panel_missing(cx, missing_id);
             }
             self.music_status(
