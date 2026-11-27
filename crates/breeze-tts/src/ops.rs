@@ -44,7 +44,7 @@ impl<B: Backend> Linear<B> {
         self.inner.weight()
     }
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         if matches!(
             self.mode,
             crate::DepthKernelMode::Gemv | crate::DepthKernelMode::GemvNorm
@@ -92,7 +92,7 @@ impl<B: Backend> Norm<B> {
         input_scale: f64,
         output_scale: f64,
     ) -> Tensor<B, D> {
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         if self.fused
             && input_scale == 1.0
             && output_scale == 1.0

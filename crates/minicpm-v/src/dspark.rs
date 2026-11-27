@@ -859,7 +859,7 @@ pub struct Draft<B: Backend> {
     norm: shared::Norm<B>,
     markov_w1: Tensor<B, 2>,
     markov_w2: shared::Linear<B>,
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     markov_quant: Option<crate::markov::MarkovQuant<B>>,
     frequencies: Vec<f64>,
 }
@@ -996,7 +996,7 @@ impl<B: Backend> Draft<B> {
                 device,
             )?,
             markov_w2: shared::Linear::from_parts(markov_w2_weights.clone(), None),
-            #[cfg(feature = "metal")]
+            #[cfg(any(feature = "wgpu", feature = "metal"))]
             markov_quant: if crate::knobs::dspark_markov_quant() {
                 Some(crate::markov::quantize_w2(
                     &markov_w2_weights,
@@ -1338,7 +1338,7 @@ impl<B: Backend> Draft<B> {
         base_row: Tensor<B, 2>,
         previous: &Tensor<B, 2, burn::tensor::Int>,
     ) -> Tensor<B, 2> {
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         if let Some(scores) = self.markov_quant.as_ref().and_then(|quant| {
             crate::markov::try_scores(
                 base_row.clone(),
@@ -1415,7 +1415,7 @@ fn project_kv<B: Backend>(
     // The per-(head, position) norm over the permuted view: the reshape
     // materializes it in (head, position, dim) order, which is exactly the
     // fused kernel's layout (one copy kernel versus the ~8-launch chain).
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if norm.kind() == shared::NormKind::Rms {
         if let Some(fused) = crate::glue::plain_rms_norm_metal(
             projected.clone().reshape([heads * seq, HEAD_DIM]),
@@ -1435,7 +1435,7 @@ fn draft_norm_seam<B: Backend>(
     x: Tensor<B, 3>,
     dtype: burn::tensor::FloatDType,
 ) -> Tensor<B, 3> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if norm.kind() == shared::NormKind::Rms {
         let [_, tokens, width] = x.dims();
         if let Some(fused) = crate::glue::plain_rms_norm_metal(
@@ -1455,7 +1455,7 @@ fn draft_residual_seam<B: Backend>(
     y: Tensor<B, 3>,
     dtype: burn::tensor::FloatDType,
 ) -> Tensor<B, 3> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     {
         let [_, tokens, width] = x.dims();
         if let Some(fused) = crate::glue::residual_draft_metal(
@@ -1474,7 +1474,7 @@ fn draft_rope_seam<B: Backend>(
     cos: &Tensor<B, 4>,
     sin: &Tensor<B, 4>,
 ) -> Tensor<B, 4> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if let Some(rotated) = crate::glue::rope_metal(x.clone(), cos, sin) {
         return rotated;
     }

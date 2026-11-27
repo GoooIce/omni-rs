@@ -1,10 +1,10 @@
 # Checks and recovery
 
-Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` selects Python 3.12 via uv and `.python-version`. Python dependencies for official model comparisons remain separate from the production runtime. Supported runtime targets are Apple Silicon macOS with native Metal/ANE. CPU remains an explicit reference diagnostic and ANE fallback. WASM, browser WebGPU, Intel Mac and other desktop GPU backends are retired. Routine validation runs locally on the Apple Silicon GPU.
+Use a login shell with `cargo`, `rustc` and `uv` on PATH. `./scripts/check` selects Python 3.12 via uv and `.python-version`. Python dependencies for official model comparisons remain separate from the production runtime. Routine validation and default builds target Apple Silicon macOS with native Metal/ANE, while portable compute backends (`wgpu` / `cpu`) stay decoupled from Apple-only acceleration layers (`metal` / `ane` / `mtl4` / `coreml`) per [ADR-0007](adr/0007-platform-backend-and-provider-boundaries.md). WASM and browser WebGPU remain retired.
 
 | Command | Coverage | Requirements |
 | --- | --- | --- |
-| `./scripts/check quick` | Live Cargo layout, profile policy, documented Cargo commands, manifest coverage, runtime boundaries, local-only workflow policy, Python tests, attention negative controls and formatting | Rust with rustfmt; no weights or device |
+| `./scripts/check quick` | Live Cargo layout, profile policy, documented Cargo commands, manifest coverage, runtime and portable-dependency boundaries (`cargo tree --offline --locked` for `cpu`/`wgpu` closures plus portable kernel/image/desktop unit tests), local-only workflow policy, Python tests, attention negative controls and formatting | Rust with rustfmt; no weights or device |
 | `./scripts/check metal` | Hook wiring, quick checks, Clippy and tests for registered Metal manifests; production attention benchmark against the independent CPU f64 oracle | Real Apple Silicon Mac with rustfmt and clippy |
 | `./scripts/check native` | Build native app and ASR harness; ASR matrix, native pause/resume, lifecycle, TTS and music checks, including long streams and muted device callbacks | Logged-in macOS desktop, local weights/recordings and an output device |
 | `./scripts/check cpu` | Optional CPU diagnostics: quick checks, Clippy and library/integration tests for registered CPU-capable manifests | Rust with rustfmt and clippy; no weights |
@@ -57,14 +57,19 @@ The pause validator checks each tail once processing reaches three seconds into 
 
 ## Vendored dependencies
 
-Burn backend and training dependency rules are recorded in
-[ADR-0005](adr/0005-burn-dependency-boundaries.md). Quick checks validate direct
-versions, explicit features, aliases and target-specific declarations. Metal
-checks also inspect locked normal/build dependency graphs for every registered
-manifest, selected GPU features, aligned shared-library versions and vendored
-patch routing. These graph checks do not compile or run CPU tests. Dev/test
-graphs deliberately retain numerical references; ANE's existing CPU fallback
-and RSI's default training graph are documented exceptions.
+Burn backend, training, and platform-decoupling dependency rules are recorded in
+[ADR-0005](adr/0005-burn-dependency-boundaries.md) and
+[ADR-0007](adr/0007-platform-backend-and-provider-boundaries.md). Quick checks
+validate direct versions, explicit features, aliases, target-specific
+declarations, and locked portable (`cpu` / `wgpu`) `cargo tree --offline --locked`
+graphs for every decoupled manifest (ensuring `burn-ane`, `objc2-metal`, `mtl4`,
+and `cubecl-cpp` stay out of portable closures) alongside portable unit tests for
+`omni-kernel`, `omni-qwen-image`, and `r2t2-makepad`. Metal checks also inspect
+locked normal/build dependency graphs for every registered manifest on Apple
+Silicon macOS, selected GPU features, aligned shared-library versions and
+vendored patch routing. Dev/test graphs deliberately retain numerical references;
+ANE's existing CPU fallback and RSI's default training graph are documented
+exceptions.
 
 Patches under `[patch.crates-io]` apply per workspace: the root `Cargo.toml` and each detached model-crate manifest (`crates/*/Cargo.toml`, `prototypes/*/Cargo.toml`) resolve dependencies independently. After adding or changing a crate under `vendor/`, register it in the root manifest and in every detached manifest whose code consumes it — a root-only registration silently leaves model crates on the registry version. Each vendored crate documents its delta in a `LOCAL-CHANGES.md` next to its sources.
 

@@ -18,12 +18,22 @@ use std::{
 struct Args {
     #[arg(long, default_value = "models/Qwen-Image-2.1-Turbo")]
     model: PathBuf,
-    #[arg(long, default_value = "metal")]
+    #[arg(long, default_value = default_backend())]
     backend: String,
     #[arg(long)]
     f32: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+const fn default_backend() -> &'static str {
+    if cfg!(feature = "metal") {
+        "metal"
+    } else if cfg!(feature = "wgpu") {
+        "wgpu"
+    } else {
+        "cpu"
+    }
 }
 
 #[derive(Subcommand)]
@@ -544,6 +554,8 @@ fn main() -> Result<()> {
     match args.backend.as_str() {
         #[cfg(feature = "metal")]
         "metal" => run::<burn::backend::wgpu::Metal>(args, Default::default(), cancel),
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
+        "wgpu" => run::<burn::backend::wgpu::Wgpu>(args, Default::default(), cancel),
         #[cfg(feature = "cpu")]
         "cpu" => run::<burn::backend::NdArray>(args, Default::default(), cancel),
         _ => Err(Error::Config("所选后端未编译到此程序中".into())),

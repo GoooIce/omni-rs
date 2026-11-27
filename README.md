@@ -4,7 +4,7 @@
   <img src="assets/readme/hero.svg" width="100%" alt="omni-rs：纯 Rust / Burn 实现的多模态本地推理套件，覆盖语音转写、翻译、语音合成、图像理解、文生图与音乐生成，推理全程在本机 GPU 上">
 </p>
 
-在一台 Mac 的 GPU 上跑完语音转写、翻译、语音合成、图像理解、文生图和音乐生成。核心 crate 是 `omni-r2t2`，推理用纯 Rust / [Burn 0.21.0](https://github.com/tracel-ai/burn/tree/v0.21.0)，不调用 Python、PyTorch、llama.cpp 或远程服务。运行平台收敛为 Apple Silicon macOS，默认使用原生 Metal，保留实验性 ANE。CPU 仅用于参考诊断和 ANE fallback；不再支持 WASM、浏览器 WebGPU 或其它桌面 GPU 后端。
+在一台 Mac 的 GPU 上跑完语音转写、翻译、语音合成、图像理解、文生图和音乐生成。核心 crate 是 `omni-r2t2`，推理用纯 Rust / [Burn 0.21.0](https://github.com/tracel-ai/burn/tree/v0.21.0)，不调用 Python、PyTorch、llama.cpp 或远程服务。架构上按 [ADR-0007](docs/adr/0007-platform-backend-and-provider-boundaries.md) 分离通用计算后端（`wgpu` / `cpu`）与 Apple 加速层（`metal` / `ane` / `mtl4` / `coreml`）；默认运行与本机验收平台仍为 Apple Silicon macOS（默认原生 Metal 与实验性 ANE），WASM 与浏览器 WebGPU 仍保持退役。
 
 每个模块都用官方完整权重在本机 M5 Max 上跑通，并与官方 PyTorch / transformers 做了数值对照。条件、性能和范围见 [VALIDATION.md](VALIDATION.md)。
 
@@ -166,17 +166,18 @@ curl -s http://127.0.0.1:8848/v1/translations \
 
 ## 运行后端
 
-当前机器是 M5 Max（40 核 GPU、128 GB）。默认 `--backend metal`：CubeCL/MSL、GPU FP16 矩阵、FP32 归一化与残差。`--precision f32` 只用于对照。
+当前机器是 M5 Max（40 核 GPU、128 GB）。代码层面把「通用计算后端（`wgpu` / `cpu`）」与「Apple 加速层（`metal` / `ane` / `mtl4` / `coreml`）」拆分为独立 Cargo feature 边界（见 [ADR-0007](docs/adr/0007-platform-backend-and-provider-boundaries.md)）。Apple Silicon macOS 默认 `--backend metal`：CubeCL/MSL、GPU FP16 矩阵、FP32 归一化与残差；`--precision f32` 只用于对照。
 
-| 后端 | 何时用 | 入口 |
-| --- | --- | --- |
-| Metal | 原生界面的默认路径 | `--backend metal` |
-| ANE | 实验。长流未过验收 | `--features ane -- --backend ane` |
-| CPU | 正确性对照，不承诺实时 | `--features native,cpu -- --backend cpu` |
+| 后端 | 层次 | 何时用 | 入口 |
+| --- | --- | --- | --- |
+| Metal | Apple 加速层 | Apple Silicon 默认路径（含 MSL/TensorOps/NAX 定制内核） | `--backend metal`（默认 feature） |
+| ANE | Apple 加速层 | 实验。长流未过验收 | `--features ane -- --backend ane` |
+| WGPU | 通用计算后端 | 可移植 Burn/CubeCL GPU 路径（不含 Apple 专属依赖与 MSL passthrough） | `--no-default-features --features native,wgpu -- --backend wgpu` |
+| CPU | 通用计算后端 | 正确性对照与无 GPU 诊断，不承诺实时 | `--no-default-features --features native,cpu -- --backend cpu` |
 
-ANE 把 Burn 子图编译成 Core ML，再由 Swift 桥执行。无 ANE 分配或编译失败会按原因回退。2026-10-11 的固定 96 条中文集热态一轮 RTF 0.7708，但 40 秒连续输入 RTF 0.9951，30 分钟复测约 1.017，**长流验收未通过**。原生界面因此仍用 Metal。选择与对照见 [优化目标](docs/ane-optimization-goal.md) 和 [后端说明](crates/burn-ane/README.md)。
+ANE 把 Burn 子图编译成 Core ML，再由 Swift 桥执行。无 ANE 分配或编译失败会按原因回退。2026-10-11 的固定 96 条中文集热态一轮 RTF 0.7708，但 40 秒连续输入 RTF 0.9951，30 分钟复测约 1.017，**长流验收未通过**。原生界面默认通过 `Ane<Metal>` 延迟路由将主路径留在 Metal。选择与对照见 [优化目标](docs/ane-optimization-goal.md) 和 [后端说明](crates/burn-ane/README.md)。
 
-2026-11-12 起停止 WASM、WebGPU/WGSL、Intel Mac、Windows 和 Linux 的运行支持。原生 Metal 仍使用 Burn/CubeCL 的 wgpu 运行时及内部 WGSL 支持；不提供可选择的 WebGPU/WGSL 后端。本地 HTTP API 与其浏览器客户端继续可用，推理在 Apple Silicon 原生进程执行。已有浏览器验证只作为历史记录，旧构建缓存不自动删除。
+WASM 与浏览器 WebGPU 推理后端已退役；非 Apple 平台的硬件调优与打包尚未开展，但通用 `wgpu` / `cpu` feature 闭包由 `./scripts/check quick` 持续守护，不误引入 `burn-ane`、`objc2-metal`、`mtl4` 或 CoreML。本地 HTTP API 与其浏览器客户端继续可用，推理在原生进程执行。已有浏览器验证只作为历史记录，旧构建缓存不自动删除。
 
 ## Rust 接口
 

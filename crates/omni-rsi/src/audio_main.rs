@@ -13,9 +13,9 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 type ModelBackend = omni_lfm3::NativeGpu;
-#[cfg(all(not(feature = "metal"), feature = "cpu"))]
+#[cfg(all(not(any(feature = "wgpu", feature = "metal")), feature = "cpu"))]
 type ModelBackend = burn::backend::NdArray<f32>;
 type TrainingBackend = burn::backend::Autodiff<ModelBackend>;
 

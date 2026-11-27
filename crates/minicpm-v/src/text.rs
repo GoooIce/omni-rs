@@ -13,7 +13,7 @@ type Norm<B> = shared::Norm<B>;
 
 /// Split-half [`shared::rope`] through the fused verify kernel.
 fn rope_seam<B: Backend>(x: Tensor<B, 4>, cos: &Tensor<B, 4>, sin: &Tensor<B, 4>) -> Tensor<B, 4> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if let Some(rotated) = crate::glue::rope_verify_metal(x.clone(), cos, sin) {
         return rotated;
     }
@@ -143,7 +143,7 @@ fn norm_seam<B: Backend>(
     x: Tensor<B, 3>,
     dtype: FloatDType,
 ) -> Tensor<B, 3> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if norm.kind() == shared::NormKind::Gemma {
         let [_, tokens, width] = x.dims();
         let fused = crate::glue::gemma_norm_metal(
@@ -160,7 +160,7 @@ fn norm_seam<B: Backend>(
 
 /// [`norm_seam`]'s twin for `shared::residual`.
 fn residual_seam<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>, dtype: FloatDType) -> Tensor<B, 3> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     {
         let [_, tokens, width] = x.dims();
         let fused = crate::glue::residual_metal(
@@ -991,7 +991,7 @@ impl<B: Backend> LinearAttention<B> {
     ) -> (Tensor<B, 4>, Tensor<B, 4>, Vec<Tensor<B, 4>>) {
         let seq = q.dims()[1];
         let heads = q.dims()[2]; // expanded to value-head groups by the caller
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         if let Some(done) = crate::gdn_scan::try_scan(
             q.clone(),
             k.clone(),

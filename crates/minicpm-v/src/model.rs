@@ -135,7 +135,7 @@ pub enum VerifyNumerics {
 
 /// Holds the thread-local kernel guards alive for a matching-decode verify.
 struct MatchingGuards {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     _tile: burn_cubecl::kernel::matmul::DecodeTileRows,
     _attention: shared::DecodeQueryAttention,
     _moe: crate::moe::MatchDecodeMoe,
@@ -144,7 +144,7 @@ struct MatchingGuards {
 impl MatchingGuards {
     fn enter() -> Self {
         Self {
-            #[cfg(feature = "metal")]
+            #[cfg(any(feature = "wgpu", feature = "metal"))]
             _tile: burn_cubecl::kernel::matmul::DecodeTileRows::enter(),
             _attention: shared::DecodeQueryAttention::enter(),
             _moe: crate::moe::MatchDecodeMoe::enter(),
@@ -429,7 +429,7 @@ impl<B: Backend> TextModel<B> {
         capture_at: &[usize],
         all_logits: bool,
     ) -> omni_r2t2::Result<(Tensor<B, 2>, Option<Tensor<B, 2>>, Vec<Tensor<B, 3>>)> {
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         let _decode_tile = burn_cubecl::kernel::matmul::DecodeTileRows::enter();
         let (hidden, captured, _) = self.walk(
             ids,
@@ -697,7 +697,7 @@ impl<B: Backend> TextModel<B> {
         positions: Option<&[[i64; 3]]>,
         state: &mut DecodeState<B>,
     ) -> omni_r2t2::Result<Tensor<B, 2>> {
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         let _decode_tile = burn_cubecl::kernel::matmul::DecodeTileRows::enter();
         let hidden = self.last_layer_sequence(ids, embeddings, positions, state)?;
         let dtype = shared::dtype(&hidden);

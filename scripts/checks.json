@@ -67,11 +67,13 @@
     },
     {
       "path": "crates/omni-kernel/Cargo.toml",
+      "cpu_features": "",
       "target": "target",
       "metal": true
     },
     {
       "path": "prototypes/makepad/Cargo.toml",
+      "cpu_features": "cpu",
       "target": "target",
       "metal": true
     },
@@ -141,7 +143,69 @@
       "wasm",
       "webgpu",
       "vulkan"
-    ]
+    ],
+    "apple_only_packages": [
+      "burn-ane",
+      "objc2-metal",
+      "mtl4",
+      "cubecl-cpp"
+    ],
+    "apple_only_features": [
+      "metal",
+      "ane",
+      "coreml",
+      "metal-shared"
+    ],
+    "portable_manifests": {
+      "Cargo.toml": {
+        "cpu": ["native", "cpu"],
+        "wgpu": ["native", "wgpu"]
+      },
+      "crates/breeze-tts/Cargo.toml": {
+        "cpu": ["cpu"],
+        "wgpu": ["wgpu"]
+      },
+      "crates/hy-mt/Cargo.toml": {
+        "cpu": ["native", "cpu"],
+        "wgpu": ["native", "wgpu"]
+      },
+      "crates/lfm3-omni/Cargo.toml": {
+        "cpu": ["native", "cpu"],
+        "wgpu": ["native", "wgpu"]
+      },
+      "crates/minicpm-v/Cargo.toml": {
+        "cpu": ["native", "cpu"],
+        "wgpu": ["native", "wgpu"]
+      },
+      "crates/omni-music/Cargo.toml": {
+        "cpu": ["cpu"],
+        "wgpu": ["wgpu"]
+      },
+      "crates/qwen-image/Cargo.toml": {
+        "cpu": ["cpu"],
+        "wgpu": ["wgpu"]
+      },
+      "crates/omni-kernel/Cargo.toml": {
+        "cpu": [],
+        "wgpu": ["wgpu"]
+      },
+      "crates/omni-api/Cargo.toml": {
+        "cpu": ["cpu"],
+        "wgpu": ["wgpu"]
+      },
+      "prototypes/makepad/Cargo.toml": {
+        "cpu": ["cpu"],
+        "wgpu": ["wgpu"]
+      },
+      "crates/omni-rsi/Cargo.toml": {
+        "cpu": ["native", "cpu"],
+        "wgpu": ["native", "wgpu"]
+      },
+      "crates/resin-metal/Cargo.toml": {
+        "cpu": ["cpu"],
+        "wgpu": ["wgpu"]
+      }
+    }
   },
   "forbidden_runtime_packages": [
     "pyo3",

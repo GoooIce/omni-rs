@@ -58,10 +58,10 @@ pub const DEFAULT_MODEL_DIR: &str = "models/MiniCPM-V-4.7-35B-A3B-int4";
 /// CLI and GPU tests verify, so the rewriter instantiates that raw backend
 /// for itself instead of sharing the diffusion model's fusion wrapper. The
 /// two runtimes coexist as separate wgpu devices in one process.
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 pub type Native = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
 /// CPU builds never wrap NdArray in fusion; use it directly.
-#[cfg(not(feature = "metal"))]
+#[cfg(not(any(feature = "wgpu", feature = "metal")))]
 pub type Native = burn::backend::NdArray;
 
 /// Local prompt rewriter on a MiniCPM-V-4.7 checkpoint. Owns the text model,

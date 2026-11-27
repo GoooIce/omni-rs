@@ -5,16 +5,16 @@
 //! backend the image rewriter already uses. It only reads the checkpoint.
 
 use crate::engine_harness::Failure;
+use crate::gpu;
 use omni_breeze_tts::enhancement::{self, Prefill, Sample, Source};
 use omni_minicpm_v::{
     chat, config::ModelDirectory, generate, model::TextModel, multimodal::Prompt,
     tokenizer::MiniCpmTokenizer,
 };
-use omni_r2t2::Precision;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub type Native = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
+pub type Native = gpu::EagerBackend;
 
 pub struct SpeechEnhancer {
     model: TextModel<Native>,
@@ -35,8 +35,8 @@ impl SpeechEnhancer {
             .tokenizer()
             .map_err(|error| format!("读取 35B 分词器失败：{error}"))?;
         let weights = omni_r2t2::weights::Weights::open(dir).map_err(|error| error.to_string())?;
-        let device = Default::default();
-        let model = TextModel::<Native>::load(&weights, &config, Precision::F16, &device)
+        let device = gpu::eager_device();
+        let model = TextModel::<Native>::load(&weights, &config, gpu::default_precision(), &device)
             .map_err(|error| format!("载入 35B 失败：{error}"))?;
         Ok(Self {
             model,

@@ -87,6 +87,7 @@ struct Args {
 enum DeviceKind {
     Auto,
     Metal,
+    Wgpu,
     Ane,
     Cpu,
 }
@@ -196,6 +197,7 @@ fn main() -> AnyResult<()> {
     };
     let backend = match args.backend {
         DeviceKind::Auto if cfg!(all(target_os = "macos", feature = "metal")) => DeviceKind::Metal,
+        DeviceKind::Auto if cfg!(feature = "wgpu") => DeviceKind::Wgpu,
         DeviceKind::Auto
             if cfg!(all(
                 target_os = "macos",
@@ -208,7 +210,7 @@ fn main() -> AnyResult<()> {
         DeviceKind::Auto if cfg!(feature = "cpu") => DeviceKind::Cpu,
         DeviceKind::Auto => {
             return Err(
-                "No backend enabled. Build with metal or ane; cpu is for reference diagnostics."
+                "No backend enabled. Build with metal, wgpu, or ane; cpu is for reference diagnostics."
                     .into(),
             );
         }
@@ -306,6 +308,18 @@ fn main() -> AnyResult<()> {
             }
             #[cfg(not(all(target_os = "macos", feature = "metal")))]
             Err("Metal needs macOS and the metal feature".into())
+        }
+        DeviceKind::Wgpu => {
+            #[cfg(any(feature = "wgpu", feature = "metal"))]
+            {
+                use burn::backend::wgpu::{WgpuDevice, graphics, init_setup};
+                let device = WgpuDevice::default();
+                let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
+                eprintln!("WGPU: {:?}", setup.adapter.get_info());
+                run::<burn::backend::wgpu::Wgpu>(&args.command, precision, &device, None)
+            }
+            #[cfg(not(any(feature = "wgpu", feature = "metal")))]
+            Err("WGPU needs the wgpu feature".into())
         }
         DeviceKind::Cpu => {
             #[cfg(feature = "cpu")]

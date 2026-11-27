@@ -148,7 +148,9 @@ fn doctor_command(model: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 fn generate_command(options: &GenerateOptions) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "metal")]
     type B = burn::backend::wgpu::Metal;
-    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
+    #[cfg(all(not(feature = "metal"), feature = "wgpu"))]
+    type B = burn::backend::wgpu::Wgpu;
+    #[cfg(all(not(any(feature = "metal", feature = "wgpu")), feature = "cpu"))]
     type B = burn::backend::NdArray;
 
     #[cfg(feature = "metal")]
@@ -159,13 +161,21 @@ fn generate_command(options: &GenerateOptions) -> Result<(), Box<dyn std::error:
         eprintln!("Metal: {:?}", setup.adapter.get_info());
         run_generate::<B>(options, &device)
     }
-    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
+    #[cfg(all(not(feature = "metal"), feature = "wgpu"))]
+    {
+        use burn::backend::wgpu::{WgpuDevice, graphics, init_setup};
+        let device = WgpuDevice::default();
+        let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
+        eprintln!("WGPU: {:?}", setup.adapter.get_info());
+        run_generate::<B>(options, &device)
+    }
+    #[cfg(all(not(any(feature = "metal", feature = "wgpu")), feature = "cpu"))]
     {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         run_generate::<B>(options, &device)
     }
-    #[cfg(not(any(feature = "metal", feature = "cpu")))]
-    Err("No backend enabled. Build with metal (or cpu for reference diagnostics).".into())
+    #[cfg(not(any(feature = "metal", feature = "wgpu", feature = "cpu")))]
+    Err("No backend enabled. Build with metal, wgpu, or cpu for reference diagnostics.".into())
 }
 
 fn run_generate<B: burn::tensor::backend::Backend + omni_minicpm_v::quant::ExpertResidence>(
@@ -866,13 +876,29 @@ fn check_backend() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Metal: {:?}", setup.adapter.get_info());
         probe::<burn::backend::wgpu::Metal>(&device)
     }
-    #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cpu"))]
+    #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "wgpu"))]
+    {
+        use burn::backend::wgpu::{WgpuDevice, graphics, init_setup};
+        let device = WgpuDevice::default();
+        let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
+        eprintln!("WGPU: {:?}", setup.adapter.get_info());
+        probe::<burn::backend::wgpu::Wgpu>(&device)
+    }
+    #[cfg(all(
+        not(all(target_os = "macos", feature = "metal")),
+        not(feature = "wgpu"),
+        feature = "cpu"
+    ))]
     {
         type B = burn::backend::NdArray;
         probe::<B>(&Default::default())
     }
-    #[cfg(not(any(all(target_os = "macos", feature = "metal"), feature = "cpu")))]
-    Err("No backend enabled. Build with metal (or cpu for reference diagnostics).".into())
+    #[cfg(not(any(
+        all(target_os = "macos", feature = "metal"),
+        feature = "wgpu",
+        feature = "cpu"
+    )))]
+    Err("No backend enabled. Build with metal, wgpu, or cpu for reference diagnostics.".into())
 }
 
 fn probe<B: burn::tensor::backend::Backend>(

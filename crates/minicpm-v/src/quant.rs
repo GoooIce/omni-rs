@@ -111,7 +111,7 @@ impl ExpertResidence for burn::backend::NdArray {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 mod cube_residence {
     use super::{ExpertResidence, LoadMode};
     use burn::backend::wgpu::{CubeBackend, WgpuRuntime};

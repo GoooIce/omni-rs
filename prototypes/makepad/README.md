@@ -74,9 +74,9 @@ python3 prototypes/makepad/build-native.py
 
 点“选择音频”挑选 WAV，或在“识别设置”里粘贴完整路径；“官方示例”填入自带的 test.wav。整数/浮点 WAV、多通道平均、16 kHz 重采样都在工作线程完成，原型限制最长 10 分钟。首次推理包含 GPU 内核编译，重复转写用于观察预热速度。提示词仅在开始一个新会话时读取。
 
-Apple Silicon 原生界面使用 `Ane<Metal>`，默认按延迟选择执行路径。短矩阵和独立逐元素图提前交给 Metal；M5 上实测更快的 TTS 预填充、逐 token 解码和流式音频解码完整留在 Metal，并保留原 GEMV/RMS 内核。ASR 的文本预填充和 KV 解码也保持在 Metal，声学编码器仍可执行 ANE。ASR、TTS 和参考音色编码共用有界 ANE 程序缓存及 Metal 设备；实际跨设备时仍通过 IOSurface 共享激活，必要的布局转换在 GPU 完成。实现和实测见 [调度优化记录](../../docs/macos-unified-memory-research.md#混合后端的延迟调度优化)。开发诊断可用 `OMNI_ANE_FIRST=1` 恢复支持即交给 ANE 的策略，正常启动无需设置。
+桌面端全部推理引擎（ASR、TTS、翻译、图像、音乐、Omni 与语音增强）统一通过 `src/gpu.rs` 选择后端与设备，不再在各引擎内部分散维护平台条件编译。Apple Silicon 默认 feature（`default = ["metal", "ane"]`）下，语音引擎使用 `Ane<Metal>`（默认按延迟选择执行路径），翻译/图像/音乐使用 `Metal`，Omni 与语音增强使用非融合 `CubeBackend<WgpuRuntime, f32, i32, u32>`。短矩阵和独立逐元素图提前交给 Metal；M5 上实测更快的 TTS 预填充、逐 token 解码和流式音频解码完整留在 Metal，并保留原 GEMV/RMS 内核。ASR 的文本预填充和 KV 解码也保持在 Metal，声学编码器仍可执行 ANE。ASR、TTS 和参考音色编码共用有界 ANE 程序缓存及 Metal 设备；实际跨设备时仍通过 IOSurface 共享激活，必要的布局转换在 GPU 完成。实现和实测见 [调度优化记录](../../docs/macos-unified-memory-research.md#混合后端的延迟调度优化)。开发诊断可用 `OMNI_ANE_FIRST=1` 恢复支持即交给 ANE 的策略，正常启动无需设置。
 
-运行和构建均要求 Apple Silicon macOS。Metal 仍使用底层 wgpu 运行时；不提供 Intel Mac、Windows、Linux 或浏览器推理后端。Makepad 自己负责界面渲染，模型常驻工作线程，命令队列有界，界面通过 `try_send` / `try_recv` 和 `SignalToUI` 通信。停止通过原子标志打断推理，当前执行的运算返回后退出，保留模型供下一次任务使用。
+除默认 Apple Silicon 构建外，`r2t2-makepad` 也支持通过 `--no-default-features --features wgpu` 或 `--no-default-features --features cpu` 构建通用计算后端（不引入 `burn-ane`、`objc2-metal` 或 `mtl4`），遵循 [ADR-0007](../../docs/adr/0007-platform-backend-and-provider-boundaries.md)；当前默认验收与日常运行仍为 Apple Silicon macOS，浏览器 WASM/WebGPU 后端保持退役。Makepad 自己负责界面渲染，模型常驻工作线程，命令队列有界，界面通过 `try_send` / `try_recv` 和 `SignalToUI` 通信。停止通过原子标志打断推理，当前执行的运算返回后退出，保留模型供下一次任务使用。
 
 此命令运行开发用的独立可执行文件。西文字体来自 Cargo 的 Makepad checkout；界面自带的字体、覆盖的文字和许可见 [resources/fonts/README.md](resources/fonts/README.md)。它不是可单独分发的 `.app` 安装包。
 原生 UI 使用独立的 `target/makepad-native`，避免与根 workspace 的 Burn 特性构建产物冲突。

@@ -3,6 +3,15 @@ use crate::{Precision, Result};
 use burn::tensor::{FloatDType, Tensor, TensorData, backend::Backend};
 use omni_r2t2::{tensor, weights::WeightSource};
 
+/// Whether Apple-only MSL TensorOps and NAX flash-attention hooks are compiled in.
+pub const fn apple_kernels_compiled() -> bool {
+    cfg!(all(
+        feature = "metal",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))
+}
+
 pub struct Linear<B: Backend> {
     inner: tensor::Linear<B>,
     tensorops: bool,
@@ -213,5 +222,69 @@ impl<B: Backend> Rotary<B> {
                 tensor::RotaryLayout::SplitHalf
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    #[test]
+    fn apple_kernel_flag_matches_metal_feature_boundary() {
+        let expected = cfg!(all(
+            feature = "metal",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ));
+        assert_eq!(apple_kernels_compiled(), expected);
+    }
+
+    #[test]
+    fn tensorops_linear_falls_back_cleanly_to_portable_burn_on_non_apple_backend() {
+        type Cpu = NdArray;
+        let device = Default::default();
+        // Linear::from_parts expects [out_features=2, in_features=2]; x is [1, 2].
+        let weight = Tensor::<Cpu, 2>::from_data(
+            TensorData::new(vec![1.0f32, 2.0, 3.0, 4.0], [2, 2]),
+            &device,
+        );
+        let bias = Tensor::<Cpu, 1>::from_data(TensorData::new(vec![0.5f32, -0.5], [2]), &device);
+        let x = Tensor::<Cpu, 2>::from_data(TensorData::new(vec![2.0f32, -1.0], [1, 2]), &device);
+        let linear = Linear::from_parts(weight, bias).with_tensorops();
+        let got = linear.forward(x).into_data().to_vec::<f32>().unwrap();
+        // Row 0: 1*2 + 2*(-1) + 0.5 = 0.5; Row 1: 3*2 + 4*(-1) - 0.5 = 1.5.
+        assert!((got[0] - 0.5).abs() < 1e-5, "got={got:?}");
+        assert!((got[1] - 1.5).abs() < 1e-5, "got={got:?}");
+    }
+
+    #[test]
+    fn dit_attention_falls_back_cleanly_to_portable_burn_attention() {
+        type Cpu = NdArray;
+        let device = Default::default();
+        let q = Tensor::<Cpu, 4>::from_data(
+            TensorData::new(vec![1.0f32, 0.0, 0.0, 1.0], [1, 1, 2, 2]),
+            &device,
+        );
+        let k = q.clone();
+        let v = Tensor::<Cpu, 4>::from_data(
+            TensorData::new(vec![2.0f32, 0.0, 0.0, 4.0], [1, 1, 2, 2]),
+            &device,
+        );
+        let got = dit_attention(q.clone(), k.clone(), v.clone(), true, 0)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let expected = attention(q, k, v, true, 0)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(got.len(), expected.len());
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        }
+        // Causal token 0 attends only to token 0 -> exact value [2.0, 0.0].
+        assert!((got[0] - 2.0).abs() < 1e-5);
+        assert!(got[1].abs() < 1e-5);
     }
 }

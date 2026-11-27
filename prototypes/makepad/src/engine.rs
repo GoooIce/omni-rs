@@ -82,7 +82,7 @@ impl Adapter for Worker {
         self.model = Some(Arc::new(
             crate::model_loader::load(
                 path,
-                Precision::F16,
+                gpu::default_precision(),
                 &self.device,
                 &context.stop,
                 |progress, message| context.loading(progress, message),

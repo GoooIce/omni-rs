@@ -50,6 +50,18 @@ class CheckRunnerTests(unittest.TestCase):
             self.assertEqual(run_steps(root, steps, root / "artifacts/report", "metal"), 1)
             spawn.assert_not_called()
 
+    def test_quick_plan_enforces_portable_dependency_graphs_and_compile_boundaries(self):
+        root = Path(__file__).resolve().parents[1]
+        steps = plan(root, "quick", root / "artifacts/unused-plan")
+        names = [step["id"] for step in steps]
+        self.assertIn("portable-dependency-graphs", names)
+        self.assertIn("portable-omni-kernel-cpu", names)
+        self.assertIn("portable-omni-kernel-wgpu", names)
+        self.assertIn("portable-qwen-image-cpu", names)
+        self.assertIn("portable-makepad-cpu", names)
+        graph_step = next(step for step in steps if step["id"] == "portable-dependency-graphs")
+        self.assertIn("--portable", graph_step["command"])
+
     def test_metal_plan_checks_local_wiring_and_lints_the_gpu_manifests(self):
         root = Path(__file__).resolve().parents[1]
         steps = plan(root, "metal", root / "artifacts/unused-plan")
