@@ -325,6 +325,20 @@ impl App {
                 m.submitted_root = None;
             }
             self.music_mode_labels(cx);
+            if update.kind == "missing"
+                || (update.kind == "error" && update.message.contains("模型目录缺少"))
+            {
+                let missing_id = if update.message.contains("MERT-v2-FullSong") {
+                    omni_hub::catalog::CheckpointId::MertV2FullSong
+                } else if update.message.contains("SheetSage2") {
+                    omni_hub::catalog::CheckpointId::SheetSage2
+                } else if update.message.contains("YuE2-Vae") {
+                    omni_hub::catalog::CheckpointId::Yue2Vae
+                } else {
+                    omni_hub::catalog::CheckpointId::Yue2_3b
+                };
+                self.notify_panel_missing(cx, missing_id);
+            }
             self.music_status(
                 cx,
                 &if matches!(update.kind, "error" | "fatal" | "missing") {
@@ -379,10 +393,23 @@ impl App {
                 .set_filename(name.into()),
         );
     }
+    pub fn open_music_models_picker(&mut self, cx: &mut Cx) {
+        let Some(dialog) = self.runtime.dialog("music") else {
+            return;
+        };
+        let Some(m) = self.music.as_mut() else {
+            return;
+        };
+        m.dialog = Some(dialog);
+        m.picking = Some(Picking::Models);
+        let path = self.ui.text_input(cx, ids!(music_models)).text();
+        crate::engine_ui::choose_directory(cx, Path::new(&path), "选择包含音乐模型的父目录");
+    }
     pub fn handle_music_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         if self.music.is_none() {
             return;
         }
+        let mut selected_models_root: Option<PathBuf> = None;
         for action in actions {
             let m = self.music.as_mut().unwrap();
             let Some(action) = action.downcast_ref::<FileDialogAction>() else {
@@ -401,9 +428,11 @@ impl App {
                 FileDialogAction::FolderSelected(path)
                     if matches!(m.picking, Some(Picking::Models)) =>
                 {
+                    let root_dir = crate::model_location::selected_directory(path);
                     self.ui
                         .text_input(cx, ids!(music_models))
-                        .set_text(cx, &path.to_string_lossy());
+                        .set_text(cx, &root_dir.to_string_lossy());
+                    selected_models_root = Some(root_dir);
                 }
                 FileDialogAction::SaveFileSelected { path, .. }
                     if matches!(m.picking, Some(Picking::Save(_))) =>
@@ -422,6 +451,19 @@ impl App {
             }
             m.picking = None;
             m.dialog = None;
+        }
+        if let Some(root_dir) = selected_models_root {
+            for (id, sub) in [
+                (
+                    omni_hub::catalog::CheckpointId::MertV2FullSong,
+                    "MERT-v2-FullSong",
+                ),
+                (omni_hub::catalog::CheckpointId::SheetSage2, "SheetSage2"),
+                (omni_hub::catalog::CheckpointId::Yue2_3b, "YuE2-3B"),
+                (omni_hub::catalog::CheckpointId::Yue2Vae, "YuE2-Vae"),
+            ] {
+                self.sync_checkpoint_directory(cx, id, root_dir.join(sub));
+            }
         }
         let source = self.ui.text_input(cx, ids!(music_source)).text();
         let m = self.music.as_mut().unwrap();

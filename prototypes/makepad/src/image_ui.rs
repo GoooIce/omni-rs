@@ -49,6 +49,16 @@ impl State {
     pub fn needs_model(&self) -> bool {
         !self.ready && !self.loading
     }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn set_directory_ready_for_load(&mut self, dir: PathBuf) {
+        self.path = dir;
+        self.needs_directory = false;
+        self.remember = true;
+        self.ready = false;
+        self.controls = None;
+    }
 
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
         let settings =
@@ -145,7 +155,15 @@ impl App {
         self.ui
             .view(cx, ids!(image_recovery))
             .set_visible(cx, !i.ready);
+        let not_ready = !i.ready;
         self.image_status(cx, message);
+        if not_ready {
+            self.notify_panel_load_error(
+                cx,
+                omni_hub::catalog::CheckpointId::QwenImage21Turbo,
+                message,
+            );
+        }
     }
     fn load_image(&mut self, cx: &mut Cx) {
         if self.runtime.busy() {
@@ -341,6 +359,10 @@ impl App {
                             Err(error) => format!("{} · 目录未能保存：{error}", update.message),
                         },
                     );
+                    self.clear_panel_load_error(
+                        cx,
+                        omni_hub::catalog::CheckpointId::QwenImage21Turbo,
+                    );
                 }
                 "missing" => {
                     i.ready = false;
@@ -351,8 +373,12 @@ impl App {
                     self.ui.view(cx, ids!(image_recovery)).set_visible(cx, true);
                     i.busy = false;
                     i.loading = false;
-                    i.needs_directory = true;
+                    i.needs_directory = false;
                     self.image_status(cx, &update.message);
+                    self.notify_panel_missing(
+                        cx,
+                        omni_hub::catalog::CheckpointId::QwenImage21Turbo,
+                    );
                 }
                 "observation" => {
                     let rejected = update.observation.as_ref().and_then(|cell| {
@@ -513,12 +539,18 @@ impl App {
                 Some(FileDialogAction::FolderSelected(path)) if i.picking => {
                     i.dialog.take();
                     i.picking = false;
-                    i.path = model_location::selected_directory(path);
+                    let selected = model_location::selected_directory(path);
+                    i.path = selected.clone();
                     i.remember = true;
                     i.ready = false;
                     i.initialized = false;
                     i.busy = false;
                     i.loading = false;
+                    self.sync_checkpoint_directory(
+                        cx,
+                        omni_hub::catalog::CheckpointId::QwenImage21Turbo,
+                        selected,
+                    );
                     if self.workspace.creative() && !self.runtime.busy() {
                         self.load_image(cx);
                     }

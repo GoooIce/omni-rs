@@ -60,6 +60,13 @@
       "metal": false
     },
     {
+      "path": "crates/omni-hub/Cargo.toml",
+      "cpu_features": "",
+      "target": "target",
+      "strict_clippy": true,
+      "metal": true
+    },
+    {
       "path": "crates/burn-ane/Cargo.toml",
       "target": "target",
       "strict_clippy": true,

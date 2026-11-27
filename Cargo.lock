@@ -4962,6 +4962,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-hub"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "omni-hy-mt"
 version = "0.1.0"
 dependencies = [
@@ -5696,6 +5710,7 @@ dependencies = [
  "hound",
  "makepad-widgets",
  "omni-breeze-tts",
+ "omni-hub",
  "omni-hy-mt",
  "omni-lfm3",
  "omni-minicpm-v",

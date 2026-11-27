@@ -190,6 +190,9 @@ impl App {
             None
         };
         if let Some(page) = page {
+            if self.settings_panel_open() {
+                self.close_settings_panel(cx);
+            }
             if self.workspace.request(page) && !self.follow_tab_indicator(cx, true) {
                 self.apply_pending_page(cx);
             }

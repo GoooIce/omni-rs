@@ -10,6 +10,8 @@ mod clip_playback;
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop_runtime;
 #[cfg(not(target_arch = "wasm32"))]
+mod download_ui;
+#[cfg(not(target_arch = "wasm32"))]
 mod engine;
 #[cfg(not(target_arch = "wasm32"))]
 mod engine_harness;
@@ -29,6 +31,8 @@ mod microphone;
 mod model_loader;
 #[cfg(not(target_arch = "wasm32"))]
 mod model_location;
+#[cfg(not(target_arch = "wasm32"))]
+mod models_state;
 #[cfg(not(target_arch = "wasm32"))]
 mod music_engine;
 #[cfg(not(target_arch = "wasm32"))]
@@ -188,6 +192,16 @@ script_mod! {
         width: Fill height: 1 padding: 0
         draw_bg.color: #344137 draw_bg.border_radius: 0
     }
+    let RecoveryCard = RoundedView{
+        visible: false width: Fill height: Fit flow: Down padding: 10 spacing: 6
+        draw_bg.color: #24312b draw_bg.border_radius: 6
+        draw_bg.border_color: #4d6155 draw_bg.border_size: 1
+    }
+    let CheckpointItem = RoundedView{
+        width: Fill height: Fit flow: Down padding: 10 spacing: 6
+        draw_bg.color: #161d19 draw_bg.border_radius: 6
+        draw_bg.border_color: #313d35 draw_bg.border_size: 1
+    }
 
     startup() do #(App::script_component(vm)){
         ui: Root{
@@ -219,6 +233,8 @@ script_mod! {
                                     draw_bg.color: #b7dfc7 draw_bg.border_radius: 2
                                 }
                             }
+                            top_bar_spacer := View{width: Fill height: 1}
+                            settings_toggle := QuietButton{visible: false text: "模型与设置" height: 36}
                         }
                         running_bar := RoundedView{
                             visible: false width: Fill height: Fit flow: Right spacing: 10
@@ -228,8 +244,169 @@ script_mod! {
                             running_stop := SpeechButton{text: "停止推理" height: 32}
                             playback_stop := SpeechButton{text: "停止播放" height: 32}
                         }
+                        download_banner := RoundedView{
+                            visible: false width: Fill height: Fit flow: Right spacing: 10
+                            padding: 9 align: Align{y: 0.5}
+                            draw_bg.color: #233029 draw_bg.border_radius: 5
+                            draw_bg.border_color: #465b4e draw_bg.border_size: 1
+                            download_banner_status := SpeechLabel{width: Fill text: "" draw_text.color: #b7dfc7}
+                            download_banner_open := QuietButton{text: "查看下载进度" height: 30}
+                        }
                         pages := ScrollYView{
                             width: Fill height: Fill flow: Down spacing: 0
+                            settings_panel := View{
+                                visible: false width: Fill height: Fit flow: Down spacing: 12
+                                WorkspacePanel{
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                                        SectionLabel{width: Fill text: "模型与下载设置"}
+                                        settings_close := QuietButton{text: "← 返回工作台" height: 32}
+                                    }
+                                    MutedLabel{text: "统一管理模型检查点、下载线路、镜像代理与受限权限凭据。下载在后台运行，不阻塞其他工作台。"}
+                                    Divider{}
+                                    SpeechLabel{text: "下载线路与代理"}
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        route_modelscope := SpeechButton{text: "● 魔搭 ModelScope（默认）" height: 32}
+                                        route_huggingface := SpeechButton{text: "Hugging Face 官方" height: 32}
+                                        route_custom_mirror := SpeechButton{text: "自定义 HF 镜像" height: 32}
+                                    }
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                        MutedLabel{width: Fit text: "遇到仅 HF 模型时"}
+                                        fallback_prompt := QuietButton{text: "● 仅 HF 模型时提示切换" height: 30}
+                                        fallback_hf := QuietButton{text: "自动走 HF 官方" height: 30}
+                                        fallback_mirror := QuietButton{text: "自动走自定义镜像" height: 30}
+                                    }
+                                    SpeechLabel{text: "自定义 HF 镜像地址（HF_ENDPOINT）"}
+                                    mirror_url_input := SpeechInput{width: Fill height: 34 empty_text: "https://hf-mirror.com 或自建反代地址"}
+                                    mirror_url_hint := MutedLabel{text: ""}
+                                    SpeechLabel{text: "HTTP(S) 代理地址（可选）"}
+                                    proxy_url_input := SpeechInput{width: Fill height: 34 empty_text: "例如 http://127.0.0.1:7890"}
+                                    proxy_url_hint := MutedLabel{text: ""}
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                        settings_save_route := PrimaryButton{text: "保存线路配置" height: 34}
+                                        settings_test_connection := SpeechButton{text: "测试连接" height: 34}
+                                        settings_save_status := MutedLabel{width: Fill text: ""}
+                                    }
+                                    connectivity_status := MutedLabel{text: "" draw_text.color: #b7dfc7}
+                                }
+                                WorkspacePanel{
+                                    SpeechLabel{text: "鉴权 Token（独立 0600 凭据文件，环境变量优先）"}
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 6
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            SpeechLabel{width: Fit text: "Hugging Face Token"}
+                                            hf_token_source := MutedLabel{width: Fill text: ""}
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8
+                                            hf_token_input := SpeechInput{width: Fill height: 34 empty_text: "输入 hf_...（默认掩码）"}
+                                            hf_token_toggle := QuietButton{text: "显示" height: 34}
+                                            hf_token_save := SpeechButton{text: "保存" height: 34}
+                                            hf_token_clear := QuietButton{text: "清除" height: 34}
+                                        }
+                                    }
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 6
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            SpeechLabel{width: Fit text: "魔搭 ModelScope Token"}
+                                            ms_token_source := MutedLabel{width: Fill text: ""}
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8
+                                            ms_token_input := SpeechInput{width: Fill height: 34 empty_text: "输入 ModelScope API Token（默认掩码）"}
+                                            ms_token_toggle := QuietButton{text: "显示" height: 34}
+                                            ms_token_save := SpeechButton{text: "保存" height: 34}
+                                            ms_token_clear := QuietButton{text: "清除" height: 34}
+                                        }
+                                    }
+                                    token_status := MutedLabel{text: ""}
+                                }
+                                WorkspacePanel{
+                                    SpeechLabel{text: "托管模型清单与下载进度"}
+                                    CheckpointItem{
+                                        SpeechLabel{text: "Confucius4-R2T2"}
+                                        ckpt_asr_status := MutedLabel{text: ""}
+                                        ckpt_asr_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_asr_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_asr_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_asr_action := SpeechButton{text: "一键下载" height: 30} ckpt_asr_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_asr_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_asr_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "Breeze-TTS-2"}
+                                        ckpt_tts_status := MutedLabel{text: ""}
+                                        ckpt_tts_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_tts_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_tts_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_tts_action := SpeechButton{text: "一键下载" height: 30} ckpt_tts_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_tts_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_tts_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "Hy-MT2-7B"}
+                                        ckpt_hymt_status := MutedLabel{text: ""}
+                                        ckpt_hymt_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_hymt_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_hymt_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_hymt_action := SpeechButton{text: "一键下载" height: 30} ckpt_hymt_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_hymt_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_hymt_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "Qwen-Image-2.1-Turbo"}
+                                        ckpt_image_status := MutedLabel{text: ""}
+                                        ckpt_image_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_image_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_image_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_image_action := SpeechButton{text: "一键下载" height: 30} ckpt_image_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_image_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_image_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "MERT-v2-FullSong"}
+                                        ckpt_mert_status := MutedLabel{text: ""}
+                                        ckpt_mert_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_mert_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_mert_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_mert_action := SpeechButton{text: "一键下载" height: 30} ckpt_mert_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_mert_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_mert_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "SheetSage2"}
+                                        ckpt_sheetsage_status := MutedLabel{text: ""}
+                                        ckpt_sheetsage_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_sheetsage_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_sheetsage_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_sheetsage_action := SpeechButton{text: "一键下载" height: 30} ckpt_sheetsage_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_sheetsage_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_sheetsage_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "YuE2-3B"}
+                                        ckpt_yue3b_status := MutedLabel{text: ""}
+                                        ckpt_yue3b_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_yue3b_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_yue3b_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_yue3b_action := SpeechButton{text: "一键下载" height: 30} ckpt_yue3b_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_yue3b_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_yue3b_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "YuE2-Vae"}
+                                        ckpt_yuevae_status := MutedLabel{text: ""}
+                                        ckpt_yuevae_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_yuevae_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_yuevae_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_yuevae_action := SpeechButton{text: "一键下载" height: 30} ckpt_yuevae_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_yuevae_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_yuevae_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "MiniCPM-V-4.7-1B"}
+                                        ckpt_vlm1b_status := MutedLabel{text: ""}
+                                        ckpt_vlm1b_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_vlm1b_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_vlm1b_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_vlm1b_action := SpeechButton{text: "一键下载" height: 30} ckpt_vlm1b_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_vlm1b_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_vlm1b_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "MiniCPM-V-4.7-35B-A3B-int4"}
+                                        ckpt_vlm35b_status := MutedLabel{text: ""}
+                                        ckpt_vlm35b_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_vlm35b_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_vlm35b_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_vlm35b_action := SpeechButton{text: "一键下载" height: 30} ckpt_vlm35b_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_vlm35b_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_vlm35b_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                    CheckpointItem{
+                                        SpeechLabel{text: "LFM3-Omni-2B"}
+                                        ckpt_omni_status := MutedLabel{text: ""}
+                                        ckpt_omni_progress := RoundedView{visible: false width: Fill height: 4 padding: 0 draw_bg.color: #344137 draw_bg.border_radius: 2 ckpt_omni_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}}
+                                        ckpt_omni_hint := MutedLabel{text: ""}
+                                        View{width: Fill height: Fit flow: Right spacing: 8 ckpt_omni_action := SpeechButton{text: "暂不支持自动下载" height: 30} ckpt_omni_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_omni_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_omni_choose := QuietButton{text: "选择本地目录…" height: 30}}
+                                    }
+                                }
+                            }
                             page_stage := View{
                                 width: Fill height: Fit flow: Down clip_x: true clip_y: false
                                 page_track := View{
@@ -252,6 +429,16 @@ script_mod! {
                                         omni_load := SpeechButton{text: "载入" height: 34}
                                     }
                                     omni_status := MutedLabel{text: "请选择并载入 LFM3-Omni-2B" draw_text.color: #d7b56a}
+                                    omni_recovery := RecoveryCard{
+                                        omni_recovery_info := SpeechLabel{width: Fill text: ""}
+                                        omni_recovery_hint := MutedLabel{text: ""}
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8
+                                            omni_download_model := SpeechButton{text: "暂不支持自动下载" height: 32}
+                                            omni_choose_recovery := SpeechButton{text: "选择本地目录…" height: 32}
+                                            omni_open_settings := QuietButton{text: "线路与 Token 设置" height: 32}
+                                        }
+                                    }
                                     omni_live := MutedLabel{text: ""}
                                     omni_transcript := SpeechInput{
                                         width: Fill height: 160 is_multiline: true is_read_only: true
@@ -304,10 +491,18 @@ script_mod! {
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
                                             model_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}
                                         }
-                                        model_recovery := View{
-                                            visible: false width: Fill height: Fit flow: Right spacing: 8
-                                            choose_model := SpeechButton{text: "选择模型…"}
-                                            retry_model := SpeechButton{text: "重试加载"}
+                                        model_recovery := RecoveryCard{
+                                            asr_recovery_info := SpeechLabel{width: Fill text: ""}
+                                            asr_recovery_hint := MutedLabel{text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                asr_download_model := PrimaryButton{text: "一键下载" height: 32}
+                                                asr_download_pause := QuietButton{visible: false text: "暂停" height: 32}
+                                                asr_download_cancel := QuietButton{visible: false text: "取消" height: 32}
+                                                choose_model := SpeechButton{text: "选择本地目录…" height: 32}
+                                                asr_open_settings := QuietButton{text: "线路与 Token 设置" height: 32}
+                                                retry_model := QuietButton{text: "重试加载" height: 32}
+                                            }
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -382,6 +577,18 @@ script_mod! {
                                                 visible: false width: Fill height: Fit
                                                 asr_translation_status := MutedLabel{text: ""}
                                             }
+                                            translation_recovery := RecoveryCard{
+                                                translation_recovery_info := SpeechLabel{width: Fill text: ""}
+                                                translation_recovery_hint := MutedLabel{text: ""}
+                                                View{
+                                                    width: Fill height: Fit flow: Right spacing: 8
+                                                    translation_download_model := PrimaryButton{text: "一键下载" height: 32}
+                                                    translation_download_pause := QuietButton{visible: false text: "暂停" height: 32}
+                                                    translation_download_cancel := QuietButton{visible: false text: "取消" height: 32}
+                                                    translation_choose_model := SpeechButton{text: "选择本地目录…" height: 32}
+                                                    translation_open_settings := QuietButton{text: "线路与 Token 设置" height: 32}
+                                                }
+                                            }
                                         }
                                         asr_details := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 10
@@ -439,10 +646,21 @@ script_mod! {
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
                                             tts_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}
                                         }
-                                        tts_recovery := View{
-                                            visible: false width: Fill height: Fit flow: Right spacing: 8
-                                            tts_choose := SpeechButton{text: "选择模型…"}
-                                            tts_retry := SpeechButton{text: "重试加载"}
+                                        tts_recovery := RecoveryCard{
+                                            tts_recovery_info := SpeechLabel{width: Fill text: ""}
+                                            tts_recovery_hint := MutedLabel{text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                tts_download_model := PrimaryButton{text: "一键下载" height: 32}
+                                                tts_download_pause := QuietButton{visible: false text: "暂停" height: 32}
+                                                tts_download_cancel := QuietButton{visible: false text: "取消" height: 32}
+                                                tts_choose := SpeechButton{text: "选择目录…" height: 32}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                tts_open_settings := QuietButton{text: "线路与 Token 设置" height: 30}
+                                                tts_retry := QuietButton{text: "重试加载" height: 30}
+                                            }
                                         }
                                         View{
                                             width: Fill height: Fit flow: Right spacing: 8
@@ -585,6 +803,21 @@ script_mod! {
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
                                             music_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}
                                         }
+                                        music_recovery := RecoveryCard{
+                                            music_recovery_info := SpeechLabel{width: Fill text: ""}
+                                            music_recovery_hint := MutedLabel{text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                music_download_model := PrimaryButton{text: "一键下载" height: 32}
+                                                music_download_pause := QuietButton{visible: false text: "暂停" height: 32}
+                                                music_download_cancel := QuietButton{visible: false text: "取消" height: 32}
+                                                music_choose_recovery := SpeechButton{text: "选择目录…" height: 32}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                music_open_settings := QuietButton{text: "线路与 Token 设置" height: 30}
+                                            }
+                                        }
                                         SpeechLabel{text: "风格与声音 · 用英文"}
                                         music_style := SpeechInput{
                                             width: Fill height: 76 is_multiline: true
@@ -680,10 +913,18 @@ script_mod! {
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
                                             image_progress_fill := RoundedView{width: 0 height: Fill draw_bg.color: #b7dfc7 draw_bg.border_radius: 2}
                                         }
-                                        image_recovery := View{
-                                            visible: false width: Fill height: Fit flow: Right spacing: 8
-                                            image_choose := SpeechButton{text: "选择模型…"}
-                                            image_retry := SpeechButton{text: "重试加载"}
+                                        image_recovery := RecoveryCard{
+                                            image_recovery_info := SpeechLabel{width: Fill text: ""}
+                                            image_recovery_hint := MutedLabel{text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                image_download_model := PrimaryButton{text: "一键下载" height: 32}
+                                                image_download_pause := QuietButton{visible: false text: "暂停" height: 32}
+                                                image_download_cancel := QuietButton{visible: false text: "取消" height: 32}
+                                                image_choose := SpeechButton{text: "选择本地目录…" height: 32}
+                                                image_open_settings := QuietButton{text: "线路与 Token 设置" height: 32}
+                                                image_retry := QuietButton{text: "重试加载" height: 32}
+                                            }
                                         }
                                         image_preview_group := RoundedView{
                                             width: Fill height: 280 padding: 8 flow: Down spacing: 0
@@ -878,6 +1119,9 @@ pub struct App {
     #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     translation: Option<translation_ui::State>,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[rust]
+    downloads: Option<download_ui::UiState>,
 }
 
 impl App {
@@ -942,6 +1186,7 @@ impl App {
         // load only from their explicit controls, music from a submitted action.
         if self.inference_busy()
             || self.runtime.dialog_busy()
+            || self.settings_panel_open()
             || !self.workspace.language()
             || self.omni.as_ref().is_some_and(|state| state.visible())
         {
@@ -984,11 +1229,15 @@ impl MatchEvent for App {
             self.ui.view(cx, ids!(app_heading)).set_visible(cx, false);
             self.ui.view(cx, ids!(nav_group)).set_visible(cx, true);
             self.ui.view(cx, ids!(navigation)).set_visible(cx, true);
+            self.ui
+                .button(cx, ids!(settings_toggle))
+                .set_visible(cx, true);
             self.ui.label(cx, ids!(app_title)).set_text(cx, "知音");
             self.ui
                 .label(cx, ids!(app_subtitle))
                 .set_text(cx, "声音、文字、图像与音乐");
             self.open_transcription(cx, &root);
+            self.initialize_downloads(cx, &root);
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1015,6 +1264,7 @@ impl MatchEvent for App {
                 }
             }
             self.handle_workspace_actions(cx, actions);
+            self.handle_download_actions(cx, actions);
             self.handle_translation_actions(cx, actions);
             self.handle_image_actions(cx, actions);
             self.handle_tts_actions(cx, actions);
@@ -1055,6 +1305,7 @@ impl AppMain for App {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.poll_downloads(cx);
             self.poll_tts(cx);
             self.poll_image(cx);
             self.poll_translation(cx);
@@ -1081,6 +1332,8 @@ impl AppMain for App {
         self.refresh_music_controls(cx);
         #[cfg(not(target_arch = "wasm32"))]
         self.refresh_omni_controls(cx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.refresh_download_controls(cx);
         self.ui.handle_event(cx, event, &mut Scope::empty());
     }
 }
