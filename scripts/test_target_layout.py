@@ -31,70 +31,44 @@ class TargetLayoutTests(unittest.TestCase):
             self.assertEqual(primary_checkout(root), root.resolve())
             self.assertEqual(primary_checkout(linked), root.resolve())
 
-    def test_links_use_the_registered_directory_in_the_primary_checkout(self):
+    def test_unified_workspace_rejects_member_and_cross_worktree_target_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             primary = Path(tmp) / "primary"
             linked = Path(tmp) / "linked"
             for checkout in (primary, linked):
                 (checkout / "crates/demo").mkdir(parents=True)
                 (checkout / "crates/demo/Cargo.toml").write_text("")
+            (primary / "target").mkdir()
             manifests = [
                 {"path": "Cargo.toml", "target": "target"},
-                {"path": "crates/demo/Cargo.toml", "target": "target/demo-cpu"},
+                {"path": "crates/demo/Cargo.toml", "target": "target"},
             ]
-            self.assertEqual(planned_links(primary, primary, manifests), [
-                (primary / "crates/demo/target", primary / "target/demo-cpu"),
-            ])
-            self.assertEqual(planned_links(linked, primary, manifests), [
-                (linked / "target", primary / "target"),
-                (linked / "crates/demo/target", primary / "target/demo-cpu"),
-            ])
-            apply_links(linked, primary, manifests)
-            self.assertEqual((linked / "target").resolve(), (primary / "target").resolve())
-            self.assertEqual((linked / "crates/demo/target").resolve(),
-                             (primary / "target/demo-cpu").resolve())
+            self.assertEqual(planned_links(primary, primary, manifests), [])
+            self.assertEqual(check_links(primary, primary, manifests), [])
+            self.assertEqual(check_links(linked, primary, manifests), [])
+
+            # Obsolete cross-worktree symlink is flagged and safely removed by apply_links.
+            (linked / "target").symlink_to(primary / "target")
+            (linked / "crates/demo/target").symlink_to(primary / "target")
+            self.assertEqual(len(check_links(linked, primary, manifests)), 2)
+            removed = apply_links(linked, primary, manifests)
+            self.assertEqual(len(removed), 2)
+            self.assertEqual(check_links(linked, primary, manifests), [])
+
+            # Real member target directory blocks cleanup without deleting user data.
             blocked = primary / "crates/demo/target"
             blocked.mkdir()
+            sentinel = blocked / "keep"
+            sentinel.write_text("baseline")
+            self.assertEqual(len(check_links(primary, primary, manifests)), 1)
             with self.assertRaises(FileExistsError):
                 apply_links(primary, primary, manifests)
+            self.assertEqual(sentinel.read_text(), "baseline")
 
-    def test_checks_registry_round_trip(self):
+    def test_checks_registry_uses_unified_workspace_target(self):
         registry = json.loads(Path(__file__).with_name("checks.json").read_text())
         targets = {row["path"]: row["target"] for row in registry["manifests"]}
-        self.assertEqual(targets["crates/minicpm-v/Cargo.toml"], "target/minicpm-v-cpu")
-        self.assertEqual(targets["crates/hy-mt/Cargo.toml"], targets["crates/omni-api/Cargo.toml"])
-
-    def test_live_check_rejects_real_wrong_and_dangling_entries_without_mutation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "crates/demo/target").mkdir(parents=True)
-            sentinel = root / "crates/demo/target/keep"
-            sentinel.write_text("baseline")
-            rows = [{"path": "crates/demo/Cargo.toml", "target": "target/shared"}]
-            self.assertEqual(len(check_links(root, root, rows)), 1)
-            self.assertEqual(sentinel.read_text(), "baseline")
-            self.assertFalse((root / "target").exists())
-            sentinel.unlink()
-            sentinel.parent.rmdir()
-            sentinel.parent.symlink_to(root / "target/wrong")
-            self.assertEqual(len(check_links(root, root, rows)), 1)
-            sentinel.parent.unlink()
-            sentinel.parent.symlink_to(root / "target/shared")
-            self.assertEqual(len(check_links(root, root, rows)), 1)
-            (root / "target/shared").mkdir(parents=True)
-            self.assertEqual(check_links(root, root, rows), [])
-
-    def test_blocked_setup_does_not_partially_redirect_other_entries(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "crates/first").mkdir(parents=True)
-            (root / "crates/blocked/target").mkdir(parents=True)
-            rows = [{"path": f"crates/{name}/Cargo.toml", "target": f"target/{name}"}
-                    for name in ("first", "blocked")]
-            with self.assertRaises(FileExistsError):
-                apply_links(root, root, rows)
-            self.assertFalse((root / "crates/first/target").exists())
-            self.assertFalse((root / "target").exists())
+        self.assertTrue(all(v == "target" for v in targets.values()))
 
 
 if __name__ == "__main__":

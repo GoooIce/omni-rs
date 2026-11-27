@@ -3,6 +3,7 @@
 //! integration tests; this catches dtype-path regressions only the GPU hits.
 #![cfg(feature = "metal")]
 
+use super::common;
 use burn::backend::wgpu::{Metal, WgpuDevice};
 use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
 use omni_minicpm_v::{
@@ -14,7 +15,6 @@ use omni_minicpm_v::{
     prompt,
     tokenizer::MiniCpmTokenizer,
 };
-mod common;
 
 use std::sync::{
     Arc,

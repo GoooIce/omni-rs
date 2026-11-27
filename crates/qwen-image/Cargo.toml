@@ -6,8 +6,6 @@ rust-version = "1.92"
 license = "Apache-2.0"
 description = "Qwen-Image-2.1-Turbo local image inference in Rust and Burn"
 
-[workspace]
-
 [features]
 default = ["metal"]
 metal = ["burn/metal", "burn/fusion", "burn/autotune", "dep:burn-cubecl", "dep:cubek-attention", "dep:cubecl", "dep:cubecl-cpp", "dep:cubecl-runtime", "dep:objc2-metal", "dep:wgpu", "omni-minicpm-v/metal"]
@@ -63,31 +61,3 @@ burn = { version = "=0.21.0", default-features = false, features = ["std", "ndar
 omni-minicpm-v = { path = "../minicpm-v", default-features = false, features = ["cpu"] }
 half = "=2.7.1"
 tempfile = "3"
-
-[patch.crates-io]
-cubek-matmul = { path = "../../vendor/cubek-matmul" }
-burn-cubecl = { path = "../../vendor/burn-cubecl" }
-cubecl-common = { path = "../../vendor/cubecl-common" }
-cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
-burn-fusion = { path = "../../vendor/burn-fusion" }
-cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
-cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
-burn-router = { path = "../../vendor/burn-router" }
-burn = { path = "../../vendor/burn" }
-
-[profile.release]
-lto = "thin"
-codegen-units = 16
-
-[profile.dev]
-debug = "line-tables-only"
-incremental = false
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 2
-
-[profile.debug-full]
-inherits = "dev"
-debug = 2
-incremental = true

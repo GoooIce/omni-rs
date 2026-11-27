@@ -11,10 +11,15 @@ pub mod reference;
 mod routing;
 pub mod sampling;
 pub mod script;
+mod script_batch;
 mod script_run;
 pub mod synthesis;
 pub mod transformer;
 pub use batch::{BatchStats, RequestId, SynthesisBatch};
+pub use script_batch::{
+    ModelScriptBatch, ModelScriptEngine, ScriptBatch, ScriptBatchEvent, ScriptBatchOutput,
+    ScriptBatchStep, ScriptEngine,
+};
 
 use burn::tensor::{Bool, FloatDType, Int, Tensor, TensorData, backend::Backend};
 pub use config::{CODEBOOKS, MAX_NEW_TOKENS, MAX_SEQ_LEN, SAMPLE_RATE, SAMPLES_PER_FRAME};

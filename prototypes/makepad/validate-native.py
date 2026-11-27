@@ -35,7 +35,7 @@ env["R2T2_SETTINGS_PATH"] = str(OUT.resolve() / "settings.json")
 env.pop("R2T2_MODEL_DIR", None)
 env.pop("MAKEPAD_FOCUS", None)
 log = log_path.open("w")
-command = [str(ROOT / "target/makepad-native/release/r2t2-makepad"), "--remote"]
+command = [str(ROOT / "target/release/r2t2-makepad"), "--remote"]
 fixture = OUT / "microphone-48k-stereo.wav"
 if MICROPHONE:
     with wave.open(str(ROOT / "artifacts/Confucius4-R2T2-upstream/resources/test.wav"), "rb") as source:

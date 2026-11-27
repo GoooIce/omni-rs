@@ -1,11 +1,8 @@
 use crate::{
-    Error, Model, Result, StreamConfig, TextPostprocess,
+    Error, Model, Result, StreamConfig,
     audio::{MelFrontend, SAMPLE_RATE},
     model::{decoder::DecoderCache, encoder::EncoderCache},
-    text::{
-        LanguagePatience, StableTail, normalize, official_candidate, official_stable_text,
-        parse_output,
-    },
+    text::TranscriptCommitter,
 };
 use burn::tensor::{Tensor, backend::Backend};
 use serde::Serialize;
@@ -36,11 +33,6 @@ pub struct StreamEvent {
 /// `language None` before that answer is committed anyway.
 const UNKNOWN_LANGUAGE_PATIENCE_MS: usize = 8000;
 
-struct Span {
-    end_sample: usize,
-    text: String,
-}
-
 /// A single streaming session. Model parameters are shared; caches are never shared
 /// between streams. Call push sequentially and finish exactly once at end of input.
 pub struct Session<B: Backend> {
@@ -56,14 +48,7 @@ pub struct Session<B: Backend> {
     finished: bool,
     consumed: usize,
     reported_samples: usize,
-    base_sample: usize,
-    fixed_raw: String,
-    local_text: String,
-    text: String,
-    language: String,
-    language_patience: LanguagePatience,
-    stable_tail: StableTail,
-    spans: VecDeque<Span>,
+    transcript: TranscriptCommitter,
     stop: Arc<AtomicBool>,
 }
 
@@ -72,6 +57,12 @@ impl<B: Backend> Session<B> {
         config.validate(model.config())?;
         let layers = model.config().thinker_config.text_config.num_hidden_layers;
         let decoder_cache = DecoderCache::with_paging(layers, config.paged_attention);
+        let transcript = TranscriptCommitter::new(
+            config.text_postprocess,
+            config.language.clone(),
+            config.stable_tail_ms * (SAMPLE_RATE / 1000),
+            UNKNOWN_LANGUAGE_PATIENCE_MS * (SAMPLE_RATE / 1000),
+        );
         Ok(Self {
             model,
             config,
@@ -85,19 +76,12 @@ impl<B: Backend> Session<B> {
             finished: false,
             consumed: 0,
             reported_samples: 0,
-            base_sample: 0,
-            fixed_raw: String::new(),
-            local_text: String::new(),
-            text: String::new(),
-            language: String::new(),
-            language_patience: LanguagePatience::default(),
-            stable_tail: StableTail::default(),
-            spans: VecDeque::new(),
+            transcript,
             stop: Arc::new(AtomicBool::new(false)),
         })
     }
     pub fn text(&self) -> &str {
-        &self.text
+        self.transcript.text()
     }
     pub fn config(&self) -> &StreamConfig {
         &self.config
@@ -130,10 +114,11 @@ impl<B: Backend> Session<B> {
         self.turn = None;
         self.encoder_cache.clear();
         self.decoder_cache.clear();
+        self.transcript.interrupt();
         StreamEvent {
             delta: String::new(),
-            text: self.text.clone(),
-            language: self.language.clone(),
+            text: self.transcript.text().to_owned(),
+            language: self.transcript.language().to_owned(),
             audio_seconds: self.reported_samples as f64 / SAMPLE_RATE as f64,
             compute_ms: 0.0,
             generated_tokens: 0,
@@ -166,23 +151,9 @@ impl<B: Backend> Session<B> {
         while self.frontend.samples() > maximum {
             let discard = maximum / 2;
             self.frontend.discard_prefix(discard);
-            self.base_sample += discard;
-            while self
-                .spans
-                .front()
-                .is_some_and(|s| s.end_sample <= self.base_sample)
-            {
-                self.spans.pop_front();
-            }
-            self.local_text = self.spans.iter().map(|s| s.text.as_str()).collect();
-            self.fixed_raw = crate::text::transcript_prefix(
-                (self.config.language.is_none() && !self.language.is_empty())
-                    .then_some(self.language.as_str()),
-                &self.local_text,
-            );
+            self.transcript.discard_prefix(discard);
             self.encoder_cache.clear();
             self.decoder_cache.clear();
-            self.stable_tail.clear();
         }
         Ok(())
     }
@@ -208,7 +179,7 @@ impl<B: Backend> Session<B> {
         let (before, after) = self.model.text().prompt(
             &self.config.context,
             self.config.language.as_deref(),
-            &self.fixed_raw,
+            self.transcript.prompt_prefix(),
         )?;
         let budget = if final_chunk {
             self.config.final_max_tokens
@@ -278,102 +249,20 @@ impl<B: Backend> Session<B> {
             ..
         } = turn;
         let generated_text = self.model.text().decode(&generated)?;
-        let official = self.config.text_postprocess == TextPostprocess::Official;
-        let official_result = official.then(|| {
-            official_candidate(
-                &self.fixed_raw,
-                &generated_text,
-                self.config.language.as_deref(),
-                final_chunk,
-            )
-        });
-        let candidate = if let Some(result) = &official_result {
-            result.raw.clone()
-        } else {
-            let candidate = normalize(&format!("{}{generated_text}", self.fixed_raw));
-            if candidate.starts_with(&self.fixed_raw) {
-                candidate
-            } else {
-                format!("{}{}", self.fixed_raw, normalize(&generated_text))
-            }
-        };
-        let confirmed_tail = self.stable_tail.observe(
-            &candidate,
-            !final_chunk && stopped,
+        let unfixed = self.config.unfixed_tokens;
+        let text_processor = self.model.text();
+        let delta = self.transcript.commit(
+            &generated_text,
             self.consumed,
-            self.config.stable_tail_ms * (SAMPLE_RATE / 1000),
-        );
-        let stable = if final_chunk || confirmed_tail {
-            candidate
-        } else {
-            self.model
-                .text()
-                .stable_prefix(&candidate, self.config.unfixed_tokens)?
-        };
-        let (language, stable_text) = if let Some(result) = official_result {
-            if !final_chunk && self.config.language.is_none() && !stable.contains("<asr_text>") {
-                (String::new(), String::new())
-            } else {
-                let text = if final_chunk {
-                    result.text
-                } else {
-                    official_stable_text(&stable)
-                };
-                (result.language, text)
-            }
-        } else {
-            parse_output(&stable, self.config.language.as_deref())
-        };
-        let have_metadata = final_chunk
-            || !official
-            || self.config.language.is_some()
-            || stable.contains("<asr_text>");
-        let unknown_language = !final_chunk
-            && official
-            && self.config.language.is_none()
-            && stable.contains("<asr_text>")
-            && language.is_empty();
-        let have_metadata = have_metadata
-            && !(unknown_language
-                && self.language_patience.waiting(
-                    &stable_text,
-                    self.consumed,
-                    UNKNOWN_LANGUAGE_PATIENCE_MS * (SAMPLE_RATE / 1000),
-                ));
-        let delta = if !have_metadata {
-            // Match the no-reset Python path: partial language metadata is not
-            // committed as a prompt prefix for the next chunk.
-            String::new()
-        } else if let Some(delta) = stable_text.strip_prefix(&self.local_text) {
-            let delta = delta.to_owned();
-            self.fixed_raw = if official {
-                stable.trim().to_owned()
-            } else {
-                stable
-            };
-            self.local_text = stable_text;
-            delta
-        } else {
-            // Re-tokenization can merge the last committed word with a new suffix.
-            // Holding the previous prefix is safe; rewinding committed text is not.
-            String::new()
-        };
-        if !language.is_empty() {
-            self.language = language;
-            self.language_patience.clear();
-        }
-        if !delta.is_empty() {
-            self.text.push_str(&delta);
-            self.spans.push_back(Span {
-                end_sample: self.consumed,
-                text: delta.clone(),
-            });
-        }
+            stopped,
+            final_chunk,
+            |candidate| text_processor.stable_prefix(candidate, unfixed),
+        )?;
         self.reported_samples = self.consumed;
         Ok(StreamEvent {
             delta,
-            text: self.text.clone(),
-            language: self.language.clone(),
+            text: self.transcript.text().to_owned(),
+            language: self.transcript.language().to_owned(),
             audio_seconds: self.consumed as f64 / SAMPLE_RATE as f64,
             compute_ms: timer.elapsed().as_secs_f64() * 1000.0,
             generated_tokens: generated.len(),

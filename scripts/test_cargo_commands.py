@@ -20,7 +20,7 @@ class CargoCommandTests(unittest.TestCase):
                               "--", "--target-dir", "application-argument"])
         split = args.index("--")
         self.assertEqual(args[split + 1:], ["--target-dir", "application-argument"])
-        self.assertTrue(args[split - 1].endswith("/target/minicpm-v-cpu"))
+        self.assertTrue(args[split - 1].endswith("/target"))
         for extra in (["--target-dir", "artifacts/private-target"], ["--target-dir=target"],
                       ["--config", "profile.dev.debug=2"]):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
@@ -28,11 +28,7 @@ class CargoCommandTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             command(ROOT, ["test", "--manifest-path", "unregistered/Cargo.toml"])
 
-    def test_registered_comparison_variant_is_resolved_without_forwarding_wrapper_flags(self):
-        args = command(ROOT, ["build", "--manifest-path", "prototypes/makepad/Cargo.toml",
-                              "--variant", "target/makepad-image", "--profile", "release"])
-        self.assertNotIn("--variant", args)
-        self.assertTrue(args[-1].endswith("/target/makepad-image"))
+    def test_unregistered_comparison_variant_is_rejected(self):
         with self.assertRaises(ValueError):
             command(ROOT, ["build", "--manifest-path", "Cargo.toml",
                            "--variant=target/makepad-image"])
@@ -88,7 +84,7 @@ class CargoCommandTests(unittest.TestCase):
                          ["sh", "scripts/pre-commit"]):
                 result = subprocess.run(args, cwd=root, env=env, text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("expected a symlink", result.stderr)
+                self.assertIn("unexpected member target entry", result.stderr)
                 self.assertFalse(marker.exists())
 
 

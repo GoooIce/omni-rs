@@ -43,7 +43,7 @@ fn every_cooperative_lease_rejects_fifo_without_blocking() {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "every_cooperative_lease_rejects_fifo_without_blocking",
+                "lease::every_cooperative_lease_rejects_fifo_without_blocking",
                 "--nocapture",
             ])
             .env(ROLE, &path)

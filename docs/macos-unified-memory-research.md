@@ -255,7 +255,7 @@ cargo build --manifest-path prototypes/makepad/Cargo.toml --release --example ap
 # 8 是诊断帧数，不是界面录音 / 合成时长限制；2 表示同进程重复两次。
 prototypes/makepad/target/release/examples/apple-hybrid tts '你好，欢迎使用本地语音合成。' 8 2
 python3 prototypes/makepad/validate-tts.py \
-  --binary target/apple-shared-ane/release/r2t2-makepad \
+  --binary target/release/r2t2-makepad \
   --output artifacts/native-validation-new --device-output-muted
 ```
 
@@ -427,7 +427,7 @@ python3 artifacts/apple-hybrid-opt/benchmark.py tts --output artifacts/hybrid-tt
 python3 artifacts/apple-hybrid-opt/benchmark.py trace --output artifacts/hybrid-trace-recheck
 python3 prototypes/makepad/validate-asr.py --suite matrix \
   --output artifacts/hybrid-asr-recheck \
-  --runner target/apple-shared-ane/release/examples/asr-regression
+  --runner target/release/examples/asr-regression
 python3 prototypes/makepad/validate-tts.py \
   --output artifacts/hybrid-ui-recheck \
   --binary target/release/r2t2-makepad --device-output-muted --long-stream

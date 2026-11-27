@@ -1,17 +1,16 @@
 //! Explicit, supervised audio-answer training; never records or publishes.
 use clap::Parser;
 use omni_rsi::{
-    lease::Lease,
+    lease::{Lease, ddust_lease, ensure_private_dir, wait_for_device},
     speech_audio_round::{AudioRoundOptions, train_audio_round, train_v3_audio_round},
 };
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(feature = "metal")]
@@ -44,57 +43,21 @@ struct Args {
     number_v3: bool,
 }
 
-fn device_lease(state: &Path, stop: &AtomicBool) -> Result<Lease, String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return Err("interrupted".into());
-        }
-        if let Some(lease) = Lease::try_acquire(&state.join("device.lock"))? {
-            return Ok(lease);
-        }
-        if Instant::now() >= deadline {
-            return Err("accelerator did not yield within 30 seconds".into());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn ddust_lease() -> Result<Option<Lease>, String> {
-    let path = if let Some(registry) = std::env::var_os("DDUST_RUN_REGISTRY") {
-        PathBuf::from(registry)
-            .parent()
-            .map(|parent| parent.join("mps.lock"))
-    } else {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("code/ddust/.ddust/mps.lock"))
-    };
-    match path {
-        Some(path) if path.exists() => Lease::try_acquire(&path)?
-            .map(Some)
-            .ok_or_else(|| "ddust accelerator lease is occupied".into()),
-        _ => Ok(None),
-    }
-}
-
 fn execute() -> Result<(), String> {
     let args = Args::parse();
-    let mut directory = std::fs::DirBuilder::new();
-    directory.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        directory.mode(0o700);
-    }
-    directory
-        .create(&args.state)
-        .map_err(|error| error.to_string())?;
+    ensure_private_dir(&args.state)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Release))
         .map_err(|error| error.to_string())?;
     let _foreground = Lease::try_acquire(&args.state.join("foreground.lock"))?
         .ok_or("another RSI foreground request is active")?;
-    let _device = device_lease(&args.state, &stop)?;
+    let _device = wait_for_device(
+        &args.state,
+        &stop,
+        Duration::from_secs(30),
+        "accelerator did not yield within 30 seconds",
+    )?;
     let _ddust = ddust_lease()?;
     let options = AudioRoundOptions {
         model: &args.model,

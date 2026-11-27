@@ -40,7 +40,7 @@ regression-plan.json     regression-inputs/*.json
 
 ```sh
 uv run --offline --no-project python scripts/share-target.py
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=2 \
   cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
   --bin omni-rsi-audio -- --number-v3 --model /path/to/local/model --data /path/to/v3-data \
   --state /path/to/state --epochs 1 --max-updates 1

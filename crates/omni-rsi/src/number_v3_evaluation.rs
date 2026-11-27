@@ -10,6 +10,11 @@ use crate::{
         PairedCase, PairedOutcome, PairedStatistics, gain_at_least_five_points, paired_statistics,
     },
     number_regression::{self, Arm, ChineseManifest},
+    safe_fs::{
+        AnchoredDir, SelectedPath, hash_regular_file, no_symlinks_on_path, read_regular_file,
+        read_single_link_child, verify_reverse_containment,
+        write_noclobber as safe_write_noclobber,
+    },
     speech_asr::AsrEvent,
     speech_audio_checkpoint::{AudioCheckpoint, AudioProtocol},
     speech_number_evaluation::{answer_number, character_error_rate, mentions_number},
@@ -24,19 +29,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 const INSTRUCTION: &str = "把听到的数字加一，用中文回答。";
 
-#[path = "number_chinese_registration.rs"]
-mod chinese_registration;
-#[path = "number_chinese_state.rs"]
-mod chinese_state;
-use chinese_state::ChineseState;
 #[path = "number_v3_voice.rs"]
 mod voice;
 
@@ -100,6 +100,14 @@ struct Prepared {
     voice: Option<voice::VoiceFormat>,
 }
 
+impl Prepared {
+    fn matches(&self, other: &Self) -> bool {
+        self.candidate == other.candidate
+            && self.protocol == other.protocol
+            && self.parameters == other.parameters
+    }
+}
+
 fn interrupted(stop: &AtomicBool) -> Result<(), String> {
     if stop.load(Ordering::Acquire) {
         Err("interrupted".into())
@@ -109,72 +117,11 @@ fn interrupted(stop: &AtomicBool) -> Result<(), String> {
 }
 
 fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let mut file = options.open(path).map_err(|e| e.to_string())?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
-        return Err("invalid or oversized v3 evaluation file".into());
-    }
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    let after = file.metadata().map_err(|e| e.to_string())?;
-    if bytes.len() as u64 != metadata.len()
-        || metadata.len() != after.len()
-        || metadata.modified().ok() != after.modified().ok()
-        || !after.is_file()
-    {
-        return Err("v3 evaluation file changed while reading".into());
-    }
-    Ok(bytes)
+    read_regular_file(path, limit)
 }
 
 fn hash_regular(path: &Path, limit: u64, stop: &AtomicBool) -> Result<String, String> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let mut file = options.open(path).map_err(|e| e.to_string())?;
-    let before = file.metadata().map_err(|e| e.to_string())?;
-    if !before.is_file() || before.len() == 0 || before.len() > limit {
-        return Err("invalid v3 evaluation artifact".into());
-    }
-    let mut hash = Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        interrupted(stop)?;
-        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        total = total
-            .checked_add(count as u64)
-            .ok_or("artifact size overflow")?;
-        if total > limit {
-            return Err("v3 evaluation artifact exceeds limit".into());
-        }
-        hash.update(&buffer[..count]);
-    }
-    let after = file.metadata().map_err(|e| e.to_string())?;
-    if total != before.len()
-        || before.len() != after.len()
-        || before.modified().ok() != after.modified().ok()
-    {
-        return Err("v3 evaluation artifact changed while hashing".into());
-    }
-    Ok(format!("{:x}", hash.finalize()))
+    hash_regular_file(path, limit, stop)
 }
 
 fn text_parameters(
@@ -393,30 +340,7 @@ fn ensure_same_data(prepared: &Prepared, registered: &RegisteredDevelopment) -> 
 }
 
 fn write_noclobber(path: &Path, bytes: &[u8], stop: &AtomicBool) -> Result<(), String> {
-    interrupted(stop)?;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut file = tempfile::Builder::new()
-        .prefix(".number-v3-")
-        .tempfile_in(parent)
-        .map_err(|e| e.to_string())?;
-    file.write_all(bytes)
-        .and_then(|_| file.as_file().sync_all())
-        .map_err(|e| e.to_string())?;
-    interrupted(stop)?;
-    file.persist_noclobber(path)
-        .map_err(|e| e.error.to_string())?;
-    fs::File::open(parent)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| {
-            format!(
-                "file published at {} but directory durability is unconfirmed: {e}",
-                path.display()
-            )
-        })?;
-    Ok(())
+    safe_write_noclobber(path, ".number-v3-", bytes, stop)
 }
 
 /// Freeze the actual training checkpoint, current executable, data and parameters.
@@ -522,10 +446,7 @@ fn preregister_with_mode<B: AutodiffBackend>(
         chinese_registration::preflight_protocol(options.registration, stop)?;
     }
     let after = prepare::<B>(options, device, stop, mode, chinese_state.as_ref())?;
-    if before.candidate != after.candidate
-        || before.protocol != after.protocol
-        || before.parameters != after.parameters
-    {
+    if !before.matches(&after) {
         return Err("v3 inputs changed during registration".into());
     }
     if chinese {
@@ -595,139 +516,280 @@ fn check_policy(
     Ok(())
 }
 
-struct SelectedPath {
-    original: PathBuf,
-    resolved: PathBuf,
-    missing_final: bool,
-}
+// Folded descriptor-anchored state and Chinese registration verification.
+mod chinese_registration {
+    use super::*;
+    use crate::number_v3_voice_recheck::{strict_json, strict_registered_protocol};
 
-// Normalize the filesystem spelling after the caller's no-follow checks so
-// that reverse nested-root checks also compare the same physical identity.
-fn normalize_selected_path(path: &Path, missing_final: bool) -> Result<PathBuf, String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err("selected path final component is a symlink".into())
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Plan {
+        version: u32,
+        criterion: String,
+        groups: Vec<Group>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Group {
+        name: String,
+        manifest_file: String,
+    }
+
+    struct Current {
+        plan_sha256: String,
+        manifest_file: String,
+        manifest: ChineseManifest,
+    }
+
+    fn valid_name(name: &str) -> bool {
+        let mut components = Path::new(name).components();
+        matches!(components.next(), Some(Component::Normal(_)))
+            && components.next().is_none()
+            && name.len() <= 255
+            && name.ends_with(".json")
+            && !name.contains('\\')
+            && !name.chars().any(char::is_control)
+    }
+
+    fn load(data: &Path, stop: &AtomicBool) -> Result<Current, String> {
+        let root = AnchoredDir::open(data)?;
+        let mut remaining = 6 * 256 * 1024;
+        let bytes = read_single_link_child(
+            root.as_file(),
+            OsStr::new("regression-plan.json"),
+            256 * 1024,
+            Some(&mut remaining),
+            stop,
+        )?;
+        let plan: Plan =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid regression plan: {e}"))?;
+        let required: HashSet<_> = ["chinese", "english", "other_omni", "reading", "dialogue"]
+            .into_iter()
+            .collect();
+        let mut seen = HashSet::new();
+        if plan.version != 1
+            || plan.criterion != "no_degradation"
+            || plan.groups.len() != required.len()
+        {
+            return Err("invalid regression plan".into());
         }
-        Ok(_) => fs::canonicalize(path).map_err(|error| error.to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && missing_final => {
-            let parent = path.parent().ok_or("selected path has no parent")?;
-            let name = path
-                .file_name()
-                .ok_or("selected path has no final component")?;
-            Ok(fs::canonicalize(parent)
-                .map_err(|error| error.to_string())?
-                .join(name))
+        for group in &plan.groups {
+            if !required.contains(group.name.as_str())
+                || !seen.insert(group.name.clone())
+                || !valid_name(&group.manifest_file)
+            {
+                return Err("invalid regression group".into());
+            }
         }
-        Err(error) => Err(error.to_string()),
+        let directory = root.open_dir(OsStr::new("regression-inputs"))?;
+        let mut chinese = None;
+        for group in plan.groups {
+            let manifest_bytes = read_single_link_child(
+                directory.as_file(),
+                OsStr::new(&group.manifest_file),
+                256 * 1024,
+                Some(&mut remaining),
+                stop,
+            )?;
+            if group.name == "chinese" {
+                chinese = Some((
+                    group.manifest_file,
+                    ChineseManifest::from_bytes(&manifest_bytes)?,
+                ));
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                    .map_err(|e| format!("invalid regression manifest: {e}"))?;
+                if !value.is_object() {
+                    return Err("regression manifest must be a JSON object".into());
+                }
+            }
+        }
+        let (manifest_file, manifest) = chinese.ok_or("missing Chinese regression")?;
+        Ok(Current {
+            plan_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            manifest_file,
+            manifest,
+        })
+    }
+
+    pub(super) fn preflight_protocol(registration: &Path, stop: &AtomicBool) -> Result<(), String> {
+        let directory = AnchoredDir::open(registration)?;
+        let mut remaining = 32 * 1024 * 1024;
+        let bytes = read_single_link_child(
+            directory.as_file(),
+            OsStr::new("protocol.json"),
+            32 * 1024 * 1024,
+            Some(&mut remaining),
+            stop,
+        )?;
+        let envelope = strict_json(&bytes, 1_000_000, stop)?;
+        let id = envelope["protocol_sha256"]
+            .as_str()
+            .ok_or("missing protocol identity")?;
+        strict_registered_protocol(&bytes, id, stop)?;
+        Ok(())
+    }
+
+    pub(super) fn current(data: &Path, stop: &AtomicBool) -> Result<ChineseManifest, String> {
+        Ok(load(data, stop)?.manifest)
+    }
+
+    pub(super) fn frozen(
+        data: &Path,
+        registration: &Path,
+        registered: &RegisteredDevelopment,
+        stop: &AtomicBool,
+    ) -> Result<ChineseManifest, String> {
+        let directory = AnchoredDir::open(registration)?;
+        let mut remaining = 32 * 1024 * 1024;
+        let bytes = read_single_link_child(
+            directory.as_file(),
+            OsStr::new("protocol.json"),
+            32 * 1024 * 1024,
+            Some(&mut remaining),
+            stop,
+        )?;
+        let protocol = strict_registered_protocol(&bytes, registered.protocol_sha256(), stop)?;
+        let current = load(data, stop)?;
+        let inputs = protocol["regression_inputs"]
+            .as_array()
+            .ok_or("missing frozen regression inputs")?;
+        let mut chinese = inputs.iter().filter(|item| item["name"] == "chinese");
+        let identity = chinese.next().ok_or("missing frozen Chinese regression")?;
+        if chinese.next().is_some()
+            || protocol["regression_plan_sha256"] != current.plan_sha256
+            || identity["manifest_file"] != current.manifest_file
+            || identity["sha256"] != current.manifest.sha256()
+        {
+            return Err("frozen Chinese regression plan or manifest changed".into());
+        }
+        Ok(current.manifest)
     }
 }
 
-// Follow aliases only until their resolved path enters a selected root. Once
-// inside, validate the remaining path without following any more links.
-fn resolve_below_selected_root(
-    path: &Path,
-    roots: &[&SelectedPath],
-    missing_final: bool,
-) -> Result<Option<PathBuf>, String> {
-    use std::{collections::VecDeque, ffi::OsString, path::Component};
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidatePointer {
+    sha256: String,
+}
 
-    fn prepend(path: &Path, pending: &mut VecDeque<OsString>) -> Result<(), String> {
-        for component in path.components().rev() {
-            match component {
-                Component::Normal(name) => pending.push_front(name.to_os_string()),
-                Component::ParentDir => pending.push_front(OsString::from("..")),
-                Component::CurDir | Component::RootDir => {}
-                Component::Prefix(_) => return Err("unsupported selected path prefix".into()),
-            }
+struct ChineseState {
+    path: PathBuf,
+    root: AnchoredDir,
+    v3: AnchoredDir,
+    conditioned: AnchoredDir,
+    checkpoints: AnchoredDir,
+    leases: [Lease; 4],
+}
+
+impl ChineseState {
+    fn acquire(path: &Path, stop: &AtomicBool) -> Result<Self, String> {
+        interrupted(stop)?;
+        let root = AnchoredDir::open(path)?;
+        let v3 = root.open_dir(OsStr::new("number-audio-v3"))?;
+        let conditioned = v3.open_dir(OsStr::new("audio-conditioned-v1"))?;
+        let checkpoints = conditioned.open_dir(OsStr::new("checkpoints"))?;
+        let foreground = Lease::try_acquire_at(root.as_file(), "foreground.lock")?
+            .ok_or("another RSI foreground request is active")?;
+        let device = Lease::try_acquire_at(root.as_file(), "device.lock")?
+            .ok_or("another RSI process owns the device lease")?;
+        let training = Lease::try_acquire_at(root.as_file(), "audio-training.lock")?
+            .ok_or("another audio trainer owns this state")?;
+        let checkpoint = Lease::try_acquire_at(v3.as_file(), "audio-training.lock")?
+            .ok_or("another audio trainer owns this state")?;
+        let state = Self {
+            path: path.into(),
+            root,
+            v3,
+            conditioned,
+            checkpoints,
+            leases: [foreground, device, training, checkpoint],
+        };
+        state.verify(stop)?;
+        Ok(state)
+    }
+
+    fn verify(&self, stop: &AtomicBool) -> Result<(), String> {
+        interrupted(stop)?;
+        let root = AnchoredDir::open(&self.path)?;
+        let v3 = root.open_dir(OsStr::new("number-audio-v3"))?;
+        let conditioned = v3.open_dir(OsStr::new("audio-conditioned-v1"))?;
+        let checkpoints = conditioned.open_dir(OsStr::new("checkpoints"))?;
+        if !self.root.same_dir(&root)?
+            || !self.v3.same_dir(&v3)?
+            || !self.conditioned.same_dir(&conditioned)?
+            || !self.checkpoints.same_dir(&checkpoints)?
+        {
+            return Err("state directory changed during Chinese evaluation".into());
+        }
+        for (lease, directory, name) in [
+            (&self.leases[0], root.as_file(), "foreground.lock"),
+            (&self.leases[1], root.as_file(), "device.lock"),
+            (&self.leases[2], root.as_file(), "audio-training.lock"),
+            (&self.leases[3], v3.as_file(), "audio-training.lock"),
+        ] {
+            lease.verify_at(directory, name)?;
         }
         Ok(())
     }
 
-    let mut current = if path.is_absolute() {
-        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
-    } else {
-        fs::canonicalize(".").map_err(|error| error.to_string())?
-    };
-    let mut pending = VecDeque::new();
-    prepend(path, &mut pending)?;
-    let mut links = 0;
-    loop {
-        if roots.iter().any(|root| current.starts_with(&root.resolved)) {
-            for part in pending {
-                current.push(part);
-            }
-            chinese_path(&current, missing_final)?;
-            return Ok(Some(current));
-        }
-        let Some(part) = pending.pop_front() else {
-            return Ok(None);
-        };
-        if part == ".." {
-            current.pop();
-            continue;
-        }
-        let candidate = current.join(&part);
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                if pending.is_empty() {
-                    return Err("selected path final component is a symlink".into());
-                }
-                links += 1;
-                if links > 40 {
-                    return Err("too many linked path components".into());
-                }
-                let target = fs::read_link(&candidate).map_err(|error| error.to_string())?;
-                if target.is_absolute() {
-                    current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
-                }
-                prepend(&target, &mut pending)?;
-            }
-            Ok(metadata) => {
-                if !pending.is_empty() && !metadata.is_dir() {
-                    return Err("non-directory selected path component".into());
-                }
-                // A case-insensitive filesystem can spell this component
-                // differently from the selected root while naming the same
-                // directory. Normalize before the next boundary check.
-                current = fs::canonicalize(&candidate).map_err(|error| error.to_string())?;
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && missing_final
-                    && pending.is_empty() =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-impl SelectedPath {
-    fn new(path: &Path, missing_final: bool, roots: &[&Self]) -> Result<Self, String> {
-        use std::path::Component;
-        if path.as_os_str().is_empty() {
-            return Err("invalid selected path".into());
-        }
-        let components: Vec<_> = path.components().collect();
-        if components
-            .iter()
-            .any(|part| matches!(part, Component::ParentDir))
+    fn checkpoint<B: AutodiffBackend>(
+        &self,
+        expected: &AudioProtocol,
+        device: &B::Device,
+        stop: &AtomicBool,
+    ) -> Result<(String, AudioCheckpoint, PathBuf), String> {
+        self.verify(stop)?;
+        let mut remaining = 256 * 1024 * 1024 + 4096;
+        let pointer = read_single_link_child(
+            self.conditioned.as_file(),
+            OsStr::new("latest.json"),
+            4096,
+            Some(&mut remaining),
+            stop,
+        )?;
+        let pointer: CandidatePointer =
+            serde_json::from_slice(&pointer).map_err(|e| e.to_string())?;
+        let id = pointer.sha256;
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err("parent traversal is not allowed".into());
+            return Err("invalid v3 candidate pointer".into());
         }
-        let resolved = if !roots.is_empty()
-            && let Some(resolved) = resolve_below_selected_root(path, roots, missing_final)?
-        {
-            resolved
-        } else {
-            crate::number_development::resolve_selected_path(path, missing_final)?
-        };
-        Ok(Self {
-            original: path.into(),
-            resolved: normalize_selected_path(&resolved, missing_final)?,
-            missing_final,
-        })
+        let name = format!("{id}.json");
+        let bytes = read_single_link_child(
+            self.checkpoints.as_file(),
+            OsStr::new(&name),
+            256 * 1024 * 1024,
+            Some(&mut remaining),
+            stop,
+        )?;
+        if format!("{:x}", Sha256::digest(&bytes)) != id {
+            return Err("v3 candidate content mismatch".into());
+        }
+        let checkpoint: AudioCheckpoint =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if checkpoint.protocol() != expected || checkpoint.progress().updates == 0 {
+            return Err(
+                "v3 checkpoint does not match current training identity or has no updates".into(),
+            );
+        }
+        let normalized =
+            serde_json::to_vec(&serde_json::to_value(&checkpoint).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if format!("{:x}", Sha256::digest(&normalized)) != id {
+            return Err("loaded checkpoint identity differs from the candidate pointer".into());
+        }
+        drop(checkpoint.restore::<B>(device)?);
+        self.verify(stop)?;
+        let path = self
+            .path
+            .join("number-audio-v3/audio-conditioned-v1/checkpoints")
+            .join(name);
+        Ok((id, checkpoint, path))
     }
 }
 
@@ -768,23 +830,13 @@ impl SelectedChinesePaths {
             output,
             unused_output: options.output.into(),
         };
-        // A root selected later may itself contain one selected earlier.
-        // Check those reverse relationships before reading any artifacts.
-        let roots = [
+        verify_reverse_containment(&[
             &selected.data,
             &selected.model,
             &selected.state,
             &selected.registration,
-        ];
-        for root in roots {
-            for candidate in roots {
-                let checked =
-                    SelectedPath::new(&candidate.original, candidate.missing_final, &[root])?;
-                if checked.resolved != candidate.resolved {
-                    return Err("linked nested Chinese path".into());
-                }
-            }
-        }
+        ])
+        .map_err(|_| "linked nested Chinese path".to_owned())?;
         Ok(selected)
     }
 
@@ -836,48 +888,16 @@ impl SelectedChinesePaths {
     }
 }
 
-// Validate the resolved physical path again. Same-account concurrent replacement
-// of path components between checks remains outside this cooperative interface.
-fn chinese_path(path: &Path, missing_final: bool) -> Result<(), String> {
-    use std::path::Component;
-    let components: Vec<_> = path.components().collect();
-    if components.is_empty() {
-        return Err("empty Chinese regression path".into());
-    }
-    let mut current = PathBuf::new();
-    for (index, component) in components.iter().enumerate() {
-        if matches!(component, Component::ParentDir) {
-            return Err("parent traversal is not allowed".into());
-        }
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink()
-                    || (index + 1 < components.len() && !metadata.is_dir())
-                {
-                    return Err("linked or non-directory path component".into());
-                }
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    && missing_final
-                    && index + 1 == components.len() => {}
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(())
-}
-
 fn chinese_paths(options: &V3Options<'_>, include_output: bool) -> Result<(), String> {
     if options.r2t2.is_some() || options.breeze.is_some() {
         return Err("Chinese text regression does not use speech tools".into());
     }
     for path in [options.model, options.data, options.state] {
-        chinese_path(path, false)?;
+        no_symlinks_on_path(path, false)?;
     }
-    chinese_path(options.registration, true)?;
+    no_symlinks_on_path(options.registration, true)?;
     if include_output {
-        chinese_path(options.output, true)?;
+        no_symlinks_on_path(options.output, true)?;
     }
     Ok(())
 }
@@ -895,9 +915,9 @@ fn chinese_policy(
         "evaluator_sha256":hash_regular(&prepared.evaluator, 2 * 1024 * 1024 * 1024, stop)?,
         "scoring_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_regression.rs"))),
         "evaluation_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_v3_evaluation.rs"))),
-        "registration_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_chinese_registration.rs"))),
-        "state_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_chinese_state.rs"))),
+        "safe_fs_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("safe_fs.rs"))),
         "lease_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("lease.rs"))),
+        "shared_lease_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("../../lfm3-omni/src/lease.rs"))),
         "protocol_verifier_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("number_v3_voice_recheck.rs"))),
         "scoring":"exact-trim-v1", "normal_end":"registered-stop-token-v1",
         "parameters":{
@@ -918,17 +938,14 @@ fn check_chinese_policy(
     manifest: &ChineseManifest,
     stop: &AtomicBool,
 ) -> Result<String, String> {
-    use std::ffi::OsStr;
-    let directory = crate::number_v3_voice_recheck::open_directory(options.registration)?;
+    let directory = AnchoredDir::open(options.registration)?;
     let mut remaining = 2 * 1024 * 1024;
-    // Canonical bytes also reject duplicate and unknown fields rather than letting
-    // serde_json::Value silently coalesce them.
     let v3 = serde_json::to_vec_pretty(&policy(prepared, registered)).map_err(|e| e.to_string())?;
-    if crate::number_v3_voice_recheck::read_child(
-        &directory,
+    if read_single_link_child(
+        directory.as_file(),
         OsStr::new("v3-evaluation-policy.json"),
         1024 * 1024,
-        &mut remaining,
+        Some(&mut remaining),
         stop,
     )? != v3
     {
@@ -937,17 +954,114 @@ fn check_chinese_policy(
     let expected =
         serde_json::to_vec_pretty(&chinese_policy(prepared, registered, manifest, stop)?)
             .map_err(|e| e.to_string())?;
-    let actual = crate::number_v3_voice_recheck::read_child(
-        &directory,
+    let actual = read_single_link_child(
+        directory.as_file(),
         OsStr::new("chinese-regression-policy.json"),
         1024 * 1024,
-        &mut remaining,
+        Some(&mut remaining),
         stop,
     )?;
     if actual != expected {
         return Err("registered Chinese regression policy changed".into());
     }
     Ok(format!("{:x}", Sha256::digest(&actual)))
+}
+
+/// Verified frozen-comparison snapshot for a Chinese v3 run or recheck.
+struct VerifiedChineseSnapshot {
+    prepared: Prepared,
+    registered: RegisteredDevelopment,
+    manifest: ChineseManifest,
+    policy_sha256: String,
+}
+
+/// Descriptor-anchored transaction owning selected roots and cooperative state
+/// leases for Chinese v3 evaluation and recheck.
+struct ChineseSession {
+    roots: SelectedChinesePaths,
+    state: ChineseState,
+}
+
+impl ChineseSession {
+    fn open(
+        options: &V3Options<'_>,
+        include_output: bool,
+        stop: &AtomicBool,
+    ) -> Result<Self, String> {
+        interrupted(stop)?;
+        let roots = SelectedChinesePaths::resolve(options, include_output)?;
+        let selected = roots.options();
+        chinese_paths(&selected, include_output)?;
+        roots.verify()?;
+        let state = ChineseState::acquire(selected.state, stop)?;
+        Ok(Self { roots, state })
+    }
+
+    fn options(&self) -> V3Options<'_> {
+        self.roots.options()
+    }
+
+    fn verify_snapshot<B: AutodiffBackend>(
+        &self,
+        device: &B::Device,
+        stop: &AtomicBool,
+    ) -> Result<VerifiedChineseSnapshot, String> {
+        let options = self.options();
+        interrupted(stop)?;
+        self.roots.verify()?;
+        self.state.verify(stop)?;
+        chinese_registration::current(options.data, stop)?;
+        chinese_registration::preflight_protocol(options.registration, stop)?;
+        let prepared = prepare::<B>(
+            &options,
+            device,
+            stop,
+            V3AsrMode::MetalF16,
+            Some(&self.state),
+        )?;
+        chinese_registration::current(options.data, stop)?;
+        chinese_registration::preflight_protocol(options.registration, stop)?;
+        let registered = verify_registration(
+            &registration_options(&options, &prepared),
+            options.registration,
+            stop,
+        )?;
+        ensure_same_data(&prepared, &registered)?;
+        let manifest =
+            chinese_registration::frozen(options.data, options.registration, &registered, stop)?;
+        let policy_sha256 =
+            check_chinese_policy(&options, &prepared, &registered, &manifest, stop)?;
+        Ok(VerifiedChineseSnapshot {
+            prepared,
+            registered,
+            manifest,
+            policy_sha256,
+        })
+    }
+
+    fn postcheck<B: AutodiffBackend>(
+        &self,
+        before: &VerifiedChineseSnapshot,
+        report: &ChineseRunReport,
+        device: &B::Device,
+        stop: &AtomicBool,
+        changed_message: &str,
+    ) -> Result<(), String> {
+        let after = self.verify_snapshot::<B>(device, stop)?;
+        if !before.prepared.matches(&after.prepared) {
+            return Err(changed_message.into());
+        }
+        self.state.verify(stop)?;
+        verify_chinese_report(
+            report,
+            &after.prepared,
+            &after.registered,
+            &after.manifest,
+            &after.policy_sha256,
+        )?;
+        self.roots.verify()?;
+        interrupted(stop)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -997,42 +1111,23 @@ fn run_chinese_v3<B: AutodiffBackend>(
     stop: &AtomicBool,
     run: impl FnOnce(&V3Options<'_>, &Prepared, &ChineseManifest) -> Result<serde_json::Value, String>,
 ) -> Result<serde_json::Value, String> {
-    interrupted(stop)?;
-    let roots = SelectedChinesePaths::resolve(options, true)?;
-    let selected = roots.options();
-    let options = &selected;
-    chinese_paths(options, true)?;
-    roots.verify()?;
-    let chinese_state = ChineseState::acquire(options.state, stop)?;
+    let session = ChineseSession::open(options, true, stop)?;
+    let options = session.options();
     match fs::symlink_metadata(options.output) {
         Ok(_) => return Err("Chinese regression report already exists".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    chinese_registration::current(options.data, stop)?;
-    chinese_registration::preflight_protocol(options.registration, stop)?;
-    let before = prepare::<B>(
-        options,
-        device,
-        stop,
-        V3AsrMode::MetalF16,
-        Some(&chinese_state),
-    )?;
-    chinese_registration::current(options.data, stop)?;
-    chinese_registration::preflight_protocol(options.registration, stop)?;
-    let registered = verify_registration(
-        &registration_options(options, &before),
-        options.registration,
-        stop,
-    )?;
-    ensure_same_data(&before, &registered)?;
-    let manifest =
-        chinese_registration::frozen(options.data, options.registration, &registered, stop)?;
-    let policy_sha256 = check_chinese_policy(options, &before, &registered, &manifest, stop)?;
-    let result = run(options, &before, &manifest).map_err(|error| {
+    let before = session.verify_snapshot::<B>(device, stop)?;
+    let result = run(&options, &before.prepared, &before.manifest).map_err(|error| {
         let detail = serde_json::from_str(&error)
             .unwrap_or_else(|_| serde_json::Value::String(error.chars().take(1024).collect()));
-        chinese_run_error(&registered, &policy_sha256, "inference", detail)
+        chinese_run_error(
+            &before.registered,
+            &before.policy_sha256,
+            "inference",
+            detail,
+        )
     })?;
     let result: number_regression::Report =
         serde_json::from_value(result).map_err(|e| e.to_string())?;
@@ -1040,49 +1135,27 @@ fn run_chinese_v3<B: AutodiffBackend>(
         version: 1,
         status: "insufficient_evidence".into(),
         candidate_eligible: false,
-        protocol_sha256: registered.protocol_sha256().into(),
-        chinese_policy_sha256: policy_sha256.clone(),
+        protocol_sha256: before.registered.protocol_sha256().into(),
+        chinese_policy_sha256: before.policy_sha256.clone(),
         result,
     };
-    verify_chinese_report(&report, &before, &registered, &manifest, &policy_sha256)?;
-    let postcheck = (|| -> Result<(), String> {
-        interrupted(stop)?;
-        roots.verify()?;
-        chinese_state.verify(stop)?;
-        chinese_registration::current(options.data, stop)?;
-        chinese_registration::preflight_protocol(options.registration, stop)?;
-        let after = prepare::<B>(
-            options,
-            device,
-            stop,
-            V3AsrMode::MetalF16,
-            Some(&chinese_state),
-        )?;
-        if before.candidate != after.candidate
-            || before.protocol != after.protocol
-            || before.parameters != after.parameters
-        {
-            return Err("v3 inputs changed during Chinese evaluation".into());
-        }
-        chinese_registration::current(options.data, stop)?;
-        chinese_registration::preflight_protocol(options.registration, stop)?;
-        let verified = verify_registration(
-            &registration_options(options, &after),
-            options.registration,
-            stop,
-        )?;
-        ensure_same_data(&after, &verified)?;
-        let after_manifest =
-            chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
-        let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
-        chinese_state.verify(stop)?;
-        roots.verify()?;
-        verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)
-    })();
-    if let Err(error) = postcheck {
+    verify_chinese_report(
+        &report,
+        &before.prepared,
+        &before.registered,
+        &before.manifest,
+        &before.policy_sha256,
+    )?;
+    if let Err(error) = session.postcheck::<B>(
+        &before,
+        &report,
+        device,
+        stop,
+        "v3 inputs changed during Chinese evaluation",
+    ) {
         return Err(chinese_run_error(
-            &registered,
-            &policy_sha256,
+            &before.registered,
+            &before.policy_sha256,
             "postcheck",
             serde_json::json!({"failure":error,"observations":report.result}),
         ));
@@ -1090,16 +1163,16 @@ fn run_chinese_v3<B: AutodiffBackend>(
     let bytes = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
     if bytes.len() > 2 * 1024 * 1024 {
         return Err(chinese_run_error(
-            &registered,
-            &policy_sha256,
+            &before.registered,
+            &before.policy_sha256,
             "report_budget",
             serde_json::json!({"failure":"Chinese regression report exceeds size limit", "observations":report.result}),
         ));
     }
     write_noclobber(options.output, &bytes, stop).map_err(|error| {
         chinese_run_error(
-            &registered,
-            &policy_sha256,
+            &before.registered,
+            &before.policy_sha256,
             "publication",
             serde_json::json!({"failure":error,"observations":report.result}),
         )
@@ -1125,33 +1198,9 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
     device: &B::Device,
     stop: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    interrupted(stop)?;
-    let roots = SelectedChinesePaths::resolve(options, true)?;
-    let selected = roots.options();
-    let options = &selected;
-    chinese_paths(options, true)?;
-    roots.verify()?;
-    let chinese_state = ChineseState::acquire(options.state, stop)?;
-    chinese_registration::current(options.data, stop)?;
-    chinese_registration::preflight_protocol(options.registration, stop)?;
-    let prepared = prepare::<B>(
-        options,
-        device,
-        stop,
-        V3AsrMode::MetalF16,
-        Some(&chinese_state),
-    )?;
-    chinese_registration::current(options.data, stop)?;
-    chinese_registration::preflight_protocol(options.registration, stop)?;
-    let registered = verify_registration(
-        &registration_options(options, &prepared),
-        options.registration,
-        stop,
-    )?;
-    ensure_same_data(&prepared, &registered)?;
-    let manifest =
-        chinese_registration::frozen(options.data, options.registration, &registered, stop)?;
-    let policy_sha256 = check_chinese_policy(options, &prepared, &registered, &manifest, stop)?;
+    let session = ChineseSession::open(options, true, stop)?;
+    let options = session.options();
+    let before = session.verify_snapshot::<B>(device, stop)?;
     let parent = options
         .output
         .parent()
@@ -1161,48 +1210,30 @@ pub fn recheck_chinese_v3<B: AutodiffBackend>(
         .output
         .file_name()
         .ok_or("invalid report filename")?;
-    let directory = crate::number_v3_voice_recheck::open_directory(parent)?;
+    let directory = AnchoredDir::open(parent)?;
     let mut remaining = 2 * 1024 * 1024;
-    let bytes = crate::number_v3_voice_recheck::read_child(
-        &directory,
+    let bytes = read_single_link_child(
+        directory.as_file(),
         name,
         2 * 1024 * 1024,
-        &mut remaining,
+        Some(&mut remaining),
         stop,
     )?;
     let report: ChineseRunReport = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    verify_chinese_report(&report, &prepared, &registered, &manifest, &policy_sha256)?;
-    chinese_state.verify(stop)?;
-    chinese_registration::current(options.data, stop)?;
-    chinese_registration::preflight_protocol(options.registration, stop)?;
-    let after = prepare::<B>(
-        options,
+    verify_chinese_report(
+        &report,
+        &before.prepared,
+        &before.registered,
+        &before.manifest,
+        &before.policy_sha256,
+    )?;
+    session.postcheck::<B>(
+        &before,
+        &report,
         device,
         stop,
-        V3AsrMode::MetalF16,
-        Some(&chinese_state),
+        "v3 inputs changed during Chinese recheck",
     )?;
-    if prepared.candidate != after.candidate
-        || prepared.protocol != after.protocol
-        || prepared.parameters != after.parameters
-    {
-        return Err("v3 inputs changed during Chinese recheck".into());
-    }
-    chinese_registration::current(options.data, stop)?;
-    chinese_registration::preflight_protocol(options.registration, stop)?;
-    let verified = verify_registration(
-        &registration_options(options, &after),
-        options.registration,
-        stop,
-    )?;
-    ensure_same_data(&after, &verified)?;
-    let after_manifest =
-        chinese_registration::frozen(options.data, options.registration, &verified, stop)?;
-    let after_policy = check_chinese_policy(options, &after, &verified, &after_manifest, stop)?;
-    chinese_state.verify(stop)?;
-    verify_chinese_report(&report, &after, &verified, &after_manifest, &after_policy)?;
-    roots.verify()?;
-    interrupted(stop)?;
     serde_json::to_value(report).map_err(|e| e.to_string())
 }
 
@@ -1290,10 +1321,7 @@ fn run_v3<B: AutodiffBackend>(
     let mut report = run(&before, &registered)?;
     interrupted(stop)?;
     let after = prepare::<B>(options, device, stop, mode, None)?;
-    if before.candidate != after.candidate
-        || before.protocol != after.protocol
-        || before.parameters != after.parameters
-    {
+    if !before.matches(&after) {
         return Err("v3 inputs changed during evaluation".into());
     }
     let verified = verify_registration(

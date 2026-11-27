@@ -442,9 +442,13 @@ burn = {{ path = "vendor/burn" }}
         self.write('[dependencies]\nmodel = { path = "crates/missing" }')
         self.assertIn("crates/missing/Cargo.toml: cannot read Cargo manifest", self.errors())
 
-    def test_workspace_inheritance_is_not_silently_certified(self):
+    def test_workspace_inheritance_resolves_against_root_workspace_dependencies(self):
         self.write('[dependencies]\nengine = { workspace = true }')
-        self.assertIn("workspace inheritance cannot be checked statically", self.errors())
+        self.assertIn("not found in root [workspace.dependencies]", self.errors())
+        self.write(f'[workspace.dependencies]\nburn = {_BURN}\n')
+        self.config["manifests"] = [{"path": "Cargo.toml"}, {"path": "crates/member/Cargo.toml"}]
+        self.write('[dependencies]\nburn = { workspace = true }\n', "crates/member/Cargo.toml", "member")
+        self.assertEqual(self.failures(), [])
 
     def test_diagnostics_are_deterministic(self):
         self.write("""

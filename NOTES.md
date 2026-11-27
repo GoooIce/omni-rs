@@ -12,6 +12,12 @@ Open findings, none introduced by the seams: pauses of one to three seconds occu
 
 Current checkpoint: `artifacts/task-checkpoint.json` (objective, accepted decisions, changed paths, next command). The previous summary, for the native-only task, is kept at `artifacts/native-only-20261112-notes.md`.
 
+## 2026-11-26 architecture deepening: unified workspace & disk footprint
+
+Implemented Candidates 1–5 from [architecture-review-20261126-0025.html](/var/folders/8r/723q1ddd4wg8445l7sltfj4c0000gn/T/architecture-review-20261126-0025.html) (recorded in `docs/adr/0006-unified-cargo-workspace-and-artifact-lifecycle.md`): unified 16 detached manifests into one root Cargo workspace (`resolver = "3"`), enforced `split-debuginfo = "off"` + `package."*".debug = 0` + uniform `opt-level`, stopped cross-worktree target symlinking, added retention-guarded `--pin-baseline` and `--prune` to `scripts/storage_report.py`, consolidated 118 integration tests into 10 harnesses, moved `web/api.html` into `crates/omni-api/assets/api.html`, retired dead Web/WASM files, and added declarative `pyproject.toml` `uv` dependency groups. Post-`./scripts/check metal` (52/52 passed) footprint dropped from 521 GiB (`target/` 414 GiB, 494,645 `.rcgu.o`) to 110 GiB (`target/` 11 GiB, 0 `.rcgu.o`).
+
+Current checkpoint: `artifacts/task-checkpoint.json`.
+
 ## 2026-11-25 architecture discussion
 
 The agreed HTTP speech contract publishes every sample handed off before cancellation once at least one exists. Cancellation before the first sample returns `cancelled` with a null result. A queued speech script waits for an available synthesis slot before tokenization and reference-encoder loading. Makepad should advance the displayed speech text only when synthesis continues and check Stop after the opening stream drains before opening the rest. The current implementation still exhibits the behaviors captured by the probes. The HTML report, probe outputs and acceptance cases are linked from `artifacts/task-checkpoint.json`.

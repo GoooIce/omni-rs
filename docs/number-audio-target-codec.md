@@ -5,7 +5,7 @@
 命令从仓库根目录运行，使用项目共享的 `target/minicpm-v-cpu` 编译目录。首次在独立工作树运行 Cargo 前，请按[开发工作流](agent-workflow.md#compilation-directories)执行 `uv run --offline --no-project python scripts/share-target.py`。命令以离线模式运行，需要提前缓存所需依赖；首次编译和加载模型可能耗时。
 
 ```sh
-( set -C; CARGO_TARGET_DIR=target/minicpm-v-cpu CARGO_BUILD_JOBS=2 cargo run --offline --locked --release --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu --example number_audio -- encode-target "$HOME/models/LiquidAI/LFM3-Omni-2B" artifacts/number-audio/answer.wav > artifacts/number-audio/answer-target.json )
+( set -C; CARGO_TARGET_DIR=target CARGO_BUILD_JOBS=2 cargo run --offline --locked --release --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu --example number_audio -- encode-target "$HOME/models/LiquidAI/LFM3-Omni-2B" artifacts/number-audio/answer.wav > artifacts/number-audio/answer-target.json )
 ```
 
 命令成功时输出的 JSON 对象可整体并入计划的对应记录，含 `frames`、原始答案 WAV 的 `target_audio_sha256`、codec 身份、模型码本配置摘要、预处理实现摘要和后端。正式编码从同一份内存快照计算包含配置、索引（若有）和权重的 `codec_fingerprint_sha256` 并构造编码器；快照总量最多 1 GiB，索引最多 8 MiB。为兼容 #81，未分片模型的 `target_codec_sha256` 仍是 `model.safetensors` 的内容哈希，分片模型使用 codec 复合指纹。训练准入遇到 `codec_fingerprint_sha256` 时会校验当前 codec 的完整复合指纹；该字段一旦提供就必须是有效摘要，`null` 不视为缺省。没有该字段的旧记录继续按原有的 `target_codec_sha256` 准入，未分片旧记录因此不能证明配置一致。请保留授权来源及原 WAV，便于之后独立核对。
@@ -19,5 +19,5 @@
 若本地已有正式模型权重和独立生成的 codec 参考文件，可运行以下可选的 `ignored` 测试；请将模型和参考文件路径替换为实际路径。该测试验证编码数值，不证明听答质量：
 
 ```sh
-LFM3_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B" LFM3_CODEC_ENCODE_REFERENCE="$PWD/artifacts/number-audio/codec-reference.json" CARGO_TARGET_DIR=target/minicpm-v-cpu CARGO_BUILD_JOBS=2 cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features cpu --test number_target official_codec_target_matches_independent_reference -- --ignored --exact
+LFM3_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B" LFM3_CODEC_ENCODE_REFERENCE="$PWD/artifacts/number-audio/codec-reference.json" CARGO_TARGET_DIR=target CARGO_BUILD_JOBS=2 cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features cpu --test number_target official_codec_target_matches_independent_reference -- --ignored --exact
 ```

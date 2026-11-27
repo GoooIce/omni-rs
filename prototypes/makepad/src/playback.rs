@@ -52,6 +52,56 @@ pub struct PlaybackStats {
     pub output_rate: usize,
 }
 
+/// Narrow audio-output seam for production playback and in-memory test adapters.
+pub trait AudioSink {
+    fn push(&mut self, samples: &[f32]) -> Result<(), String>;
+    fn stats(&self) -> Option<PlaybackStats>;
+    fn drain_with_progress(
+        &mut self,
+        progress: &mut dyn FnMut(PlaybackStats),
+    ) -> Result<(), String>;
+}
+
+/// Factory seam for opening playback streams on demand.
+pub trait AudioSinkOpener {
+    type Sink: AudioSink;
+    fn open(
+        &mut self,
+        cancel: Arc<AtomicBool>,
+        estimate: Option<f64>,
+    ) -> Result<Self::Sink, String>;
+}
+
+/// Production [`AudioSinkOpener`] backed by `cpal` via [`Playback::open`].
+#[derive(Default)]
+pub struct DeviceAudio;
+
+impl AudioSinkOpener for DeviceAudio {
+    type Sink = Playback;
+    fn open(
+        &mut self,
+        cancel: Arc<AtomicBool>,
+        estimate: Option<f64>,
+    ) -> Result<Self::Sink, String> {
+        Playback::open(cancel, estimate)
+    }
+}
+
+impl AudioSink for Playback {
+    fn push(&mut self, samples: &[f32]) -> Result<(), String> {
+        Playback::push(self, samples)
+    }
+    fn stats(&self) -> Option<PlaybackStats> {
+        Playback::stats(self)
+    }
+    fn drain_with_progress(
+        &mut self,
+        progress: &mut dyn FnMut(PlaybackStats),
+    ) -> Result<(), String> {
+        Playback::drain_with_progress(self, progress)
+    }
+}
+
 /// Single producer, device-owned consumer. Resampling and waiting happen only
 /// on the producer; the device callback never takes the producer's mutex.
 pub struct Playback {
@@ -63,19 +113,6 @@ pub struct Playback {
     cancel: Arc<AtomicBool>,
 }
 impl Playback {
-    /// A device-less playback for tests: stats-less, drained on demand.
-    #[cfg(test)]
-    pub fn stub(cancel: Arc<AtomicBool>) -> Self {
-        Self {
-            _stream: None,
-            shared: None,
-            resampler: None,
-            policy: None,
-            finished: false,
-            cancel,
-        }
-    }
-
     /// None is pre-generated replay; Some(duration) enables adaptive streaming.
     pub fn open(cancel: Arc<AtomicBool>, estimate: Option<f64>) -> Result<Self, String> {
         let origin = Instant::now();

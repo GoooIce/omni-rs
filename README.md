@@ -104,7 +104,7 @@ cargo run --release --manifest-path crates/minicpm-v/Cargo.toml -- generate \
 使用本地官方模型目录（包含 `audio_tokenizer/`），按顺序组合文字、图片、音频和视频。语音输出为 24 kHz 单声道；视频和非 WAV 音频解码需要本地 `ffmpeg`。格式、会话与验证范围见 [LFM3-Omni 接入说明](docs/lfm3-omni.md)。
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
+CARGO_TARGET_DIR=target cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
   --model models/LFM3-Omni-2B --part 'text:描述这张图' --part image:photo.jpg --mode text
 ```
 

@@ -101,7 +101,7 @@ def plan(root, profile, output):
             name = Path(manifest).parent.name if "/" in manifest else "root"
             flags = ["--locked", "--manifest-path", manifest, "--no-default-features",
                      "--features", row["cpu_features"], "--target-dir", output_dir(row["path"])]
-            add("clippy-" + name, ["cargo", "clippy", *flags, "--lib", "--tests"] +
+            add("clippy-" + name, ["cargo", "clippy", "--no-deps", *flags, "--lib", "--tests"] +
                 (["--", "-D", "warnings"] if row.get("strict_clippy") else []))
             add("test-" + name, ["cargo", "test", *flags, "--lib", "--tests"])
     elif profile == "metal":
@@ -115,7 +115,7 @@ def plan(root, profile, output):
             if name == "burn-ane":
                 flags += ["--features", "metal-shared"]
             targets = ["--tests"] if name == "makepad" else ["--lib", "--tests"]
-            add("clippy-" + name, ["cargo", "clippy", *flags, *targets] +
+            add("clippy-" + name, ["cargo", "clippy", "--no-deps", *flags, *targets] +
                 (["--", "-D", "warnings"] if row.get("strict_clippy") else []))
             # These numerical tests are ignored by default solely because they need Metal.
             ignored = ["--include-ignored"] if name in ("breeze-tts", "omni-kernel") else []

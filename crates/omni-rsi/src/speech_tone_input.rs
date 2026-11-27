@@ -477,59 +477,15 @@ fn preflight<'a>(
     Ok(records)
 }
 
-#[cfg(unix)]
 fn open_root(root: &Path) -> Result<File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(root)
+    crate::safe_fs::AnchoredDir::open_selected(root)
+        .map(crate::safe_fs::AnchoredDir::into_file)
         .map_err(|e| format!("open tone root: {e}"))
 }
 
-#[cfg(unix)]
 fn open_audio(root: &File, path: &str, stop: &AtomicBool) -> Result<File, String> {
-    use std::{
-        ffi::CString,
-        os::fd::{AsRawFd, FromRawFd},
-    };
-    let mut directory = root.try_clone().map_err(|e| e.to_string())?;
-    let mut components = path.split('/').peekable();
-    while let Some(component) = components.next() {
-        check_stop(stop)?;
-        let name = CString::new(component).map_err(|_| "invalid audio path")?;
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_CLOEXEC
-            | if components.peek().is_some() {
-                libc::O_DIRECTORY
-            } else {
-                0
-            };
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(format!(
-                "open tone audio without symlinks: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        directory = unsafe { File::from_raw_fd(fd) };
-    }
-    if !directory.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("tone audio must be a regular file".into());
-    }
-    Ok(directory)
-}
-
-#[cfg(not(unix))]
-fn open_root(_: &Path) -> Result<File, String> {
-    Err("safe tone input preparation is unsupported on this platform".into())
-}
-
-#[cfg(not(unix))]
-fn open_audio(_: &File, _: &str, _: &AtomicBool) -> Result<File, String> {
-    Err("safe tone input preparation is unsupported on this platform".into())
+    crate::safe_fs::open_relative_file(root, path, stop)
+        .map_err(|e| format!("open tone audio without symlinks: {e}"))
 }
 
 fn read_audio(

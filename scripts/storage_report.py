@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Inspect local storage without following symlinks or deleting artifacts."""
+"""Storage governance: inspect usage, pin A/B baselines, and run retention-guarded GC."""
 import argparse
 from collections import defaultdict
 from datetime import date, datetime, timezone
+import hashlib
 import heapq
 import json
 import os
@@ -11,12 +12,18 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 from target_layout import load_manifests, primary_checkout
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = {"debug", "release", "debug-full", "web"}
+WORKSPACE_TARGET_KEEP = {
+    "debug", "release", "debug-full", "autotune", "tmp",
+    "CACHEDIR.TAG", ".rustc_info.json", ".cargo-lock",
+    ".cargo-artifact-lock", ".cargo-build-lock",
+}
 
 
 def write_json(path, value):
@@ -172,6 +179,13 @@ def active_files(paths):
                                          "absence is not evidence that a path is safe to remove."}
 
 
+def load_retention(primary):
+    ledger = Path(primary) / "artifacts/storage-retention.json"
+    if not ledger.exists():
+        return []
+    return json.loads(ledger.read_text()).get("entries", [])
+
+
 def record_retention(primary, path, owner, purpose, keep, expires=None):
     path = Path(os.path.abspath(path))
     relative = str(path.relative_to(primary))
@@ -188,6 +202,161 @@ def record_retention(primary, path, owner, purpose, keep, expires=None):
     return ledger
 
 
+def pin_baseline(primary, binary, tag, purpose, owner="baseline"):
+    """Copy a standalone executable into artifacts/baselines/<tag>/ with checksum provenance."""
+    primary = Path(primary).resolve()
+    source = Path(binary).resolve()
+    if not source.is_file():
+        raise ValueError(f"Baseline executable does not exist: {source}")
+    if not tag.strip() or "/" in tag or ".." in tag:
+        raise ValueError(f"Invalid baseline tag: {tag!r}")
+    dest_dir = primary / "artifacts/baselines" / tag
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_bin = dest_dir / source.name
+    digest = hashlib.sha256()
+    with tempfile.NamedTemporaryFile(dir=dest_dir, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        with source.open("rb") as reader, tmp_path.open("wb") as writer:
+            while chunk := reader.read(1024 * 1024):
+                digest.update(chunk)
+                writer.write(chunk)
+        shutil.copymode(source, tmp_path)
+        os.replace(tmp_path, dest_bin)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    metadata = {
+        "tag": tag,
+        "binary": source.name,
+        "bytes": dest_bin.stat().st_size,
+        "sha256": digest.hexdigest(),
+        "source": str(source),
+        "purpose": purpose,
+        "pinned_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(dest_dir / "metadata.json", metadata)
+    record_retention(primary, dest_dir, owner, purpose, "pinned")
+    return dest_dir, metadata
+
+
+def _tree_allocated_bytes(path):
+    total = 0
+    if path.is_symlink():
+        return 0
+    if path.is_file():
+        return path.lstat().st_blocks * 512
+    for dirpath, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_blocks * 512
+    return total
+
+
+def _is_protected(primary, path, protected_paths):
+    rel = path.resolve(strict=False)
+    for guard in protected_paths:
+        if rel == guard or rel.is_relative_to(guard) or guard.is_relative_to(rel):
+            return True
+    return False
+
+
+def plan_prune(root, primary, max_age_days=7, keep_check_runs=10):
+    """Identify reclaimable build debris while strictly honoring active/pinned retention records."""
+    root = Path(root).resolve()
+    primary = Path(primary).resolve()
+    protected = {
+        (primary / row["path"]).resolve(strict=False)
+        for row in load_retention(primary)
+        if row.get("keep") in ("active", "pinned")
+    }
+    cutoff = time.time() - max_age_days * 86400
+    items = []
+
+    target_root = root / "target"
+    if target_root.is_dir() and not target_root.is_symlink():
+        for entry in sorted(target_root.iterdir()):
+            if entry.is_symlink() or entry.name in WORKSPACE_TARGET_KEEP:
+                continue
+            if _is_protected(primary, entry, protected):
+                continue
+            items.append({
+                "path": str(entry),
+                "kind": "unregistered_target_dir",
+                "allocated_bytes": _tree_allocated_bytes(entry),
+            })
+
+        for mode in ("debug", "release"):
+            for sub in ("deps", "examples"):
+                folder = target_root / mode / sub
+                if not folder.is_dir():
+                    continue
+                for entry in sorted(folder.iterdir()):
+                    if entry.is_symlink() or not entry.is_file():
+                        continue
+                    try:
+                        st = entry.lstat()
+                    except OSError:
+                        continue
+                    is_unpacked_obj = entry.name.endswith(".rcgu.o") or entry.name.endswith(".o")
+                    is_old = st.st_mtime < cutoff
+                    if is_unpacked_obj or is_old:
+                        if _is_protected(primary, entry, protected):
+                            continue
+                        items.append({
+                            "path": str(entry),
+                            "kind": "stale_split_debug_obj" if is_unpacked_obj else "stale_build_artifact",
+                            "allocated_bytes": st.st_blocks * 512,
+                        })
+
+    checks_dir = root / "artifacts/checks"
+    if checks_dir.is_dir():
+        runs = sorted(
+            [p for p in checks_dir.iterdir() if p.is_dir() and not p.is_symlink()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old_run in runs[keep_check_runs:]:
+            if _is_protected(primary, old_run, protected):
+                continue
+            items.append({
+                "path": str(old_run),
+                "kind": "rotated_check_run",
+                "allocated_bytes": _tree_allocated_bytes(old_run),
+            })
+
+    return {
+        "root": str(root),
+        "protected_count": len(protected),
+        "candidate_count": len(items),
+        "reclaimable_bytes": sum(item["allocated_bytes"] for item in items),
+        "items": items,
+    }
+
+
+def execute_prune(plan):
+    removed = 0
+    reclaimed = 0
+    errors = []
+    for item in plan["items"]:
+        path = Path(item["path"])
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                continue
+            removed += 1
+            reclaimed += item["allocated_bytes"]
+        except OSError as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+    return {"removed": removed, "reclaimed_bytes": reclaimed, "errors": errors}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=Path, action="append", help="scan this directory; repeatable")
@@ -195,14 +364,33 @@ def main():
     parser.add_argument("--max-seconds", type=float, default=120)
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--record", type=Path, help="record ownership only; does not scan or delete files")
+    parser.add_argument("--pin-baseline", type=Path, help="copy executable into artifacts/baselines/<tag>/ and pin it")
+    parser.add_argument("--tag", help="baseline tag for --pin-baseline")
     parser.add_argument("--owner")
     parser.add_argument("--purpose")
     parser.add_argument("--keep", choices=("active", "pinned", "review"), default="review")
     parser.add_argument("--review-after", help="ISO date for review, never automatic deletion")
+    parser.add_argument("--prune-dry-run", action="store_true", help="list retention-safe reclaimable build debris without deleting")
+    parser.add_argument("--prune", action="store_true", help="delete retention-safe reclaimable build debris")
+    parser.add_argument("--max-age-days", type=float, default=7.0, help="age threshold for stale deps/examples artifacts")
+    parser.add_argument("--keep-check-runs", type=int, default=10, help="number of recent artifacts/checks runs to retain")
     args = parser.parse_args()
     if args.max_seconds <= 0 or not 1 <= args.top <= 100:
         parser.error("--max-seconds must be positive and --top must be between 1 and 100")
     primary = primary_checkout(ROOT)
+
+    if args.pin_baseline:
+        if not args.tag or not args.purpose:
+            parser.error("--pin-baseline requires --tag and --purpose")
+        try:
+            dest_dir, meta = pin_baseline(
+                primary, args.pin_baseline, args.tag, args.purpose, args.owner or "baseline"
+            )
+            print(json.dumps({"pinned": str(dest_dir), **meta}, ensure_ascii=False, indent=2))
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+        return 0
+
     if args.record:
         if not args.owner or not args.purpose:
             parser.error("--record requires --owner and --purpose")
@@ -212,20 +400,40 @@ def main():
         except (ValueError, OSError) as error:
             parser.error(str(error))
         return 0
+
+    if args.prune_dry_run or args.prune:
+        prune_plan = plan_prune(ROOT, primary, args.max_age_days, args.keep_check_runs)
+        if args.prune:
+            result = execute_prune(prune_plan)
+            print(f"Pruned {result['removed']}/{prune_plan['candidate_count']} items, "
+                  f"reclaimed ~{result['reclaimed_bytes'] / 2**30:.2f} GiB "
+                  f"(errors: {len(result['errors'])}, protected ledger entries: {prune_plan['protected_count']})")
+            return 0 if not result["errors"] else 1
+        print(f"Dry-run: {prune_plan['candidate_count']} reclaimable items, "
+              f"~{prune_plan['reclaimable_bytes'] / 2**30:.2f} GiB "
+              f"(protected ledger entries: {prune_plan['protected_count']})")
+        by_kind = defaultdict(lambda: [0, 0])
+        for item in prune_plan["items"]:
+            by_kind[item["kind"]][0] += 1
+            by_kind[item["kind"]][1] += item["allocated_bytes"]
+        for kind, (count, nbytes) in sorted(by_kind.items(), key=lambda kv: -kv[1][1]):
+            print(f"  {kind:26s}: {nbytes / 2**30:7.2f} GiB ({count} items)")
+        return 0
+
     paths = args.path
     if paths is None:
-        paths = [primary / "target", ROOT / "artifacts"]
+        paths = [ROOT / "target", ROOT / "artifacts"]
         paths += [ROOT / Path(row["path"]).parent / "target" for row in load_manifests(ROOT)
-                  if (ROOT / Path(row["path"]).parent / "target").is_dir() and
-                  not (ROOT / Path(row["path"]).parent / "target").is_symlink()]
+                  if row["path"] != "Cargo.toml"
+                  and (ROOT / Path(row["path"]).parent / "target").is_dir()
+                  and not (ROOT / Path(row["path"]).parent / "target").is_symlink()]
     paths = selection(paths)
     print("Inspecting metadata; no symlink traversal or file deletion.", flush=True)
     report = scan(paths, args.max_seconds, args.top)
     report["active_files"] = active_files(paths)
     report["created_at"] = datetime.now(timezone.utc).isoformat()
     report["disk"] = dict(zip(("total", "used", "free"), shutil.disk_usage(ROOT)))
-    ledger = primary / "artifacts/storage-retention.json"
-    report["retention"] = json.loads(ledger.read_text())["entries"] if ledger.exists() else []
+    report["retention"] = load_retention(primary)
     for entry in report["retention"]:
         entry["review_due"] = bool(entry.get("review_after") and
                                    date.fromisoformat(entry["review_after"]) <= date.today())

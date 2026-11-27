@@ -112,7 +112,11 @@ fn check_supervised_resume_scope(test: &str, mode: &str) {
     if std::env::var_os(ROLE).is_none() {
         let temp = tempfile::tempdir().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
+            .args([
+                "--exact",
+                &format!("audio_idle_namespace::{test}"),
+                "--nocapture",
+            ])
             .env(ROLE, "1")
             .env(
                 "DDUST_RUN_REGISTRY",

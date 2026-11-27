@@ -14,7 +14,7 @@
 
 ```sh
 export CARGO_BUILD_JOBS=1 CARGO_NET_OFFLINE=true
-export CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu"
+export CARGO_TARGET_DIR="$PWD/target"
 ./scripts/cargo build --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features native,cpu --example number_audio
 "$CARGO_TARGET_DIR/debug/examples/number_audio" preregister-chinese-v3 "$MODEL" "$DATA" "$STATE" "$REG"

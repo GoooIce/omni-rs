@@ -213,8 +213,10 @@ fn image() -> Command {
         ..Default::default()
     })
 }
-fn speech_product(samples: usize, cancelled: bool) -> Product {
+fn speech_product(audio: Vec<f32>, cancelled: bool) -> Product {
+    let samples = audio.len();
     Product::speech(
+        audio,
         omni_breeze_tts::ScriptReport {
             texts: vec![],
             speech_texts: vec![omni_breeze_tts::SynthesisReport {
@@ -239,10 +241,16 @@ fn speech_product(samples: usize, cancelled: bool) -> Product {
         Default::default(),
     )
 }
+fn speech_audio_progress(samples: usize) -> Update {
+    Update::Progress(Progress::SpeechAudio {
+        audio_seconds: samples as f64 / 24000.0,
+    })
+}
 fn speech_step(id: u64, audio: Vec<f32>, cancelled: bool) -> Step {
+    let samples = audio.len();
     Step {
-        completed: vec![(id, Ok(speech_product(audio.len(), cancelled)))],
-        updates: vec![(id, Update::Audio(audio))],
+        completed: vec![(id, Ok(speech_product(audio, cancelled)))],
+        updates: vec![(id, speech_audio_progress(samples))],
     }
 }
 fn done(id: u64, product: Product) -> Step {
@@ -379,7 +387,7 @@ fn full_admission_cancelled_partial_audio_and_out_of_order_completion_keep_owner
     h.step(Kind::Speech, &[11]);
     let b = h.jobs.submit(speech()).unwrap().id;
     h.reply(Reply::Step(Step {
-        updates: vec![(11, Update::Audio(vec![0.1]))],
+        updates: vec![(11, speech_audio_progress(1))],
         ..Default::default()
     }));
     h.expect(Call::Admit(Kind::Speech));
@@ -393,12 +401,12 @@ fn full_admission_cancelled_partial_audio_and_out_of_order_completion_keep_owner
     h.jobs.cancel(&a);
     h.reply(Reply::Step(Step {
         updates: vec![
-            (12, Update::Audio(vec![-0.5, -0.25])),
-            (11, Update::Audio(vec![0.2])),
+            (12, speech_audio_progress(2)),
+            (11, speech_audio_progress(2)),
         ],
         completed: vec![
-            (12, Ok(speech_product(2, false))),
-            (11, Ok(speech_product(2, true))),
+            (12, Ok(speech_product(vec![-0.5, -0.25], false))),
+            (11, Ok(speech_product(vec![0.1, 0.2], true))),
         ],
     }));
     assert_eq!(h.terminal(&a).status, "cancelled");
@@ -451,15 +459,15 @@ fn duplicate_unknown_and_wrong_modality_events_fail_the_whole_batch_then_reload(
             let step = match scenario {
                 0 => Step {
                     completed: vec![
-                        (1, Ok(speech_product(0, false))),
-                        (1, Ok(speech_product(0, false))),
+                        (1, Ok(speech_product(vec![], false))),
+                        (1, Ok(speech_product(vec![], false))),
                     ],
                     ..Default::default()
                 },
-                1 => done(99, speech_product(0, false)),
+                1 => done(99, speech_product(vec![], false)),
                 2 => done(1, transcription()),
                 3 => Step {
-                    updates: vec![(99, Update::Audio(vec![1.0]))],
+                    updates: vec![(99, speech_audio_progress(1))],
                     ..Default::default()
                 },
                 _ => unreachable!(),
@@ -594,7 +602,7 @@ fn speech_cancelled_before_first_sample_publishes_no_wav() {
     h.jobs.cancel(&id);
     // The driver reports a stopped synthesis that never delivered PCM.
     h.reply(Reply::Step(Step {
-        completed: vec![(1, Ok(speech_product(0, true)))],
+        completed: vec![(1, Ok(speech_product(vec![], true)))],
         ..Default::default()
     }));
     let view = h.terminal(&id);
@@ -619,7 +627,7 @@ fn speech_cancelled_while_queued_publishes_no_wav() {
     // finished, and a cancellation finds no WAV to publish.
     let queued = h.jobs.submit(speech()).unwrap().id;
     h.jobs.cancel(&queued);
-    h.reply(Reply::Step(done(1, speech_product(1, false))));
+    h.reply(Reply::Step(done(1, speech_product(vec![0.1], false))));
     let view = h.terminal(&queued);
     assert_eq!(view.status, "cancelled");
     // A job cancelled before it ran has no result and publishes no file; it
@@ -643,7 +651,7 @@ fn a_full_batch_keeps_the_queue_fifo() {
     // While the batch is full neither queued script is admitted; once the
     // running job finishes, the head of the queue is admitted before the
     // later arrival, one admission attempt each.
-    h.reply(Reply::Step(done(1, speech_product(0, false))));
+    h.reply(Reply::Step(done(1, speech_product(vec![], false))));
     assert_eq!(h.terminal(&running).status, "done");
     h.expect(Call::Admit(Kind::Speech));
     h.reply(Reply::Admit(Ok(Some(2))));
@@ -652,12 +660,12 @@ fn a_full_batch_keeps_the_queue_fifo() {
     h.step(Kind::Speech, &[2]);
     assert_eq!(h.jobs.get(&head).unwrap().status, "running");
     assert_eq!(h.jobs.get(&later).unwrap().status, "queued");
-    h.reply(Reply::Step(done(2, speech_product(0, false))));
+    h.reply(Reply::Step(done(2, speech_product(vec![], false))));
     assert_eq!(h.terminal(&head).status, "done");
     h.expect(Call::Admit(Kind::Speech));
     h.reply(Reply::Admit(Ok(Some(3))));
     h.step(Kind::Speech, &[3]);
-    h.reply(Reply::Step(done(3, speech_product(0, false))));
+    h.reply(Reply::Step(done(3, speech_product(vec![], false))));
     assert_eq!(h.terminal(&later).status, "done");
 }
 
@@ -671,7 +679,7 @@ fn speech_cancelled_between_speech_texts_keeps_delivered_audio_and_skips_event()
     h.step(Kind::Speech, &[1]);
     // First speech text delivers its PCM and ends.
     h.reply(Reply::Step(Step {
-        updates: vec![(1, Update::Audio(vec![0.25, -0.5]))],
+        updates: vec![(1, speech_audio_progress(2))],
         ..Default::default()
     }));
     h.step(Kind::Speech, &[1]);
@@ -680,7 +688,7 @@ fn speech_cancelled_between_speech_texts_keeps_delivered_audio_and_skips_event()
     // delivered audio or emit a start event for a speech text that never ran:
     // the job completes with the product of the audio it already spoke.
     h.reply(Reply::Step(Step {
-        completed: vec![(1, Ok(speech_product(2, true)))],
+        completed: vec![(1, Ok(speech_product(vec![0.25, -0.5], true)))],
         ..Default::default()
     }));
     let view = h.terminal(&id);
@@ -707,13 +715,10 @@ fn interleaved_speech_jobs_keep_their_own_partial_audio() {
     h.step(Kind::Speech, &[1, 2]);
     h.jobs.cancel(&a);
     h.reply(Reply::Step(Step {
-        updates: vec![
-            (2, Update::Audio(vec![-0.5, -0.25])),
-            (1, Update::Audio(vec![0.5])),
-        ],
+        updates: vec![(2, speech_audio_progress(2)), (1, speech_audio_progress(1))],
         completed: vec![
-            (2, Ok(speech_product(2, false))),
-            (1, Ok(speech_product(1, true))),
+            (2, Ok(speech_product(vec![-0.5, -0.25], false))),
+            (1, Ok(speech_product(vec![0.5], true))),
         ],
     }));
     assert_eq!(h.terminal(&a).status, "cancelled");

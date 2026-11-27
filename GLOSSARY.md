@@ -134,6 +134,14 @@ A completed audio or image file whose download link remains valid while the file
 
 ## 执行位置
 
+**Compute backend**:
+The portable Burn execution target (`wgpu` or `cpu`) that runs model graphs without platform-specific hardware calls.
+_Avoid_: platform backend, Metal-only backend
+
+**Apple accelerator layer**:
+Optional Apple Silicon acceleration (Metal MSL passthrough, TensorOps, `ane`, `mtl4`, CoreML) layered alongside the compute backend behind explicit features and fallback guards.
+_Avoid_: default backend, mandatory Metal
+
 **Neural Accelerator**:
 GPU 每个着色器核心里的矩阵单元，经 Metal 张量运算使用。
 _Avoid_: Apple Neural Engine, ANE, NAX
@@ -141,3 +149,17 @@ _Avoid_: Apple Neural Engine, ANE, NAX
 **Apple Neural Engine**:
 独立的神经引擎，实验性 ANE 后端走它。
 _Avoid_: Neural Accelerator, NAX
+
+## 模型获取与外部提供方
+
+**Download route**:
+The configured checkpoint source preset (ModelScope, Hugging Face, or a custom mirror endpoint) plus optional HTTP(S) proxy used to fetch checkpoint files and resolve per-model source availability.
+_Avoid_: mirror URL, source flag
+
+**Capability slot**:
+An independently switchable task boundary in the desktop workflow—prompt enhancement, speech recognition, speech synthesis, or translation—whose provider selection never silently alters another slot or crosses the local/external boundary.
+_Avoid_: global provider, model mode
+
+**Capability provider**:
+Either the default local Burn model or an explicitly selected OpenAI-compatible external endpoint (such as a local Magpie gateway) bound to one capability slot.
+_Avoid_: cloud fallback, remote engine

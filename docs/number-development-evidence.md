@@ -38,7 +38,7 @@ cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-def
 显式本地入口可将诊断打印到标准输出；调用方须提供注册时使用的原评估器文件、候选文件、模型、开发数据和 R2T2 身份文件，若注册还绑定 Breeze 则在末尾追加其模型和二进制路径。入口逐级打开并固定注册目录，然后重新读取和比较协议、实际开发清单与音频、公开保留元数据、回归输入清单、模型、完整 codec、候选、评估器和工具身份，不读取训练清单、训练音频或训练目标。它使用专门的受限开发视图，不构造或返回 `RegisteredDevelopment` 或 `VerifiedDevelopment`；输出明确标记 `training_identity=not_reverified`、`partition_isolation=not_reverified`、`protocol_authenticity=not_verified`。所给协议和对应本地文件的摘要一致，不证明协议确曾冻结、训练数据未改变、跨分区真实隔离或来源许可；这些仍需独立的完整注册核验与人工证据。模型和工具文件只用于身份核对，不启动模型、codec 或 ASR。`DATA` 必须是已授权的开发数据目录，`VOICE_DIR` 必须是开发语音工件目录，不能指向私有保留材料；入口无法自行识别用户指定目录的真实用途。在这些路径选择前提下，它不打开私有保留题、盐或媒体。
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=1 \
   cargo run --offline --locked --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu \
   --example number_voice_recheck -- "$MODEL" "$DATA" "$CANDIDATE" "$EVALUATOR" \
   "$REGISTRATION" "$REPORT" "$VOICE_DIR" "$BACKEND" "$R2T2_MODEL" "$R2T2_BINARY"

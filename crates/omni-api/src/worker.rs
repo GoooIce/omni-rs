@@ -149,7 +149,7 @@ mod driver;
 mod music;
 pub(crate) mod omni;
 mod speech;
-use driver::{Driver, NativeDriver, Progress, Step, Update};
+use driver::{Driver, NativeDriver, Step, Update};
 
 impl driver::Progress {
     pub fn value(self) -> serde_json::Value {
@@ -167,14 +167,23 @@ impl driver::Progress {
             Self::Transcription(e) => {
                 json!({"stage":"transcription","text":e.event.text,"audio_seconds":e.event.audio_seconds})
             }
-            Self::Speech {
-                speech_text,
-                speech_texts,
-            } => {
-                json!({"stage":"speech","speech_text":speech_text,"speech_texts":speech_texts})
+            Self::SpeechAudio { audio_seconds } => {
+                json!({"stage":"speech","audio_seconds":audio_seconds})
             }
             Self::Image(e) => json!(e),
             Self::Music(e) => json!(e),
+        }
+    }
+}
+
+impl driver::Event {
+    pub fn value(self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Self::Speech {
+                speech_text,
+                speech_texts,
+            } => json!({"stage":"speech","speech_text":speech_text,"speech_texts":speech_texts}),
         }
     }
 }
@@ -200,13 +209,9 @@ impl Command {
         }
     }
 }
-struct JobRun {
-    context: Context,
-    audio: Vec<f32>,
-}
 struct Active {
     kind: Kind,
-    members: BTreeMap<u64, JobRun>,
+    members: BTreeMap<u64, Context>,
     failure: Option<String>,
 }
 /// Resident weights survive modality switches; only one modality owns active jobs.
@@ -241,7 +246,7 @@ impl<D: Driver> Models<D> {
         active
             .into_iter()
             .flat_map(|active| active.members.into_values())
-            .map(|job| (job.context.id(), Err(Failure::Error(message.clone()))))
+            .map(|context| (context.id(), Err(Failure::Error(message.clone()))))
             .collect()
     }
     fn apply(&mut self, step: Step) -> Vec<(String, Result<Output, Failure>)> {
@@ -266,22 +271,11 @@ impl<D: Driver> Models<D> {
         }
         let active = self.active.as_mut().unwrap();
         for (id, update) in step.updates {
-            let job = active.members.get_mut(&id).unwrap();
+            let context = active.members.get(&id).unwrap();
             match update {
-                // Which speech text is running is an event; the audio update
-                // below keeps reporting the seconds handed off so far.
-                Update::Progress(Progress::Speech {
-                    speech_text,
-                    speech_texts,
-                }) => {
-                    job.context.event(
-                        json!({"stage":"speech","speech_text":speech_text,"speech_texts":speech_texts}),
-                    );
-                }
-                Update::Progress(progress) => job.context.progress(progress.value()),
-                Update::Audio(audio) => {
-                    job.audio.extend(audio);
-                    job.context.progress(json!({"stage":"speech","audio_seconds":job.audio.len() as f64 / omni_breeze_tts::SAMPLE_RATE as f64}));
+                Update::Progress(progress) => context.progress(progress.value()),
+                Update::Event(event) => {
+                    context.event(event.value());
                 }
             }
         }
@@ -289,9 +283,9 @@ impl<D: Driver> Models<D> {
             .completed
             .into_iter()
             .map(|(id, result)| {
-                let job = active.members.remove(&id).unwrap();
-                let result = result.and_then(|product| product.render(&job.context, job.audio));
-                (job.context.id(), result)
+                let context = active.members.remove(&id).unwrap();
+                let result = result.and_then(|product| product.render(&context));
+                (context.id(), result)
             })
             .collect();
         if active.members.is_empty() {
@@ -355,13 +349,7 @@ impl<D: Driver> Executor for Models<D> {
             self.resident.clear();
             return Err(Failure::Error(message));
         }
-        active.members.insert(
-            id,
-            JobRun {
-                context: context.clone(),
-                audio: Vec::new(),
-            },
-        );
+        active.members.insert(id, context.clone());
         Ok(true)
     }
     fn step(&mut self) -> Vec<(String, Result<Output, Failure>)> {
@@ -535,7 +523,7 @@ impl driver::Product {
         report: omni_hy_mt::Translation,
         batch: omni_hy_mt::BatchStats,
     ) -> Self {
-        Self::new(Kind::Translation, move |_context, _audio| {
+        Self::new(Kind::Translation, move |_context| {
             let cancelled = report.finish_reason == "cancelled";
             let mut value = json!(report);
             value["batch"] = json!(batch);
@@ -546,7 +534,7 @@ impl driver::Product {
         report: omni_r2t2::stream::BatchReport,
         batch: omni_r2t2::stream::BatchStats,
     ) -> Self {
-        Self::new(Kind::Transcription, move |_context, _audio| {
+        Self::new(Kind::Transcription, move |_context| {
             let cancelled = report.cancelled;
             let mut value = json!(report);
             value["batch"] = json!(batch);
@@ -554,22 +542,21 @@ impl driver::Product {
         })
     }
     pub(crate) fn speech(
+        audio: Vec<f32>,
         report: omni_breeze_tts::ScriptReport,
         batch: omni_breeze_tts::BatchStats,
     ) -> Self {
-        Self::new(Kind::Speech, move |context, audio| {
+        Self::new(Kind::Speech, move |context| {
             speech_output(context, audio, report, batch)
         })
     }
     pub(crate) fn image(encode: driver::Png, batch: omni_qwen_image::BatchStats) -> Self {
-        Self::new(Kind::Image, move |context, _audio| {
+        Self::new(Kind::Image, move |context| {
             image_output(context, encode, batch)
         })
     }
     pub(crate) fn music(product: omni_music::pipeline::Product) -> Self {
-        Self::new(Kind::Music, move |context, _audio| {
-            music_output(context, product)
-        })
+        Self::new(Kind::Music, move |context| music_output(context, product))
     }
 }
 

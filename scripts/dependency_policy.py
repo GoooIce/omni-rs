@@ -166,6 +166,10 @@ def dependency_failures(root, config) -> list[str]:
                 cache[path] = None
         return cache[path]
 
+    root_toml = root / "Cargo.toml"
+    root_manifest = read(root_toml) if root_toml.is_file() else None
+    workspace_deps = (root_manifest or {}).get("workspace", {}).get("dependencies", {})
+
     for row in config["manifests"]:
         path = (root / row["path"]).resolve()
         manifest = read(path)
@@ -198,24 +202,34 @@ def dependency_failures(root, config) -> list[str]:
             context = f"{relative}: {dep.scope}.{dep.alias} ({dep.package})"
             for name in sorted(set(dep.spec.get("features", [])) & unsupported):
                 failures.append(f"{context}: requests unsupported feature {name}")
-            if dep.spec.get("workspace"):
-                failures.append(f"{context}: workspace inheritance cannot be checked statically; "
-                                "use an explicit declaration")
-                continue
+            spec = dep.spec
+            if spec.get("workspace"):
+                inherited = workspace_deps.get(dep.alias)
+                if inherited is None:
+                    failures.append(f"{context}: workspace dependency not found in root [workspace.dependencies]")
+                    continue
+                base = {"version": inherited} if isinstance(inherited, str) else dict(inherited)
+                merged = dict(base)
+                merged.update({k: v for k, v in spec.items() if k != "workspace"})
+                merged["features"] = list(base.get("features", [])) + list(spec.get("features", []))
+                if "default-features" not in spec and "default-features" in base:
+                    merged["default-features"] = base["default-features"]
+                spec = merged
             pin = _pin(dep.package)
             if pin:
-                if dep.spec.get("version") != pin:
+                if spec.get("version") != pin:
                     failures.append(f"{context}: version must be {pin!r}")
-                if dep.spec.get("default-features") is not False:
+                if spec.get("default-features") is not False:
                     failures.append(f"{context}: default-features must be false")
 
-            if "path" in dep.spec:
-                target = (path.parent / dep.spec["path"] / "Cargo.toml").resolve()
+            if "path" in spec:
+                base_dir = root if dep.spec.get("workspace") and "path" not in dep.spec else path.parent
+                target = (base_dir / spec["path"] / "Cargo.toml").resolve()
                 if target.is_relative_to(root) and target.relative_to(root).parts[0] != "vendor":
                     target_manifest = read(target)
                     if (target_manifest is not None
                             and "default" in target_manifest.get("features", {})
-                            and dep.spec.get("default-features") is not False):
+                            and spec.get("default-features") is not False):
                         failures.append(f"{context}: first-party path {label(target)} declares "
                                         "default features; default-features must be false")
 

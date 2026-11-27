@@ -238,7 +238,7 @@ fn tool_fingerprint() -> String {
             include_bytes!("bin/alimeeting-screen.rs"),
         ),
         ("Cargo.toml", include_bytes!("../Cargo.toml")),
-        ("Cargo.lock", include_bytes!("../Cargo.lock")),
+        ("Cargo.lock", include_bytes!("../../../Cargo.lock")),
     ];
     let mut hash = Sha256::new();
     hash.update(b"omni-rsi/alimeeting-screen-tool/v1\0");

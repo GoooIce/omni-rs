@@ -70,13 +70,13 @@ def command_failures(root, arguments, config, primary=None, environment_target=N
 
 def plan_failures(root, steps):
     config = json.loads((root / "scripts/checks.json").read_text())
-    primary = primary_checkout(root)
+    checkout = Path(root).resolve()
     failures = []
     for step in steps:
         command = step["command"]
         if len(command) > 1 and command[0] == "cargo" and command[1] in BUILD_COMMANDS:
             failures += [f"{step['id']}: {error}" for error in
-                         command_failures(root, command, config, primary=primary, required=True)]
+                         command_failures(root, command, config, primary=checkout, required=True)]
     return failures
 
 

@@ -1,128 +1,97 @@
-//! Cooperative, process-scoped exclusive file leases.
-#[cfg(unix)]
-mod unix {
-    use std::{
-        ffi::CString,
-        fs::{self, File, OpenOptions},
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        },
-        path::Path,
-    };
+//! Cooperative, process-scoped exclusive file leases backed by the shared
+//! Burn-free [`omni_lfm3::lease::FileLease`], plus shared RSI device/ddust
+//! lease helpers.
 
-    pub struct Lease(File);
-    impl Lease {
-        pub fn try_acquire(path: &Path) -> Result<Option<Self>, String> {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            Self::try_acquire_existing_parent(path)
-        }
+use omni_lfm3::lease::FileLease;
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
-        pub(super) fn try_acquire_existing_parent(path: &Path) -> Result<Option<Self>, String> {
-            match fs::metadata(path) {
-                Ok(metadata) if !metadata.is_file() => {
-                    return Err("lease path is not a regular file".into());
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
-            }
-            let mut options = OpenOptions::new();
-            options
-                .create(true)
-                .append(true)
-                .custom_flags(libc::O_NONBLOCK);
-            let file = options.open(path).map_err(|e| e.to_string())?;
-            if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-                return Err("lease path is not a regular file".into());
-            }
-            Self::lock(file)
-        }
+pub struct Lease(FileLease);
 
-        pub(crate) fn try_acquire_at(directory: &File, name: &str) -> Result<Option<Self>, String> {
-            let file = Self::open_at(directory, name, true)?;
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
-            if !metadata.is_file() || metadata.nlink() != 1 {
-                return Err("lease must be a single-link regular file".into());
-            }
-            Self::lock(file)
-        }
-
-        pub(crate) fn verify_at(&self, directory: &File, name: &str) -> Result<(), String> {
-            let current = Self::open_at(directory, name, false)?;
-            let before = self.0.metadata().map_err(|e| e.to_string())?;
-            let after = current.metadata().map_err(|e| e.to_string())?;
-            if !before.is_file()
-                || !after.is_file()
-                || before.nlink() != 1
-                || after.nlink() != 1
-                || before.dev() != after.dev()
-                || before.ino() != after.ino()
-            {
-                return Err("lease path changed".into());
-            }
-            Ok(())
-        }
-
-        fn open_at(directory: &File, name: &str, create: bool) -> Result<File, String> {
-            if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-                return Err("invalid lease name".into());
-            }
-            let name = CString::new(name).map_err(|_| "invalid lease name")?;
-            let flags = libc::O_WRONLY
-                | libc::O_APPEND
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | libc::O_CLOEXEC
-                | if create { libc::O_CREAT } else { 0 };
-            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-            Ok(unsafe { File::from_raw_fd(fd) })
-        }
-
-        fn lock(file: File) -> Result<Option<Self>, String> {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Some(Self(file)));
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                Ok(None)
-            } else {
-                Err(error.to_string())
-            }
-        }
+impl Lease {
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>, String> {
+        FileLease::try_acquire(path)
+            .map(|opt| opt.map(Self))
+            .map_err(|e| e.to_string())
     }
-    impl AsRawFd for Lease {
-        fn as_raw_fd(&self) -> std::os::fd::RawFd {
-            self.0.as_raw_fd()
-        }
+
+    pub(crate) fn try_acquire_at(directory: &File, name: &str) -> Result<Option<Self>, String> {
+        FileLease::try_acquire_at(directory, name)
+            .map(|opt| opt.map(Self))
+            .map_err(|e| e.to_string())
     }
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            unsafe {
-                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-            }
-        }
+
+    pub(crate) fn verify_at(&self, directory: &File, name: &str) -> Result<(), String> {
+        self.0.verify_at(directory, name).map_err(|e| e.to_string())
     }
 }
-#[cfg(unix)]
-pub use unix::Lease;
 
-#[cfg(not(unix))]
-pub struct Lease;
-#[cfg(not(unix))]
-impl Lease {
-    pub fn try_acquire(_: &std::path::Path) -> Result<Option<Self>, String> {
-        Err("cooperative device leases are not supported on this platform".into())
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Lease {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
     }
-    pub(crate) fn try_acquire_at(_: &std::fs::File, _: &str) -> Result<Option<Self>, String> {
-        Err("cooperative device leases are not supported on this platform".into())
+}
+
+/// Ensure a state directory exists with 0700 permissions on Unix.
+pub fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    pub(crate) fn verify_at(&self, _: &std::fs::File, _: &str) -> Result<(), String> {
-        Err("cooperative device leases are not supported on this platform".into())
+    builder.create(path).map_err(|e| e.to_string())
+}
+
+/// Wait up to `timeout` for the cooperative `device.lock` lease to yield.
+pub fn wait_for_device(
+    root: &Path,
+    stop: &AtomicBool,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<Lease, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err("interrupted".into());
+        }
+        if let Some(lease) = Lease::try_acquire(&root.join("device.lock"))? {
+            return Ok(lease);
+        }
+        if Instant::now() >= deadline {
+            return Err(timeout_message.into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Acquire the optional external `ddust` MPS accelerator lease if present.
+pub fn ddust_lease() -> Result<Option<Lease>, String> {
+    let path = if let Some(registry) = std::env::var_os("DDUST_RUN_REGISTRY") {
+        PathBuf::from(registry)
+            .parent()
+            .map(|parent| parent.join("mps.lock"))
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("code/ddust/.ddust/mps.lock"))
+    };
+    match path {
+        Some(path) if path.exists() => Lease::try_acquire(&path)?
+            .map(Some)
+            .ok_or_else(|| "ddust accelerator lease is occupied".into()),
+        _ => Ok(None),
+    }
+}
+
+/// Returns true if no foreground request currently holds `foreground.lock`.
+pub fn foreground_clear(root: &Path) -> bool {
+    matches!(
+        Lease::try_acquire(&root.join("foreground.lock")),
+        Ok(Some(_))
+    )
 }

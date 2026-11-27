@@ -6,8 +6,6 @@ rust-version = "1.92"
 license = "Apache-2.0"
 description = "Hy-MT2 translation in Rust/Burn with RadixAttention prefix reuse"
 
-[workspace]
-
 [features]
 default = ["native", "metal"]
 native = ["omni-r2t2/native", "dep:clap", "dep:pollster", "dep:ctrlc"]
@@ -49,31 +47,3 @@ required-features = ["native", "metal"]
 [[example]]
 name = "batch-bench"
 required-features = ["native"]
-
-[patch.crates-io]
-cubek-matmul = { path = "../../vendor/cubek-matmul" }
-burn-cubecl = { path = "../../vendor/burn-cubecl" }
-cubecl-common = { path = "../../vendor/cubecl-common" }
-cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
-burn-fusion = { path = "../../vendor/burn-fusion" }
-cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
-cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
-burn-router = { path = "../../vendor/burn-router" }
-burn = { path = "../../vendor/burn" }
-
-[profile.release]
-lto = "thin"
-codegen-units = 16
-
-[profile.dev]
-debug = "line-tables-only"
-incremental = false
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 2
-
-[profile.debug-full]
-inherits = "dev"
-debug = 2
-incremental = true

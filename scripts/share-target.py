@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Point this checkout's Cargo output at the primary checkout's registered target directories."""
+"""Verify or clean obsolete member/worktree target symlinks for the unified Cargo workspace."""
 import argparse
 import sys
 from pathlib import Path
@@ -19,15 +19,17 @@ def main():
         if failures:
             print("\n".join(failures), file=sys.stderr)
             return 1
-        print(f"Shared Cargo layout checked: {len(manifests)} manifests.")
+        print(f"Unified workspace Cargo layout checked: {len(manifests)} manifests.")
         return 0
     try:
-        ensured = apply_links(checkout, primary, manifests)
+        removed = apply_links(checkout, primary, manifests)
     except FileExistsError as error:
         print(error, file=sys.stderr)
         return 1
-    for link, dest in ensured:
-        print(f"{link.relative_to(checkout)} -> {dest}")
+    for link, dest in removed:
+        print(f"removed obsolete symlink {link.relative_to(checkout)} -> {dest}")
+    if not removed:
+        print("Unified workspace Cargo layout already clean.")
     return 0
 
 

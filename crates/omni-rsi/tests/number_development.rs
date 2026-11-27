@@ -1894,7 +1894,7 @@ fn registration_rechecks_model_codec_candidate_evaluator_and_regression_inputs()
         );
         fs::write(path, original).unwrap();
     }
-    let mut changed = crate::options(root.path());
+    let mut changed = self::options(root.path());
     changed.backend = "different-backend".into();
     assert!(verify_registration(&changed, &destination, &stop).is_err());
     verify_registration(&options, &destination, &stop).unwrap();
@@ -2203,7 +2203,7 @@ fn crash_after_directory_reservation_cannot_be_silently_reused() {
         .unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("crash_after_directory_reservation_cannot_be_silently_reused")
+        .arg("number_development::crash_after_directory_reservation_cannot_be_silently_reused")
         .env(CHILD, root.path())
         .stdout(Stdio::null())
         .spawn()

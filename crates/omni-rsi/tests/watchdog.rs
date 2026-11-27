@@ -47,7 +47,7 @@ fn embedded_watchdog_leaves_host_panic_hook_in_place() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "embedded_watchdog_leaves_host_panic_hook_in_place",
+                "watchdog::embedded_watchdog_leaves_host_panic_hook_in_place",
                 "--nocapture",
             ])
             .env(ROLE, "1")

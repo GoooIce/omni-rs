@@ -969,7 +969,7 @@ fn public_module_rejects_an_empty_source_path() {
     let child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "public_module_rejects_an_empty_source_path",
+            "alimeeting_screen::public_module_rejects_an_empty_source_path",
             "--nocapture",
         ])
         .env(CHILD_OUTPUT, &output)

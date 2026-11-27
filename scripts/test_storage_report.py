@@ -6,7 +6,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from storage_report import active_files, record_retention, scan
+from storage_report import (
+    active_files,
+    execute_prune,
+    pin_baseline,
+    plan_prune,
+    record_retention,
+    scan,
+)
 
 
 class StorageReportTests(unittest.TestCase):
@@ -64,6 +71,57 @@ class StorageReportTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), "baseline")
             with self.assertRaises(ValueError):
                 record_retention(root, root.parent / "outside", "task", "outside", "review")
+
+    def test_pin_baseline_and_guarded_prune_respect_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            # Create a source executable, an unregistered target dir, a pinned target dir,
+            # a stale .rcgu.o file, and 3 check runs.
+            src_bin = root / "target/minicpm-v-old/release/minicpm-v"
+            src_bin.parent.mkdir(parents=True)
+            src_bin.write_bytes(b"ELF-baseline-binary")
+            pinned_dir = root / "target/keep-me"
+            pinned_dir.mkdir(parents=True)
+            (pinned_dir / "file").write_bytes(b"stay")
+            record_retention(root, pinned_dir, "bench", "active experiment", "active")
+
+            deps_dir = root / "target/debug/deps"
+            deps_dir.mkdir(parents=True)
+            obj = deps_dir / "crate-abc.rcgu.o"
+            obj.write_bytes(b"o" * 4096)
+            fresh = deps_dir / "libfresh.rlib"
+            fresh.write_bytes(b"r" * 4096)
+
+            for idx in range(3):
+                run = root / f"artifacts/checks/2026112{idx}-quick"
+                run.mkdir(parents=True)
+                (run / "report.json").write_text("{}")
+                os.utime(run, (1700000000 + idx * 100, 1700000000 + idx * 100))
+
+            dest_dir, meta = pin_baseline(root, src_bin, "minicpm-v-old", "ADR-0003 baseline")
+            self.assertTrue((dest_dir / "minicpm-v").is_file())
+            self.assertEqual(meta["bytes"], len(b"ELF-baseline-binary"))
+
+            plan = plan_prune(root, root, max_age_days=7, keep_check_runs=1)
+            kinds = {item["kind"] for item in plan["items"]}
+            paths = {Path(item["path"]) for item in plan["items"]}
+            self.assertIn("unregistered_target_dir", kinds)
+            self.assertIn("stale_split_debug_obj", kinds)
+            self.assertIn("rotated_check_run", kinds)
+            self.assertIn(root / "target/minicpm-v-old", paths)
+            self.assertIn(obj, paths)
+            self.assertNotIn(pinned_dir, paths)
+            self.assertNotIn(fresh, paths)
+            self.assertNotIn(dest_dir, paths)
+
+            result = execute_prune(plan)
+            self.assertEqual(result["errors"], [])
+            self.assertFalse((root / "target/minicpm-v-old").exists())
+            self.assertFalse(obj.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(pinned_dir.exists())
+            self.assertTrue((dest_dir / "minicpm-v").is_file())
+            self.assertEqual(len(list((root / "artifacts/checks").iterdir())), 1)
 
 
 if __name__ == "__main__":

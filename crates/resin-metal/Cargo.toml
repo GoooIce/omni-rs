@@ -1,12 +1,11 @@
 [package]
+autotests = false
 name = "resin-metal"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
 description = "Resin EngineCore serving stack driven from Rust with local model runners"
-
-[workspace]
 
 [features]
 default = ["metal"]
@@ -24,10 +23,6 @@ sha2 = "0.10"
 
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
-
-[[test]]
-name = "minicpm_engine_parity"
-required-features = ["cpu"]
 
 [[example]]
 name = "greedy_engine"
@@ -53,22 +48,11 @@ required-features = ["cpu"]
 name = "state_reuse_ab"
 required-features = ["cpu"]
 
-[patch.crates-io]
-cubek-matmul = { path = "../../vendor/cubek-matmul" }
-burn-cubecl = { path = "../../vendor/burn-cubecl" }
-cubecl-common = { path = "../../vendor/cubecl-common" }
-cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
-burn-fusion = { path = "../../vendor/burn-fusion" }
-cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
-cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
-burn-router = { path = "../../vendor/burn-router" }
-burn = { path = "../../vendor/burn" }
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
-[profile.dev]
-debug = "line-tables-only"
-incremental = false
-
-[profile.debug-full]
-inherits = "dev"
-debug = 2
-incremental = true
+[[test]]
+name = "minicpm_engine_parity"
+path = "tests/minicpm_engine_parity.rs"
+required-features = ["cpu"]

@@ -172,7 +172,10 @@ pub fn implementation_hash() -> String {
         include_bytes!("speech_generate.rs").as_slice(),
         include_bytes!("speech_publish.rs").as_slice(),
         include_bytes!("main.rs").as_slice(),
+        include_bytes!("idle_supervisor.rs").as_slice(),
+        include_bytes!("lease.rs").as_slice(),
         include_bytes!("child.rs").as_slice(),
+        include_bytes!("../../lfm3-omni/src/lease.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/text.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/depth.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/model.rs").as_slice(),
@@ -180,8 +183,6 @@ pub fn implementation_hash() -> String {
         include_bytes!("../../lfm3-omni/src/speech_inbox.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/speech_adapter.rs").as_slice(),
         include_bytes!("../../../src/audio.rs").as_slice(),
-        include_bytes!("../Cargo.lock").as_slice(),
-        include_bytes!("../../lfm3-omni/Cargo.lock").as_slice(),
         include_bytes!("../../../Cargo.lock").as_slice(),
     ] {
         hash.update((bytes.len() as u64).to_le_bytes());

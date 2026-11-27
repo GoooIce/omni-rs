@@ -148,13 +148,13 @@ pub type Native = …;
 `Rewriter` seam 桩实现；feature `rewrite` 另加后端消息映射测试）。Feature 矩阵：
 
 ```sh
-cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen-image-test \
+cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target \
   --no-default-features --features cpu
-cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen-image-test \
+cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target \
   --no-default-features --features cpu,rewrite
-cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target/qwen-image-test
+cargo test --manifest-path crates/qwen-image/Cargo.toml --target-dir target
 cargo test --features rewrite --manifest-path crates/qwen-image/Cargo.toml \
-  --target-dir target/qwen-image-rewrite
+  --target-dir target
 ```
 
 ## 验证证据

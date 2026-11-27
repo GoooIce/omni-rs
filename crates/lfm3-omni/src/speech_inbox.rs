@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -133,33 +133,21 @@ impl SpeechCapture {
 }
 
 /// Cooperate with the idle RSI scheduler while a live request owns the device.
-#[cfg(unix)]
 pub struct ForegroundLease {
-    _foreground: File,
-    _device: File,
+    _foreground: crate::lease::FileLease,
+    _device: crate::lease::FileLease,
 }
 
-#[cfg(unix)]
 impl ForegroundLease {
     pub fn acquire(
         root: &Path,
         stop: &std::sync::atomic::AtomicBool,
         timeout: std::time::Duration,
     ) -> io::Result<Self> {
-        use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering;
         fs::create_dir_all(root)?;
-        let open = |name| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(root.join(name))
-        };
-        let foreground = open("foreground.lock")?;
-        if unsafe { libc::flock(foreground.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let device = open("device.lock")?;
+        let foreground = crate::lease::FileLease::try_acquire(&root.join("foreground.lock"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "foreground lease busy"))?;
         let started = std::time::Instant::now();
         loop {
             if stop.load(Ordering::Acquire) {
@@ -168,15 +156,11 @@ impl ForegroundLease {
                     "live request cancelled",
                 ));
             }
-            if unsafe { libc::flock(device.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            if let Some(device) = crate::lease::FileLease::try_acquire(&root.join("device.lock"))? {
                 return Ok(Self {
                     _foreground: foreground,
                     _device: device,
                 });
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::WouldBlock {
-                return Err(error);
             }
             if started.elapsed() >= timeout {
                 return Err(io::Error::new(
@@ -189,68 +173,58 @@ impl ForegroundLease {
     }
 }
 
-#[cfg(not(unix))]
-pub struct ForegroundLease;
-#[cfg(not(unix))]
-impl ForegroundLease {
-    pub fn acquire(
-        _: &Path,
-        _: &std::sync::atomic::AtomicBool,
-        _: std::time::Duration,
-    ) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "cooperative device leases are unavailable",
-        ))
+/// Read-only view of queued speech-learning utterances across inbox directories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeechQueueCounts {
+    pub inbox: usize,
+    pub processing: usize,
+    pub online_data: usize,
+    pub rejected: usize,
+}
+
+impl SpeechQueueCounts {
+    pub fn inspect(root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            inbox: Self::count_entries(&root.join("inbox"))?,
+            processing: Self::count_entries(&root.join("processing"))?,
+            online_data: Self::count_entries(&root.join("online-data"))?,
+            rejected: Self::count_entries(&root.join("rejected"))?,
+        })
+    }
+
+    pub fn count_entries(directory: &Path) -> io::Result<usize> {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(valid_hex_id) && entry.file_type()?.is_dir() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 }
 
-#[cfg(unix)]
-struct QueueLock(File);
-#[cfg(unix)]
+fn valid_hex_id(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+struct QueueLock(#[allow(dead_code)] crate::lease::FileLease);
 impl QueueLock {
     fn try_acquire(directory: &Path) -> io::Result<Option<Self>> {
         Self::try_acquire_file(&directory.join(".queue.lock"))
     }
 
     fn try_acquire_file(path: &Path) -> io::Result<Option<Self>> {
-        use std::os::fd::AsRawFd;
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Some(Self(file)));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            Ok(None)
-        } else {
-            Err(error)
-        }
-    }
-}
-#[cfg(unix)]
-impl Drop for QueueLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
-#[cfg(not(unix))]
-struct QueueLock;
-#[cfg(not(unix))]
-impl QueueLock {
-    fn try_acquire(_: &Path) -> io::Result<Option<Self>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "speech inbox locking is unavailable",
-        ))
-    }
-
-    fn try_acquire_file(_: &Path) -> io::Result<Option<Self>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "speech worker locking is unavailable",
-        ))
+        Ok(crate::lease::FileLease::try_acquire(path)?.map(Self))
     }
 }
 

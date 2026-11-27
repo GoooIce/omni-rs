@@ -58,9 +58,17 @@ fn independent_self_reading_implementation_identity_is_unchanged() {
     // hashed inputs changed only in those lockfiles (wasm-only dependencies
     // left, one crate moved from 1.0.151 to 1.0.154). The earlier pin matched
     // neither that revision nor its own.
+    // Repinned on 2026-11-26 after ADR-0006 unified the 16 detached manifests
+    // into one root Cargo workspace (`Cargo.lock`), removing the redundant
+    // per-crate `crates/omni-rsi/Cargo.lock` and `crates/lfm3-omni/Cargo.lock`
+    // inputs without changing any training/loss/checkpoint implementation source.
+    // Repinned on 2026-11-26 after deepening idle supervision into
+    // `idle_supervisor.rs` and unifying cooperative file leases across
+    // `omni-lfm3::lease` and `omni-rsi::lease` (`O_NONBLOCK` FIFO guard in
+    // `ForegroundLease`); no training, loss, or checkpoint algorithm changed.
     assert_eq!(
         omni_rsi::speech_checkpoint::implementation_hash(),
-        "2d60e1d7eca057df45222bbebff391bec8c0a55fe5c07ab20bad32c72a61a80c"
+        "82beea6d3df1e990b35f576a0498e99ec19d169d30f1c2c86970da24fb9d345a"
     );
 }
 
@@ -226,9 +234,7 @@ fn scanner_manifest_keeps_the_real_cpu_roots_without_scanning_gpu_only_paths() {
         "Cargo.toml",
         "Cargo.lock",
         "crates/lfm3-omni/Cargo.toml",
-        "crates/lfm3-omni/Cargo.lock",
         "crates/omni-rsi/Cargo.toml",
-        "crates/omni-rsi/Cargo.lock",
         "vendor/burn/Cargo.toml",
         "vendor/cubecl-common/Cargo.toml",
         "crates/burn-ane/Cargo.toml",
@@ -277,14 +283,6 @@ fn scanner_manifest_keeps_the_real_cpu_roots_without_scanning_gpu_only_paths() {
         (
             "crates/lfm3-omni/Cargo.toml",
             "cbb8099b360eff538b8d76585c1cd7691e0d47d6a85b7ca2dcc016b90c1d8de0",
-        ),
-        (
-            "crates/lfm3-omni/Cargo.lock",
-            "2e9f1267311142fe5a0dd4b6b9fa5513f44b1992e58f2c54d270fa2685781b8d",
-        ),
-        (
-            "crates/omni-rsi/Cargo.lock",
-            "9699cd05ba24998f463e8e50b8b8980c09bea0932849df38a03622b1ff1a21a0",
         ),
         (
             "vendor/burn/Cargo.toml",
@@ -336,10 +334,17 @@ fn scanner_manifest_keeps_the_real_cpu_roots_without_scanning_gpu_only_paths() {
                 *known_cpu_hash.as_ref().unwrap()
             );
         } else {
-            let expected: std::collections::BTreeSet<_> = build_backend::patch_paths(candidate)
-                .unwrap()
+            let root_patches = fs::read_to_string(repo.join("Cargo.toml")).unwrap();
+            let (patch_base, parsed) = match build_backend::patch_paths(candidate) {
+                Ok(patches) => (manifest.as_path(), patches),
+                Err(_) => (
+                    repo.as_path(),
+                    build_backend::patch_paths(&root_patches).unwrap(),
+                ),
+            };
+            let expected: std::collections::BTreeSet<_> = parsed
                 .into_iter()
-                .map(|(_, path)| manifest.join(path))
+                .map(|(_, path)| patch_base.join(path))
                 .collect();
             assert_eq!(
                 cpu.iter()

@@ -109,7 +109,7 @@ Makepad 实际 Metal 推理、重采样、环形缓冲与 48 kHz CPAL 回调完�
 ## 复现
 
 ```sh
-CARGO_TARGET_DIR=target/makepad-native cargo build --offline --locked --release \
+CARGO_TARGET_DIR=target cargo build --offline --locked --release \
   --manifest-path prototypes/makepad/Cargo.toml -p r2t2-makepad -p omni-breeze-tts \
   --bin r2t2-makepad --bin breeze-tts --example stream-bench
 

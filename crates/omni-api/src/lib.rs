@@ -31,7 +31,7 @@ fn error(code: StatusCode, message: impl ToString) -> (StatusCode, Json<Value>) 
 
 pub fn router(jobs: Jobs) -> Router {
     Router::new()
-        .route("/",get(||async {Html(include_str!("../../../web/api.html"))}))
+        .route("/",get(||async {Html(include_str!("../assets/api.html"))}))
         .route("/health",get(||async {Json(json!({"status":"ok"}))}))
         .route("/v1/models",get(||async {Json(json!({"models":["netease-youdao/Confucius4-R2T2","BreezeBlue/Breeze-TTS-2","tencent/Hy-MT2-7B","Qwen/Qwen-Image-2.1-Turbo", "m-a-p/MERT-v2-FullSong", "m-a-p/SheetSage2", "m-a-p/YuE2-3B", "LiquidAI/LFM3-Omni-2B"]}))}))
         .route("/v1/omni/generations",post(omni))

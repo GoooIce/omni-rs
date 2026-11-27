@@ -5832,7 +5832,7 @@ fn relative_output_link_inside_selected_data_root_is_rejected() {
     preregister_chinese_v3::<Cpu>(&options, &Default::default(), &AtomicBool::new(false)).unwrap();
     let child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("relative_output_link_inside_selected_data_root_is_rejected")
+        .arg("number_v3_train::relative_output_link_inside_selected_data_root_is_rejected")
         .arg("--nocapture")
         .current_dir(&nested)
         .env(ROOT, root.path())

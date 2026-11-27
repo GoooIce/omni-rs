@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check lightweight dev/test profiles and explicit full-debug opt-in."""
+"""Check unified workspace dev/test profiles, macOS split-debuginfo, and explicit debug-full opt-in."""
 import json
 import os
 from pathlib import Path
@@ -9,37 +9,84 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_PROFILE_KEYS = ("debug", "split-debuginfo", "incremental", "opt-level")
+
 
 def profile_failures(root, config):
     failures = []
     policies = config.get("profiles")
     if not policies or set(policies) != {"dev", "debug-full"}:
         return ["scripts/checks.json: declare dev and debug-full profile policies"]
+    root_manifest = root / "Cargo.toml"
+    if not root_manifest.is_file():
+        return ["Cargo.toml: missing workspace root manifest"]
+    root_value = tomllib.loads(root_manifest.read_text())
+    root_profiles = root_value.get("profile", {})
+
+    for name, expected in policies.items():
+        actual = root_profiles.get(name, {})
+        for key, value in expected.items():
+            if key == "package_debug":
+                pkg_wild = actual.get("package", {}).get("*", {})
+                if pkg_wild.get("debug") != value:
+                    failures.append(
+                        f'Cargo.toml: profile.{name}.package."*".debug must be {value!r}'
+                    )
+                continue
+            if actual.get(key) != value:
+                failures.append(f"Cargo.toml: profile.{name}.{key} must be {value!r}")
+
+    dev_policy = policies["dev"]
+    pkg_debug_expected = dev_policy.get("package_debug")
+    for name in ("dev", "test"):
+        actual = root_profiles.get(name, {})
+        for key in ("debug", "split-debuginfo", "incremental"):
+            if key not in dev_policy:
+                continue
+            expected = dev_policy[key]
+            if key in actual and actual[key] != expected:
+                failures.append(f"Cargo.toml: profile.{name}.{key} overrides the routine-check policy")
+            for package, overrides in actual.get("package", {}).items():
+                if key not in overrides:
+                    continue
+                if key == "debug" and package == "*" and pkg_debug_expected is not None:
+                    if overrides[key] != pkg_debug_expected:
+                        failures.append(
+                            f'Cargo.toml: profile.{name}.package."*".debug must be {pkg_debug_expected!r}'
+                        )
+                elif overrides[key] != expected:
+                    failures.append(
+                        f"Cargo.toml: profile.{name}.package.{package}.{key} "
+                        "overrides the routine-check policy"
+                    )
+            overrides = actual.get("build-override", {})
+            if key in overrides and overrides[key] != expected:
+                failures.append(
+                    f"Cargo.toml: profile.{name}.build-override.{key} "
+                    "overrides the routine-check policy"
+                )
+
     for row in config["manifests"]:
+        if row["path"] == "Cargo.toml":
+            continue
         path = root / row["path"]
         if not path.is_file():
             continue
-        profiles = tomllib.loads(path.read_text()).get("profile", {})
-        for name, expected in policies.items():
-            actual = profiles.get(name, {})
-            for key, value in expected.items():
-                if actual.get(key) != value:
-                    failures.append(f"{row['path']}: profile.{name}.{key} must be {value!r}")
-        for name in ("dev", "test"):
-            actual = profiles.get(name, {})
-            for key in ("debug", "incremental"):
-                expected = policies["dev"][key]
-                if key in actual and actual[key] != expected:
-                    failures.append(f"{row['path']}: profile.{name}.{key} overrides the routine-check policy")
-                for package, overrides in actual.get("package", {}).items():
-                    if key in overrides and overrides[key] != expected:
-                        failures.append(f"{row['path']}: profile.{name}.package.{package}.{key} "
-                                        "overrides the routine-check policy")
-            for key in ("debug", "incremental"):
-                overrides = actual.get("build-override", {})
-                if key in overrides and overrides[key] != policies["dev"][key]:
-                    failures.append(f"{row['path']}: profile.{name}.build-override.{key} "
-                                    "overrides the routine-check policy")
+        member = tomllib.loads(path.read_text())
+        if member.get("profile"):
+            failures.append(
+                f"{row['path']}: workspace member must not declare [profile.*]; "
+                "profiles are defined once in root Cargo.toml"
+            )
+        if member.get("patch"):
+            failures.append(
+                f"{row['path']}: workspace member must not declare [patch.*]; "
+                "vendor patches are defined once in root Cargo.toml"
+            )
+        if "workspace" in member:
+            failures.append(
+                f"{row['path']}: workspace member must not declare standalone [workspace]"
+            )
     return failures
 
 
@@ -56,9 +103,12 @@ def environment_failures(root, profile="dev", environ=None):
             return str(value).lower() in (("true", "1") if expected[key] else ("false", "0"))
         return value == expected[key] or str(value) == str(expected[key])
 
+    checked_keys = [k for k in ("debug", "split-debuginfo", "incremental") if expected and k in expected]
+
     for name in names:
-        for key in ("debug", "incremental"):
-            for suffix in (key.upper(), "BUILD_OVERRIDE_" + key.upper()):
+        for key in checked_keys:
+            env_key = key.upper().replace("-", "_")
+            for suffix in (env_key, "BUILD_OVERRIDE_" + env_key):
                 variable = f"CARGO_PROFILE_{name.upper().replace('-', '_')}_{suffix}"
                 if variable in env and not matches(key, env[variable]):
                     failures.append(f"{variable} overrides profile {profile}; "
@@ -68,7 +118,7 @@ def environment_failures(root, profile="dev", environ=None):
 
     def flag_override(value):
         text = " ".join(value) if isinstance(value, list) else str(value)
-        return re.search(r"(?:debuginfo|incremental)(?:=|\s)", text)
+        return re.search(r"(?:debuginfo|split-debuginfo|incremental)(?:=|\s)", text)
 
     for key in ("RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         if expected and flag_override(env.get(key, "")):
@@ -81,22 +131,27 @@ def environment_failures(root, profile="dev", environ=None):
     files = {cargo_home / ("config" if (cargo_home / "config").is_file() else "config.toml")}
     for start in starts:
         for directory in (start, *start.parents):
-            # Cargo gives the extensionless file precedence over config.toml.
             legacy = directory / ".cargo/config"
             files.add(legacy if legacy.is_file() else directory / ".cargo/config.toml")
+    pkg_debug_expected = expected.get("package_debug") if expected else None
     for path in sorted(files):
         if not path.is_file():
             continue
         value = tomllib.loads(path.read_text())
         for name in names:
             actual = value.get("profile", {}).get(name, {})
-            scopes = [(f"profile.{name}", actual),
-                      (f"profile.{name}.build-override", actual.get("build-override", {}))]
-            scopes += [(f"profile.{name}.package.{package}", overrides)
+            scopes = [(f"profile.{name}", actual, None),
+                      (f"profile.{name}.build-override", actual.get("build-override", {}), None)]
+            scopes += [(f"profile.{name}.package.{package}", overrides, package)
                        for package, overrides in actual.get("package", {}).items()]
-            for label, overrides in scopes:
-                for key in ("debug", "incremental"):
-                    if key in overrides and not matches(key, overrides[key]):
+            for label, overrides, package in scopes:
+                for key in checked_keys:
+                    if key not in overrides:
+                        continue
+                    if key == "debug" and package == "*" and pkg_debug_expected is not None:
+                        if overrides[key] != pkg_debug_expected:
+                            failures.append(f"{path}: {label}.{key} overrides profile {profile}")
+                    elif not matches(key, overrides[key]):
                         failures.append(f"{path}: {label}.{key} overrides profile {profile}")
         if expected and "incremental" in value.get("build", {}) and \
                 not matches("incremental", value["build"]["incremental"]):
@@ -126,8 +181,8 @@ def main():
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1
-    print(f"Routine-check profiles verified: {len(config['manifests'])} manifests; "
-          "full debugging: --profile debug-full")
+    print(f"Unified workspace profile verified: {len(config['manifests'])} manifests; "
+          "routine dev uses split-debuginfo=off; full debugging: --profile debug-full")
     return 0
 
 

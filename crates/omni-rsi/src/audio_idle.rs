@@ -118,43 +118,13 @@ pub(super) fn watch_audio(
 
 #[cfg(unix)]
 fn collect_worker_output(
-    mut stream: std::os::unix::net::UnixStream,
+    stream: std::os::unix::net::UnixStream,
     limit: usize,
     stop: &AtomicBool,
     finished: &AtomicBool,
     exceeded: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    use std::{
-        io::{ErrorKind, Read},
-        sync::atomic::Ordering,
-        time::Duration,
-    };
-    let mut result = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let remaining = limit - result.len();
-        let available = buffer.len().min(remaining + 1);
-        match stream.read(&mut buffer[..available]) {
-            Ok(0) => return Ok(result),
-            Ok(count) if count > remaining => {
-                exceeded.store(true, Ordering::Release);
-                stop.store(true, Ordering::Release);
-                return Ok(result);
-            }
-            Ok(count) => result.extend_from_slice(&buffer[..count]),
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                if finished.load(Ordering::Acquire) {
-                    return Ok(result);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => {
-                stop.store(true, Ordering::Release);
-                return Err(format!("audio worker output failed: {error}"));
-            }
-        }
-    }
+    omni_rsi::idle_supervisor::collect_bounded_stream(stream, limit, stop, finished, exceeded)
 }
 
 #[cfg(not(unix))]

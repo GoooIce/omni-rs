@@ -294,16 +294,8 @@ pub fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
             "cbb8099b360eff538b8d76585c1cd7691e0d47d6a85b7ca2dcc016b90c1d8de0",
         ),
         (
-            "crates/lfm3-omni/Cargo.lock",
-            "2e9f1267311142fe5a0dd4b6b9fa5513f44b1992e58f2c54d270fa2685781b8d",
-        ),
-        (
             "crates/omni-rsi/Cargo.toml",
             "1f19d2ed09a4704028cada1ee7ae3a510ac728a5f43ed67d74b5a5864cd864fc",
-        ),
-        (
-            "crates/omni-rsi/Cargo.lock",
-            "9699cd05ba24998f463e8e50b8b8980c09bea0932849df38a03622b1ff1a21a0",
         ),
         (
             "vendor/burn/Cargo.toml",
@@ -333,11 +325,18 @@ pub fn known_cpu_graph(repo: &Path) -> Result<bool, String> {
     Ok(known)
 }
 
-/// Derive both backend root sets from the actual manifest and graph anchors.
+/// Derive both backend root sets from the actual manifest (or workspace root) and graph anchors.
 pub fn backend_roots(repo: &Path, manifest: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
-    let patches = build_backend::patch_paths(
-        &fs::read_to_string(manifest.join("Cargo.toml")).map_err(|e| e.to_string())?,
-    )?;
+    let local_text = fs::read_to_string(manifest.join("Cargo.toml")).map_err(|e| e.to_string())?;
+    let (patch_base, patches) = match build_backend::patch_paths(&local_text) {
+        Ok(patches) => (manifest, patches),
+        Err(err) if err == "missing local Cargo patches" && manifest != repo => {
+            let root_text =
+                fs::read_to_string(repo.join("Cargo.toml")).map_err(|e| e.to_string())?;
+            (repo, build_backend::patch_paths(&root_text)?)
+        }
+        Err(err) => return Err(err),
+    };
     let known_cpu_graph = known_cpu_graph(repo)?;
     let gpu_only = [
         "burn-cubecl",
@@ -350,7 +349,7 @@ pub fn backend_roots(repo: &Path, manifest: &Path) -> Result<(Vec<PathBuf>, Vec<
     let mut cpu = Vec::new();
     let mut gpu = vec![repo.join("crates/omni-kernel")];
     for (name, path) in patches {
-        let path = manifest.join(path);
+        let path = patch_base.join(path);
         if !known_cpu_graph || !gpu_only.contains(&name.as_str()) {
             cpu.push(path.clone());
         }

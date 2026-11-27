@@ -29,21 +29,21 @@ Record ownership when creating a long-lived experiment or pinned baseline:
   --purpose "Development experiment" --keep active
 ```
 
-Records live in the primary checkout's `artifacts/storage-retention.json`; `--keep pinned` marks a retained baseline, while `--keep review --review-after 2027-01-01` schedules a review date. Recording ownership and producing reports never delete files. Reconcile completed worktree contents, active processes, unique evidence and retained binaries before choosing old outputs for removal.
+Records live in the primary checkout's `artifacts/storage-retention.json`; `--keep pinned` marks a retained baseline, while `--keep review --review-after 2027-01-01` schedules a review date. Pin standalone ADR-0003 A/B executables under `artifacts/baselines/<tag>/` with `./scripts/storage-report --pin-baseline <binary> --tag <name> --purpose "..."` instead of keeping whole Cargo build trees under `target/`. Preview or execute retention-guarded cleanup of unregistered `target/*` trees, stale `.rcgu.o` files, old `deps/`/`examples/` artifacts and rotated check runs with `./scripts/storage-report --prune-dry-run` and `./scripts/storage-report --prune`.
 
 ## Compilation directories
 
-Each manifest in `scripts/checks.json` has one `target` directory. Those directories live in the primary checkout, the parent of `git rev-parse --git-common-dir`. A linked worktree uses that same tree.
+All 16 manifests in `scripts/checks.json` belong to the unified root Cargo workspace (`resolver = "3"`, see [ADR-0006](adr/0006-unified-cargo-workspace-and-artifact-lifecycle.md)) and share one workspace `Cargo.lock`, one `[patch.crates-io]`, one `[profile.*]` and one checkout-local `target/`. Linked worktrees keep their own local `target/` instead of symlinking into the primary checkout so Cargo's absolute-path hashing never pollutes the primary `target/`.
 
-`./scripts/check` and `./scripts/cargo` resolve absolute output paths from that registry. Use `./scripts/cargo` for builds, tests and runs; it checks the live layout before launching Cargo and keeps program arguments after `--` intact. Before the first build in a new worktree, run `uv run --no-project --python 3.12 python scripts/share-target.py`. It points the worktree's `target` entry at the primary `target`, and points each manifest's default output directory at the registered path. `--check` only inspects those links and is the first step of each check profile and the commit hook. Setup rejects all real-directory collisions before changing links; preserve and reconcile their contents before retrying.
+`./scripts/check` and `./scripts/cargo` resolve output paths from `scripts/checks.json`. Use `./scripts/cargo` for builds, tests and runs; it checks the live layout before launching Cargo and keeps program arguments after `--` intact. Run `uv run --no-project --python 3.12 python scripts/share-target.py` to remove any obsolete member or cross-worktree `target` symlinks (`--check` is read-only and is the first step of each check profile and the commit hook). Setup rejects real member `target/` directories so their contents are reconciled before removal.
 
-Routine `dev` and inherited `test` builds use `debug = "line-tables-only"` and `incremental = false`. Existing optimization levels stay with each workspace. The policy in `scripts/checks.json` is checked against every independent manifest, including package/test overrides. Local Cargo configuration and environment overrides are checked before routine acceptance. Full variable/type debugging is an explicit, separately named output:
+Routine `dev` and inherited `test` builds use `debug = "line-tables-only"`, `split-debuginfo = "off"`, `incremental = false`, `opt-level = 1`, and `[profile.dev.package."*"] opt-level = 2, debug = 0` in root `Cargo.toml`. Member manifests must not declare `[profile.*]` or `[patch.*]`. Local Cargo configuration and environment overrides are checked before routine acceptance. Full variable/type debugging is an explicit, separately named output (`split-debuginfo = "packed"`):
 
 ```sh
 ./scripts/cargo test --manifest-path crates/omni-kernel/Cargo.toml --profile debug-full
 ```
 
-`debug-full` inherits the workspace's dev optimization, enables full debug information and incremental compilation, and writes under the registered target's `debug-full/`. Release settings are independent. Changing profiles prevents future heavy routine output; it does not remove existing debug caches. Every direct Cargo build command in the runner must select a registered output, including auxiliary oracles. Shell examples in README/docs are checked for unregistered target overrides; intentional comparison directories need a manifest and reason in `target_variants`. Select one with `./scripts/cargo build --manifest-path <manifest> --variant target/<registered-variant>`. The browser build entry point now refuses to run and the threaded Web output is no longer registered. Existing Web outputs and the old nightly toolchain are preserved until a separate storage cleanup.
+`debug-full` inherits the workspace's dev optimization, enables full packed DWARF debug information and incremental compilation, and writes under `target/debug-full/`. Release settings are independent. Shell examples in README/docs are checked for unregistered target overrides. Development-only Python reference oracles are declared in root `pyproject.toml` (`uv run --group <name> python scripts/...`) rather than per-model `.venv-*` directories.
 
 The Metal profile leaves the explicitly registered full-weight CPU-only integration tests in the optional CPU diagnostic; MiniCPM uses `metal_spot` for its GPU image parity. Every exclusion has an existing target and reason in `cpu_only_tests`, checked by the repository gate. Newly added integration targets are included automatically. The Metal profile explicitly includes the normally ignored Breeze tensor and shared-kernel tests. Makepad's audible output-device unit test stays ignored there; the native profile exercises device timing, drain and cancellation through the existing muted TTS suite.
 
@@ -91,7 +91,7 @@ The CPU audio context precondition is rerun on resume along with the rest of the
 The build-context tests run the direct-Cargo verified and failure-closed probes in the optional CPU suite. Two rustup-specific positive probes are marked ignored there, so a direct-Cargo installation does not need a rustup proxy. An ignored probe is **not verified coverage**. For an explicit local rustup diagnostic, use a host with a rustup proxy at `$CARGO_HOME/bin/cargo` and a valid `RUSTUP_HOME` (or its default), and run:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=1 \
   cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features native,cpu --test backend_production_context \
   rustup_ -- --ignored --test-threads=1

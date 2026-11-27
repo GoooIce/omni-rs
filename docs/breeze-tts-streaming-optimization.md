@@ -140,15 +140,15 @@ GPU 采样与 CPU 采样回退也得到相同码字和全部 15,360 个 PCM 样�
 ## 复现
 
 ```sh
-CARGO_TARGET_DIR=target/makepad-native cargo build --offline --locked --release \
+CARGO_TARGET_DIR=target cargo build --offline --locked --release \
   --manifest-path prototypes/makepad/Cargo.toml -p omni-breeze-tts --example stream-bench
 
-target/makepad-native/release/examples/stream-bench \
+target/release/examples/stream-bench \
   artifacts/tts-streaming-opt/cases.json /tmp/breeze-stream-bench 6 64
 python3 scripts/analyze_breeze_benchmark.py /tmp/breeze-stream-bench
 
 # 诊断模式会改变同步行为；吞吐验收应移除此变量。
-BREEZE_TTS_PROFILE=sync target/makepad-native/release/examples/stream-bench \
+BREEZE_TTS_PROFILE=sync target/release/examples/stream-bench \
   artifacts/tts-streaming-opt/cases.json /tmp/breeze-stream-profile 3 32
 
 python3 prototypes/makepad/validate-tts.py --device-output-muted --long-stream \

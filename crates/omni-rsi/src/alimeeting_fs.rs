@@ -11,7 +11,7 @@ mod platform {
             fd::{AsRawFd, FromRawFd, IntoRawFd},
             unix::{ffi::OsStrExt, fs::MetadataExt},
         },
-        path::{Component, Path},
+        path::Path,
     };
 
     const MAX_DEPTH: usize = 16;
@@ -45,61 +45,11 @@ mod platform {
     }
 
     fn open_child(dir: &File, name: &OsStr, directory: bool) -> Result<File, String> {
-        let before = entry_stat(dir, name)?;
-        let expected = if directory {
-            libc::S_IFDIR
-        } else {
-            libc::S_IFREG
-        };
-        if before.st_mode & libc::S_IFMT != expected {
-            return Err("symlink, special file, or unexpected entry type".into());
-        }
-        let name = cstring(name)?;
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_CLOEXEC
-            | if directory { libc::O_DIRECTORY } else { 0 };
-        // The returned descriptor is transferred into File exactly once.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(format!(
-                "cannot open path without following links: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata().map_err(|error| error.to_string())?;
-        if (directory && !metadata.is_dir())
-            || (!directory && !metadata.is_file())
-            || metadata.dev() != before.st_dev as u64
-            || metadata.ino() != before.st_ino
-        {
-            return Err("path changed while opening".into());
-        }
-        Ok(file)
+        crate::safe_fs::open_child_os(dir, name, directory)
     }
 
     pub(crate) fn open_directory(path: &Path) -> Result<File, String> {
-        if path.as_os_str().is_empty() {
-            return Err("directory path must not be empty".into());
-        }
-        let mut directory = if path.is_absolute() {
-            File::open("/")
-        } else {
-            File::open(".")
-        }
-        .map_err(|error| error.to_string())?;
-        for part in path.components() {
-            match part {
-                Component::RootDir | Component::CurDir => {}
-                Component::Normal(name) => directory = open_child(&directory, name, true)?,
-                Component::ParentDir | Component::Prefix(_) => {
-                    return Err("parent traversal or path prefix is unsupported".into());
-                }
-            }
-        }
-        Ok(directory)
+        crate::safe_fs::AnchoredDir::open(path).map(crate::safe_fs::AnchoredDir::into_file)
     }
 
     struct DirectoryStream(*mut libc::DIR);

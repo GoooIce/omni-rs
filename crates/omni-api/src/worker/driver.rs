@@ -18,23 +18,38 @@ pub(crate) enum Progress {
     },
     Translation(omni_hy_mt::TranslationEvent),
     Transcription(omni_r2t2::TranscriptionEvent),
-    /// A speech script moved on to its next speech text.
-    Speech {
-        speech_text: usize,
-        speech_texts: usize,
+    /// Cumulative delivered audio duration for a running speech script.
+    SpeechAudio {
+        audio_seconds: f64,
     },
     Image(omni_qwen_image::Progress),
     Music(omni_music::Progress),
 }
 
+pub(crate) enum Event {
+    /// A speech script moved on to its next speech text.
+    Speech {
+        speech_text: usize,
+        speech_texts: usize,
+    },
+}
+impl Event {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Self::Speech { .. } => Kind::Speech,
+        }
+    }
+}
+
 pub(crate) enum Update {
     Progress(Progress),
-    Audio(Vec<f32>),
+    Event(Event),
 }
 impl Update {
     pub fn kind(&self) -> Option<Kind> {
         Some(match self {
-            Self::Audio(_) | Self::Progress(Progress::Speech { .. }) => Kind::Speech,
+            Self::Progress(Progress::SpeechAudio { .. }) => Kind::Speech,
+            Self::Event(event) => event.kind(),
             Self::Progress(Progress::Translation(_)) => Kind::Translation,
             Self::Progress(Progress::Transcription(_)) => Kind::Transcription,
             Self::Progress(Progress::Image(_)) => Kind::Image,
@@ -47,8 +62,7 @@ impl Update {
 // Encoding consumes the image only after its engine borrow has ended. Returning
 // the report keeps GeneratedImage's source-path protection inside save_png.
 pub(crate) type Png = Box<dyn FnOnce(&Path) -> Result<omni_qwen_image::Report, Failure> + Send>;
-type Render =
-    Box<dyn FnOnce(&crate::jobs::Context, Vec<f32>) -> Result<crate::jobs::Output, Failure> + Send>;
+type Render = Box<dyn FnOnce(&crate::jobs::Context) -> Result<crate::jobs::Output, Failure> + Send>;
 /// A finished request's value and file writes. The driver builds this and does
 /// not mark the inference job terminal; Jobs publishes that once.
 pub(crate) struct Product {
@@ -58,7 +72,7 @@ pub(crate) struct Product {
 impl Product {
     pub(super) fn new(
         kind: Kind,
-        render: impl FnOnce(&crate::jobs::Context, Vec<f32>) -> Result<crate::jobs::Output, Failure>
+        render: impl FnOnce(&crate::jobs::Context) -> Result<crate::jobs::Output, Failure>
         + Send
         + 'static,
     ) -> Self {
@@ -70,12 +84,8 @@ impl Product {
     pub fn kind(&self) -> Kind {
         self.kind
     }
-    pub fn render(
-        self,
-        context: &crate::jobs::Context,
-        audio: Vec<f32>,
-    ) -> Result<crate::jobs::Output, Failure> {
-        (self.render)(context, audio)
+    pub fn render(self, context: &crate::jobs::Context) -> Result<crate::jobs::Output, Failure> {
+        (self.render)(context)
     }
 }
 #[derive(Default)]
@@ -235,6 +245,7 @@ impl Driver for NativeDriver {
                 )?;
                 NativeLoaded::Speech(Box::new(super::speech::Speech::new(
                     model,
+                    paths.tts.clone(),
                     paths.tts_batch_size,
                 )?))
             }
@@ -294,7 +305,6 @@ impl Driver for NativeDriver {
                 engine.admit(
                     options,
                     omni_breeze_tts::ScriptBudget::default(),
-                    &self.paths.tts,
                     cancel,
                     progress,
                 )?

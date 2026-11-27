@@ -9,12 +9,12 @@ On Metal and WebGPU, `omni_lfm3::NativeGpu` is the eager CubeCL backend. The Bur
 ## CLI
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
+CARGO_TARGET_DIR=target cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
   --model /path/to/LFM3-Omni-2B --precision f16 \
   --part 'text:What can you see and hear?' \
   --part image:photo.jpg --part audio:question.wav --mode text
 
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
+CARGO_TARGET_DIR=target cargo run --release --manifest-path crates/lfm3-omni/Cargo.toml -- \
   --model /path/to/LFM3-Omni-2B --part 'text:Say hello.' \
   --mode audio --audio-temperature 0.4 --audio-top-k 32 --seed 42 \
   --audio-output hello.wav --json
@@ -28,8 +28,8 @@ For Mandarin text-to-speech, supply the official Chinese TTS system instruction 
 
 ```sh
 mkdir -p artifacts/chinese-speech
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo build --manifest-path crates/lfm3-omni/Cargo.toml
-target/minicpm-v-cpu/debug/lfm3-omni --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
+CARGO_TARGET_DIR=target cargo build --manifest-path crates/lfm3-omni/Cargo.toml
+target/debug/lfm3-omni --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
   --precision f16 --conversation crates/lfm3-omni/examples/chinese-tts.json \
   --mode audio --audio-output artifacts/chinese-speech/tts-example.wav
 ```
@@ -49,7 +49,7 @@ In the language workspace, open **全能对话**, select the model directory and
 ## HTTP
 
 ```sh
-CARGO_TARGET_DIR=target/omni-api-cpu cargo run --release --manifest-path crates/omni-api/Cargo.toml -- \
+CARGO_TARGET_DIR=target cargo run --release --manifest-path crates/omni-api/Cargo.toml -- \
   --lfm3-model /path/to/LFM3-Omni-2B --port 8848
 curl -s http://127.0.0.1:8848/v1/omni/generations \
   -H 'Content-Type: application/json' \

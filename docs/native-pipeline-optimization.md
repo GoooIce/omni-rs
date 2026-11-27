@@ -80,7 +80,7 @@ CPU 时间使用 macOS `proc_pid_rusage`，按 Mach timebase 转成秒；每次�
 ```sh
 # 构建与启动
 python3 prototypes/makepad/build-native.py
-./target/makepad-native/release/r2t2-makepad
+./target/release/r2t2-makepad
 
 # CPU 和实时采集对照；输出必须是尚不存在的目录
 python3 prototypes/makepad/measure-native.py --output artifacts/native-repeat
@@ -220,7 +220,7 @@ token 回退，但没有足够的末尾音频上下文。对原 WAV 保持不变
 可重复验证（新报告目录必须不存在）：
 
 ```sh
-CARGO_TARGET_DIR=target/makepad-native cargo build --release --locked \
+CARGO_TARGET_DIR=target cargo build --release --locked \
   --manifest-path prototypes/makepad/Cargo.toml --bin r2t2-makepad --example asr-regression
 python3 prototypes/makepad/validate-asr.py --suite matrix --output artifacts/asr-matrix-repeat
 python3 prototypes/makepad/validate-asr.py --suite corpus --output artifacts/asr-corpus-repeat

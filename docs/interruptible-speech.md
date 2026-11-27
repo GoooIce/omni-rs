@@ -57,7 +57,7 @@ These guarantees hold only while the host retains and exclusively uses this owne
 The device-free integration test exercises the public reducer with a mock clock and playback queue: input causality, normal drain, interruption with an in-flight callback, tail clearing, cancellation and recovery, stale turns, session changes, failure, invalid boundaries and backwards time. Run it from the repository root:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=2 \
   cargo test --manifest-path crates/lfm3-omni/Cargo.toml --locked --offline \
   --no-default-features --features cpu --test interruptible_session
 ```
@@ -67,11 +67,11 @@ This is preparation for #83, which still depends on the validated audio-conditio
 The guarded input seam has separate synthetic-encoder tests, including same-prefix/different-future input, immutable earlier snapshots, matching IDs on different stream instances, cancellation, failure, session drop, and stop without cancelling input. Run those together with the existing encoder and reducer regressions, without model weights or devices:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=1 \
   cargo test --manifest-path crates/lfm3-omni/Cargo.toml --locked --offline \
   --no-default-features --features cpu --test causal_audio_session \
   --test audio_encoder_reference --test interruptible_session -- --test-threads=1
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=1 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=1 \
   cargo test --manifest-path crates/lfm3-omni/Cargo.toml --locked --offline \
   --no-default-features --features cpu --doc -- --test-threads=1
 ```

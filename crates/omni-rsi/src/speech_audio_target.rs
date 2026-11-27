@@ -141,7 +141,7 @@ fn preparation_sources() -> Vec<(&'static str, &'static [u8])> {
         source!("Cargo.toml", "../Cargo.toml"),
         source!("lfm3/Cargo.toml", "../../lfm3-omni/Cargo.toml"),
         source!("root/Cargo.toml", "../../../Cargo.toml"),
-        source!("Cargo.lock", "../Cargo.lock"),
+        source!("Cargo.lock", "../../../Cargo.lock"),
     ]
 }
 

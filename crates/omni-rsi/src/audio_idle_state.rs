@@ -237,31 +237,13 @@ impl AudioSupervision {
         stop: &std::sync::atomic::AtomicBool,
         work: impl FnOnce() -> R,
     ) -> Result<R, String> {
-        use std::sync::atomic::{AtomicBool, Ordering};
         let stream = self.stream.try_clone().map_err(|error| error.to_string())?;
-        let done = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            // The guard also stops and joins the monitor while unwinding.
-            struct Finish<'a>(&'a AtomicBool);
-            impl Drop for Finish<'_> {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::Release);
-                }
-            }
-            scope.spawn(|| {
-                while !done.load(Ordering::Acquire) {
-                    if !supervisor_alive(&stream) {
-                        stop.store(true, Ordering::Release);
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            });
-            let finish = Finish(&done);
-            let result = work();
-            drop(finish);
-            Ok(result)
-        })
+        Ok(crate::watchdog::Watchdog::scoped(
+            stop,
+            std::time::Duration::from_millis(100),
+            move || supervisor_alive(&stream),
+            work,
+        ))
     }
 
     pub(crate) fn check_scope(&self, root: &Path) -> Result<(), String> {

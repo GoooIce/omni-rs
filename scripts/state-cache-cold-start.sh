@@ -24,7 +24,7 @@ if [[ ! -f "$model/config.json" ]]; then
 fi
 
 export RESIN_STATE_CACHE=1
-export RESIN_STATE_CACHE_DIR="${RESIN_STATE_CACHE_DIR:-$root/target/resin-state-cold-start}"
+export RESIN_STATE_CACHE_DIR="${RESIN_STATE_CACHE_DIR:-$root/artifacts/state/resin-state-cold-start}"
 rm -rf "$RESIN_STATE_CACHE_DIR"
 
 run() {

@@ -1,0 +1,32 @@
+//! Consolidated integration test harness for omni-lfm3.
+
+mod audio_encoder_reference;
+mod audio_reference;
+mod causal_audio_session;
+mod chat_reference;
+mod cli_reference;
+mod codec_encoder_checkpoint;
+mod codec_reference;
+mod depth_reference;
+mod generation_reference;
+mod image_reference;
+mod interruptible_session;
+mod lora_reference;
+mod lora_training;
+mod media_binding;
+mod media_io;
+mod media_reference;
+mod metal_reference;
+mod sampling_reference;
+mod speech_adapter;
+mod speech_foreground;
+mod speech_handoff;
+mod speech_inbox;
+mod speech_learning_cli;
+mod speech_native_queue;
+mod stable_metal;
+mod stable_text;
+mod stop_barrier;
+mod text_reference;
+mod video_reference;
+mod vision_encoder_reference;

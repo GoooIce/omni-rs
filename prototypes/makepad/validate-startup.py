@@ -161,7 +161,7 @@ def main():
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    binary = ROOT / "target/makepad-native/release/r2t2-makepad"
+    binary = ROOT / "target/release/r2t2-makepad"
     shim = out / "folder-panel.dylib"
     with (out / "shim-build.log").open("w") as log:
         subprocess.run(["clang", "-dynamiclib", "-fobjc-arc", "-framework", "AppKit",

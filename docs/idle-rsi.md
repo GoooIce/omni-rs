@@ -7,23 +7,23 @@
 需要本地 LFM3-Omni-2B 官方权重、Apple Silicon 和 Metal；也可编译 CPU 版本用于无设备测试。以下命令从仓库根目录运行。`--model` 可省略，依次使用 `LFM3_MODEL_DIR`、`models/LFM3-Omni-2B` 或 `~/models/LiquidAI/LFM3-Omni-2B`。
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo build --manifest-path crates/omni-rsi/Cargo.toml
+CARGO_TARGET_DIR=target cargo build --manifest-path crates/omni-rsi/Cargo.toml
 
 # 显式启动后等待闲时；完成四轮后退出，Ctrl-C 停止，不会自动重启。
-target/minicpm-v-cpu/debug/omni-rsi watch
+target/debug/omni-rsi watch
 
 # 从另一个终端查看调度状态和当前候选。
-target/minicpm-v-cpu/debug/omni-rsi status
+target/debug/omni-rsi status
 
 # 停止调度器后恢复上一个已校验的候选。
-target/minicpm-v-cpu/debug/omni-rsi rollback
+target/debug/omni-rsi rollback
 
 # 单轮立即运行，适合有人看管的试验。
-target/minicpm-v-cpu/debug/omni-rsi once
+target/debug/omni-rsi once
 
 # 在实验性的双柱图问答入口使用已晋级的读图头。
-target/minicpm-v-cpu/debug/omni-rsi read --image chart.png --question taller
-target/minicpm-v-cpu/debug/omni-rsi read --image chart.png --question twice
+target/debug/omni-rsi read --image chart.png --question taller
+target/debug/omni-rsi read --image chart.png --question twice
 ```
 
 `read` 输出 Yes/No、Yes 概率和 `adapted`：仅有本模型指纹匹配且通过开发集门槛的候选时才为 `true`，否则使用原模型的 Yes/No logits。该头只针对 192×192、白底、左红右蓝的合成双柱图及两个英文问题训练；不要把结果当作通用读图能力或校准概率。

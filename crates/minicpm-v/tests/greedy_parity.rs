@@ -2,6 +2,7 @@
 //!
 //! Requires the local checkpoint (`models/MiniCPM-V-4.7-1B`) and the exported
 //! reference (`artifacts/minicpm-reference/greedy-text.json`); skips otherwise.
+use super::common;
 use burn::backend::NdArray;
 use omni_minicpm_v::{
     chat::{Message, Role},
@@ -11,7 +12,6 @@ use omni_minicpm_v::{
     multimodal::Prompt,
     tokenizer::MiniCpmTokenizer,
 };
-mod common;
 
 use std::sync::atomic::AtomicBool;
 

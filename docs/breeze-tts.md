@@ -389,7 +389,7 @@ TTS 模型的 13 个 crate 文件、29 个受保护 ASR/ANE/Web 文件、上一�
 仍未达到实时吞吐。实现边界、原始数据和复现方式见[Metal depth 优化](breeze-tts-metal-depth-optimization.md)。
 
 ```sh
-CARGO_TARGET_DIR=target/makepad-native cargo run --offline --locked --release \
+CARGO_TARGET_DIR=target cargo run --offline --locked --release \
   --manifest-path prototypes/makepad/Cargo.toml --example playback-trace -- \
   artifacts/tts-playback/traces.json
 python3 prototypes/makepad/validate-tts.py --device-output-muted --output <新目录>

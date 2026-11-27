@@ -12,7 +12,9 @@
 
 ## 落地与验收
 
-各模型暂时保持独立 Cargo 项目。依赖或补丁变更要更新所有消费者的 lockfile；兼容的公共库版本尽量对齐，不能只看根项目。每个消费者都必须解析到仓库内相应的 vendored 补丁，根项目的 `[patch]` 不会自动覆盖独立项目。补丁说明写在对应 `vendor/*/LOCAL-CHANGES.md`。
+> 状态更新（2026-11-26）：下文「各模型暂时保持独立 Cargo 项目」的临时条款已由 [ADR-0006](0006-unified-cargo-workspace-and-artifact-lifecycle.md) 取代，仓库改为单一 Cargo Workspace（`resolver = "3"`）；本决定关于默认 GPU 推理、CPU/训练显式 feature 与按包依赖图检查的规则继续生效。
+
+各模型原保持独立 Cargo 项目时的依赖约束如下：依赖或补丁变更要更新锁文件；兼容的公共库版本对齐。每个消费者都必须解析到仓库内相应的 vendored 补丁，补丁说明写在对应 `vendor/*/LOCAL-CHANGES.md`。
 
 `./scripts/check quick` 检查清单里的版本、features、别名和平台依赖边界；`./scripts/check metal` 另外检查当前平台的正常/构建依赖图与补丁来源，再运行本机 GPU 验收。参考测试允许编译 NdArray 和 Autodiff，不能拿测试图代替生产图，也不能通过删掉或跳过数值断言来缩小依赖。后端迁移要覆盖真实生产装配、独立参考、变长输入和零 panic；原生界面受影响时运行对应 harness。远程 CI 保持停用，CPU 只作按需本地诊断。
 

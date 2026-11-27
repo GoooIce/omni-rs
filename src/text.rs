@@ -291,7 +291,7 @@ pub(crate) struct OfficialCandidate {
 /// The upstream streaming path only strips metadata and whitespace after token
 /// rollback. Re-running repetition cleanup here would change already cleaned
 /// text: the upstream repetition function is not idempotent.
-pub(crate) fn official_stable_text(raw: &str) -> String {
+fn official_stable_text(raw: &str) -> String {
     raw.split_once("<asr_text>")
         .map_or(raw, |(_, text)| text)
         .trim()
@@ -301,7 +301,7 @@ pub(crate) fn official_stable_text(raw: &str) -> String {
 /// Confirm a withheld suffix using existing decoding passes. Audio sample time
 /// makes this independent of GPU speed and repeated calls without new input.
 #[derive(Default)]
-pub(crate) struct StableTail {
+struct StableTail {
     candidate: Option<(String, usize)>,
 }
 
@@ -311,16 +311,16 @@ pub(crate) struct StableTail {
 /// wait once speech text appears, so a model that never leaves `None` is
 /// still committed.
 #[derive(Default)]
-pub(crate) struct LanguagePatience {
+struct LanguagePatience {
     speech_since: Option<usize>,
 }
 
 impl LanguagePatience {
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.speech_since = None;
     }
 
-    pub fn waiting(&mut self, text: &str, samples: usize, maximum_samples: usize) -> bool {
+    fn waiting(&mut self, text: &str, samples: usize, maximum_samples: usize) -> bool {
         if text.is_empty() {
             return true;
         }
@@ -330,11 +330,11 @@ impl LanguagePatience {
 }
 
 impl StableTail {
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.candidate = None;
     }
 
-    pub fn observe(
+    fn observe(
         &mut self,
         raw: &str,
         completed: bool,
@@ -355,7 +355,189 @@ impl StableTail {
     }
 }
 
-pub(crate) fn official_candidate(
+struct Span {
+    end_sample: usize,
+    text: String,
+}
+
+/// Backend-free committed-transcript state machine for streaming ASR.
+/// Owns committed text, prompt prefix, language patience, tail confirmation,
+/// rollback protection, and rolling-window span eviction.
+pub(crate) struct TranscriptCommitter {
+    official: bool,
+    forced_language: Option<String>,
+    stable_tail_samples: usize,
+    unknown_language_patience_samples: usize,
+    base_sample: usize,
+    fixed_raw: String,
+    local_text: String,
+    text: String,
+    language: String,
+    language_patience: LanguagePatience,
+    stable_tail: StableTail,
+    spans: std::collections::VecDeque<Span>,
+}
+
+impl TranscriptCommitter {
+    pub(crate) fn new(
+        postprocess: crate::TextPostprocess,
+        forced_language: Option<String>,
+        stable_tail_samples: usize,
+        unknown_language_patience_samples: usize,
+    ) -> Self {
+        Self {
+            official: postprocess == crate::TextPostprocess::Official,
+            forced_language,
+            stable_tail_samples,
+            unknown_language_patience_samples,
+            base_sample: 0,
+            fixed_raw: String::new(),
+            local_text: String::new(),
+            text: String::new(),
+            language: String::new(),
+            language_patience: LanguagePatience::default(),
+            stable_tail: StableTail::default(),
+            spans: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn prompt_prefix(&self) -> &str {
+        &self.fixed_raw
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// Retire audio before the rolling window and rebuild the local prompt prefix.
+    pub(crate) fn discard_prefix(&mut self, discard_samples: usize) {
+        self.base_sample += discard_samples;
+        while self
+            .spans
+            .front()
+            .is_some_and(|s| s.end_sample <= self.base_sample)
+        {
+            self.spans.pop_front();
+        }
+        self.local_text = self.spans.iter().map(|s| s.text.as_str()).collect();
+        self.fixed_raw = transcript_prefix(
+            (self.forced_language.is_none() && !self.language.is_empty())
+                .then_some(self.language.as_str()),
+            &self.local_text,
+        );
+        self.stable_tail.clear();
+        self.language_patience.clear();
+    }
+
+    /// Stop withholding tail/language hypotheses while retaining committed text.
+    pub(crate) fn interrupt(&mut self) {
+        self.stable_tail.clear();
+        self.language_patience.clear();
+    }
+
+    /// Fold one decoded chunk into committed text and return the newly committed delta.
+    pub(crate) fn commit(
+        &mut self,
+        generated_text: &str,
+        consumed_samples: usize,
+        stopped: bool,
+        final_chunk: bool,
+        stable_prefix: impl FnOnce(&str) -> Result<String>,
+    ) -> Result<String> {
+        let official_result = self.official.then(|| {
+            official_candidate(
+                &self.fixed_raw,
+                generated_text,
+                self.forced_language.as_deref(),
+                final_chunk,
+            )
+        });
+        let candidate = if let Some(result) = &official_result {
+            result.raw.clone()
+        } else {
+            let candidate = normalize(&format!("{}{generated_text}", self.fixed_raw));
+            if candidate.starts_with(&self.fixed_raw) {
+                candidate
+            } else {
+                format!("{}{}", self.fixed_raw, normalize(generated_text))
+            }
+        };
+        let confirmed_tail = self.stable_tail.observe(
+            &candidate,
+            !final_chunk && stopped,
+            consumed_samples,
+            self.stable_tail_samples,
+        );
+        let stable = if final_chunk || confirmed_tail {
+            candidate
+        } else {
+            stable_prefix(&candidate)?
+        };
+        let has_asr_tag = stable.contains("<asr_text>");
+        let (language, stable_text) = if let Some(result) = official_result {
+            if !final_chunk && self.forced_language.is_none() && !has_asr_tag {
+                (String::new(), String::new())
+            } else {
+                let text = if final_chunk {
+                    result.text
+                } else {
+                    official_stable_text(&stable)
+                };
+                (result.language, text)
+            }
+        } else {
+            parse_output(&stable, self.forced_language.as_deref())
+        };
+        let metadata_ready =
+            final_chunk || !self.official || self.forced_language.is_some() || has_asr_tag;
+        let waiting_for_language = !final_chunk
+            && self.official
+            && self.forced_language.is_none()
+            && has_asr_tag
+            && language.is_empty()
+            && self.language_patience.waiting(
+                &stable_text,
+                consumed_samples,
+                self.unknown_language_patience_samples,
+            );
+        let delta = if !metadata_ready || waiting_for_language {
+            // Match the no-reset Python path: partial language metadata is not
+            // committed as a prompt prefix for the next chunk.
+            String::new()
+        } else if let Some(delta) = stable_text.strip_prefix(&self.local_text) {
+            let delta = delta.to_owned();
+            self.fixed_raw = if self.official {
+                stable.trim().to_owned()
+            } else {
+                stable
+            };
+            self.local_text = stable_text;
+            delta
+        } else {
+            // Re-tokenization can merge the last committed word with a new suffix.
+            // Holding the previous prefix is safe; rewinding committed text is not.
+            String::new()
+        };
+        if !language.is_empty() {
+            self.language = language;
+            self.language_patience.clear();
+        }
+        if !delta.is_empty() {
+            self.text.push_str(&delta);
+            self.spans.push_back(Span {
+                end_sample: consumed_samples,
+                text: delta.clone(),
+            });
+        }
+        Ok(delta)
+    }
+}
+
+fn official_candidate(
     prefix: &str,
     generated: &str,
     forced: Option<&str>,
@@ -491,5 +673,95 @@ mod official_tests {
             assert_eq!(lang, case["parsed"][0].as_str().unwrap(), "{case}");
             assert_eq!(text, case["parsed"][1].as_str().unwrap(), "{case}");
         }
+    }
+
+    #[test]
+    fn committer_holds_unknown_language_until_detected_preserving_punctuation() {
+        let mut committer =
+            TranscriptCommitter::new(crate::TextPostprocess::Official, None, 12_800, 128_000);
+        // Chunk 1: model emits `language None` with speech; held within patience window.
+        let d1 = committer
+            .commit(
+                "language None<asr_text>之前有顾客",
+                16_000,
+                true,
+                false,
+                |s| Ok(s.to_owned()),
+            )
+            .unwrap();
+        assert_eq!(d1, "");
+        assert_eq!(committer.prompt_prefix(), "");
+
+        // Chunk 2: model identifies Chinese with punctuation; prompt prefix was not locked to None.
+        let d2 = committer
+            .commit(
+                "language Chinese<asr_text>之前有顾客，你好。",
+                32_000,
+                true,
+                false,
+                |s| Ok(s.to_owned()),
+            )
+            .unwrap();
+        assert_eq!(d2, "之前有顾客，你好。");
+        assert_eq!(committer.language(), "Chinese");
+        assert_eq!(committer.text(), "之前有顾客，你好。");
+        assert!(
+            committer
+                .prompt_prefix()
+                .starts_with("language Chinese<asr_text>")
+        );
+    }
+
+    #[test]
+    fn committer_window_eviction_resets_patience_and_protects_against_rollback() {
+        let mut committer =
+            TranscriptCommitter::new(crate::TextPostprocess::Official, None, 12_800, 16_000);
+        // Start patience clock at sample 10_000 under unknown language.
+        assert_eq!(
+            committer
+                .commit("language None<asr_text>你好", 10_000, true, false, |s| Ok(
+                    s.to_owned()
+                ))
+                .unwrap(),
+            ""
+        );
+        // Window eviction must reset language_patience so patience starts fresh at 20_000.
+        committer.discard_prefix(8_000);
+        assert_eq!(
+            committer
+                .commit("language None<asr_text>你好", 20_000, true, false, |s| Ok(
+                    s.to_owned()
+                ))
+                .unwrap(),
+            ""
+        );
+        // Once patience elapses from the post-eviction sample, text commits.
+        assert_eq!(
+            committer
+                .commit(
+                    "language None<asr_text>你好世界",
+                    36_000,
+                    true,
+                    false,
+                    |s| Ok(s.to_owned())
+                )
+                .unwrap(),
+            "你好世界"
+        );
+        // Re-tokenization rollback attempt must not shrink or rewind committed text.
+        assert_eq!(
+            committer
+                .commit("", 40_000, true, false, |_| Ok(
+                    "language None<asr_text>别的".into()
+                ))
+                .unwrap(),
+            ""
+        );
+        assert_eq!(committer.text(), "你好世界");
+
+        // Retiring spans past end_sample keeps global committed text intact while emptying local prompt.
+        committer.discard_prefix(30_000);
+        assert_eq!(committer.text(), "你好世界");
+        assert_eq!(committer.prompt_prefix(), "");
     }
 }

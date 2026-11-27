@@ -24,29 +24,3 @@ wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "st
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }
 half = "=2.7.1"
-
-[workspace]
-
-[patch.crates-io]
-cubek-matmul = { path = "../../vendor/cubek-matmul" }
-burn-cubecl = { path = "../../vendor/burn-cubecl" }
-cubecl-common = { path = "../../vendor/cubecl-common" }
-burn-fusion = { path = "../../vendor/burn-fusion" }
-cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
-cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
-cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
-burn-router = { path = "../../vendor/burn-router" }
-burn = { path = "../../vendor/burn" }
-
-[profile.dev]
-debug = "line-tables-only"
-incremental = false
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 2
-
-[profile.debug-full]
-inherits = "dev"
-debug = 2
-incremental = true

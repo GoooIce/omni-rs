@@ -4,9 +4,8 @@
 //! codec/ASR behavior and cannot create a holdout or publication credential.
 
 use crate::{
-    number_blind_holdout::BlindSource,
     number_development::{
-        DevelopmentView, FrozenSwap, RegisteredDevelopment, RegistrationOptions,
+        DevelopmentView, RegisteredDevelopment, RegistrationOptions,
         verify_open_development_recheck,
     },
     number_v3_evaluation::recheck_development_view,
@@ -15,7 +14,7 @@ use crate::{
         answer_number, character_error_rate, inspect_speech_output, mentions_number,
     },
 };
-use serde::{Deserialize, Serialize, de::DeserializeSeed};
+use serde::{Deserialize, de::DeserializeSeed};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,7 +23,7 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{BufReader, Cursor, Read},
-    path::{Component, Path},
+    path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -48,131 +47,23 @@ fn cancelled(stop: &AtomicBool) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn open_child(
-    directory: &File,
-    name: &OsStr,
-    is_directory: bool,
-) -> Result<File, String> {
-    use std::{
-        ffi::CString,
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::ffi::OsStrExt,
-        },
-    };
-    let name = CString::new(name.as_bytes()).map_err(|_| "invalid path component")?;
-    let flags = libc::O_RDONLY
-        | libc::O_NOFOLLOW
-        | libc::O_NONBLOCK
-        | libc::O_CLOEXEC
-        | if is_directory { libc::O_DIRECTORY } else { 0 };
-    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(format!(
-            "cannot open artifact without following links: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[cfg(not(unix))]
-pub(crate) fn open_child(_: &File, _: &OsStr, _: bool) -> Result<File, String> {
-    Err("voice recheck requires no-follow Unix file access".into())
+fn open_directory(path: &Path) -> Result<File, String> {
+    crate::safe_fs::AnchoredDir::open(path).map(crate::safe_fs::AnchoredDir::into_file)
 }
 
 fn open_directory_with_parent(path: &Path) -> Result<(File, File), String> {
-    if path.as_os_str().is_empty() {
-        return Err("empty artifact directory".into());
-    }
-    let mut directory =
-        File::open(if path.is_absolute() { "/" } else { "." }).map_err(|e| e.to_string())?;
-    let mut parent = directory.try_clone().map_err(|e| e.to_string())?;
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => (),
-            Component::Normal(name) => {
-                let child = open_child(&directory, name, true)?;
-                parent = directory;
-                directory = child;
-            }
-            _ => return Err("artifact directory traversal is unsupported".into()),
-        }
-    }
-    if !directory.metadata().map_err(|e| e.to_string())?.is_dir() {
-        return Err("artifact root is not a directory".into());
-    }
-    Ok((directory, parent))
+    crate::safe_fs::AnchoredDir::open_with_parent(path)
+        .map(|(dir, parent)| (dir.into_file(), parent.into_file()))
 }
 
-pub(crate) fn open_directory(path: &Path) -> Result<File, String> {
-    open_directory_with_parent(path).map(|(directory, _)| directory)
-}
-
-#[cfg(unix)]
-fn same_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    before.is_file()
-        && after.is_file()
-        && before.nlink() == 1
-        && after.nlink() == 1
-        && before.dev() == after.dev()
-        && before.ino() == after.ino()
-        && before.len() == after.len()
-        && before.mtime() == after.mtime()
-        && before.mtime_nsec() == after.mtime_nsec()
-        && before.ctime() == after.ctime()
-        && before.ctime_nsec() == after.ctime_nsec()
-}
-
-#[cfg(not(unix))]
-fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
-    false
-}
-
-pub(crate) fn read_child(
+fn read_child(
     directory: &File,
     name: &OsStr,
     limit: u64,
     remaining: &mut u64,
     stop: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    cancelled(stop)?;
-    let mut file = open_child(directory, name, false)?;
-    let before = file.metadata().map_err(|e| e.to_string())?;
-    if !same_file(&before, &before) {
-        return Err("artifact must be a single-link regular file".into());
-    }
-    if before.len() == 0 || before.len() > limit {
-        return Err("invalid or oversized voice artifact".into());
-    }
-    *remaining = remaining
-        .checked_sub(before.len())
-        .ok_or("voice artifact byte budget exceeded")?;
-    let mut bytes =
-        Vec::with_capacity(usize::try_from(before.len()).map_err(|_| "artifact size overflow")?);
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        cancelled(stop)?;
-        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        if (bytes.len() as u64)
-            .checked_add(count as u64)
-            .is_none_or(|n| n > limit || n > before.len())
-        {
-            return Err("voice artifact changed or exceeds its limit".into());
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    let after = file.metadata().map_err(|e| e.to_string())?;
-    if bytes.len() as u64 != before.len() || !same_file(&before, &after) {
-        return Err("voice artifact changed while reading".into());
-    }
-    cancelled(stop)?;
-    Ok(bytes)
+    crate::safe_fs::read_single_link_child(directory, name, limit, Some(remaining), stop)
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -380,79 +271,6 @@ fn number(value: &Value, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("invalid {name}"))
 }
 
-// This read-only mirror preserves the v1 registration's typed serialization
-// order without changing the training/registration source identity. Schema
-// changes fail closed and must be reviewed with the final integrated protocol.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProtocolCase {
-    id: String,
-    audio_file: String,
-    audio_sha256: String,
-    pcm_sha256: String,
-    spoken_number: u32,
-    answer: u32,
-    source: BlindSource,
-    declaration_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    speech_target_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_provenance: Option<ProtocolProvenance>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    target_provenance: Option<ProtocolProvenance>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProtocolProvenance {
-    status: String,
-    created_at: Option<String>,
-    teacher_sha256: Option<String>,
-    verifier_sha256: Option<String>,
-    missing: Vec<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProtocolRegression {
-    name: String,
-    manifest_file: String,
-    sha256: String,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProtocolSnapshot {
-    version: u32,
-    policy: Value,
-    train_manifest_sha256: String,
-    dev_manifest_sha256: String,
-    train_groups_sha256: String,
-    dev_groups_sha256: String,
-    train_cases: Vec<ProtocolCase>,
-    dev_cases: Vec<ProtocolCase>,
-    swaps: Vec<FrozenSwap>,
-    blind_public_fingerprint: String,
-    base_model_sha256: String,
-    codec_sha256: String,
-    candidate_sha256: String,
-    evaluator_sha256: String,
-    r2t2_sha256: Option<String>,
-    breeze_sha256: Option<String>,
-    regression_plan_sha256: String,
-    regression_inputs: Vec<ProtocolRegression>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProtocolEnvelope {
-    version: u32,
-    status: String,
-    candidate_eligible: bool,
-    protocol_sha256: String,
-    protocol: ProtocolSnapshot,
-}
-
 pub(crate) fn strict_registered_protocol(
     bytes: &[u8],
     expected_id: &str,
@@ -460,7 +278,8 @@ pub(crate) fn strict_registered_protocol(
 ) -> Result<Value, String> {
     let envelope = strict_json(bytes, MAX_PROTOCOL_JSON_NODES, stop)?;
     let protocol = validate_registered_protocol(&envelope, expected_id)?;
-    let typed: ProtocolEnvelope = serde_json::from_value(envelope).map_err(|e| e.to_string())?;
+    let typed: crate::number_development::Envelope =
+        serde_json::from_value(envelope).map_err(|e| e.to_string())?;
     if serde_json::to_vec_pretty(&typed).map_err(|e| e.to_string())? != bytes {
         return Err("registered protocol encoding changed".into());
     }
@@ -472,14 +291,10 @@ fn validate_registered_protocol(envelope: &Value, expected_id: &str) -> Result<V
         .get("protocol")
         .filter(|v| v.is_object())
         .ok_or("missing frozen protocol")?;
-    let protocol: ProtocolSnapshot = serde_json::from_value(protocol_value.clone())
-        .map_err(|e| format!("unsupported frozen protocol: {e}"))?;
-    let protocol_bytes = serde_json::to_vec(&protocol).map_err(|e| e.to_string())?;
-    let mut digest = Sha256::new();
-    digest.update(b"omni-rsi-number-development-preregistration-v1\0");
-    digest.update((protocol_bytes.len() as u64).to_be_bytes());
-    digest.update(&protocol_bytes);
-    let id = format!("{:x}", digest.finalize());
+    let protocol: crate::number_development::FrozenProtocol =
+        serde_json::from_value(protocol_value.clone())
+            .map_err(|e| format!("unsupported frozen protocol: {e}"))?;
+    let id = crate::number_development::protocol_hash(&protocol)?;
     if envelope.as_object().is_none_or(|fields| fields.len() != 5)
         || envelope["version"] != 1
         || envelope["status"] != "insufficient_evidence"
@@ -1113,7 +928,7 @@ mod frozen_protocol_tests {
 
     #[test]
     fn strict_protocol_rejects_rebinding_a_frozen_manifest() {
-        let protocol = ProtocolSnapshot {
+        let protocol = crate::number_development::FrozenProtocol {
             version: 1,
             policy: json!({}),
             train_manifest_sha256: "train".into(),
@@ -1131,19 +946,14 @@ mod frozen_protocol_tests {
             r2t2_sha256: None,
             breeze_sha256: None,
             regression_plan_sha256: "plan".into(),
-            regression_inputs: vec![ProtocolRegression {
+            regression_inputs: vec![crate::number_development::RegressionIdentity {
                 name: "chinese".into(),
                 manifest_file: "chinese.json".into(),
                 sha256: "manifest".into(),
             }],
         };
-        let bytes = serde_json::to_vec(&protocol).unwrap();
-        let mut hash = Sha256::new();
-        hash.update(b"omni-rsi-number-development-preregistration-v1\0");
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-        let id = format!("{:x}", hash.finalize());
-        let mut envelope = ProtocolEnvelope {
+        let id = crate::number_development::protocol_hash(&protocol).unwrap();
+        let mut envelope = crate::number_development::Envelope {
             version: 1,
             status: "insufficient_evidence".into(),
             candidate_eligible: false,

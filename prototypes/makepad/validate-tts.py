@@ -330,7 +330,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--binary", type=Path,
-                        default=ROOT / "target/makepad-native/release/r2t2-makepad",
+                        default=ROOT / "target/release/r2t2-makepad",
                         help="Native executable to validate without replacing the installed build")
     parser.add_argument("--device-output-muted", action="store_true",
                         help="Exercise actual CPAL timing and buffers while outputting digital silence")

@@ -17,7 +17,7 @@ class BuildHelperTests(unittest.TestCase):
     def test_atomic_install_uses_registry_output_instead_of_a_private_directory(self):
         for module, name, manifest in [
             (build_qwen_image, "qwen-image", "crates/qwen-image/Cargo.toml"),
-            (build_breeze, "breeze-tts", "prototypes/makepad/Cargo.toml"),
+            (build_breeze, "breeze-tts", "crates/breeze-tts/Cargo.toml"),
         ]:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

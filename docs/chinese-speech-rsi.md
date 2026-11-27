@@ -53,7 +53,7 @@
 显式使用本地已授权数据运行，首次运行要求 `audio-conditioned-v1` 不存在；恢复必须带 `--resume`。`--epochs` 是希望达到的总 epoch，`--max-updates` 是本次调用最多更新数，可在恢复时调整；固定学习率、损失权重、掩码规则和初始化由实现指纹绑定。每次完整更新后保存参数、AdamW 状态和下一条记录的位置；中断时保留最后一个完整检查点。损坏、旧版或不匹配的音频检查点会报错，必须另选状态目录，不自动迁移或覆盖；原有自朗读检查点保持隔离。
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu,training \
+CARGO_TARGET_DIR=target cargo run --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu,training \
   --bin omni-rsi-audio -- --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
   --data /path/to/authorized-training-data --state /path/to/rsi-state \
   --epochs 2 --max-updates 1
@@ -68,7 +68,7 @@ CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/
 
 ```sh
 uv run --no-project python scripts/share-target.py
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --offline --locked \
+CARGO_TARGET_DIR=target cargo run --offline --locked \
   --manifest-path crates/omni-rsi/Cargo.toml --no-default-features --features native,cpu,training \
   --bin omni-rsi -- --model "$HOME/models/LiquidAI/LFM3-Omni-2B" \
   --state /path/to/rsi-state audio-watch --data /path/to/authorized-training-data \
@@ -109,7 +109,7 @@ stdout 和等待提示采用有界、尽力交付：接收端长期不读取时�
 闲时调度使用 mock 验证：模拟空闲信号和工作负载，检查用户返回、前台设备请求、让出后恢复、无任务等待以及停止；不加载模型，也不根据训练效果判定调度通过。运行：
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo test --manifest-path crates/omni-rsi/Cargo.toml \
+CARGO_TARGET_DIR=target cargo test --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features native,cpu,training --bin omni-rsi mock_
 ```
 
@@ -118,7 +118,7 @@ CARGO_TARGET_DIR=target/minicpm-v-cpu cargo test --manifest-path crates/omni-rsi
 ```sh
 SPEECH_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B"
 QUALITY_STATE=artifacts/chinese-speech/quality-native-v1
-target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$QUALITY_STATE" \
+target/debug/omni-rsi --model "$SPEECH_MODEL" --state "$QUALITY_STATE" \
   speech-once --data artifacts/chinese-speech/synthetic-breeze-r2t2-v1 \
   --epochs 1 --updates-per-round 6
 ```
@@ -128,7 +128,7 @@ target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$QUALITY_ST
 报告生成后可用同一份固定题集独立汇总 CER、正常结束数量和开发门槛，不加载模型：
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/Cargo.toml \
+CARGO_TARGET_DIR=target cargo run --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features native,cpu --example speech_quality_report -- \
   "$QUALITY_STATE/speech-native/epoch-1.json"
 ```
@@ -141,15 +141,15 @@ CARGO_TARGET_DIR=target/minicpm-v-cpu cargo run --manifest-path crates/omni-rsi/
 SPEECH_STATE=artifacts/chinese-speech/online-r2t2
 SPEECH_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B"
 
-target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" \
+target/debug/omni-rsi --state "$SPEECH_STATE" \
   speech-watch --online --rounds 1000 --epochs 100 --updates-per-round 1
 
 # 另一个终端：标准输入由调用方提供，不会自动采集麦克风。
-target/minicpm-v-cpu/debug/lfm3-omni --model "$SPEECH_MODEL" \
+target/debug/lfm3-omni --model "$SPEECH_MODEL" \
   --live-pcm --live-route stable --live-language Chinese --learn-state "$SPEECH_STATE" --json < input.f32
 
-target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" status
-target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" stop
+target/debug/omni-rsi --state "$SPEECH_STATE" status
+target/debug/omni-rsi --state "$SPEECH_STATE" stop
 ```
 
 `status` 展示排队、处理中、已核验、拒绝和候选包数量；`stop` 请求调度器及其子进程让出设备，随后用 `status` 确认停止。录音保存在该状态目录下的 `inbox`、`processing`、`processed` 或 `rejected`，核验样本保存在 `online-data`；不会上传。队列上限为 128 条。处理器认领时会检查清单和录音的完整性，损坏的录音直接移入拒绝目录，不会加载核验模型。处理异常可恢复，不能确认的音频不会入训。
@@ -161,7 +161,7 @@ target/minicpm-v-cpu/debug/omni-rsi --state "$SPEECH_STATE" stop
 开发集合格的候选可以另行运行一次 Rust 保留集报告；命令会再次验证候选、R2T2、底座、数据划分及 AISHELL 源音频哈希，只把结果写入新目录，不改变候选或训练状态。报告不会自动运行英语及其他 Omni 回归，也不能用于反复调参。
 
 ```sh
-target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STATE" \
+target/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STATE" \
   speech-evaluate --data artifacts/chinese-speech/synthetic-breeze-r2t2-v1 \
   --online "$SPEECH_STATE/online-data" --candidate "$SPEECH_STATE/speech-native/candidates/候选ID" \
   --asr models/Confucius4-R2T2 --asr-binary target/release/r2t2 \
@@ -174,12 +174,12 @@ target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STA
 
 ```sh
 CARGO_TARGET_DIR=target cargo build --release --bin r2t2
-CARGO_TARGET_DIR=target/minicpm-v-cpu cargo build --manifest-path crates/omni-rsi/Cargo.toml
+CARGO_TARGET_DIR=target cargo build --manifest-path crates/omni-rsi/Cargo.toml
 
-target/minicpm-v-cpu/debug/omni-rsi \
+target/debug/omni-rsi \
   --state artifacts/chinese-speech/idle-r2t2 speech-watch
 
-target/minicpm-v-cpu/debug/omni-rsi \
+target/debug/omni-rsi \
   --state artifacts/chinese-speech/idle-r2t2 status
 ```
 
@@ -198,7 +198,7 @@ SPEECH_MODEL="$HOME/models/LiquidAI/LFM3-Omni-2B"
 SPEECH_STATE=artifacts/chinese-speech/native-seed-state
 SPEECH_DATA=artifacts/chinese-speech/native-seeds-v1
 
-target/minicpm-v-cpu/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STATE" \
+target/debug/omni-rsi --model "$SPEECH_MODEL" --state "$SPEECH_STATE" \
   speech-seed --data "$SPEECH_DATA" \
   --tts-model models/Breeze-TTS-2 --tts-binary target/release/breeze-tts \
   --asr models/Confucius4-R2T2 --asr-binary target/release/r2t2

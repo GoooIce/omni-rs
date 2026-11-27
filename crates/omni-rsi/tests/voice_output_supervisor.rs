@@ -42,7 +42,7 @@ mod unix {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
-            .arg("unix::synthetic_writer_worker")
+            .arg("voice_output_supervisor::unix::synthetic_writer_worker")
             .arg("--nocapture")
             .env("VOICE_RECHECK_SYNTHETIC_WRITER", marker)
             .stdin(Stdio::null())

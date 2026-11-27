@@ -1,0 +1,62 @@
+[project]
+name = "omni-rs-tooling"
+version = "0.1.0"
+description = "Development-only Python reference oracles and evaluation scripts (production inference stays in Rust/Burn)"
+requires-python = ">=3.12,<3.13"
+
+# Invoke via `uv run --group <name> python scripts/<script>.py`.
+# uv hardlinks/clones wheels from a single global cache instead of duplicating
+# multi-hundred-MiB PyTorch installs across repo-local .venv-* directories.
+[dependency-groups]
+reference = [
+    "torch==2.14.1",
+    "numpy==2.5.3",
+    "transformers==4.57.6",
+    "safetensors==0.8.0",
+    "librosa==1.0.0",
+    "accelerate==1.15.0",
+    "nagisa==0.3.0",
+    "soynlp==0.0.493",
+    "soundfile==0.14.0",
+]
+breeze = [
+    "torch==2.9.1",
+    "torchaudio",
+    "transformers>=4.57",
+    "tokenizers==0.22.2",
+    "safetensors==0.8.0",
+    "librosa",
+    "soundfile",
+    "accelerate",
+]
+qwen-image = [
+    "torch==2.9.1",
+    "torchvision",
+    "transformers>=4.57",
+    "safetensors==0.8.0",
+    "accelerate",
+    "pillow",
+]
+minicpm = [
+    "torch==2.14.1",
+    "torchvision",
+    "transformers==4.57.6",
+    "safetensors==0.8.0",
+    "accelerate==1.15.0",
+    "compressed-tensors",
+]
+hy-mt = [
+    "torch==2.9.1",
+    "transformers==5.17.0",
+    "safetensors==0.8.0",
+    "tokenizers==0.23.3",
+]
+coreml = [
+    "coremltools==9.0",
+    "torch==2.7.0",
+    "numpy==2.2.6",
+    "safetensors==0.8.0",
+]
+eval = [
+    "pyarrow==21.0.0",
+]

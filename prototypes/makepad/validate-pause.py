@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/makepad-native/release/r2t2-makepad")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/r2t2-makepad")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--gain", type=float, default=1.0)

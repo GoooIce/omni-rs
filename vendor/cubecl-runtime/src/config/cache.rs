@@ -25,19 +25,30 @@ impl CacheConfig {
         match self {
             Self::Local => std::env::current_dir().unwrap(),
             Self::Target => {
+                if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR")
+                    && !target_dir.is_empty()
+                {
+                    return std::path::PathBuf::from(target_dir);
+                }
+
                 let dir_original =
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
                 let mut dir = dir_original.clone();
+                let mut workspace_root = None;
 
-                // Search for Cargo.toml in parent directories to locate project root.
+                // Walk up to the outermost Cargo.toml so workspace members share one
+                // root `target/autotune` cache instead of creating `crates/*/target`.
                 loop {
                     if let Ok(true) = std::fs::exists(dir.join("Cargo.toml")) {
-                        return dir.join("target");
+                        workspace_root = Some(dir.clone());
                     }
 
                     if !dir.pop() {
                         break;
                     }
+                }
+                if let Some(root) = workspace_root {
+                    return root.join("target");
                 }
 
                 // No Cargo.toml anywhere above cwd — this is a bundled or

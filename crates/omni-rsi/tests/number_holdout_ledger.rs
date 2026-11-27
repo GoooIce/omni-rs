@@ -122,7 +122,7 @@ fn process_exit_after_reservation_leaves_the_holdout_consumed() {
     let ledger = directory.path().join("shared-ledger");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("process_exit_after_reservation_leaves_the_holdout_consumed")
+        .arg("number_holdout_ledger::process_exit_after_reservation_leaves_the_holdout_consumed")
         .env(CHILD_LEDGER, &ledger)
         .status()
         .unwrap();

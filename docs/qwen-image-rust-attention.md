@@ -141,13 +141,13 @@ CFG 为 1.735 → 1.740 s。这里是累计 CPU 时间，不是 CPU 占用率。
 
 ```sh
 cargo build --release --locked --manifest-path crates/qwen-image/Cargo.toml \
-  --target-dir target/qwen-image-test --bin qwen-image --example attention-bench
-target/qwen-image-test/release/examples/attention-bench
+  --target-dir target --bin qwen-image --example attention-bench
+target/release/examples/attention-bench
 
 cargo build --release --locked --manifest-path prototypes/makepad/Cargo.toml \
-  --target-dir target/makepad-image
+  --target-dir target
 .venv-qwen-image/bin/python prototypes/makepad/validate-image-guidance.py \
-  --binary target/makepad-image/release/r2t2-makepad \
+  --binary target/release/r2t2-makepad \
   --output artifacts/qwen-image-rust-attention/benchmark-rerun --benchmark-only
 
 .venv-qwen-image/bin/python scripts/check_qwen_image_rust_attention.py

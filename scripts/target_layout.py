@@ -1,4 +1,4 @@
-"""Registered Cargo target directories, rooted at the primary checkout."""
+"""Workspace Cargo target layout: one local target/ per checkout, no cross-worktree pollution."""
 import json
 import os
 from pathlib import Path
@@ -22,11 +22,11 @@ def load_manifests(checkout):
     return config["manifests"]
 
 
-def registered_dir(primary, relative):
+def registered_dir(base, relative):
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts or path.parts[:1] != ("target",):
         raise ValueError(f"Invalid registered Cargo target directory: {relative}")
-    return primary / relative
+    return base / relative
 
 
 def manifest_entry(checkout, manifest="Cargo.toml"):
@@ -41,6 +41,13 @@ def manifest_entry(checkout, manifest="Cargo.toml"):
 
 
 def cargo_target(checkout, manifest="Cargo.toml", variant=None):
+    """Resolve Cargo output under this checkout's own workspace target directory.
+
+    Linked worktrees intentionally keep their own local target/ instead of
+    symlinking into primary_checkout/target, because Cargo hashes absolute path
+    dependencies and cross-worktree sharing leaves orphaned duplicate graphs
+    behind in the primary target directory.
+    """
     row = manifest_entry(checkout, manifest)
     relative = row["target"]
     if variant is not None:
@@ -51,7 +58,7 @@ def cargo_target(checkout, manifest="Cargo.toml", variant=None):
         if len(matching) != 1:
             raise ValueError(f"Unregistered target variant for {row['path']}: {variant}")
         relative = matching[0]["target"]
-    return registered_dir(primary_checkout(checkout), relative)
+    return registered_dir(Path(checkout).resolve(), relative)
 
 
 def integration_tests(checkout, row):
@@ -66,53 +73,72 @@ def integration_tests(checkout, row):
 
 
 def planned_links(checkout, primary, manifests):
-    """Symlinks that send Cargo output at the registered directories.
-
-    The root manifest already uses ``<primary>/target``. Each other manifest's
-    default directory is ``<manifest>/target``; point that name at the registered
-    path. A linked worktree's ``target`` entry points at the primary tree, so
-    ``--target-dir target/...`` from that worktree lands in the same place.
-    """
-    links = []
-    if checkout.resolve() != primary.resolve():
-        links.append((checkout / "target", primary / "target"))
-    for row in manifests:
-        if row["target"] == "target":
-            continue
-        link = checkout / Path(row["path"]).parent / "target"
-        links.append((link, registered_dir(primary, row["target"])))
-    return links
+    """In the unified workspace, no member or worktree target symlinks are used."""
+    return []
 
 
 def check_links(checkout, primary, manifests):
-    """Inspect the live layout without creating, removing or redirecting entries."""
+    """Verify the unified workspace layout without mutating the filesystem.
+
+    Rejects:
+    - Any member crate target/ directory or symlink (Cargo uses root target/).
+    - A linked worktree target/ symlink pointing into the primary checkout
+      (which would pollute primary target/ with absolute-path-hashed crates).
+    """
+    checkout_resolved = Path(checkout).resolve()
+    primary_resolved = Path(primary).resolve()
     failures = []
-    for link, dest in planned_links(checkout, primary, manifests):
-        try:
-            valid = link.is_symlink() and link.resolve() == dest.resolve() and dest.is_dir()
-        except (OSError, RuntimeError):
-            valid = False
-        if not valid:
-            failures.append(f"{link}: expected a symlink to {dest}; "
-                            "preserve existing contents and reconcile with scripts/share-target.py")
+    if checkout_resolved != primary_resolved:
+        worktree_target = checkout_resolved / "target"
+        if worktree_target.is_symlink():
+            try:
+                dest = worktree_target.resolve()
+                points_primary = dest == (primary_resolved / "target") or dest.is_relative_to(primary_resolved / "target")
+            except (OSError, RuntimeError):
+                points_primary = True
+            if points_primary:
+                failures.append(
+                    f"{worktree_target}: linked worktree must not symlink target into primary checkout "
+                    "(causes Cargo path-hash duplication); run scripts/share-target.py"
+                )
+    for row in manifests:
+        if row["path"] == "Cargo.toml":
+            continue
+        member_target = checkout_resolved / Path(row["path"]).parent / "target"
+        if member_target.is_symlink() or member_target.exists():
+            failures.append(
+                f"{member_target}: unexpected member target entry in unified workspace; "
+                "reconcile contents and run scripts/share-target.py"
+            )
     return failures
 
 
 def apply_links(checkout, primary, manifests):
-    links = planned_links(checkout, primary, manifests)
-    blocked = [str(link) for link, _ in links if link.exists() and not link.is_symlink()]
+    """Remove obsolete member/worktree target symlinks without touching real directories."""
+    checkout_resolved = Path(checkout).resolve()
+    primary_resolved = Path(primary).resolve()
+    candidates = []
+    if checkout_resolved != primary_resolved:
+        wt_target = checkout_resolved / "target"
+        if wt_target.is_symlink():
+            candidates.append(wt_target)
+    for row in manifests:
+        if row["path"] == "Cargo.toml":
+            continue
+        member_target = checkout_resolved / Path(row["path"]).parent / "target"
+        if member_target.is_symlink() or member_target.exists():
+            candidates.append(member_target)
+    blocked = [str(p) for p in candidates if p.exists() and not p.is_symlink()]
     if blocked:
         raise FileExistsError(
-            "Real directories block the shared Cargo layout:\n" + "\n".join(blocked) +
-            "\nPreserve and reconcile their contents before rerunning scripts/share-target.py.")
-    ensured = []
-    for link, dest in links:
-        dest.mkdir(parents=True, exist_ok=True)
+            "Real member target directories block the unified workspace layout:\n"
+            + "\n".join(blocked)
+            + "\nPreserve and reconcile their contents before rerunning scripts/share-target.py."
+        )
+    removed = []
+    for link in candidates:
         if link.is_symlink():
-            if link.resolve() == dest.resolve():
-                ensured.append((link, dest))
-                continue
+            dest = link.readlink()
             link.unlink()
-        link.symlink_to(dest)
-        ensured.append((link, dest))
-    return ensured
+            removed.append((link, dest))
+    return removed

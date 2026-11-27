@@ -213,7 +213,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=("probe", "matrix", "corpus"), default="matrix")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--runner", type=Path, default=ROOT / "target/makepad-native/release/examples/asr-regression")
+    parser.add_argument("--runner", type=Path, default=ROOT / "target/release/examples/asr-regression")
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)

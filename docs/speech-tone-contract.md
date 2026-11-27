@@ -67,7 +67,7 @@
 基础设施测试不需要语料、权重或设备：
 
 ```sh
-CARGO_TARGET_DIR=target/minicpm-v-cpu CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_DIR=target CARGO_BUILD_JOBS=2 \
   cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features cpu --test speech_tone
 ```

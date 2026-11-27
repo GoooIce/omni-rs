@@ -10,6 +10,7 @@ pub mod generate;
 pub mod image;
 pub mod input_stream;
 pub mod interruptible;
+pub mod lease;
 pub mod live;
 pub mod media;
 pub mod media_io;

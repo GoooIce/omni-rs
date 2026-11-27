@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[workspace]
-
 [dependencies]
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "711521dbfaba2d04be4d88176deef367f33d9ed3", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -24,27 +22,3 @@ omni-lfm3 = { path = "../../crates/lfm3-omni", default-features = false, feature
 burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"] }
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
 burn-ane = { path = "../../crates/burn-ane", version = "=0.21.0", default-features = false, features = ["metal-shared"] }
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-
-[patch.crates-io]
-cubek-matmul = { path = "../../vendor/cubek-matmul" }
-burn-cubecl = { path = "../../vendor/burn-cubecl" }
-cubecl-common = { path = "../../vendor/cubecl-common" }
-cubecl-cpp = { path = "../../vendor/cubecl-cpp" }
-burn-fusion = { path = "../../vendor/burn-fusion" }
-cubecl-runtime = { path = "../../vendor/cubecl-runtime" }
-cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
-burn-router = { path = "../../vendor/burn-router" }
-burn = { path = "../../vendor/burn" }
-
-[profile.dev]
-debug = "line-tables-only"
-incremental = false
-
-[profile.debug-full]
-inherits = "dev"
-debug = 2
-incremental = true

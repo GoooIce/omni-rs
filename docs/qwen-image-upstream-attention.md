@@ -118,8 +118,8 @@ python3 scripts/import_mlx_attention.py artifacts/qwen-image-upstream-attention/
 
 # 下面的 attention-bench 构建仅适用于归档的 source.tar.gz；当前源码已改成 Rust 内核
 cargo build --release --locked --manifest-path crates/qwen-image/Cargo.toml \
-  --target-dir target/qwen-image-test --example attention-bench
-target/qwen-image-test/release/examples/attention-bench
+  --target-dir target --example attention-bench
+target/release/examples/attention-bench
 
 clang++ -O2 -std=c++17 -fobjc-arc -framework Foundation -framework Metal \
   scripts/bench_qwen_mlx_gemm.mm -o artifacts/qwen-image-upstream-attention/bench-mlx-gemm

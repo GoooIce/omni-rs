@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "mtl4"
 version = "0.1.0"
 edition = "2024"
@@ -34,11 +35,6 @@ objc2-metal = { version = "0.3", features = [
     "MTLTensor",
 ] }
 
-[profile.dev]
-debug = "line-tables-only"
-incremental = false
-
-[profile.debug-full]
-inherits = "dev"
-debug = 2
-incremental = true
+[[test]]
+name = "suite"
+path = "tests/suite.rs"

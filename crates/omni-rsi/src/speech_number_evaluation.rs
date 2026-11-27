@@ -402,7 +402,7 @@ fn evaluation_implementation_hash() -> String {
         include_bytes!("../../lfm3-omni/src/media_io.rs").as_slice(),
         include_bytes!("../../lfm3-omni/src/sampling.rs").as_slice(),
         include_bytes!("../Cargo.toml").as_slice(),
-        include_bytes!("../Cargo.lock").as_slice(),
+        include_bytes!("../../../Cargo.lock").as_slice(),
     ] {
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);

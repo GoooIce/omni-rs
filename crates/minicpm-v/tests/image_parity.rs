@@ -2,6 +2,7 @@
 //!
 //! Requires the local checkpoint and `artifacts/minicpm-reference/greedy-image.json`;
 //! skips otherwise. The image fixtures live in `tests/fixtures/images`.
+use super::common;
 use burn::backend::NdArray;
 use omni_minicpm_v::{
     chat::{Message, Part, Role},
@@ -12,7 +13,6 @@ use omni_minicpm_v::{
     prompt,
     tokenizer::MiniCpmTokenizer,
 };
-mod common;
 
 use std::sync::atomic::AtomicBool;
 

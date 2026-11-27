@@ -845,121 +845,22 @@ fn validate_target_wav(
     })
 }
 
-#[cfg(unix)]
 fn open_root(path: &Path) -> Result<File, String> {
-    open_strict_root(&resolve_selected_path(path, false)?)
+    crate::safe_fs::AnchoredDir::open_selected(path)
+        .map(crate::safe_fs::AnchoredDir::into_file)
+        .map_err(|e| format!("v3 dataset root: {e}"))
 }
 
-// The caller selects the root; aliases in its parent are trusted. Its last
-// component and everything opened relative to it remain no-follow.
 pub(crate) fn resolve_selected_path(path: &Path, missing_final: bool) -> Result<PathBuf, String> {
-    use std::path::Component;
-    if path.as_os_str().is_empty() {
-        return Err("invalid selected path".into());
-    }
-    if path
-        .components()
-        .any(|part| matches!(part, Component::ParentDir))
-    {
-        return Err("parent traversal is not allowed".into());
-    }
-    let Some(name) = path.file_name() else {
-        return std::fs::canonicalize(path).map_err(|e| e.to_string());
-    };
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let resolved = std::fs::canonicalize(parent)
-        .map_err(|e| e.to_string())?
-        .join(name);
-    match std::fs::symlink_metadata(&resolved) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err("selected path final component is a symlink".into());
-        }
-        Ok(_) => (),
-        Err(error) if missing_final && error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(error) => return Err(error.to_string()),
-    }
-    Ok(resolved)
+    crate::safe_fs::resolve_selected_path(path, missing_final)
 }
 
-#[cfg(unix)]
-fn open_strict_root(path: &Path) -> Result<File, String> {
-    use std::path::Component;
-    if path.as_os_str().is_empty() {
-        return Err("empty v3 root path".into());
-    }
-    let mut file =
-        File::open(if path.is_absolute() { "/" } else { "." }).map_err(|e| e.to_string())?;
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => (),
-            Component::Normal(name) => {
-                file =
-                    open_child_os(&file, name, true).map_err(|e| format!("v3 dataset root: {e}"))?
-            }
-            _ => return Err("v3 root traversal is unsupported".into()),
-        }
-    }
-    if !file.metadata().map_err(|e| e.to_string())?.is_dir() {
-        return Err("invalid v3 dataset root".into());
-    }
-    Ok(file)
-}
-
-#[cfg(unix)]
 fn open_child(directory: &File, name: &str, is_directory: bool) -> Result<File, String> {
     open_child_io(directory, name, is_directory).map_err(|e| e.to_string())
 }
 
-#[cfg(unix)]
 fn open_child_io(directory: &File, name: &str, is_directory: bool) -> std::io::Result<File> {
-    open_child_os(directory, std::ffi::OsStr::new(name), is_directory)
-}
-
-#[cfg(unix)]
-fn open_child_os(
-    directory: &File,
-    name: &std::ffi::OsStr,
-    is_directory: bool,
-) -> std::io::Result<File> {
-    use std::{
-        ffi::CString,
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::ffi::OsStrExt,
-        },
-    };
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid filename"))?;
-    let flags = libc::O_RDONLY
-        | libc::O_NOFOLLOW
-        | libc::O_NONBLOCK
-        | libc::O_CLOEXEC
-        | if is_directory { libc::O_DIRECTORY } else { 0 };
-    // A successful descriptor is transferred exactly once into File.
-    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[cfg(not(unix))]
-fn open_root(_: &Path) -> Result<File, String> {
-    Err("isolated v3 data is unsupported on this platform".into())
-}
-#[cfg(not(unix))]
-fn open_child(_: &File, _: &str, _: bool) -> Result<File, String> {
-    Err("isolated v3 data is unsupported on this platform".into())
-}
-#[cfg(not(unix))]
-fn open_child_io(_: &File, _: &str, _: bool) -> std::io::Result<File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "isolated data is unsupported",
-    ))
+    crate::safe_fs::open_child_io(directory, std::ffi::OsStr::new(name), is_directory)
 }
 
 fn read_child(
@@ -972,50 +873,19 @@ fn read_child(
     read_open_file(open_child(directory, name, false)?, limit, stop)
 }
 
-#[cfg(unix)]
-fn same_single_link_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    before.is_file()
-        && after.is_file()
-        && before.nlink() == 1
-        && after.nlink() == 1
-        && before.dev() == after.dev()
-        && before.ino() == after.ino()
-        && before.len() == after.len()
-        && before.mtime() == after.mtime()
-        && before.mtime_nsec() == after.mtime_nsec()
-        && before.ctime() == after.ctime()
-        && before.ctime_nsec() == after.ctime_nsec()
-}
-
-#[cfg(not(unix))]
-fn same_single_link_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
-    false
-}
-
 fn read_single_link_child(
     directory: &File,
     name: &str,
     limit: usize,
     stop: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    check_stop(stop)?;
-    let file = open_child(directory, name, false)?;
-    let observer = file.try_clone().map_err(|e| e.to_string())?;
-    let before = observer.metadata().map_err(|e| e.to_string())?;
-    if !same_single_link_file(&before, &before) {
-        return Err("artifact must be a single-link regular file".into());
-    }
-    if before.len() == 0 || before.len() > limit as u64 {
-        return Err("invalid or oversized artifact".into());
-    }
-    let bytes = read_open_file(file, limit, stop)?;
-    let after = observer.metadata().map_err(|e| e.to_string())?;
-    if !same_single_link_file(&before, &after) {
-        return Err("artifact changed while reading".into());
-    }
-    check_stop(stop)?;
-    Ok(bytes)
+    crate::safe_fs::read_single_link_child(
+        directory,
+        std::ffi::OsStr::new(name),
+        limit as u64,
+        None,
+        stop,
+    )
 }
 
 /// Reopen a previously admitted target through no-follow directory handles.
@@ -1150,7 +1020,7 @@ pub struct RegistrationOptions<'a> {
 
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct CaseIdentity {
+pub(crate) struct CaseIdentity {
     id: String,
     audio_file: String,
     audio_sha256: String,
@@ -1217,43 +1087,43 @@ impl<'a> FrozenSwaps<'a> {
 
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct RegressionIdentity {
-    name: String,
-    manifest_file: String,
-    sha256: String,
+pub(crate) struct RegressionIdentity {
+    pub(crate) name: String,
+    pub(crate) manifest_file: String,
+    pub(crate) sha256: String,
 }
 
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct FrozenProtocol {
-    version: u32,
-    policy: serde_json::Value,
-    train_manifest_sha256: String,
-    dev_manifest_sha256: String,
-    train_groups_sha256: String,
-    dev_groups_sha256: String,
-    train_cases: Vec<CaseIdentity>,
-    dev_cases: Vec<CaseIdentity>,
-    swaps: Vec<FrozenSwap>,
-    blind_public_fingerprint: String,
-    base_model_sha256: String,
-    codec_sha256: String,
-    candidate_sha256: String,
-    evaluator_sha256: String,
-    r2t2_sha256: Option<String>,
-    breeze_sha256: Option<String>,
-    regression_plan_sha256: String,
-    regression_inputs: Vec<RegressionIdentity>,
+pub(crate) struct FrozenProtocol {
+    pub(crate) version: u32,
+    pub(crate) policy: serde_json::Value,
+    pub(crate) train_manifest_sha256: String,
+    pub(crate) dev_manifest_sha256: String,
+    pub(crate) train_groups_sha256: String,
+    pub(crate) dev_groups_sha256: String,
+    pub(crate) train_cases: Vec<CaseIdentity>,
+    pub(crate) dev_cases: Vec<CaseIdentity>,
+    pub(crate) swaps: Vec<FrozenSwap>,
+    pub(crate) blind_public_fingerprint: String,
+    pub(crate) base_model_sha256: String,
+    pub(crate) codec_sha256: String,
+    pub(crate) candidate_sha256: String,
+    pub(crate) evaluator_sha256: String,
+    pub(crate) r2t2_sha256: Option<String>,
+    pub(crate) breeze_sha256: Option<String>,
+    pub(crate) regression_plan_sha256: String,
+    pub(crate) regression_inputs: Vec<RegressionIdentity>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope {
-    version: u32,
-    status: String,
-    candidate_eligible: bool,
-    protocol_sha256: String,
-    protocol: FrozenProtocol,
+pub(crate) struct Envelope {
+    pub(crate) version: u32,
+    pub(crate) status: String,
+    pub(crate) candidate_eligible: bool,
+    pub(crate) protocol_sha256: String,
+    pub(crate) protocol: FrozenProtocol,
 }
 
 pub struct RegisteredDevelopment {
@@ -1597,17 +1467,17 @@ fn hash_regular_path(
         // Unknown external artifacts have no supplied root to anchor against.
         // Require a physical path so an alternate spelling cannot turn a
         // descendant symlink into a trusted artifact parent.
-        open_strict_root(parent)?
+        crate::safe_fs::AnchoredDir::open(parent)?.into_file()
     };
     let file = open_child(&directory, name, false)?;
     let observer = file.try_clone().map_err(|e| e.to_string())?;
     let before = observer.metadata().map_err(|e| e.to_string())?;
-    if !same_single_link_file(&before, &before) {
+    if !crate::safe_fs::same_single_link_file(&before, &before) {
         return Err("artifact must be a single-link regular file".into());
     }
     let hash = hash_open_regular(file, limit, stop)?;
     let after = observer.metadata().map_err(|e| e.to_string())?;
-    if !same_single_link_file(&before, &after) {
+    if !crate::safe_fs::same_single_link_file(&before, &after) {
         return Err("artifact changed while hashing".into());
     }
     Ok(hash)
@@ -2020,7 +1890,7 @@ fn snapshot(
     })
 }
 
-fn protocol_hash(protocol: &FrozenProtocol) -> Result<String, String> {
+pub(crate) fn protocol_hash(protocol: &FrozenProtocol) -> Result<String, String> {
     let bytes = serde_json::to_vec(protocol).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
     hash.update(b"omni-rsi-number-development-preregistration-v1\0");

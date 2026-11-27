@@ -42,7 +42,7 @@ assert_eq!(report.mean_signed_onset_error_seconds, Some(0.1));
 从仓库根目录运行无设备合成负例：
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target/minicpm-v-cpu" CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_DIR="$PWD/target" CARGO_BUILD_JOBS=2 \
   cargo test --offline --locked --manifest-path crates/omni-rsi/Cargo.toml \
   --no-default-features --features cpu --test humming_metrics
 ```
