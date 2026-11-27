@@ -17,7 +17,7 @@ pub struct State {
     stopping: bool,
     mode: usize,
     language_choice: String,
-    controls: Option<(bool, bool, bool, bool, bool, bool)>,
+    controls: Option<(bool, bool, bool, bool, bool, bool, bool, bool)>,
     directory: String,
     #[cfg(not(target_arch = "wasm32"))]
     engine: Option<engine::Engine>,
@@ -35,6 +35,14 @@ pub struct State {
     remember_model: bool,
     #[cfg(not(target_arch = "wasm32"))]
     settings_path: Option<std::path::PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    finish_recording: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    external_uploading: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    external_error: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_external_action: Option<&'static str>,
 }
 
 impl State {
@@ -107,7 +115,48 @@ impl App {
         self.ui
             .label(cx, ids!(backend))
             .set_text(cx, crate::gpu::initial_backend_label());
-        self.start_model_load(cx);
+        if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+            self.status(
+                cx,
+                &format!(
+                    "已就绪（{} · 文件整段与录音后批处理模式）",
+                    self.slot_badge(omni_hub::providers::CapabilitySlot::Asr)
+                ),
+            );
+            self.refresh_speed_choices(cx);
+        } else {
+            self.start_model_load(cx);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_asr_provider_changed(&mut self, cx: &mut Cx) {
+        self.transcription.controls = None;
+        self.transcription.external_error = None;
+        self.ui
+            .view(cx, ids!(asr_external_error))
+            .set_visible(cx, false);
+        self.refresh_speed_choices(cx);
+        if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+            self.ui
+                .view(cx, ids!(model_recovery))
+                .set_visible(cx, false);
+            self.status(
+                cx,
+                &format!(
+                    "已切至{} · 整段/录音后批处理模式（不提供本地低延迟流式字幕）",
+                    self.slot_badge(omni_hub::providers::CapabilitySlot::Asr)
+                ),
+            );
+        } else if self.transcription.ready {
+            self.status(cx, "已切回本地模型 · Confucius4-R2T2 流式转写就绪");
+        } else {
+            self.transcription.pending_model_load = true;
+            self.status(cx, "已切回本地模型 · 正在准备加载 Confucius4-R2T2…");
+            if !self.settings_panel_open() && self.workspace.language() && !self.inference_busy() {
+                self.start_model_load(cx);
+            }
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -136,6 +185,9 @@ impl App {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn resume_transcription_model(&mut self, cx: &mut Cx) {
+        if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+            return;
+        }
         if self.transcription.needs_directory {
             self.choose_model(cx);
         } else if self.transcription.pending_model_load {
@@ -146,6 +198,19 @@ impl App {
     pub fn cancel_transcription(&mut self, cx: &mut Cx) {
         if !self.transcription.busy || self.transcription.stopping {
             return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr)
+            && self.transcription.microphone
+            && !self.transcription.external_uploading
+        {
+            if let Some(flag) = &self.transcription.finish_recording {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                self.transcription.external_uploading = true;
+                self.transcription.controls = None;
+                self.status(cx, "录音结束 · 正在上传至外部网关批处理转写…");
+                return;
+            }
         }
         self.transcription.stopping = true;
         self.submit_transcription(cx, "stop");
@@ -188,31 +253,45 @@ impl App {
 
     pub fn refresh_transcription_controls(&mut self, cx: &mut Cx) {
         let busy = self.transcription.busy || self.inference_busy();
+        #[cfg(not(target_arch = "wasm32"))]
+        let external = self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
+        #[cfg(target_arch = "wasm32")]
+        let external = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let uploading = self.transcription.external_uploading;
+        #[cfg(target_arch = "wasm32")]
+        let uploading = false;
+
+        let effective_ready = external || self.transcription.ready;
         let state = (
             self.transcription.busy,
             self.transcription.loading,
-            self.transcription.ready,
+            effective_ready,
             self.transcription.transcript.is_empty(),
             self.transcription.stopping,
             self.inference_busy(),
+            external,
+            uploading,
         );
         if self.transcription.controls == Some(state) {
             return;
         }
         self.transcription.controls = Some(state);
-        self.ui.button(cx, ids!(load)).set_action_enabled(cx, !busy);
+        self.ui
+            .button(cx, ids!(load))
+            .set_action_enabled(cx, !busy && !external);
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.ui
                 .button(cx, ids!(choose_model))
-                .set_action_enabled(cx, !busy);
+                .set_action_enabled(cx, !busy && !external);
             self.ui
                 .button(cx, ids!(retry_model))
-                .set_action_enabled(cx, !busy);
+                .set_action_enabled(cx, !busy && !external);
         }
         self.ui
             .button(cx, ids!(transcribe))
-            .set_action_enabled(cx, self.transcription.ready && !busy);
+            .set_action_enabled(cx, effective_ready && !busy);
         self.ui
             .button(cx, ids!(sample))
             .set_action_enabled(cx, !busy);
@@ -235,14 +314,24 @@ impl App {
             ids!(speed_fast),
             ids!(speed_save),
         ] {
-            self.ui.button(cx, id).set_action_enabled(cx, !busy);
+            self.ui
+                .button(cx, id)
+                .set_action_enabled(cx, !busy && !external);
         }
         self.ui
             .button(cx, ids!(microphone))
-            .set_action_enabled(cx, self.transcription.ready && !busy);
+            .set_action_enabled(cx, effective_ready && !busy);
         self.ui
             .button(cx, ids!(stop))
             .set_visible(cx, self.transcription.busy);
+        self.ui.button(cx, ids!(stop)).set_text(
+            cx,
+            if external && self.transcription.microphone && !uploading {
+                "结束录音并转写"
+            } else {
+                "停止"
+            },
+        );
         self.ui
             .button(cx, ids!(stop))
             .set_action_enabled(cx, self.transcription.busy && !self.transcription.stopping);
@@ -338,9 +427,17 @@ impl App {
             };
             self.ui.button(cx, id).set_text(cx, &label);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let speed_text = if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+            "外部 ASR 仅支持文件整段与录音后批处理转写，本地低延迟流式速度档位已禁用。".to_owned()
+        } else {
+            protocol::mode_hint(self.transcription.mode)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let speed_text = protocol::mode_hint(self.transcription.mode);
         self.ui
             .label(cx, ids!(speed_hint))
-            .set_text(cx, &protocol::mode_hint(self.transcription.mode));
+            .set_text(cx, &speed_text);
     }
 
     fn asr_language_raw(&self, cx: &mut Cx) -> String {
@@ -588,6 +685,15 @@ impl App {
                 if update.kind == "done" {
                     self.transcription.busy = false;
                     self.transcription.stopping = false;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.transcription.finish_recording = None;
+                        self.transcription.external_uploading = false;
+                        self.transcription.external_error = None;
+                        self.ui
+                            .view(cx, ids!(asr_external_error))
+                            .set_visible(cx, false);
+                    }
                     if self.transcription.microphone {
                         self.show_input_status(
                             cx,
@@ -618,7 +724,7 @@ impl App {
                     );
                 }
             }
-            "error" | "fatal" | "load_cancelled" => {
+            "error" | "fatal" | "load_cancelled" | "cancelled" => {
                 self.transcription.busy = false;
                 if self.transcription.loading || update.kind == "fatal" {
                     self.transcription.ready = false;
@@ -629,9 +735,30 @@ impl App {
                     self.show_input_status(cx, "麦克风已关闭");
                 }
                 self.transcription.microphone = false;
-                self.status(cx, &format!("错误：{}", update.message));
                 #[cfg(not(target_arch = "wasm32"))]
-                if !self.transcription.ready {
+                {
+                    self.transcription.finish_recording = None;
+                    self.transcription.external_uploading = false;
+                }
+                let status_text = if update.kind == "cancelled" {
+                    update.message.clone()
+                } else {
+                    format!("错误：{}", update.message)
+                };
+                self.status(cx, &status_text);
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+                    if update.kind != "cancelled" {
+                        self.transcription.external_error = Some(update.message.clone());
+                        self.ui.label(cx, ids!(asr_ext_error_info)).set_text(
+                            cx,
+                            &format!("外部转写失败（不会静默回退本地）：{}", update.message),
+                        );
+                        self.ui
+                            .view(cx, ids!(asr_external_error))
+                            .set_visible(cx, true);
+                    }
+                } else if !self.transcription.ready && update.kind != "cancelled" {
                     self.ui
                         .view(cx, ids!(model_progress))
                         .set_visible(cx, false);
@@ -676,6 +803,41 @@ impl App {
             }
             let request = if command == "load" {
                 engine::Command::Load(path)
+            } else if self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr) {
+                let target =
+                    match self.resolve_slot_external(omni_hub::providers::CapabilitySlot::Asr) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => return,
+                        Err(err) => {
+                            self.apply_update(cx, Update::status("error", err));
+                            return;
+                        }
+                    };
+                self.transcription.external_error = None;
+                self.ui
+                    .view(cx, ids!(asr_external_error))
+                    .set_visible(cx, false);
+                if command == "microphone" {
+                    let finish_flag =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    self.transcription.finish_recording = Some(finish_flag.clone());
+                    self.transcription.external_uploading = false;
+                    self.transcription.last_external_action = Some("microphone");
+                    engine::Command::MicrophoneExternal {
+                        context,
+                        language,
+                        target,
+                        finish_recording: finish_flag,
+                    }
+                } else {
+                    self.transcription.last_external_action = Some("transcribe");
+                    engine::Command::TranscribeExternal {
+                        path: audio,
+                        context,
+                        language,
+                        target,
+                    }
+                }
             } else if command == "microphone" {
                 engine::Command::Microphone {
                     context,
@@ -786,6 +948,39 @@ impl App {
             }
             if self.ui.button(cx, ids!(retry_model)).clicked(actions) && !self.transcription.busy {
                 self.start_model_load(cx);
+            }
+            if self
+                .ui
+                .button(cx, ids!(asr_ext_switch_local))
+                .clicked(actions)
+                && !self.transcription.busy
+            {
+                self.switch_slot_to_local(cx, omni_hub::providers::CapabilitySlot::Asr);
+                return;
+            }
+            if self
+                .ui
+                .button(cx, ids!(asr_ext_open_settings))
+                .clicked(actions)
+            {
+                self.open_providers_settings(cx);
+                return;
+            }
+            if self.ui.button(cx, ids!(asr_ext_retry)).clicked(actions)
+                && !self.transcription.busy
+                && !self.inference_busy()
+            {
+                let action = self
+                    .transcription
+                    .last_external_action
+                    .unwrap_or("transcribe");
+                self.transcription.busy = true;
+                self.transcription.microphone = action == "microphone";
+                self.transcription.stopping = false;
+                self.transcription.transcript.clear();
+                self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
+                self.submit_transcription(cx, action);
+                return;
             }
         }
         let speed_choice = [
@@ -902,7 +1097,11 @@ impl App {
             && !self.transcription.busy
             && !self.inference_busy()
         {
-            if !self.transcription.ready {
+            #[cfg(not(target_arch = "wasm32"))]
+            let external = self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
+            #[cfg(target_arch = "wasm32")]
+            let external = false;
+            if !external && !self.transcription.ready {
                 self.status(cx, "请先载入模型");
                 return;
             }
@@ -914,13 +1113,25 @@ impl App {
             self.transcription.transcript.clear();
             self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
             self.set_transcript_language(cx, "");
-            self.status(cx, "开始转写 · 首次运行可能需要较长时间");
+            self.status(
+                cx,
+                if external {
+                    "开始外部整段转写 · 正在准备上传 WAV…"
+                } else {
+                    "开始转写 · 首次运行可能需要较长时间"
+                },
+            );
             self.submit_transcription(cx, "transcribe");
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let mic_ready = self.transcription.ready
+            || self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
+        #[cfg(target_arch = "wasm32")]
+        let mic_ready = self.transcription.ready;
         if self.ui.button(cx, ids!(microphone)).clicked(actions)
             && !self.transcription.busy
             && !self.inference_busy()
-            && self.transcription.ready
+            && mic_ready
         {
             if let Err(error) = protocol::asr_language(&self.asr_language_raw(cx)) {
                 self.status(cx, &error);
@@ -933,7 +1144,18 @@ impl App {
             self.ui.text_input(cx, ids!(transcript)).set_text(cx, "");
             self.set_transcript_language(cx, "");
             self.show_input_status(cx, "正在打开默认输入设备…");
-            self.status(cx, "正在开启麦克风 · 首次使用请允许录音权限");
+            #[cfg(not(target_arch = "wasm32"))]
+            let ext_mic = self.slot_is_external(omni_hub::providers::CapabilitySlot::Asr);
+            #[cfg(target_arch = "wasm32")]
+            let ext_mic = false;
+            self.status(
+                cx,
+                if ext_mic {
+                    "外部 ASR 批处理录音中 · 说完请点击「结束录音并转写」上传"
+                } else {
+                    "正在开启麦克风 · 首次使用请允许录音权限"
+                },
+            );
             self.submit_transcription(cx, "microphone");
         }
     }

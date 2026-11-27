@@ -1,9 +1,11 @@
 use crate::ActionButtonState;
 use crate::{
-    image_engine::{Command, Engine},
+    image_engine::{Command, Engine, RewriteTarget},
     model_location, App,
 };
 use makepad_widgets::*;
+use omni_hub::catalog::CheckpointId;
+use omni_hub::providers::CapabilitySlot;
 use omni_qwen_image::{dimensions, Options};
 use std::path::{Path, PathBuf};
 
@@ -30,8 +32,10 @@ pub struct State {
     advanced: bool,
     cfg_enabled: bool,
     observation: bool,
+    rewriting: bool,
     observation_board: ObservationBoard,
     controls: Option<(
+        bool,
         bool,
         bool,
         bool,
@@ -92,6 +96,7 @@ impl State {
             advanced: false,
             cfg_enabled: false,
             observation: false,
+            rewriting: false,
             observation_board: ObservationBoard::new(0, 0),
             controls: None,
         }
@@ -99,6 +104,14 @@ impl State {
 }
 
 impl App {
+    pub fn on_image_provider_changed(&mut self, cx: &mut Cx) {
+        if let Some(i) = self.image.as_mut() {
+            i.controls = None;
+        }
+        self.ui
+            .view(cx, ids!(image_rewrite_error))
+            .set_visible(cx, false);
+    }
     pub fn activate_image(&mut self, cx: &mut Cx) {
         if self.inference_busy() || self.runtime.dialog_busy() {
             return;
@@ -142,8 +155,11 @@ impl App {
         );
     }
     fn image_error(&mut self, cx: &mut Cx, message: &str, fatal: bool) {
+        let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
         let i = self.image.as_mut().unwrap();
-        if fatal || i.loading {
+        let was_rewriting = i.rewriting;
+        i.rewriting = false;
+        if !was_rewriting && (fatal || i.loading) {
             i.ready = false;
         }
         i.busy = false;
@@ -152,6 +168,21 @@ impl App {
         self.ui
             .view(cx, ids!(image_progress))
             .set_visible(cx, false);
+        if was_rewriting && enhance_external {
+            self.ui.label(cx, ids!(image_rewrite_error_info)).set_text(
+                cx,
+                &format!("外部提示词改写失败（不会静默回退本地）：{message}"),
+            );
+            self.ui
+                .view(cx, ids!(image_rewrite_error))
+                .set_visible(cx, true);
+            self.image_status(cx, message);
+            return;
+        }
+        if was_rewriting {
+            self.image_status(cx, message);
+            return;
+        }
         self.ui
             .view(cx, ids!(image_recovery))
             .set_visible(cx, !i.ready);
@@ -204,6 +235,7 @@ impl App {
     pub fn refresh_image_controls(&mut self, cx: &mut Cx) {
         let other_busy = self.inference_busy();
         let dialog_busy = self.runtime.dialog_busy();
+        let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
         let Some(i) = self.image.as_mut() else {
             return;
         };
@@ -219,6 +251,7 @@ impl App {
             self.workspace.language(),
             i.picking || i.saving || i.picking_reference,
             i.observation,
+            enhance_external,
         );
         if i.controls == Some(state) {
             return;
@@ -226,6 +259,17 @@ impl App {
         i.controls = Some(state);
         let idle = !other_busy && !i.busy && !dialog_busy;
         self.ui.button(cx, ids!(image_load)).set_visible(cx, false);
+        self.ui
+            .button(cx, ids!(image_rewrite))
+            .set_action_enabled(cx, idle && !i.observation);
+        self.ui
+            .view(cx, ids!(image_rewrite_hint_row))
+            .set_visible(cx, i.observation);
+        if i.observation {
+            self.ui
+                .label(cx, ids!(image_rewrite_hint))
+                .set_text(cx, "去噪观察模式不支持 JSON 提示词改写。");
+        }
         self.ui.button(cx, ids!(image_generate)).set_text(
             cx,
             if !i.ready {
@@ -499,10 +543,37 @@ impl App {
                 }
                 "cancelled" => {
                     i.busy = false;
+                    i.rewriting = false;
                     i.stopping = false;
                     self.ui
                         .view(cx, ids!(image_progress))
                         .set_visible(cx, false);
+                    self.image_status(cx, &update.message);
+                }
+                "rewritten" => {
+                    i.busy = false;
+                    i.rewriting = false;
+                    i.stopping = false;
+                    self.ui
+                        .view(cx, ids!(image_progress))
+                        .set_visible(cx, false);
+                    self.ui
+                        .view(cx, ids!(image_rewrite_error))
+                        .set_visible(cx, false);
+                    if let Some(outcome) = update.rewrite {
+                        self.ui
+                            .text_input(cx, ids!(image_prompt))
+                            .set_text(cx, &outcome.positive_prompt);
+                    }
+                    if let Some((w, h)) = update.rewrite_canvas {
+                        self.ui
+                            .text_input(cx, ids!(image_width))
+                            .set_text(cx, &w.to_string());
+                        self.ui
+                            .text_input(cx, ids!(image_height))
+                            .set_text(cx, &h.to_string());
+                        self.update_image_dimensions_hint(cx);
+                    }
                     self.image_status(cx, &update.message);
                 }
                 "error" | "fatal" | "load_cancelled" => {
@@ -729,6 +800,85 @@ impl App {
         }
         if self.ui.button(cx, ids!(image_example)).clicked(actions) {
             self.ui.text_input(cx, ids!(image_prompt)).set_text(cx, if i.references.is_empty() {"一只红色陶瓷茶壶放在木桌上，窗外清晨的柔和阳光照进房间，写实摄影，细腻的陶瓷质感，简洁的构图。"} else {"把图中的主体改成蓝色，保持背景、光照和构图不变。"});
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(image_rewrite_ext_switch_local))
+            .clicked(actions)
+        {
+            self.switch_slot_to_local(cx, CapabilitySlot::PromptEnhancement);
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(image_rewrite_ext_open_settings))
+            .clicked(actions)
+        {
+            self.open_providers_settings(cx);
+            return;
+        }
+        if self.ui.button(cx, ids!(image_rewrite)).clicked(actions)
+            || self
+                .ui
+                .button(cx, ids!(image_rewrite_ext_retry))
+                .clicked(actions)
+        {
+            if i.observation {
+                self.image_status(cx, "去噪观察模式不支持 JSON 提示词改写");
+                return;
+            }
+            let prompt = self.ui.text_input(cx, ids!(image_prompt)).text();
+            if prompt.trim().is_empty() {
+                self.image_status(cx, "请先输入画面描述或编辑指令，再进行改写");
+                return;
+            }
+            let images = i.references.clone();
+            let target = if self.slot_is_external(CapabilitySlot::PromptEnhancement) {
+                match self.resolve_slot_external(CapabilitySlot::PromptEnhancement) {
+                    Ok(Some(ext)) => RewriteTarget::External(ext),
+                    Ok(None) => return,
+                    Err(err) => {
+                        self.ui.label(cx, ids!(image_rewrite_error_info)).set_text(
+                            cx,
+                            &format!("外部提示词改写失败（不会静默回退本地）：{err}"),
+                        );
+                        self.ui
+                            .view(cx, ids!(image_rewrite_error))
+                            .set_visible(cx, true);
+                        self.image_status(cx, &err);
+                        return;
+                    }
+                }
+            } else {
+                let checkpoint = self
+                    .downloads
+                    .as_ref()
+                    .map(|d| d.ctrl.directory(CheckpointId::MiniCpmV47_35bInt4))
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(
+                            omni_qwen_image::rewrite::minicpm::DEFAULT_MODEL_DIR,
+                        )
+                    });
+                RewriteTarget::Local { checkpoint }
+            };
+            self.ui
+                .view(cx, ids!(image_rewrite_error))
+                .set_visible(cx, false);
+            let badge = self.slot_badge(CapabilitySlot::PromptEnhancement);
+            let i = self.image.as_mut().unwrap();
+            i.busy = true;
+            i.rewriting = true;
+            i.stopping = false;
+            let result = i.engine.submit(Command::Rewrite {
+                prompt,
+                images,
+                target,
+            });
+            self.image_status(cx, &format!("正在通过 {badge} 改写提示词…"));
+            if let Err(e) = result {
+                self.image_error(cx, &e.to_string(), false);
+            }
             return;
         }
         if self

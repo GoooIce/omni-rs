@@ -39,9 +39,11 @@
 use crate::{Error, Result, dimensions};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 #[cfg(feature = "rewrite")]
 pub mod minicpm;
+pub mod openai;
 
 /// Pinned upstream commit of the prompt assets and this port's reference.
 /// QwenLM/Qwen-Image-2.1 @ ab96caa (see THIRD_PARTY.md).
@@ -270,6 +272,46 @@ pub trait Rewriter {
         prompt: &str,
         images: &[PathBuf],
     ) -> Result<RewriteOutcome>;
+
+    fn rewrite_cancellable(
+        &mut self,
+        profile: TaskProfile,
+        prompt: &str,
+        images: &[PathBuf],
+        _cancel: &AtomicBool,
+    ) -> Result<RewriteOutcome> {
+        self.rewrite(profile, prompt, images)
+    }
+}
+
+/// Resolve the canvas dimensions suggested by a [`RewriteOutcome`] using the
+/// exact upstream contract: `WhRatio` maps to the nearest official preset;
+/// `FollowImage(idx)` (1-based, edit only) reads `images[idx - 1]` and computes
+/// an aligned canvas preserving its aspect ratio. Returns `Ok(None)` when the
+/// user explicitly pinned dimensions or the outcome carries no usable ratio.
+pub fn resolve_canvas(
+    outcome: &RewriteOutcome,
+    images: &[PathBuf],
+    user_explicit_dimensions: bool,
+) -> Result<Option<(usize, usize)>> {
+    if user_explicit_dimensions {
+        return Ok(None);
+    }
+    match outcome.ratio {
+        RatioDecision::None => Ok(None),
+        RatioDecision::WhRatio(w, h) => {
+            let (_, width, height) = nearest_preset(w, h);
+            Ok(Some((width, height)))
+        }
+        RatioDecision::FollowImage(idx) => {
+            let Some(path) = idx.checked_sub(1).and_then(|i| images.get(i)) else {
+                return Ok(None);
+            };
+            let img = crate::reference::open(path)?;
+            let (width, height) = canvas_for_ratio(img.width(), img.height())?;
+            Ok(Some((width, height)))
+        }
+    }
 }
 
 /// The CLI's fallback backend factory, used when the crate is built without

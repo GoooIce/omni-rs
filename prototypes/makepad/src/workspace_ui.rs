@@ -280,6 +280,7 @@ impl App {
             }
             if self.ui.button(cx, ids!(tts_load)).clicked(actions)
                 || (self.ui.button(cx, ids!(tts_synthesize)).clicked(actions)
+                    && !self.slot_is_external(omni_hub::providers::CapabilitySlot::Tts)
                     && self.tts.as_ref().is_some_and(|state| state.needs_model()))
             {
                 self.activate_tts(cx);

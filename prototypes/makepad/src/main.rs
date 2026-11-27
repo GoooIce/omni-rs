@@ -259,11 +259,19 @@ script_mod! {
                                 WorkspacePanel{
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
-                                        SectionLabel{width: Fill text: "模型与下载设置"}
+                                        SectionLabel{width: Fill text: "模型、提供方与设置"}
                                         settings_close := QuietButton{text: "← 返回工作台" height: 32}
                                     }
-                                    MutedLabel{text: "统一管理模型检查点、下载线路、镜像代理与受限权限凭据。下载在后台运行，不阻塞其他工作台。"}
-                                    Divider{}
+                                    MutedLabel{text: "统一管理本地模型检查点、下载线路、外部 OpenAI 兼容网关（含 Magpie 预设）与受限权限凭据。默认全部纯本地运行。"}
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        settings_tab_models := SpeechButton{text: "● 模型与下载" height: 32}
+                                        settings_tab_providers := SpeechButton{text: "外部提供方与槽位" height: 32}
+                                    }
+                                }
+                                settings_models_section := View{
+                                    width: Fill height: Fit flow: Down spacing: 12
+                                WorkspacePanel{
                                     SpeechLabel{text: "下载线路与代理"}
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 8
@@ -406,6 +414,121 @@ script_mod! {
                                         View{width: Fill height: Fit flow: Right spacing: 8 ckpt_omni_action := SpeechButton{text: "暂不支持自动下载" height: 30} ckpt_omni_pause := QuietButton{visible: false text: "暂停" height: 30} ckpt_omni_cancel := QuietButton{visible: false text: "取消" height: 30} ckpt_omni_choose := QuietButton{text: "选择本地目录…" height: 30}}
                                     }
                                 }
+                                }
+                                settings_providers_section := View{
+                                    visible: false width: Fill height: Fit flow: Down spacing: 12
+                                    WorkspacePanel{
+                                        SpeechLabel{text: "外部 OpenAI 兼容网关（含 Magpie 本地网关预设）"}
+                                        MutedLabel{text: "默认不发起任何网络请求；仅当某个能力槽位显式切到「外部网关」时才会调用对应接口，失败时绝不静默回退。"}
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8
+                                            provider_preset_magpie := SpeechButton{text: "Magpie 本地网关预设" height: 32}
+                                            provider_preset_custom := QuietButton{text: "自定义 OpenAI 兼容" height: 32}
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            SpeechLabel{width: Fit text: "提供方名称"}
+                                            provider_name_input := SpeechInput{width: Fill height: 34 empty_text: "Magpie 本地网关"}
+                                            SpeechLabel{width: Fit text: "超时(秒)"}
+                                            provider_timeout_input := SpeechInput{width: 72 height: 34 text: "60"}
+                                        }
+                                        SpeechLabel{text: "网关地址（Base URL）"}
+                                        provider_base_url_input := SpeechInput{width: Fill height: 34 empty_text: "http://127.0.0.1:3425/v1"}
+                                        provider_url_hint := MutedLabel{text: ""}
+                                        SpeechLabel{text: "可选环境变量覆盖（例如 OPENAI_API_KEY / MAGPIE_API_KEY）"}
+                                        provider_api_key_env_input := SpeechInput{width: Fill height: 34 empty_text: "留空则仅读取本地 0600 凭据文件"}
+                                        View{
+                                            width: Fill height: Fit flow: Down spacing: 6
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                                SpeechLabel{width: Fit text: "API Key"}
+                                                provider_api_key_source := MutedLabel{width: Fill text: ""}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                provider_api_key_input := SpeechInput{width: Fill height: 34 empty_text: "本地 Magpie 网关可留空；远程 API 填写 sk-..."}
+                                                provider_api_key_toggle := QuietButton{text: "显示" height: 34}
+                                                provider_api_key_save := SpeechButton{text: "保存 Key" height: 34}
+                                                provider_api_key_clear := QuietButton{text: "清除" height: 34}
+                                            }
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            provider_save := PrimaryButton{text: "保存提供方" height: 34}
+                                            provider_fetch_models := SpeechButton{text: "拉取模型 / 测试连接" height: 34}
+                                            provider_save_status := MutedLabel{width: Fill text: ""}
+                                        }
+                                        provider_probe_status := MutedLabel{text: "" draw_text.color: #b7dfc7}
+                                        provider_models_summary := MutedLabel{text: "尚未拉取模型列表"}
+                                    }
+                                    WorkspacePanel{
+                                        SpeechLabel{text: "4 个能力槽位独立路由（默认均为本地模型）"}
+                                        CheckpointItem{
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                                SpeechLabel{width: Fit text: "1. 提示词增强（图像改写 / 语音增强）"}
+                                                slot_enhance_badge := MutedLabel{width: Fill text: "本地模型" draw_text.color: #b7dfc7}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                slot_enhance_local := SpeechButton{text: "● 本地模型" height: 30}
+                                                slot_enhance_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_enhance_model := SpeechInput{width: Fill height: 30 empty_text: "外部模型 ID（如 gpt-4o / qwen-pe）"}
+                                                slot_enhance_use_first := QuietButton{text: "填入首个模型" height: 30}
+                                            }
+                                        }
+                                        CheckpointItem{
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                                SpeechLabel{width: Fit text: "2. 语音转写（ASR）"}
+                                                slot_asr_badge := MutedLabel{width: Fill text: "本地模型" draw_text.color: #b7dfc7}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                slot_asr_local := SpeechButton{text: "● 本地模型" height: 30}
+                                                slot_asr_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_asr_model := SpeechInput{width: Fill height: 30 empty_text: "外部 ASR 模型 ID（如 whisper-1）"}
+                                                slot_asr_use_first := QuietButton{text: "填入首个模型" height: 30}
+                                            }
+                                            MutedLabel{text: "外部 ASR 使用 /v1/audio/transcriptions（文件整段与录音后批处理），不提供本地低延迟流式字幕。"}
+                                        }
+                                        CheckpointItem{
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                                SpeechLabel{width: Fit text: "3. 语音合成（TTS）"}
+                                                slot_tts_badge := MutedLabel{width: Fill text: "本地模型" draw_text.color: #b7dfc7}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                slot_tts_local := SpeechButton{text: "● 本地模型" height: 30}
+                                                slot_tts_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_tts_model := SpeechInput{width: Fill height: 30 empty_text: "外部 TTS 模型 ID（如 tts-1）"}
+                                                slot_tts_voice := SpeechInput{width: 110 height: 30 text: "alloy" empty_text: "音色"}
+                                                slot_tts_use_first := QuietButton{text: "填入首个模型" height: 30}
+                                            }
+                                            MutedLabel{text: "外部 TTS 使用 /v1/audio/speech（WAV/PCM 解码），Breeze 本地声音克隆与音色设计将自动禁用。"}
+                                        }
+                                        CheckpointItem{
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                                SpeechLabel{width: Fit text: "4. 文本翻译"}
+                                                slot_translation_badge := MutedLabel{width: Fill text: "本地模型" draw_text.color: #b7dfc7}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                slot_translation_local := SpeechButton{text: "● 本地模型" height: 30}
+                                                slot_translation_external := SpeechButton{text: "外部网关" height: 30}
+                                                slot_translation_model := SpeechInput{width: Fill height: 30 empty_text: "外部翻译模型 ID（如 gpt-4o-mini）"}
+                                                slot_translation_use_first := QuietButton{text: "填入首个模型" height: 30}
+                                            }
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                            slot_save_all := PrimaryButton{text: "保存槽位配置" height: 34}
+                                            slot_save_status := MutedLabel{width: Fill text: ""}
+                                        }
+                                    }
+                                }
                             }
                             page_stage := View{
                                 width: Fill height: Fit flow: Down clip_x: true clip_y: false
@@ -485,7 +608,17 @@ script_mod! {
                                             omni_toggle := QuietButton{text: "全能对话 →" height: 30}
                                             asr_details_toggle := QuietButton{text: "识别设置" height: 30}
                                         }
+                                        asr_provider_badge := MutedLabel{text: "当前提供方：本地模型" draw_text.color: #b7dfc7}
                                         status := MutedLabel{text: "正在准备转写模型…" draw_text.color: #b7dfc7}
+                                        asr_external_error := RecoveryCard{
+                                            asr_ext_error_info := SpeechLabel{width: Fill text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                asr_ext_retry := PrimaryButton{text: "重试" height: 32}
+                                                asr_ext_switch_local := SpeechButton{text: "切回本地模型" height: 32}
+                                                asr_ext_open_settings := QuietButton{text: "提供方设置" height: 32}
+                                            }
+                                        }
                                         model_progress := RoundedView{
                                             visible: false width: Fill height: 4 padding: 0
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
@@ -552,7 +685,17 @@ script_mod! {
                                         }
                                         asr_translation_group := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 8
-                                                asr_translation_readiness := MutedLabel{text: "尚未载入" draw_text.color: #d7b56a}
+                                            translation_provider_badge := MutedLabel{text: "翻译提供方：本地模型" draw_text.color: #b7dfc7}
+                                            asr_translation_readiness := MutedLabel{text: "尚未载入" draw_text.color: #d7b56a}
+                                            translation_external_error := RecoveryCard{
+                                                translation_ext_error_info := SpeechLabel{width: Fill text: ""}
+                                                View{
+                                                    width: Fill height: Fit flow: Right spacing: 8
+                                                    translation_ext_retry := PrimaryButton{text: "重试翻译" height: 32}
+                                                    translation_ext_switch_local := SpeechButton{text: "切回本地模型" height: 32}
+                                                    translation_ext_open_settings := QuietButton{text: "提供方设置" height: 32}
+                                                }
+                                            }
                                                 View{
                                                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                                 SpeechLabel{text: "翻译为"}
@@ -640,7 +783,24 @@ script_mod! {
                                             SectionLabel{width: Fill text: "让文字开口"}
                                             tts_load := QuietButton{text: "载入模型" height: 30}
                                         }
+                                        tts_provider_badge := MutedLabel{text: "当前提供方：本地模型" draw_text.color: #b7dfc7}
                                         tts_status := MutedLabel{text: "语音模型尚未载入" draw_text.color: #d7b56a}
+                                        tts_external_notice_row := View{
+                                            visible: false width: Fill height: Fit
+                                            tts_external_notice := MutedLabel{text: "" draw_text.color: #d7b56a}
+                                        }
+                                        tts_external_error := RecoveryCard{
+                                            tts_ext_error_info := SpeechLabel{width: Fill text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                tts_ext_retry := PrimaryButton{text: "重试合成" height: 32}
+                                                tts_ext_switch_local := SpeechButton{text: "切回本地模型" height: 32}
+                                            }
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 6
+                                                tts_ext_open_settings := QuietButton{text: "提供方设置" height: 30}
+                                            }
+                                        }
                                         tts_progress := RoundedView{
                                             visible: false width: Fill height: 4 padding: 0
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
@@ -708,6 +868,7 @@ script_mod! {
                                         tts_details_toggle := QuietButton{text: "声音设置" height: 32}
                                         tts_details := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 9
+                                            tts_enhance_provider_badge := MutedLabel{text: "提示词增强提供方：本地模型" draw_text.color: #b7dfc7}
                                             tts_enhance := QuietButton{text: "提示词增强" height: 32}
                                             SpeechLabel{text: "填充方式"}
                                             View{
@@ -715,7 +876,7 @@ script_mod! {
                                                 tts_prefill_dense := SpeechButton{text: "● 稠密 KV" width: Fill height: 30}
                                                 tts_prefill_latent := SpeechButton{text: "隐向量" width: Fill height: 30}
                                             }
-                                            MutedLabel{text: "隐向量缩短 35B 长提示的预填充，需要已拟合的因子文件。"}
+                                            tts_prefill_hint := MutedLabel{text: "隐向量缩短 35B 长提示的预填充，需要已拟合的因子文件。"}
                                             tts_instruction_title := SpeechLabel{text: "声音描述（可选）"}
                                             tts_instruction := SpeechInput{
                                                 width: Fill height: 66 is_multiline: true
@@ -765,6 +926,7 @@ script_mod! {
                                         tts_translate_toggle := QuietButton{text: "翻译这段朗读" height: 32}
                                         tts_translation_panel := View{
                                             visible: false width: Fill height: Fit flow: Down spacing: 8
+                                            tts_translation_provider_badge := MutedLabel{text: "翻译提供方：本地模型" draw_text.color: #b7dfc7}
                                             View{
                                                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                                 SpeechLabel{text: "翻译为"}
@@ -907,7 +1069,17 @@ script_mod! {
                                             SectionLabel{width: Fill text: "画出想象"}
                                             image_load := QuietButton{text: "载入模型" height: 30}
                                         }
+                                        image_rewrite_badge := MutedLabel{text: "提示词改写：本地模型" draw_text.color: #b7dfc7}
                                         image_status := MutedLabel{text: "图像模型尚未载入" draw_text.color: #d7b56a}
+                                        image_rewrite_error := RecoveryCard{
+                                            image_rewrite_error_info := SpeechLabel{width: Fill text: ""}
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                image_rewrite_ext_retry := PrimaryButton{text: "重试改写" height: 32}
+                                                image_rewrite_ext_switch_local := SpeechButton{text: "切回本地模型" height: 32}
+                                                image_rewrite_ext_open_settings := QuietButton{text: "提供方设置" height: 32}
+                                            }
+                                        }
                                         image_progress := RoundedView{
                                             visible: false width: Fill height: 4 padding: 0
                                             draw_bg.color: #344137 draw_bg.border_radius: 2
@@ -984,7 +1156,7 @@ script_mod! {
                                                 draw_text.text_style.font_size: 16
                                             }
                                             View{
-                                                width: Fill height: 48 flow: Right spacing: 10
+                                                width: Fill height: Fit flow: Right spacing: 10
                                                 image_reference_thumb := View{
                                                     visible: false width: Fit height: Fit
                                                     image_reference_preview := Image{width: 48 height: 48 fit: ImageFit.Smallest}
@@ -996,8 +1168,13 @@ script_mod! {
                                                         image_reference_choose := QuietButton{text: "参考图" height: 28}
                                                         image_reference_clear := QuietButton{text: "清除" height: 28}
                                                         image_example := QuietButton{text: "示例描述" height: 28}
+                                                        image_rewrite := SpeechButton{text: "改写提示词" height: 28}
                                                     }
                                                     image_reference_name := MutedLabel{text: "可添加 1–4 张 PNG、JPEG 或 WebP"}
+                                                    image_rewrite_hint_row := View{
+                                                        visible: false width: Fill height: Fit
+                                                        image_rewrite_hint := MutedLabel{text: "" draw_text.color: #d7b56a}
+                                                    }
                                                 }
                                             }
                                         }
@@ -1236,8 +1413,9 @@ impl MatchEvent for App {
             self.ui
                 .label(cx, ids!(app_subtitle))
                 .set_text(cx, "声音、文字、图像与音乐");
-            self.open_transcription(cx, &root);
             self.initialize_downloads(cx, &root);
+            self.open_transcription(cx, &root);
+            self.sync_transcription_download_directory(cx);
         }
         #[cfg(target_arch = "wasm32")]
         {

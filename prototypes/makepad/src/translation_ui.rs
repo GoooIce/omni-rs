@@ -5,6 +5,7 @@ use crate::{
     App,
 };
 use makepad_widgets::*;
+use omni_hub::providers::CapabilitySlot;
 use omni_hy_mt::{Options, Request};
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ pub struct State {
     current: Option<(u64, usize)>,
     pending: Option<Request>,
     results: [String; 2],
+    last_external: Option<(usize, Request)>,
 }
 impl State {
     pub fn ready(&self) -> bool {
@@ -57,10 +59,30 @@ impl State {
             current: None,
             pending: None,
             results: Default::default(),
+            last_external: None,
         }
     }
 }
 impl App {
+    pub fn on_translation_provider_changed(&mut self, cx: &mut Cx) {
+        self.ui
+            .view(cx, ids!(translation_external_error))
+            .set_visible(cx, false);
+        if self.slot_is_external(CapabilitySlot::Translation) {
+            self.ui
+                .view(cx, ids!(translation_recovery))
+                .set_visible(cx, false);
+            self.translation_status(
+                cx,
+                &format!(
+                    "翻译已切至{} · 可直接翻译",
+                    self.slot_badge(CapabilitySlot::Translation)
+                ),
+            );
+        } else {
+            self.translation_status(cx, "翻译已切回本地模型 · Hy-MT2-7B");
+        }
+    }
     pub fn stop_translation(&mut self, cx: &mut Cx) {
         let Some(state) = self.translation.as_mut() else {
             return;
@@ -88,13 +110,15 @@ impl App {
     }
     pub fn refresh_translation_controls(&mut self, cx: &mut Cx) {
         let other_busy = self.runtime.busy() || self.runtime.dialog_busy();
+        let external = self.slot_is_external(CapabilitySlot::Translation);
         let Some(state) = self.translation.as_ref() else {
             return;
         };
+        let effective_ready = external || state.ready;
         let idle = !state.busy && !other_busy;
         self.ui.button(cx, ids!(asr_translate)).set_text(
             cx,
-            if state.ready {
+            if effective_ready {
                 "翻译"
             } else {
                 "载入翻译模型"
@@ -102,7 +126,9 @@ impl App {
         );
         self.ui.label(cx, ids!(asr_translation_readiness)).set_text(
             cx,
-            if state.ready {
+            if external {
+                "翻译上面的转写 · 外部网关已就绪"
+            } else if state.ready {
                 "翻译上面的转写 · 模型已就绪"
             } else {
                 "翻译上面的转写 · 模型尚未载入"
@@ -110,7 +136,7 @@ impl App {
         );
         self.ui.button(cx, ids!(asr_translate)).set_action_enabled(
             cx,
-            idle && (!state.ready || !self.transcription.transcript().is_empty()),
+            idle && (!effective_ready || !self.transcription.transcript().is_empty()),
         );
         self.ui
             .button(cx, ids!(tts_translate))
@@ -122,8 +148,12 @@ impl App {
                 .set_action_enabled(cx, state.busy && !state.stopping && !state.picking);
         }
         for id in [ids!(asr_translation_model), ids!(tts_translation_model)] {
-            self.ui.button(cx, id).set_visible(cx, state.ready);
-            self.ui.button(cx, id).set_action_enabled(cx, idle);
+            self.ui
+                .button(cx, id)
+                .set_visible(cx, !external && state.ready);
+            self.ui
+                .button(cx, id)
+                .set_action_enabled(cx, idle && !external);
         }
         let asr_result = !state.results[0].is_empty();
         self.ui
@@ -168,6 +198,47 @@ impl App {
     fn submit_translation(&mut self, cx: &mut Cx, origin: usize, request: Request) {
         if let Err(error) = request.validate() {
             self.translation_status(cx, &error.to_string());
+            return;
+        }
+        let external = self.slot_is_external(CapabilitySlot::Translation);
+        if external {
+            let target = match self.resolve_slot_external(CapabilitySlot::Translation) {
+                Ok(Some(t)) => t,
+                Ok(None) => return,
+                Err(err) => {
+                    self.ui
+                        .label(cx, ids!(translation_ext_error_info))
+                        .set_text(cx, &format!("外部翻译失败（不会静默回退本地）：{err}"));
+                    self.ui
+                        .view(cx, ids!(translation_external_error))
+                        .set_visible(cx, true);
+                    self.translation_status(cx, &err);
+                    return;
+                }
+            };
+            self.ui
+                .view(cx, ids!(translation_external_error))
+                .set_visible(cx, false);
+            let badge = target.display_badge();
+            let state = self.translation.as_mut().unwrap();
+            state.next_id += 1;
+            state.current = Some((state.next_id, origin));
+            state.busy = true;
+            state.stopping = false;
+            state.pending = None;
+            state.last_external = Some((origin, request.clone()));
+            let command = Command::TranslateExternal {
+                job_id: state.next_id,
+                request,
+                target,
+            };
+            if let Err(error) = state.engine.submit(command) {
+                state.busy = false;
+                state.current = None;
+                self.translation_status(cx, &error.to_string());
+            } else {
+                self.translation_status(cx, &format!("正在通过 {badge} 翻译…"));
+            }
             return;
         }
         let state = self.translation.as_mut().unwrap();
@@ -298,7 +369,38 @@ impl App {
                 self.ui.text_input(cx, ids!(tts_text)).set_text(cx, text);
             }
         }
+        if self
+            .ui
+            .button(cx, ids!(translation_ext_switch_local))
+            .clicked(actions)
+        {
+            self.switch_slot_to_local(cx, CapabilitySlot::Translation);
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(translation_ext_open_settings))
+            .clicked(actions)
+        {
+            self.open_providers_settings(cx);
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(translation_ext_retry))
+            .clicked(actions)
+        {
+            if let Some((origin, request)) = self
+                .translation
+                .as_ref()
+                .and_then(|s| s.last_external.clone())
+            {
+                self.submit_translation(cx, origin, request);
+            }
+            return;
+        }
         if self.ui.button(cx, ids!(asr_translate)).clicked(actions)
+            && !self.slot_is_external(CapabilitySlot::Translation)
             && !self.translation.as_ref().is_some_and(|state| state.ready())
         {
             self.load_translation_model(cx);
@@ -398,7 +500,17 @@ impl App {
                     if update.kind != "error" {
                         state.ready = false;
                     }
-                    if update.kind == "missing" {
+                    if self.slot_is_external(CapabilitySlot::Translation) {
+                        self.ui
+                            .label(cx, ids!(translation_ext_error_info))
+                            .set_text(
+                                cx,
+                                &format!("外部翻译失败（不会静默回退本地）：{}", update.message),
+                            );
+                        self.ui
+                            .view(cx, ids!(translation_external_error))
+                            .set_visible(cx, true);
+                    } else if update.kind == "missing" {
                         self.notify_panel_missing(cx, omni_hub::catalog::CheckpointId::HyMt2_7b);
                     }
                 }
