@@ -26,6 +26,13 @@ impl State {
     pub fn ready(&self) -> bool {
         self.ready
     }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn set_directory(&mut self, dir: PathBuf) {
+        self.path = dir;
+        self.ready = false;
+    }
     pub fn running(&self) -> Option<bool> {
         (self.busy && !self.picking).then_some(self.stopping)
     }
@@ -186,6 +193,24 @@ impl App {
             self.translation_status(cx, "正在准备翻译 · 首次使用会载入 Hy-MT2-7B…");
         }
     }
+    pub fn open_translation_folder_picker(&mut self, cx: &mut Cx) {
+        if self.runtime.busy()
+            || self.runtime.dialog_busy()
+            || self.translation.as_ref().is_some_and(|s| s.busy)
+        {
+            return;
+        }
+        let Some(state) = self.translation.as_mut() else {
+            return;
+        };
+        let Some(dialog) = self.runtime.dialog("translation") else {
+            return;
+        };
+        state.dialog = Some(dialog);
+        state.picking = true;
+        state.busy = true;
+        crate::engine_ui::choose_directory(cx, &state.path, "选择 Hy-MT2-7B 模型目录");
+    }
     pub fn handle_translation_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         if self.translation.is_none() {
             return;
@@ -200,8 +225,14 @@ impl App {
                     state.dialog.take();
                     state.picking = false;
                     state.busy = false;
-                    state.path = model_location::selected_directory(path);
+                    let selected = model_location::selected_directory(path);
+                    state.path = selected.clone();
                     state.ready = false;
+                    self.sync_checkpoint_directory(
+                        cx,
+                        omni_hub::catalog::CheckpointId::HyMt2_7b,
+                        selected,
+                    );
                     self.translation_status(cx, "翻译目录已选择 · 点击翻译以载入模型");
                 }
                 Some(FileDialogAction::FolderCancelled) => {
@@ -366,6 +397,9 @@ impl App {
                     state.pending = None;
                     if update.kind != "error" {
                         state.ready = false;
+                    }
+                    if update.kind == "missing" {
+                        self.notify_panel_missing(cx, omni_hub::catalog::CheckpointId::HyMt2_7b);
                     }
                 }
                 _ => {}

@@ -95,7 +95,7 @@ class App:
             # below the fold is still open; its toggle records that state.
             if name in controls and "收起" not in self.widget(toggle)["t"]:
                 self.click(toggle)
-        fixed = {"language_tab", "creative_tab", "running_stop", "playback_stop"}
+        fixed = {"language_tab", "creative_tab", "settings_toggle", "running_stop", "playback_stop"}
         translation = {"tts_translate", "tts_translation", "tts_translation_use", "tts_translation_model",
                        "tts_translation_language", "tts_translation_stop", "tts_translation_status"}
         if name in translation and "收起" not in self.widget("tts_translate_toggle")["t"]:
@@ -233,13 +233,18 @@ def main():
     for name in ("tokenizer.json", "model.safetensors"):
         (chosen / name).symlink_to(MODEL / name)
     (chosen / "config.json").write_text("{}")
-    with launch("recovery", [None, str(empty), None, str(chosen / "config.json")], out / "missing") as app:
+    with launch("recovery", [None, str(empty), str(chosen / "config.json")], out / "missing") as app:
+        app.wait(lambda: (w := app.widget("choose_model")) and w["enabled"] and w["r"][3] > 0, 30)
+        assert not app.events("picker-test"), "missing model must show inline recovery card instead of auto-opening modal picker"
+        assert app.widget("asr_download_model")["enabled"]
+        assert app.widget("asr_open_settings")["enabled"]
+        assert app.widget("retry_model")["enabled"]
+        app.click("choose_model")
         app.cancelled(1)
         app.screenshot("cancelled")
         assert not settings.exists()
         app.click("choose_model")
-        app.cancelled(3)
-        assert len([e for e in app.events() if e["kind"] == "missing"]) == 2
+        app.wait(lambda: len([e for e in app.events() if e["kind"] == "missing"]) == 2 and app.widget("choose_model")["enabled"], 30)
         app.click("choose_model")
         app.wait(lambda: app.widget("status")["t"].startswith("错误：") and app.widget("retry_model")["enabled"])
         assert not settings.exists(), "failed selection must not be persisted"
@@ -249,7 +254,7 @@ def main():
         app.click("retry_model")
         app.ready()
         assert Path(json.loads(settings.read_text())["model_directory"]) == chosen.resolve()
-        report["checks"].append("missing default opens picker; cancel and invalid folder recover; selected file resolves its directory")
+        report["checks"].append("missing default shows inline recovery card; manual folder picker cancel and invalid folder recover; selected file resolves its directory")
         report["checks"].append("corrupt config reports load error; repaired model retries; only successful choice persists")
 
     with launch("remembered", []) as app:
@@ -261,10 +266,13 @@ def main():
     chosen.rename(moved)
     try:
         with launch("moved", [None]) as app:
-            app.cancelled(1)
+            app.wait(lambda: (w := app.widget("choose_model")) and w["enabled"] and w["r"][3] > 0, 30)
+            assert not app.events("picker-test")
             missing = next(e for e in app.events() if e["kind"] == "missing")
             assert str(chosen) in missing["message"]
-            report["checks"].append("remembered directory moved: picker opens again without overwriting preferences")
+            app.click("choose_model")
+            app.cancelled(1)
+            report["checks"].append("remembered directory moved: recovery card opens without overwriting preferences")
     finally:
         moved.rename(chosen)
     (out / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")

@@ -9,6 +9,7 @@ members = [
     "crates/minicpm-v",
     "crates/mtl4",
     "crates/omni-api",
+    "crates/omni-hub",
     "crates/omni-kernel",
     "crates/omni-music",
     "crates/omni-rsi",

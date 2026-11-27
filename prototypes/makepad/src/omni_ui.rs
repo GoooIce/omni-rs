@@ -325,6 +325,9 @@ impl App {
                 state.ready = false;
                 state.loaded_path = None;
                 state.loading_path = None;
+                if update.kind == "missing" {
+                    self.notify_panel_missing(cx, omni_hub::catalog::CheckpointId::Lfm3Omni2b);
+                }
             } else if update.kind == "error" {
                 if state.submitted.is_some() {
                     state.can_continue = false;
@@ -336,10 +339,26 @@ impl App {
             self.omni_transcript(cx);
         }
     }
+    pub fn open_omni_model_picker(&mut self, cx: &mut Cx) {
+        let Some(dialog) = self.runtime.dialog("lfm3-omni") else {
+            return;
+        };
+        let Some(state) = self.omni.as_mut() else {
+            return;
+        };
+        state.dialog = Some(dialog);
+        state.picking = Some(Picking::Model);
+        crate::engine_ui::choose_directory(
+            cx,
+            Path::new(&self.ui.text_input(cx, ids!(omni_model)).text()),
+            "选择 LFM3-Omni-2B 模型目录",
+        );
+    }
     pub fn handle_omni_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         if self.omni.is_none() {
             return;
         }
+        let mut chosen_omni_dir: Option<PathBuf> = None;
         for action in actions {
             let Some(action) = action.downcast_ref::<FileDialogAction>() else {
                 continue;
@@ -349,9 +368,11 @@ impl App {
                 FileDialogAction::FolderSelected(path)
                     if matches!(state.picking, Some(Picking::Model)) =>
                 {
+                    let dir = crate::model_location::selected_directory(path);
                     self.ui
                         .text_input(cx, ids!(omni_model))
-                        .set_text(cx, &path.to_string_lossy());
+                        .set_text(cx, &dir.to_string_lossy());
+                    chosen_omni_dir = Some(dir);
                 }
                 FileDialogAction::FileSelected { paths, .. }
                     if matches!(state.picking, Some(Picking::Media)) =>
@@ -379,6 +400,9 @@ impl App {
             state.picking = None;
             state.dialog = None;
             self.omni_parts(cx);
+        }
+        if let Some(dir) = chosen_omni_dir {
+            self.sync_checkpoint_directory(cx, omni_hub::catalog::CheckpointId::Lfm3Omni2b, dir);
         }
         if self.ui.button(cx, ids!(omni_toggle)).clicked(actions)
             || self.ui.button(cx, ids!(omni_back)).clicked(actions)

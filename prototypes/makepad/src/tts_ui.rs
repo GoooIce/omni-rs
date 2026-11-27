@@ -73,6 +73,23 @@ impl State {
     pub fn needs_model(&self) -> bool {
         !self.ready && !self.loading
     }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn enhancement_checkpoint(&self) -> &Path {
+        &self.checkpoint
+    }
+    pub fn set_directory_ready_for_load(&mut self, dir: PathBuf) {
+        self.path = dir;
+        self.needs_directory = false;
+        self.remember = true;
+        self.ready = false;
+        self.controls = None;
+    }
+    pub fn set_enhancement_checkpoint(&mut self, dir: PathBuf) {
+        self.checkpoint = dir;
+        self.controls = None;
+    }
 
     pub fn new(root: &Path, runtime: crate::desktop_runtime::Runtime) -> Self {
         let settings =
@@ -293,7 +310,11 @@ impl App {
         self.ui
             .view(cx, ids!(tts_recovery))
             .set_visible(cx, !t.ready);
+        let not_ready = !t.ready;
         self.tts_status(cx, &format!("错误：{error}"));
+        if not_ready {
+            self.notify_panel_load_error(cx, omni_hub::catalog::CheckpointId::BreezeTts2, error);
+        }
     }
     pub fn refresh_tts_controls(&mut self, cx: &mut Cx) {
         let other_busy = self.inference_busy();
@@ -514,6 +535,7 @@ impl App {
                     };
                     self.ui.view(cx, ids!(tts_progress)).set_visible(cx, false);
                     self.ui.view(cx, ids!(tts_recovery)).set_visible(cx, false);
+                    self.clear_panel_load_error(cx, omni_hub::catalog::CheckpointId::BreezeTts2);
                     self.tts_status(cx, &update.message);
                     if let Err(error) = result {
                         self.tts_status(cx, &format!("模型已就绪 · 目录未保存：{error}"));
@@ -525,8 +547,9 @@ impl App {
                     self.ui.view(cx, ids!(tts_recovery)).set_visible(cx, true);
                     t.busy = false;
                     t.loading = false;
-                    t.needs_directory = true;
+                    t.needs_directory = false;
                     self.tts_status(cx, &update.message);
+                    self.notify_panel_missing(cx, omni_hub::catalog::CheckpointId::BreezeTts2);
                 }
                 "remembered" => {
                     if let Some(t) = self.tts.as_mut() {
@@ -682,12 +705,18 @@ impl App {
                 Some(FileDialogAction::FolderSelected(path)) if t.picking => {
                     t.dialog.take();
                     t.picking = false;
-                    t.path = model_location::selected_directory(path);
+                    let selected = model_location::selected_directory(path);
+                    t.path = selected.clone();
                     t.remember = true;
                     t.ready = false;
                     t.initialized = false;
                     t.busy = false;
                     t.loading = false;
+                    self.sync_checkpoint_directory(
+                        cx,
+                        omni_hub::catalog::CheckpointId::BreezeTts2,
+                        selected,
+                    );
                     if self.workspace.language() && !self.runtime.busy() {
                         self.load_tts(cx);
                     }

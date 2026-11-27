@@ -67,6 +67,7 @@ omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features =
 omni-music = { path = "../../crates/omni-music", default-features = false }
 omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false }
 omni-lfm3 = { path = "../../crates/lfm3-omni", default-features = false }
+omni-hub = { path = "../../crates/omni-hub", default-features = false }
 burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"], optional = true }
 

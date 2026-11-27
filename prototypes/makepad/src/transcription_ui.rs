@@ -43,7 +43,6 @@ impl State {
         &self.transcript
     }
 
-    #[cfg(target_arch = "wasm32")]
     pub fn busy(&self) -> bool {
         self.busy
     }
@@ -55,6 +54,30 @@ impl State {
 }
 
 impl App {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn transcription_directory(&self) -> Option<std::path::PathBuf> {
+        (!self.transcription.directory.is_empty())
+            .then(|| std::path::PathBuf::from(&self.transcription.directory))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_downloaded_asr_directory(&mut self, cx: &mut Cx, dir: &std::path::Path) {
+        self.transcription.directory = dir.to_string_lossy().into_owned();
+        self.ui
+            .text_input(cx, ids!(model_path))
+            .set_text(cx, &self.transcription.directory);
+        self.transcription.remember_model = true;
+        self.transcription.needs_directory = false;
+        self.transcription.ready = false;
+        self.transcription.pending_model_load = true;
+        self.ui
+            .view(cx, ids!(model_recovery))
+            .set_visible(cx, false);
+        self.status(cx, "Confucius4-R2T2 下载并校验完成 · 正在自动载入…");
+        if self.workspace.language() && !self.inference_busy() && !self.transcription.busy {
+            self.start_model_load(cx);
+        }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_transcription(&mut self, cx: &mut Cx, root: &std::path::Path) {
         self.transcription.settings_path = model_location::settings_path();
@@ -476,6 +499,10 @@ impl App {
                 self.status(cx, &update.message);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
+                    self.clear_panel_load_error(
+                        cx,
+                        omni_hub::catalog::CheckpointId::Confucius4R2t2,
+                    );
                     self.ui
                         .view(cx, ids!(model_progress))
                         .set_visible(cx, false);
@@ -516,7 +543,8 @@ impl App {
                 self.ui.view(cx, ids!(model_recovery)).set_visible(cx, true);
                 self.transcription.busy = false;
                 self.transcription.loading = false;
-                self.transcription.needs_directory = true;
+                self.transcription.needs_directory = false;
+                self.notify_panel_missing(cx, omni_hub::catalog::CheckpointId::Confucius4R2t2);
             }
             "capture" => {
                 if self.transcription.microphone && self.transcription.busy {
@@ -608,6 +636,11 @@ impl App {
                         .view(cx, ids!(model_progress))
                         .set_visible(cx, false);
                     self.ui.view(cx, ids!(model_recovery)).set_visible(cx, true);
+                    self.notify_panel_load_error(
+                        cx,
+                        omni_hub::catalog::CheckpointId::Confucius4R2t2,
+                        &update.message,
+                    );
                 }
             }
             _ => (),
@@ -723,6 +756,11 @@ impl App {
                         self.transcription.busy = false;
                         self.transcription.loading = false;
                         self.transcription.pending_model_load = true;
+                        self.sync_checkpoint_directory(
+                            cx,
+                            omni_hub::catalog::CheckpointId::Confucius4R2t2,
+                            directory,
+                        );
                         if self.workspace.language() && !self.inference_busy() {
                             self.start_model_load(cx);
                         }
