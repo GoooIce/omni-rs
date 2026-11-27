@@ -9,7 +9,8 @@ description = "Resin EngineCore serving stack driven from Rust with local model 
 
 [features]
 default = ["metal"]
-metal = ["omni-minicpm-v/metal", "burn/metal", "burn/autotune"]
+wgpu = ["omni-minicpm-v/wgpu", "burn/wgpu", "burn/autotune"]
+metal = ["wgpu", "omni-minicpm-v/metal", "burn/metal"]
 cpu = ["omni-minicpm-v/cpu", "burn/ndarray"]
 
 [dependencies]

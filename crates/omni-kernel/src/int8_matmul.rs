@@ -6,409 +6,461 @@
 //! `matmul2d`, the measured faster path. Other devices, and
 //! `OMNI_CONVROT_TENSOROPS=0`, keep the scalar CubeCL kernel. Weights stay
 //! packed and are not expanded to FP16.
-use crate::{Metal, Raw, RawTensor, Runtime};
-use burn::tensor::{
-    DType, FloatDType, Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive,
-    backend::Backend,
-};
+#[cfg(feature = "wgpu")]
+use crate::{Metal, Raw, RawTensor, RawWgpu, Wgpu};
+use burn::tensor::{DType, FloatDType, Tensor as BurnTensor, backend::Backend};
+#[cfg(feature = "wgpu")]
+use burn::tensor::{Shape, TensorMetadata, TensorPrimitive};
+#[cfg(feature = "wgpu")]
 use burn_fusion::{
-    FusionRuntime, FusionTensor,
+    FusionBackend, FusionRuntime, FusionTensor,
     stream::{Operation, OperationStreams},
 };
+#[cfg(feature = "wgpu")]
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
+#[cfg(feature = "wgpu")]
 use cubecl::{CubeCount, CubeDim, prelude::*, wgpu::WgpuRuntime};
+#[cfg(feature = "wgpu")]
 use std::any::Any;
 
-/// One cube per row, 256 threads. A 4096-wide denoiser row is not scanned by one thread.
-#[cube(launch_unchecked)]
-fn quantize_rows(
-    x: &Tensor<f32>,
-    packed: &mut Tensor<i32>,
-    scale: &mut Tensor<f32>,
-    sum: &mut Tensor<i32>,
-    words: u32,
-    #[comptime] write_sum: bool,
-) {
-    let mut peaks = SharedMemory::<f32>::new(256usize);
-    let mut totals = SharedMemory::<i32>::new(256usize);
-    let row = CUBE_POS_X as usize;
-    let tx = UNIT_POS_X as usize;
-    let count = words as usize;
-    let width = count * 4;
-    let stride0 = x.stride(0) as usize;
-    let stride1 = x.stride(1) as usize;
-    let mut peak = 0.0f32;
-    let steps = (width + 255usize) / 256usize;
-    let word_steps = (count + 255usize) / 256usize;
-    for step in 0..steps {
-        let column = tx + step * 256usize;
-        if column < width {
-            let value = x[row * stride0 + column * stride1];
-            let magnitude = if value < 0.0 { -value } else { value };
-            if magnitude > peak {
-                peak = magnitude;
+/// Whether the Apple10 64×64 int8 `matmul2d` TensorOps lowering is compiled in.
+pub const fn apple_tensorops_compiled() -> bool {
+    cfg!(all(
+        feature = "metal",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))
+}
+
+#[cfg(feature = "wgpu")]
+mod gpu {
+    use super::*;
+
+    /// One cube per row, 256 threads. A 4096-wide denoiser row is not scanned by one thread.
+    #[cube(launch_unchecked)]
+    fn quantize_rows(
+        x: &Tensor<f32>,
+        packed: &mut Tensor<i32>,
+        scale: &mut Tensor<f32>,
+        sum: &mut Tensor<i32>,
+        words: u32,
+        #[comptime] write_sum: bool,
+    ) {
+        let mut peaks = SharedMemory::<f32>::new(256usize);
+        let mut totals = SharedMemory::<i32>::new(256usize);
+        let row = CUBE_POS_X as usize;
+        let tx = UNIT_POS_X as usize;
+        let count = words as usize;
+        let width = count * 4;
+        let stride0 = x.stride(0) as usize;
+        let stride1 = x.stride(1) as usize;
+        let mut peak = 0.0f32;
+        let steps = (width + 255usize) / 256usize;
+        let word_steps = (count + 255usize) / 256usize;
+        for step in 0..steps {
+            let column = tx + step * 256usize;
+            if column < width {
+                let value = x[row * stride0 + column * stride1];
+                let magnitude = if value < 0.0 { -value } else { value };
+                if magnitude > peak {
+                    peak = magnitude;
+                }
             }
         }
-    }
-    peaks[tx] = peak;
-    sync_cube();
-    if tx == 0usize {
-        let mut maxp = 0.0f32;
-        for i in 0..256usize {
-            let value = peaks[i];
-            if value > maxp {
-                maxp = value;
-            }
-        }
-        let floor = f32::new(1.0e-30_f32);
-        let row_scale = if maxp / 127.0 > floor {
-            maxp / 127.0
-        } else {
-            floor
-        };
-        scale[row] = row_scale;
-        peaks[0] = row_scale;
-    }
-    sync_cube();
-    let row_scale = peaks[0];
-    let mut local = 0i32;
-    for step in 0..word_steps {
-        let word = tx + step * 256usize;
-        if word < count {
-            let base = row * stride0 + word * 4 * stride1;
-            let q0 = quantize_i8(x[base] / row_scale);
-            let q1 = quantize_i8(x[base + stride1] / row_scale);
-            let q2 = quantize_i8(x[base + stride1 * 2] / row_scale);
-            let q3 = quantize_i8(x[base + stride1 * 3] / row_scale);
-            let packed_word =
-                (q0 & 255) | ((q1 & 255) << 8) | ((q2 & 255) << 16) | ((q3 & 255) << 24);
-            packed[row * count + word] = packed_word;
-            local += sum4(packed_word);
-        }
-    }
-    if comptime!(write_sum) {
-        totals[tx] = local;
+        peaks[tx] = peak;
         sync_cube();
         if tx == 0usize {
-            let mut total = 0i32;
+            let mut maxp = 0.0f32;
             for i in 0..256usize {
-                total += totals[i];
+                let value = peaks[i];
+                if value > maxp {
+                    maxp = value;
+                }
             }
-            sum[row] = total;
+            let floor = f32::new(1.0e-30_f32);
+            let row_scale = if maxp / 127.0 > floor {
+                maxp / 127.0
+            } else {
+                floor
+            };
+            scale[row] = row_scale;
+            peaks[0] = row_scale;
+        }
+        sync_cube();
+        let row_scale = peaks[0];
+        let mut local = 0i32;
+        for step in 0..word_steps {
+            let word = tx + step * 256usize;
+            if word < count {
+                let base = row * stride0 + word * 4 * stride1;
+                let q0 = quantize_i8(x[base] / row_scale);
+                let q1 = quantize_i8(x[base + stride1] / row_scale);
+                let q2 = quantize_i8(x[base + stride1 * 2] / row_scale);
+                let q3 = quantize_i8(x[base + stride1 * 3] / row_scale);
+                let packed_word =
+                    (q0 & 255) | ((q1 & 255) << 8) | ((q2 & 255) << 16) | ((q3 & 255) << 24);
+                packed[row * count + word] = packed_word;
+                local += sum4(packed_word);
+            }
+        }
+        if comptime!(write_sum) {
+            totals[tx] = local;
+            sync_cube();
+            if tx == 0usize {
+                let mut total = 0i32;
+                for i in 0..256usize {
+                    total += totals[i];
+                }
+                sum[row] = total;
+            }
         }
     }
-}
 
-#[cube]
-fn quantize_i8(value: f32) -> i32 {
-    // Half away from zero, matching `round_half_away` on the host.
-    let magnitude = if value >= 0.0 { value } else { -value };
-    let rounded = f32::floor(magnitude + 0.5);
-    let signed = if value >= 0.0 { rounded } else { -rounded };
-    let hi = f32::new(127.0_f32);
-    let lo = f32::new(-128.0_f32);
-    let clamped = if signed > hi {
-        hi
-    } else if signed < lo {
-        lo
-    } else {
-        signed
-    };
-    i32::cast_from(clamped)
-}
+    #[cube]
+    fn quantize_i8(value: f32) -> i32 {
+        // Half away from zero, matching `round_half_away` on the host.
+        let magnitude = if value >= 0.0 { value } else { -value };
+        let rounded = f32::floor(magnitude + 0.5);
+        let signed = if value >= 0.0 { rounded } else { -rounded };
+        let hi = f32::new(127.0_f32);
+        let lo = f32::new(-128.0_f32);
+        let clamped = if signed > hi {
+            hi
+        } else if signed < lo {
+            lo
+        } else {
+            signed
+        };
+        i32::cast_from(clamped)
+    }
 
-/// Sign-extend one little-endian byte. `shift` is 0, 8, 16, or 24.
-#[cube]
-fn sext(word: i32, shift: i32) -> i32 {
-    let byte = (word >> shift) & 255;
-    byte - ((byte >> 7) * 256)
-}
+    /// Sign-extend one little-endian byte. `shift` is 0, 8, 16, or 24.
+    #[cube]
+    fn sext(word: i32, shift: i32) -> i32 {
+        let byte = (word >> shift) & 255;
+        byte - ((byte >> 7) * 256)
+    }
 
-#[cube]
-fn dot4(x_word: i32, w_word: i32) -> i32 {
-    let x0 = sext(x_word, 0);
-    let x1 = sext(x_word, 8);
-    let x2 = sext(x_word, 16);
-    let x3 = sext(x_word, 24);
-    let w0 = sext(w_word, 0);
-    let w1 = sext(w_word, 8);
-    let w2 = sext(w_word, 16);
-    let w3 = sext(w_word, 24);
-    x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3
-}
+    #[cube]
+    fn dot4(x_word: i32, w_word: i32) -> i32 {
+        let x0 = sext(x_word, 0);
+        let x1 = sext(x_word, 8);
+        let x2 = sext(x_word, 16);
+        let x3 = sext(x_word, 24);
+        let w0 = sext(w_word, 0);
+        let w1 = sext(w_word, 8);
+        let w2 = sext(w_word, 16);
+        let w3 = sext(w_word, 24);
+        x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3
+    }
 
-#[cube]
-fn sum4(word: i32) -> i32 {
-    sext(word, 0) + sext(word, 8) + sext(word, 16) + sext(word, 24)
-}
+    #[cube]
+    fn sum4(word: i32) -> i32 {
+        sext(word, 0) + sext(word, 8) + sext(word, 16) + sext(word, 24)
+    }
 
-#[cube]
-fn store(
-    out: &mut Tensor<f32>,
-    row: usize,
-    column: usize,
-    acc: i32,
-    sum: i32,
-    row_scale: f32,
-    w_scale: &Tensor<f32>,
-    w_zero: &Tensor<i32>,
-) {
-    let centered = acc - sum * w_zero[column];
-    out[row * out.stride(0) + column * out.stride(1)] =
-        f32::cast_from(centered) * row_scale * w_scale[column];
-}
+    #[cube]
+    fn store(
+        out: &mut Tensor<f32>,
+        row: usize,
+        column: usize,
+        acc: i32,
+        sum: i32,
+        row_scale: f32,
+        w_scale: &Tensor<f32>,
+        w_zero: &Tensor<i32>,
+    ) {
+        let centered = acc - sum * w_zero[column];
+        out[row * out.stride(0) + column * out.stride(1)] =
+            f32::cast_from(centered) * row_scale * w_scale[column];
+    }
 
-/// 64×64 device-tensor int8 `matmul2d`. `MatrixIdent::Accumulator` selects that lowering.
-#[cube]
-#[allow(unused_variables)]
-fn mma_i8_64(
-    x: &Tensor<i32>,
-    w: &Tensor<i32>,
-    y: &mut Tensor<i32>,
-    #[comptime] rows: u32,
-    #[comptime] cols: u32,
-    #[comptime] inner: u32,
-) {
-    intrinsic!(|scope| {
-        use cubecl::ir::{CoopMma, Instruction, Matrix, MatrixIdent, MatrixLayout};
-        scope.register(Instruction::new(
-            CoopMma::ExecuteManual {
-                matrix: Matrix {
-                    ident: MatrixIdent::Accumulator,
-                    m: rows as usize,
-                    n: cols as usize,
-                    k: inner as usize,
-                    storage: i32::as_type(scope).storage_type(),
-                    layout: MatrixLayout::RowMajor,
+    /// 64×64 device-tensor int8 `matmul2d`. `MatrixIdent::Accumulator` selects that lowering.
+    #[cube]
+    #[allow(unused_variables)]
+    fn mma_i8_64(
+        x: &Tensor<i32>,
+        w: &Tensor<i32>,
+        y: &mut Tensor<i32>,
+        #[comptime] rows: u32,
+        #[comptime] cols: u32,
+        #[comptime] inner: u32,
+    ) {
+        intrinsic!(|scope| {
+            use cubecl::ir::{CoopMma, Instruction, Matrix, MatrixIdent, MatrixLayout};
+            scope.register(Instruction::new(
+                CoopMma::ExecuteManual {
+                    matrix: Matrix {
+                        ident: MatrixIdent::Accumulator,
+                        m: rows as usize,
+                        n: cols as usize,
+                        k: inner as usize,
+                        storage: i32::as_type(scope).storage_type(),
+                        layout: MatrixLayout::RowMajor,
+                    },
+                    registers_a: *x.expand,
+                    registers_b: *w.expand,
+                    registers_c: *y.expand,
                 },
-                registers_a: *x.expand,
-                registers_b: *w.expand,
-                registers_c: *y.expand,
-            },
-            *y.expand,
-        ));
-    });
-}
+                *y.expand,
+            ));
+        });
+    }
 
-#[cube(launch_unchecked)]
-fn int8_dot_tile64(
-    x_packed: &Tensor<i32>,
-    w_packed: &Tensor<i32>,
-    acc: &mut Tensor<i32>,
-    x_scale: &Tensor<f32>,
-    x_sum: &Tensor<i32>,
-    w_scale: &Tensor<f32>,
-    w_zero: &Tensor<i32>,
-    out: &mut Tensor<f32>,
-    #[comptime] rows: u32,
-    #[comptime] cols: u32,
-    #[comptime] inner: u32,
-) {
-    mma_i8_64(x_packed, w_packed, acc, rows, cols, inner);
-    let rows = rows as usize;
-    let cols = cols as usize;
-    let tile_row = (CUBE_POS_Y as usize) * 64usize;
-    let tile_col = (CUBE_POS_X as usize) * 64usize;
-    let local = UNIT_POS_X as usize;
-    for step in 0..32usize {
-        let offset = local + step * 128usize;
-        let row = tile_row + offset / 64usize;
-        let col = tile_col + offset % 64usize;
-        if row < rows && col < cols {
-            store(
-                out,
-                row,
-                col,
-                acc[row * cols + col],
-                x_sum[row],
-                x_scale[row],
-                w_scale,
-                w_zero,
-            );
+    #[cube(launch_unchecked)]
+    fn int8_dot_tile64(
+        x_packed: &Tensor<i32>,
+        w_packed: &Tensor<i32>,
+        acc: &mut Tensor<i32>,
+        x_scale: &Tensor<f32>,
+        x_sum: &Tensor<i32>,
+        w_scale: &Tensor<f32>,
+        w_zero: &Tensor<i32>,
+        out: &mut Tensor<f32>,
+        #[comptime] rows: u32,
+        #[comptime] cols: u32,
+        #[comptime] inner: u32,
+    ) {
+        mma_i8_64(x_packed, w_packed, acc, rows, cols, inner);
+        let rows = rows as usize;
+        let cols = cols as usize;
+        let tile_row = (CUBE_POS_Y as usize) * 64usize;
+        let tile_col = (CUBE_POS_X as usize) * 64usize;
+        let local = UNIT_POS_X as usize;
+        for step in 0..32usize {
+            let offset = local + step * 128usize;
+            let row = tile_row + offset / 64usize;
+            let col = tile_col + offset % 64usize;
+            if row < rows && col < cols {
+                store(
+                    out,
+                    row,
+                    col,
+                    acc[row * cols + col],
+                    x_sum[row],
+                    x_scale[row],
+                    w_scale,
+                    w_zero,
+                );
+            }
         }
     }
-}
 
-/// Eight columns per unit, two partial sums per column. The extra accumulators
-/// keep the int8 dot pipeline full on the 4096-wide denoiser projections.
-#[cube(launch_unchecked)]
-fn int8_dot(
-    x_packed: &Tensor<i32>,
-    x_scale: &Tensor<f32>,
-    w_packed: &Tensor<i32>,
-    w_scale: &Tensor<f32>,
-    w_zero: &Tensor<i32>,
-    out: &mut Tensor<f32>,
-    words: u32,
-) {
-    let row = (CUBE_POS_Y as usize) * 16usize + UNIT_POS_Y as usize;
-    let col0 = ((CUBE_POS_X as usize) * 16usize + UNIT_POS_X as usize) * 8usize;
-    let count = words as usize;
-    let columns = w_scale.shape(0);
-    if row < x_scale.shape(0) && col0 + 7usize < columns {
-        let mut a0 = 0i32;
-        let mut a1 = 0i32;
-        let mut a2 = 0i32;
-        let mut a3 = 0i32;
-        let mut a4 = 0i32;
-        let mut a5 = 0i32;
-        let mut a6 = 0i32;
-        let mut a7 = 0i32;
-        let mut b0 = 0i32;
-        let mut b1 = 0i32;
-        let mut b2 = 0i32;
-        let mut b3 = 0i32;
-        let mut b4 = 0i32;
-        let mut b5 = 0i32;
-        let mut b6 = 0i32;
-        let mut b7 = 0i32;
-        let mut sum = 0i32;
-        let pairs = count / 2usize;
-        for pair in 0..pairs {
-            let word = pair * 2usize;
-            let x0 = x_packed[row * count + word];
-            let x1 = x_packed[row * count + word + 1usize];
-            sum += sum4(x0);
-            sum += sum4(x1);
-            a0 += dot4(x0, w_packed[col0 * count + word]);
-            b0 += dot4(x1, w_packed[col0 * count + word + 1usize]);
-            a1 += dot4(x0, w_packed[(col0 + 1usize) * count + word]);
-            b1 += dot4(x1, w_packed[(col0 + 1usize) * count + word + 1usize]);
-            a2 += dot4(x0, w_packed[(col0 + 2usize) * count + word]);
-            b2 += dot4(x1, w_packed[(col0 + 2usize) * count + word + 1usize]);
-            a3 += dot4(x0, w_packed[(col0 + 3usize) * count + word]);
-            b3 += dot4(x1, w_packed[(col0 + 3usize) * count + word + 1usize]);
-            a4 += dot4(x0, w_packed[(col0 + 4usize) * count + word]);
-            b4 += dot4(x1, w_packed[(col0 + 4usize) * count + word + 1usize]);
-            a5 += dot4(x0, w_packed[(col0 + 5usize) * count + word]);
-            b5 += dot4(x1, w_packed[(col0 + 5usize) * count + word + 1usize]);
-            a6 += dot4(x0, w_packed[(col0 + 6usize) * count + word]);
-            b6 += dot4(x1, w_packed[(col0 + 6usize) * count + word + 1usize]);
-            a7 += dot4(x0, w_packed[(col0 + 7usize) * count + word]);
-            b7 += dot4(x1, w_packed[(col0 + 7usize) * count + word + 1usize]);
-        }
-        if pairs * 2usize < count {
-            let word = pairs * 2usize;
-            let x0 = x_packed[row * count + word];
-            sum += sum4(x0);
-            a0 += dot4(x0, w_packed[col0 * count + word]);
-            a1 += dot4(x0, w_packed[(col0 + 1usize) * count + word]);
-            a2 += dot4(x0, w_packed[(col0 + 2usize) * count + word]);
-            a3 += dot4(x0, w_packed[(col0 + 3usize) * count + word]);
-            a4 += dot4(x0, w_packed[(col0 + 4usize) * count + word]);
-            a5 += dot4(x0, w_packed[(col0 + 5usize) * count + word]);
-            a6 += dot4(x0, w_packed[(col0 + 6usize) * count + word]);
-            a7 += dot4(x0, w_packed[(col0 + 7usize) * count + word]);
-        }
-        a0 += b0;
-        a1 += b1;
-        a2 += b2;
-        a3 += b3;
-        a4 += b4;
-        a5 += b5;
-        a6 += b6;
-        a7 += b7;
-        let row_scale = x_scale[row];
-        store(out, row, col0, a0, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 1usize, a1, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 2usize, a2, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 3usize, a3, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 4usize, a4, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 5usize, a5, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 6usize, a6, sum, row_scale, w_scale, w_zero);
-        store(out, row, col0 + 7usize, a7, sum, row_scale, w_scale, w_zero);
-    } else if row < x_scale.shape(0) && col0 < columns {
-        let mut a0 = 0i32;
-        let mut a1 = 0i32;
-        let mut a2 = 0i32;
-        let mut a3 = 0i32;
-        let mut a4 = 0i32;
-        let mut a5 = 0i32;
-        let mut a6 = 0i32;
-        let mut sum = 0i32;
-        for word in 0..count {
-            let x_word = x_packed[row * count + word];
-            sum += sum4(x_word);
-            a0 += dot4(x_word, w_packed[col0 * count + word]);
+    /// Eight columns per unit, two partial sums per column. The extra accumulators
+    /// keep the int8 dot pipeline full on the 4096-wide denoiser projections.
+    #[cube(launch_unchecked)]
+    fn int8_dot(
+        x_packed: &Tensor<i32>,
+        x_scale: &Tensor<f32>,
+        w_packed: &Tensor<i32>,
+        w_scale: &Tensor<f32>,
+        w_zero: &Tensor<i32>,
+        out: &mut Tensor<f32>,
+        words: u32,
+    ) {
+        let row = (CUBE_POS_Y as usize) * 16usize + UNIT_POS_Y as usize;
+        let col0 = ((CUBE_POS_X as usize) * 16usize + UNIT_POS_X as usize) * 8usize;
+        let count = words as usize;
+        let columns = w_scale.shape(0);
+        if row < x_scale.shape(0) && col0 + 7usize < columns {
+            let mut a0 = 0i32;
+            let mut a1 = 0i32;
+            let mut a2 = 0i32;
+            let mut a3 = 0i32;
+            let mut a4 = 0i32;
+            let mut a5 = 0i32;
+            let mut a6 = 0i32;
+            let mut a7 = 0i32;
+            let mut b0 = 0i32;
+            let mut b1 = 0i32;
+            let mut b2 = 0i32;
+            let mut b3 = 0i32;
+            let mut b4 = 0i32;
+            let mut b5 = 0i32;
+            let mut b6 = 0i32;
+            let mut b7 = 0i32;
+            let mut sum = 0i32;
+            let pairs = count / 2usize;
+            for pair in 0..pairs {
+                let word = pair * 2usize;
+                let x0 = x_packed[row * count + word];
+                let x1 = x_packed[row * count + word + 1usize];
+                sum += sum4(x0);
+                sum += sum4(x1);
+                a0 += dot4(x0, w_packed[col0 * count + word]);
+                b0 += dot4(x1, w_packed[col0 * count + word + 1usize]);
+                a1 += dot4(x0, w_packed[(col0 + 1usize) * count + word]);
+                b1 += dot4(x1, w_packed[(col0 + 1usize) * count + word + 1usize]);
+                a2 += dot4(x0, w_packed[(col0 + 2usize) * count + word]);
+                b2 += dot4(x1, w_packed[(col0 + 2usize) * count + word + 1usize]);
+                a3 += dot4(x0, w_packed[(col0 + 3usize) * count + word]);
+                b3 += dot4(x1, w_packed[(col0 + 3usize) * count + word + 1usize]);
+                a4 += dot4(x0, w_packed[(col0 + 4usize) * count + word]);
+                b4 += dot4(x1, w_packed[(col0 + 4usize) * count + word + 1usize]);
+                a5 += dot4(x0, w_packed[(col0 + 5usize) * count + word]);
+                b5 += dot4(x1, w_packed[(col0 + 5usize) * count + word + 1usize]);
+                a6 += dot4(x0, w_packed[(col0 + 6usize) * count + word]);
+                b6 += dot4(x1, w_packed[(col0 + 6usize) * count + word + 1usize]);
+                a7 += dot4(x0, w_packed[(col0 + 7usize) * count + word]);
+                b7 += dot4(x1, w_packed[(col0 + 7usize) * count + word + 1usize]);
+            }
+            if pairs * 2usize < count {
+                let word = pairs * 2usize;
+                let x0 = x_packed[row * count + word];
+                sum += sum4(x0);
+                a0 += dot4(x0, w_packed[col0 * count + word]);
+                a1 += dot4(x0, w_packed[(col0 + 1usize) * count + word]);
+                a2 += dot4(x0, w_packed[(col0 + 2usize) * count + word]);
+                a3 += dot4(x0, w_packed[(col0 + 3usize) * count + word]);
+                a4 += dot4(x0, w_packed[(col0 + 4usize) * count + word]);
+                a5 += dot4(x0, w_packed[(col0 + 5usize) * count + word]);
+                a6 += dot4(x0, w_packed[(col0 + 6usize) * count + word]);
+                a7 += dot4(x0, w_packed[(col0 + 7usize) * count + word]);
+            }
+            a0 += b0;
+            a1 += b1;
+            a2 += b2;
+            a3 += b3;
+            a4 += b4;
+            a5 += b5;
+            a6 += b6;
+            a7 += b7;
+            let row_scale = x_scale[row];
+            store(out, row, col0, a0, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 1usize, a1, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 2usize, a2, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 3usize, a3, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 4usize, a4, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 5usize, a5, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 6usize, a6, sum, row_scale, w_scale, w_zero);
+            store(out, row, col0 + 7usize, a7, sum, row_scale, w_scale, w_zero);
+        } else if row < x_scale.shape(0) && col0 < columns {
+            let mut a0 = 0i32;
+            let mut a1 = 0i32;
+            let mut a2 = 0i32;
+            let mut a3 = 0i32;
+            let mut a4 = 0i32;
+            let mut a5 = 0i32;
+            let mut a6 = 0i32;
+            let mut sum = 0i32;
+            for word in 0..count {
+                let x_word = x_packed[row * count + word];
+                sum += sum4(x_word);
+                a0 += dot4(x_word, w_packed[col0 * count + word]);
+                if col0 + 1usize < columns {
+                    a1 += dot4(x_word, w_packed[(col0 + 1usize) * count + word]);
+                }
+                if col0 + 2usize < columns {
+                    a2 += dot4(x_word, w_packed[(col0 + 2usize) * count + word]);
+                }
+                if col0 + 3usize < columns {
+                    a3 += dot4(x_word, w_packed[(col0 + 3usize) * count + word]);
+                }
+                if col0 + 4usize < columns {
+                    a4 += dot4(x_word, w_packed[(col0 + 4usize) * count + word]);
+                }
+                if col0 + 5usize < columns {
+                    a5 += dot4(x_word, w_packed[(col0 + 5usize) * count + word]);
+                }
+                if col0 + 6usize < columns {
+                    a6 += dot4(x_word, w_packed[(col0 + 6usize) * count + word]);
+                }
+            }
+            let row_scale = x_scale[row];
+            store(out, row, col0, a0, sum, row_scale, w_scale, w_zero);
             if col0 + 1usize < columns {
-                a1 += dot4(x_word, w_packed[(col0 + 1usize) * count + word]);
+                store(out, row, col0 + 1usize, a1, sum, row_scale, w_scale, w_zero);
             }
             if col0 + 2usize < columns {
-                a2 += dot4(x_word, w_packed[(col0 + 2usize) * count + word]);
+                store(out, row, col0 + 2usize, a2, sum, row_scale, w_scale, w_zero);
             }
             if col0 + 3usize < columns {
-                a3 += dot4(x_word, w_packed[(col0 + 3usize) * count + word]);
+                store(out, row, col0 + 3usize, a3, sum, row_scale, w_scale, w_zero);
             }
             if col0 + 4usize < columns {
-                a4 += dot4(x_word, w_packed[(col0 + 4usize) * count + word]);
+                store(out, row, col0 + 4usize, a4, sum, row_scale, w_scale, w_zero);
             }
             if col0 + 5usize < columns {
-                a5 += dot4(x_word, w_packed[(col0 + 5usize) * count + word]);
+                store(out, row, col0 + 5usize, a5, sum, row_scale, w_scale, w_zero);
             }
             if col0 + 6usize < columns {
-                a6 += dot4(x_word, w_packed[(col0 + 6usize) * count + word]);
+                store(out, row, col0 + 6usize, a6, sum, row_scale, w_scale, w_zero);
             }
         }
-        let row_scale = x_scale[row];
-        store(out, row, col0, a0, sum, row_scale, w_scale, w_zero);
-        if col0 + 1usize < columns {
-            store(out, row, col0 + 1usize, a1, sum, row_scale, w_scale, w_zero);
-        }
-        if col0 + 2usize < columns {
-            store(out, row, col0 + 2usize, a2, sum, row_scale, w_scale, w_zero);
-        }
-        if col0 + 3usize < columns {
-            store(out, row, col0 + 3usize, a3, sum, row_scale, w_scale, w_zero);
-        }
-        if col0 + 4usize < columns {
-            store(out, row, col0 + 4usize, a4, sum, row_scale, w_scale, w_zero);
-        }
-        if col0 + 5usize < columns {
-            store(out, row, col0 + 5usize, a5, sum, row_scale, w_scale, w_zero);
-        }
-        if col0 + 6usize < columns {
-            store(out, row, col0 + 6usize, a6, sum, row_scale, w_scale, w_zero);
-        }
     }
-}
 
-fn empty_tensor(like: &RawTensor, shape: Shape, dtype: DType) -> RawTensor {
-    let bytes = shape.iter().product::<usize>() * dtype.size();
-    RawTensor::new_contiguous(
-        like.client.clone(),
-        like.device.clone(),
-        shape,
-        like.client.empty(bytes),
-        dtype,
-    )
-}
+    fn empty_tensor(like: &RawTensor, shape: Shape, dtype: DType) -> RawTensor {
+        let bytes = shape.iter().product::<usize>() * dtype.size();
+        RawTensor::new_contiguous(
+            like.client.clone(),
+            like.device.clone(),
+            shape,
+            like.client.empty(bytes),
+            dtype,
+        )
+    }
 
-fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTensor) -> RawTensor {
-    let tile64 = {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            crate::int8_tensorops::enabled(&x)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            false
-        }
-    };
-    let x_shape = x.shape();
-    let rows = x_shape[0];
-    let width = x_shape[1];
-    let columns = w_scale.shape()[0];
-    let words = width / 4;
-    let client = x.client.clone();
-    let x_packed = empty_tensor(&x, Shape::new([rows * words]), DType::I32);
-    let x_scale = empty_tensor(&x, Shape::new([rows]), DType::F32);
-    let x_sum = empty_tensor(&x, Shape::new([rows]), DType::I32);
-    let out = empty_tensor(&x, Shape::new([rows, columns]), DType::F32);
-    let w_packed = burn_cubecl::kernel::into_contiguous(w_packed);
-    let w_scale = burn_cubecl::kernel::into_contiguous(w_scale);
-    let w_zero = burn_cubecl::kernel::into_contiguous(w_zero);
-    unsafe {
-        if tile64 {
+    fn launch(
+        x: RawTensor,
+        w_packed: RawTensor,
+        w_scale: RawTensor,
+        w_zero: RawTensor,
+    ) -> RawTensor {
+        let tile64 = {
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            {
+                crate::int8_tensorops::enabled(&x)
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+            {
+                false
+            }
+        };
+        let x_shape = x.shape();
+        let rows = x_shape[0];
+        let width = x_shape[1];
+        let columns = w_scale.shape()[0];
+        let words = width / 4;
+        let client = x.client.clone();
+        let x_packed = empty_tensor(&x, Shape::new([rows * words]), DType::I32);
+        let x_scale = empty_tensor(&x, Shape::new([rows]), DType::F32);
+        let x_sum = empty_tensor(&x, Shape::new([rows]), DType::I32);
+        let out = empty_tensor(&x, Shape::new([rows, columns]), DType::F32);
+        let w_packed = burn_cubecl::kernel::into_contiguous(w_packed);
+        let w_scale = burn_cubecl::kernel::into_contiguous(w_scale);
+        let w_zero = burn_cubecl::kernel::into_contiguous(w_zero);
+        unsafe {
+            if tile64 {
+                quantize_rows::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    CubeCount::Static(rows as u32, 1, 1),
+                    CubeDim::new_1d(256),
+                    x.into_tensor_arg(),
+                    x_packed.clone().into_tensor_arg(),
+                    x_scale.clone().into_tensor_arg(),
+                    x_sum.clone().into_tensor_arg(),
+                    words as u32,
+                    true,
+                );
+                let acc = empty_tensor(&out, Shape::new([rows * columns]), DType::I32);
+                int8_dot_tile64::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    CubeCount::Static((columns as u32).div_ceil(64), (rows as u32).div_ceil(64), 1),
+                    CubeDim::new_1d(128),
+                    x_packed.into_tensor_arg(),
+                    w_packed.into_tensor_arg(),
+                    acc.into_tensor_arg(),
+                    x_scale.into_tensor_arg(),
+                    x_sum.into_tensor_arg(),
+                    w_scale.into_tensor_arg(),
+                    w_zero.into_tensor_arg(),
+                    out.clone().into_tensor_arg(),
+                    rows as u32,
+                    columns as u32,
+                    width as u32,
+                );
+                return out;
+            }
             quantize_rows::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(rows as u32, 1, 1),
@@ -416,147 +468,159 @@ fn launch(x: RawTensor, w_packed: RawTensor, w_scale: RawTensor, w_zero: RawTens
                 x.into_tensor_arg(),
                 x_packed.clone().into_tensor_arg(),
                 x_scale.clone().into_tensor_arg(),
-                x_sum.clone().into_tensor_arg(),
-                words as u32,
-                true,
-            );
-            let acc = empty_tensor(&out, Shape::new([rows * columns]), DType::I32);
-            int8_dot_tile64::launch_unchecked::<WgpuRuntime>(
-                &client,
-                CubeCount::Static((columns as u32).div_ceil(64), (rows as u32).div_ceil(64), 1),
-                CubeDim::new_1d(128),
-                x_packed.into_tensor_arg(),
-                w_packed.into_tensor_arg(),
-                acc.into_tensor_arg(),
-                x_scale.into_tensor_arg(),
                 x_sum.into_tensor_arg(),
+                words as u32,
+                false,
+            );
+            int8_dot::launch_unchecked::<WgpuRuntime>(
+                &out.client,
+                CubeCount::Static(
+                    (columns as u32).div_ceil(8).div_ceil(16),
+                    (rows as u32).div_ceil(16),
+                    1,
+                ),
+                CubeDim::new_2d(16, 16),
+                x_packed.into_tensor_arg(),
+                x_scale.into_tensor_arg(),
+                w_packed.into_tensor_arg(),
                 w_scale.into_tensor_arg(),
                 w_zero.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
-                rows as u32,
-                columns as u32,
-                width as u32,
+                words as u32,
             );
-            return out;
         }
-        quantize_rows::launch_unchecked::<WgpuRuntime>(
-            &client,
-            CubeCount::Static(rows as u32, 1, 1),
-            CubeDim::new_1d(256),
-            x.into_tensor_arg(),
-            x_packed.clone().into_tensor_arg(),
-            x_scale.clone().into_tensor_arg(),
-            x_sum.into_tensor_arg(),
-            words as u32,
-            false,
+        out
+    }
+
+    struct Int8Gemm<FB> {
+        desc: CustomOpIr,
+        _backend: std::marker::PhantomData<fn() -> FB>,
+    }
+
+    impl<FB> std::fmt::Debug for Int8Gemm<FB> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.desc.fmt(f)
+        }
+    }
+
+    impl<FB> Operation<FB::FusionRuntime> for Int8Gemm<FB>
+    where
+        FB: FusionBackend<FloatTensorPrimitive = RawTensor, IntTensorPrimitive = RawTensor>,
+    {
+        fn execute(
+            &self,
+            handles: &mut HandleContainer<<FB::FusionRuntime as FusionRuntime>::FusionHandle>,
+        ) {
+            let (inputs, [output]) = self.desc.as_fixed::<4, 1>();
+            let x = handles.get_float_tensor::<FB>(&inputs[0]);
+            let w_packed = handles.get_int_tensor::<FB>(&inputs[1]);
+            let w_scale = handles.get_float_tensor::<FB>(&inputs[2]);
+            let w_zero = handles.get_int_tensor::<FB>(&inputs[3]);
+            handles.register_float_tensor::<FB>(&output.id, launch(x, w_packed, w_scale, w_zero));
+        }
+    }
+
+    fn fusion_tensor<FB: FusionBackend, B: Backend>(
+        primitive: impl Any,
+    ) -> Option<FusionTensor<FB::FusionRuntime>> {
+        let primitive: Box<dyn Any> = Box::new(primitive);
+        primitive
+            .downcast::<FusionTensor<FB::FusionRuntime>>()
+            .ok()
+            .map(|tensor| *tensor)
+    }
+
+    fn fusion_out<FB: FusionBackend, B: Backend>(
+        tensor: FusionTensor<FB::FusionRuntime>,
+    ) -> Option<B::FloatTensorPrimitive> {
+        let tensor: Box<dyn Any> = Box::new(tensor);
+        tensor
+            .downcast::<B::FloatTensorPrimitive>()
+            .ok()
+            .map(|tensor| *tensor)
+    }
+
+    pub(super) fn try_gpu_gemm<FB, B>(
+        x: BurnTensor<B, 2>,
+        w_packed: BurnTensor<B, 1, burn::tensor::Int>,
+        w_scale: BurnTensor<B, 1>,
+        w_zero: BurnTensor<B, 1, burn::tensor::Int>,
+    ) -> Option<BurnTensor<B, 2>>
+    where
+        FB: FusionBackend<FloatTensorPrimitive = RawTensor, IntTensorPrimitive = RawTensor>
+            + 'static,
+        B: Backend,
+    {
+        let [rows, _width] = x.dims();
+        let columns = w_scale.dims()[0];
+        let x = x.cast(FloatDType::F32);
+        let w_scale = w_scale.cast(FloatDType::F32);
+        let x = match x.into_primitive() {
+            TensorPrimitive::Float(tensor) => fusion_tensor::<FB, B>(tensor)?,
+            TensorPrimitive::QFloat(_) => return None,
+        };
+        let w_scale = match w_scale.into_primitive() {
+            TensorPrimitive::Float(tensor) => fusion_tensor::<FB, B>(tensor)?,
+            TensorPrimitive::QFloat(_) => return None,
+        };
+        let w_packed = fusion_tensor::<FB, B>(w_packed.into_primitive())?;
+        let w_zero = fusion_tensor::<FB, B>(w_zero.into_primitive())?;
+        let client = x.client.clone();
+        let output = TensorIr::uninit(
+            client.create_empty_handle(),
+            Shape::new([rows, columns]),
+            DType::F32,
         );
-        int8_dot::launch_unchecked::<WgpuRuntime>(
-            &out.client,
-            CubeCount::Static(
-                (columns as u32).div_ceil(8).div_ceil(16),
-                (rows as u32).div_ceil(16),
-                1,
-            ),
-            CubeDim::new_2d(16, 16),
-            x_packed.into_tensor_arg(),
-            x_scale.into_tensor_arg(),
-            w_packed.into_tensor_arg(),
-            w_scale.into_tensor_arg(),
-            w_zero.into_tensor_arg(),
-            out.clone().into_tensor_arg(),
-            words as u32,
+        let inputs = [x, w_packed, w_scale, w_zero];
+        let streams = OperationStreams::with_inputs(inputs.iter());
+        let desc = CustomOpIr::new(
+            "int8_scaled_matmul",
+            &inputs.map(FusionTensor::into_ir),
+            &[output],
         );
+        let tensor = client
+            .register(
+                streams,
+                OperationIr::Custom(desc.clone()),
+                Int8Gemm::<FB> {
+                    desc,
+                    _backend: std::marker::PhantomData,
+                },
+            )
+            .output();
+        Some(BurnTensor::from_primitive(TensorPrimitive::Float(
+            fusion_out::<FB, B>(tensor)?,
+        )))
     }
-    out
-}
-
-struct Int8Gemm {
-    desc: CustomOpIr,
-}
-
-impl std::fmt::Debug for Int8Gemm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.desc.fmt(f)
-    }
-}
-
-impl Operation<Runtime> for Int8Gemm {
-    fn execute(&self, handles: &mut HandleContainer<<Runtime as FusionRuntime>::FusionHandle>) {
-        let (inputs, [output]) = self.desc.as_fixed::<4, 1>();
-        let x = handles.get_float_tensor::<Raw>(&inputs[0]);
-        let w_packed = handles.get_int_tensor::<Raw>(&inputs[1]);
-        let w_scale = handles.get_float_tensor::<Raw>(&inputs[2]);
-        let w_zero = handles.get_int_tensor::<Raw>(&inputs[3]);
-        handles.register_float_tensor::<Raw>(&output.id, launch(x, w_packed, w_scale, w_zero));
-    }
-}
-
-fn fusion_tensor<B: Backend>(primitive: impl Any) -> Option<FusionTensor<Runtime>> {
-    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>() {
-        return None;
-    }
-    let primitive: Box<dyn Any> = Box::new(primitive);
-    primitive
-        .downcast::<FusionTensor<Runtime>>()
-        .ok()
-        .map(|tensor| *tensor)
 }
 
 /// `x @ W^T` after per-row symmetric int8 quantization of `x`.
 ///
 /// `w_packed` holds `n * (k / 4)` little-endian int8 groups. `w_scale` and
-/// `w_zero` are per output row. Metal fusion runs the CubeCL kernel. Any other
-/// backend runs the host integer gemm in this module. Returns `None` when the
-/// shapes disagree.
+/// `w_zero` are per output row. GPU fusion runs the CubeCL kernel (with
+/// Apple10 TensorOps lowering only when built with `metal` on Apple Silicon).
+/// Any other backend or CPU-only build runs the host integer gemm in this
+/// module. Returns `None` when the shapes disagree.
 pub fn try_int8_gemm<B: Backend>(
     x: BurnTensor<B, 2>,
     w_packed: BurnTensor<B, 1, burn::tensor::Int>,
     w_scale: BurnTensor<B, 1>,
     w_zero: BurnTensor<B, 1, burn::tensor::Int>,
 ) -> Option<BurnTensor<B, 2>> {
-    let [rows, width] = x.dims();
+    let [_rows, width] = x.dims();
     let columns = w_scale.dims()[0];
     if width % 4 != 0 || w_packed.dims()[0] != columns * width / 4 || w_zero.dims()[0] != columns {
         return None;
     }
-    if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Metal>() {
-        return host_gemm(x, w_packed, w_scale, w_zero);
+    #[cfg(feature = "wgpu")]
+    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Metal>() {
+        return gpu::try_gpu_gemm::<Raw, B>(x, w_packed, w_scale, w_zero);
     }
-    let x = x.cast(FloatDType::F32);
-    let w_scale = w_scale.cast(FloatDType::F32);
-    let x = match x.into_primitive() {
-        TensorPrimitive::Float(tensor) => fusion_tensor::<B>(tensor)?,
-        TensorPrimitive::QFloat(_) => return None,
-    };
-    let w_scale = match w_scale.into_primitive() {
-        TensorPrimitive::Float(tensor) => fusion_tensor::<B>(tensor)?,
-        TensorPrimitive::QFloat(_) => return None,
-    };
-    let w_packed = fusion_tensor::<B>(w_packed.into_primitive())?;
-    let w_zero = fusion_tensor::<B>(w_zero.into_primitive())?;
-    let client = x.client.clone();
-    let output = TensorIr::uninit(
-        client.create_empty_handle(),
-        Shape::new([rows, columns]),
-        DType::F32,
-    );
-    let inputs = [x, w_packed, w_scale, w_zero];
-    let streams = OperationStreams::with_inputs(inputs.iter());
-    let desc = CustomOpIr::new(
-        "int8_scaled_matmul",
-        &inputs.map(FusionTensor::into_ir),
-        &[output],
-    );
-    let tensor = client
-        .register(
-            streams,
-            OperationIr::Custom(desc.clone()),
-            Int8Gemm { desc },
-        )
-        .output();
-    Some(BurnTensor::from_primitive(TensorPrimitive::Float(
-        fusion_out::<B>(tensor)?,
-    )))
+    #[cfg(feature = "wgpu")]
+    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<Wgpu>() {
+        return gpu::try_gpu_gemm::<RawWgpu, B>(x, w_packed, w_scale, w_zero);
+    }
+    host_gemm(x, w_packed, w_scale, w_zero)
 }
 
 fn host_gemm<B: Backend>(
@@ -592,14 +656,6 @@ fn read_i32(data: burn::tensor::TensorData) -> Option<Vec<i32>> {
             .map(|values| values.into_iter().map(|value| value as i32).collect()),
         _ => data.to_vec::<i32>().ok(),
     }
-}
-
-fn fusion_out<B: Backend>(tensor: FusionTensor<Runtime>) -> Option<B::FloatTensorPrimitive> {
-    let tensor: Box<dyn Any> = Box::new(tensor);
-    tensor
-        .downcast::<B::FloatTensorPrimitive>()
-        .ok()
-        .map(|tensor| *tensor)
 }
 
 #[cfg(test)]
@@ -654,6 +710,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "wgpu")]
     fn run_gemm(
         device: &cubecl::wgpu::WgpuDevice,
         x: Vec<f32>,
@@ -684,7 +741,7 @@ mod tests {
             device,
         );
         try_int8_gemm(x, w_packed, w_scale, w_zero)
-            .expect("metal int8 gemm")
+            .expect("gpu int8 gemm")
             .into_data()
             .to_vec::<f32>()
             .unwrap()
@@ -731,6 +788,27 @@ mod tests {
         assert_close(&got, &expected);
     }
 
+    #[test]
+    fn invalid_int8_gemm_shape_declines_cleanly() {
+        type Cpu = burn::backend::NdArray;
+        let device = Default::default();
+        let x = BurnTensor::<Cpu, 2>::from_data(
+            TensorData::new(vec![1.0f32, 2.0, 3.0], [1, 3]),
+            &device,
+        );
+        let w_packed = BurnTensor::<Cpu, 1, burn::tensor::Int>::from_data(
+            TensorData::new(vec![0i32], [1]),
+            &device,
+        );
+        let w_scale = BurnTensor::<Cpu, 1>::from_data(TensorData::new(vec![1.0f32], [1]), &device);
+        let w_zero = BurnTensor::<Cpu, 1, burn::tensor::Int>::from_data(
+            TensorData::new(vec![0i32], [1]),
+            &device,
+        );
+        assert!(try_int8_gemm(x, w_packed, w_scale, w_zero).is_none());
+    }
+
+    #[cfg(feature = "wgpu")]
     fn tile_fixture() -> (Vec<f32>, Vec<i8>, Vec<f32>, Vec<i32>, Vec<f32>) {
         let rows = 64;
         let columns = 64;
@@ -746,8 +824,9 @@ mod tests {
         (x, weights, scale, zero, expected)
     }
 
+    #[cfg(feature = "wgpu")]
     #[test]
-    #[ignore = "requires a Metal device"]
+    #[ignore = "requires a GPU device"]
     fn int8_gemm_matches_dequantized_weights_on_scalar_and_tile64() {
         let device = cubecl::wgpu::WgpuDevice::default();
         // Hand value: codes 32, -64, 16, 127 against weights 1, -2, 3, -4, zero 1.
@@ -767,12 +846,15 @@ mod tests {
         assert_close(&got, &expected);
 
         unsafe { std::env::remove_var("OMNI_CONVROT_TENSOROPS") };
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         assert!(
             crate::int8_tensorops::matmul2d_lowered(&device),
             "64×64 matmul2d lowering is off"
         );
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(all(
+            feature = "metal",
+            not(all(target_os = "macos", target_arch = "aarch64"))
+        ))]
         panic!("64×64 matmul2d lowering is only built for Apple Silicon");
         let (x, weights, scale, zero, expected) = tile_fixture();
         assert!((expected[0] - (-411.0 / 127.0)).abs() < 1.0e-5);

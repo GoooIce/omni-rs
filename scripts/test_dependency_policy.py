@@ -179,7 +179,7 @@ burn = {_BURN}
         self.assertEqual(self.failures(), [])
 
     def test_gpu_closure_catches_cpu_and_training_through_intermediate_features(self):
-        for gpu in ("metal", "webgpu"):
+        for gpu in ("metal", "wgpu", "webgpu"):
             for gate, backend in (("cpu", "ndarray"), ("training", "autodiff")):
                 with self.subTest(gpu=gpu, gate=gate):
                     self.write(f"""
@@ -449,6 +449,51 @@ burn = {{ path = "vendor/burn" }}
         self.config["manifests"] = [{"path": "Cargo.toml"}, {"path": "crates/member/Cargo.toml"}]
         self.write('[dependencies]\nburn = { workspace = true }\n', "crates/member/Cargo.toml", "member")
         self.assertEqual(self.failures(), [])
+
+    def test_portable_manifests_reject_apple_only_packages_and_features(self):
+        self.config["dependency_policy"].update({
+            "apple_only_packages": ["burn-ane", "objc2-metal", "mtl4", "cubecl-cpp"],
+            "apple_only_features": ["metal", "ane", "coreml", "metal-shared"],
+            "portable_manifests": {"Cargo.toml": {"cpu": ["cpu"], "wgpu": ["wgpu"]}},
+        })
+        self.write(f"""
+[features]
+default = ["metal"]
+wgpu = ["burn/wgpu"]
+metal = ["wgpu", "burn/metal", "dep:objc2-metal"]
+cpu = ["burn/ndarray"]
+[dependencies]
+burn = {_BURN}
+objc2-metal = {{ version = "0.3", optional = true }}
+""")
+        self.assertEqual(self.failures(), [])
+
+        # Unconditional Apple-only dep leaks into both cpu and wgpu portable modes.
+        self.write(f"""
+[features]
+default = ["metal"]
+wgpu = ["burn/wgpu"]
+metal = ["wgpu", "burn/metal"]
+cpu = ["burn/ndarray"]
+[dependencies]
+burn = {_BURN}
+objc2-metal = "0.3"
+""")
+        errors = self.errors()
+        self.assertIn("portable mode cpu reaches Apple package dep:objc2-metal (objc2-metal)", errors)
+        self.assertIn("portable mode wgpu reaches Apple package dep:objc2-metal (objc2-metal)", errors)
+
+        # Forwarding burn/metal inside wgpu leaks an Apple feature.
+        self.write(f"""
+[features]
+default = ["metal"]
+wgpu = ["burn/wgpu", "burn/metal"]
+metal = ["wgpu"]
+cpu = ["burn/ndarray"]
+[dependencies]
+burn = {_BURN}
+""")
+        self.assertIn("portable mode wgpu reaches Apple feature request burn/metal", self.errors())
 
     def test_diagnostics_are_deterministic(self):
         self.write("""

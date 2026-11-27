@@ -7,19 +7,22 @@ license = "Apache-2.0"
 description = "Shared Burn Fusion and ANE adapter for model-specific GPU kernels"
 
 [features]
-ane = ["dep:burn-ane"]
+default = ["metal"]
+wgpu = ["burn/wgpu", "burn/fusion", "dep:burn-cubecl", "dep:burn-fusion", "dep:burn-ir", "dep:cubecl"]
+metal = ["wgpu", "burn/metal", "dep:objc2-metal", "dep:wgpu"]
+ane = ["metal", "dep:burn-ane"]
 
 [dependencies]
-burn = { version = "=0.21.0", default-features = false, features = ["std", "metal", "fusion"] }
-burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"] }
-burn-fusion = { version = "=0.21.0", default-features = false, features = ["std"] }
-burn-ir = { version = "=0.21.0", default-features = false, features = ["std"] }
-cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn-fusion = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn-ir = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"], optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 burn-ane = { path = "../burn-ane", version = "=0.21.0", default-features = false, features = ["metal-shared"], optional = true }
-objc2-metal = "0.3"
-wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"] }
+objc2-metal = { version = "0.3", optional = true }
+wgpu = { version = "=29.0.4", default-features = false, features = ["metal", "std"], optional = true }
 
 [dev-dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray"] }

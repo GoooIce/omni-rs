@@ -1,7 +1,7 @@
 from pathlib import Path
 import unittest
 
-from check_dependency_graphs import graph_failures, parse_tree
+from check_dependency_graphs import graph_failures, parse_tree, portable_graph_failures
 
 
 class DependencyGraphTests(unittest.TestCase):
@@ -81,6 +81,53 @@ class DependencyGraphTests(unittest.TestCase):
         self.assertEqual(graph_failures(Path("/repo"), rows, policy), [])
         next(row for row in rows if row["name"] == "burn-ane")["source"] = None
         self.assertTrue(graph_failures(Path("/repo"), rows, policy))
+
+    def test_portable_cpu_graph_rejects_apple_and_gpu_packages_and_features(self):
+        root = Path("/repo")
+        policy = {
+            "apple_only_packages": ["burn-ane", "objc2-metal", "mtl4", "cubecl-cpp"],
+            "apple_only_features": ["metal", "ane", "coreml", "metal-shared"],
+        }
+        clean = parse_tree("omni-qwen-image v0.1.0 (/repo/crates/qwen-image)|cpu\n"
+                           "burn-ndarray v0.21.0|std\n")
+        self.assertEqual(portable_graph_failures(
+            root, clean, policy, mode="cpu", target="aarch64-apple-darwin"), [])
+        for bad in ("burn-ane v0.21.0 (/repo/crates/burn-ane)|\n",
+                    "objc2-metal v0.3.2|std\n",
+                    "mtl4 v0.1.0 (/repo/crates/mtl4)|\n",
+                    "wgpu v29.0.4|std,wgsl\n"):
+            with self.subTest(bad=bad):
+                errors = portable_graph_failures(
+                    root, clean + parse_tree(bad), policy, mode="cpu", target="aarch64-apple-darwin")
+                self.assertTrue(errors)
+        leaked_feature = parse_tree("omni-qwen-image v0.1.0 (/repo/crates/qwen-image)|cpu,metal\n")
+        self.assertTrue(any("Apple feature metal" in err for err in portable_graph_failures(
+            root, leaked_feature, policy, mode="cpu", target="aarch64-apple-darwin")))
+
+    def test_portable_wgpu_graph_enforces_non_apple_and_host_boundaries(self):
+        root = Path("/repo")
+        policy = {
+            "apple_only_packages": ["burn-ane", "objc2-metal", "mtl4", "cubecl-cpp"],
+            "apple_only_features": ["metal", "ane", "coreml", "metal-shared"],
+        }
+        clean = parse_tree("omni-kernel v0.1.0 (/repo/crates/omni-kernel)|wgpu\n"
+                           "wgpu v29.0.4|std,wgsl\n")
+        self.assertEqual(portable_graph_failures(
+            root, clean, policy, mode="wgpu", target="x86_64-unknown-linux-gnu"), [])
+        # Non-Apple targets must reject objc2-metal completely.
+        with_objc2 = clean + parse_tree("objc2-metal v0.3.2|std\n")
+        self.assertTrue(any("objc2-metal" in err for err in portable_graph_failures(
+            root, with_objc2, policy, mode="wgpu", target="x86_64-unknown-linux-gnu")))
+        # On macOS hosts wgpu-hal pulls objc2-metal, but burn-ane / mtl4 / cubecl-cpp remain forbidden.
+        self.assertEqual(portable_graph_failures(
+            root, with_objc2, policy, mode="wgpu", target="aarch64-apple-darwin"), [])
+        for bad in ("burn-ane v0.21.0 (/repo/crates/burn-ane)|\n",
+                    "cubecl-cpp v0.10.0 (/repo/vendor/cubecl-cpp)|metal\n",
+                    "burn-ndarray v0.21.0|std\n"):
+            with self.subTest(bad=bad):
+                errors = portable_graph_failures(
+                    root, clean + parse_tree(bad), policy, mode="wgpu", target="aarch64-apple-darwin")
+                self.assertTrue(errors)
 
 
 if __name__ == "__main__":

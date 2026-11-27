@@ -2,6 +2,7 @@
 //! Usage: asr-regression CASES.json [MODEL_DIR] > events.jsonl
 #[path = "../src/asr.rs"]
 mod asr;
+#[allow(dead_code)]
 #[path = "../src/gpu.rs"]
 mod gpu;
 #[allow(dead_code)]
@@ -10,7 +11,7 @@ mod resampler;
 #[path = "../src/transcription_start.rs"]
 mod transcription_start;
 
-use omni_r2t2::{Error, Model, Precision, Session};
+use omni_r2t2::{Error, Model, Session};
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
@@ -56,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = gpu::device();
     let model = Arc::new(Model::<gpu::Backend>::from_directory(
         &directory,
-        Precision::F16,
+        gpu::default_precision(),
         &device,
     )?);
     for case in corpus.cases {

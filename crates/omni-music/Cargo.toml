@@ -8,7 +8,8 @@ description = "MERT2, SheetSage2 and YuE2 music inference in Rust and Burn"
 
 [features]
 default = ["metal"]
-metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune"]
+wgpu = ["omni-r2t2/wgpu", "burn/wgpu", "burn/fusion", "burn/autotune"]
+metal = ["wgpu", "omni-r2t2/metal", "burn/metal"]
 cpu = ["burn/ndarray"]
 
 [dependencies]

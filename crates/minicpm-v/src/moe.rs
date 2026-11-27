@@ -437,7 +437,7 @@ impl<B: Backend> SparseMoeBlock<B> {
     /// folds the weighted combine, the shared expert and the final add.
     /// Returns `None` when the kernels cannot run; the caller falls back to
     /// the dispatched paths.
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     fn forward_dense(&self, flat: Tensor<B, 2>) -> Option<Tensor<B, 2>> {
         let dense = self.dense.as_ref()?;
         let dtype = shared::dtype(&flat);
@@ -449,7 +449,7 @@ impl<B: Backend> SparseMoeBlock<B> {
         if tokens > 1 && MATCH_DECODE.with(|flag| flag.get()) {
             return self.forward_rows_matching_decode(x);
         }
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         if tokens > 1 && tokens <= DENSE_MOE_MAX_TOKENS && self.dense.is_some() {
             let width = x.dims()[2];
             let flat = x

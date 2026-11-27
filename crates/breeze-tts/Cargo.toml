@@ -20,12 +20,13 @@ required-features = ["metal"]
 
 [features]
 default = ["metal"]
-metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune", "dep:burn-cubecl", "dep:omni-kernel", "dep:cubecl"]
+wgpu = ["omni-r2t2/wgpu", "burn/wgpu", "burn/fusion", "burn/autotune", "dep:burn-cubecl", "omni-kernel/wgpu", "dep:cubecl"]
+metal = ["wgpu", "omni-r2t2/metal", "burn/metal", "omni-kernel/metal"]
 ane = ["omni-r2t2/ane", "metal", "burn/ane", "dep:burn-ane", "omni-kernel/ane"]
-cpu = ["burn/ndarray"]
+cpu = ["omni-r2t2/cpu", "burn/ndarray"]
 
 [dependencies]
-omni-kernel = { path = "../omni-kernel", optional = true }
+omni-kernel = { path = "../omni-kernel", default-features = false, optional = true }
 omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }

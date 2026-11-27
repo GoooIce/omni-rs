@@ -4,9 +4,6 @@
 //! A session accepts mono 16 kHz PCM and emits immutable transcript deltas.
 //! Model weights are shared; audio, encoder and decoder caches belong to a session.
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-compile_error!("omni-rs supports Apple Silicon macOS with native Metal/ANE only");
-
 pub mod audio;
 pub mod config;
 #[cfg(all(feature = "coreml", target_os = "macos"))]

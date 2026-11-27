@@ -26,6 +26,7 @@ pub mod vae;
 pub mod vision;
 pub use config::Config;
 pub use minicpm_condition::{MiniCpm1bText, MiniCpm35bText};
+pub use ops::apple_kernels_compiled;
 pub use pipeline::{
     BatchStats, DEFAULT_TURBO_STEPS, DenoisingObservation, GeneratedImage, ImageBatch, Model,
     ObservationCell, ObservationRequest, ObservationRow, OfficialObservation, Options, Report,

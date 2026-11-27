@@ -3,7 +3,7 @@
 mod config;
 mod model;
 mod paged;
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 mod paged_kernel;
 #[cfg(test)]
 mod paged_tests;

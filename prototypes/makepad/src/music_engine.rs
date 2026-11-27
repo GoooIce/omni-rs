@@ -1,16 +1,12 @@
 //! Native music uses the same cancellable admission as speech and image jobs.
 //! Pipeline models are scoped to each request and released before completion.
 use crate::engine_harness::{Adapter, Context, Event, Lifecycle};
-use omni_music::{pipeline, Error, Precision, Progress, SongRequest};
+use crate::gpu::{self, GpuBackend as Backend};
+use omni_music::{pipeline, Error, Progress, SongRequest};
 use std::{
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
 };
-
-#[cfg(target_os = "macos")]
-type Backend = burn::backend::wgpu::Metal;
-#[cfg(not(target_os = "macos"))]
-type Backend = burn::backend::wgpu::WebGpu;
 
 pub enum Job {
     Analyze(PathBuf),
@@ -126,8 +122,8 @@ impl Adapter for Worker {
         Self::initialize();
         let result = pipeline::run::<Backend>(
             &root,
-            Precision::F16,
-            &Default::default(),
+            gpu::default_precision(),
+            &gpu::gpu_device(),
             request,
             &context.stop,
             |p: Progress| {
