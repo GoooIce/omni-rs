@@ -15,9 +15,9 @@ use omni_minicpm_v::{
 use omni_r2t2::Precision;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 type Native = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
-#[cfg(not(feature = "metal"))]
+#[cfg(not(any(feature = "wgpu", feature = "metal")))]
 type Native = burn::backend::NdArray;
 
 fn default_device<B: Backend>() -> B::Device {
@@ -126,9 +126,9 @@ pub fn default_minicpm_1b_dir(qwen_root: &Path) -> PathBuf {
 /// Full-attention layers use the image-aligned fallback: eager Metal autotune
 /// can keep a stage size that does not divide the next prompt. This path never
 /// opens an image or the JSON rewriter.
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 type MiniCpm35bBackend = burn_cubecl::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
-#[cfg(not(feature = "metal"))]
+#[cfg(not(any(feature = "wgpu", feature = "metal")))]
 type MiniCpm35bBackend = burn::backend::NdArray;
 
 pub struct MiniCpm35bText {
@@ -163,9 +163,9 @@ impl MiniCpm35bText {
             ))
         })?;
         let weights = omni_r2t2::weights::Weights::open(model_dir).map_err(Error::Weights)?;
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         let precision = Precision::F16;
-        #[cfg(not(feature = "metal"))]
+        #[cfg(not(any(feature = "wgpu", feature = "metal")))]
         let precision = Precision::F32;
         let device = default_device::<MiniCpm35bBackend>();
         let model = TextModel::<MiniCpm35bBackend>::load(&weights, &config, precision, &device)

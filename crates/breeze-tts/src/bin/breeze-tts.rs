@@ -203,7 +203,11 @@ fn run<B: burn::tensor::backend::Backend>(args: Args, device: B::Device) -> Resu
         );
         return Ok(());
     }
-    let precision = if args.fp32 || cfg!(all(feature = "cpu", not(feature = "metal"))) {
+    let precision = if args.fp32
+        || cfg!(all(
+            feature = "cpu",
+            not(any(feature = "wgpu", feature = "metal"))
+        )) {
         Precision::F32
     } else {
         Precision::F16
@@ -344,7 +348,15 @@ fn main() -> Result<()> {
         eprintln!("{:?}", setup.adapter.get_info());
         run::<Metal>(args, device)
     }
-    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
+    #[cfg(all(not(feature = "metal"), feature = "wgpu"))]
+    {
+        use burn::backend::wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
+        let device = WgpuDevice::default();
+        let setup = init_setup::<graphics::AutoGraphicsApi>(&device, Default::default());
+        eprintln!("{:?}", setup.adapter.get_info());
+        run::<Wgpu>(args, device)
+    }
+    #[cfg(all(not(any(feature = "metal", feature = "wgpu")), feature = "cpu"))]
     {
         run::<burn::backend::NdArray>(args, Default::default())
     }

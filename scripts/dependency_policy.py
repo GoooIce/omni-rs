@@ -83,7 +83,7 @@ def _pin(package):
 def _closure(features, dependencies, start, include_base=False):
     """Follow local edges, aliases, dep: activation and dependency feature lists."""
     local, requests, activated, seen = set(), set(), set(), set()
-    pending = [start]
+    pending = list(start) if isinstance(start, (list, tuple, set)) else [start]
 
     def activate(alias):
         if alias in activated or alias not in dependencies:
@@ -152,6 +152,9 @@ def dependency_failures(root, config) -> list[str]:
     training = set(policy.get("training_manifests", []))
     unsupported = set(policy.get("unsupported_features", []))
     fallbacks = policy.get("ndarray_fallbacks", {})
+    apple_packages = set(policy.get("apple_only_packages", []))
+    apple_features = set(policy.get("apple_only_features", []))
+    portable_manifests = policy.get("portable_manifests", {})
     failures, cache = [], {}
 
     def label(path):
@@ -262,7 +265,7 @@ def dependency_failures(root, config) -> list[str]:
                 gates = "cpu or ane" if category == "cpu" else "training"
                 failures.append(f"{relative}: {request} must be enabled through local feature {gates}")
 
-        for name in ("metal", "webgpu", "default"):
+        for name in ("metal", "wgpu", "webgpu", "default"):
             if name != "default" and name not in features:
                 continue
             effects = _effects(_closure(features, production, name, include_base=True), production)
@@ -280,4 +283,31 @@ def dependency_failures(root, config) -> list[str]:
             if effects:
                 details = ", ".join(f"{category} via {source}" for category, source in sorted(effects))
                 failures.append(f"{relative}: features.{name} reaches {details}")
+
+        for mode, selected in sorted(portable_manifests.get(relative, {}).items()):
+            missing = [feat for feat in selected if feat not in features]
+            if missing:
+                failures.append(
+                    f"{relative}: portable mode {mode} references unknown features {missing}"
+                )
+                continue
+            closure = _closure(features, production, list(selected), include_base=True)
+            leaks = []
+            for feat in sorted(closure.local & apple_features):
+                leaks.append(f"Apple feature {feat}")
+            for alias in sorted(closure.activated):
+                for dep in production[alias]:
+                    if dep.package in apple_packages:
+                        leaks.append(f"Apple package dep:{alias} ({dep.package})")
+                    if mode == "cpu" and dep.package in ("wgpu", "burn-wgpu"):
+                        leaks.append(f"GPU package dep:{alias} ({dep.package})")
+            for alias, req in sorted(closure.requests):
+                if req in apple_features:
+                    leaks.append(f"Apple feature request {alias}/{req}")
+                if mode == "cpu" and req == "wgpu":
+                    leaks.append(f"GPU feature request {alias}/{req}")
+            if leaks:
+                failures.append(
+                    f"{relative}: portable mode {mode} reaches {', '.join(sorted(set(leaks)))}"
+                )
     return failures

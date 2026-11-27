@@ -74,6 +74,8 @@ def plan(root, profile, output):
     if profile in ("quick", "cpu", "metal"):
         add("repository", [python, "scripts/check_repo.py"], 60)
         add("python-tests", [python, "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"], 120)
+        add("portable-dependency-graphs", [python, "scripts/check_dependency_graphs.py", "--portable",
+                                           "--report", str(output / "portable-dependency-graphs.json")], 180)
         add("build-oracle-tests", ["rustc", "--edition", "2024", "--test",
                                   "crates/qwen-image/examples/support/parity.rs", "-o", str(output / "oracle-tests")], 120)
         add("oracle-negative-controls", [str(output / "oracle-tests")], 60)
@@ -82,6 +84,26 @@ def plan(root, profile, output):
             name = Path(manifest).parent.name if "/" in manifest else "root"
             add("fmt-" + name, ["cargo", "fmt", "--manifest-path", manifest, "--", "--check"], 120)
         if profile == "quick":
+            add("portable-omni-kernel-cpu", [
+                "cargo", "test", "--offline", "--locked", "--manifest-path",
+                "crates/omni-kernel/Cargo.toml", "--no-default-features",
+                "--target-dir", output_dir("crates/omni-kernel/Cargo.toml"), "--lib",
+            ], 600)
+            add("portable-omni-kernel-wgpu", [
+                "cargo", "test", "--offline", "--locked", "--manifest-path",
+                "crates/omni-kernel/Cargo.toml", "--no-default-features", "--features", "wgpu",
+                "--target-dir", output_dir("crates/omni-kernel/Cargo.toml"), "--lib",
+            ], 600)
+            add("portable-qwen-image-cpu", [
+                "cargo", "test", "--offline", "--locked", "--manifest-path",
+                "crates/qwen-image/Cargo.toml", "--no-default-features", "--features", "cpu",
+                "--target-dir", output_dir("crates/qwen-image/Cargo.toml"), "--lib",
+            ], 600)
+            add("portable-makepad-cpu", [
+                "cargo", "test", "--offline", "--locked", "--manifest-path",
+                "prototypes/makepad/Cargo.toml", "--no-default-features", "--features", "cpu",
+                "--target-dir", output_dir("prototypes/makepad/Cargo.toml"), "--tests",
+            ], 600)
             failures = plan_failures(root, steps)
             if failures:
                 raise ValueError("\n".join(failures))
@@ -101,9 +123,10 @@ def plan(root, profile, output):
             name = Path(manifest).parent.name if "/" in manifest else "root"
             flags = ["--locked", "--manifest-path", manifest, "--no-default-features",
                      "--features", row["cpu_features"], "--target-dir", output_dir(row["path"])]
-            add("clippy-" + name, ["cargo", "clippy", "--no-deps", *flags, "--lib", "--tests"] +
+            targets = ["--tests"] if name == "makepad" else ["--lib", "--tests"]
+            add("clippy-" + name, ["cargo", "clippy", "--no-deps", *flags, *targets] +
                 (["--", "-D", "warnings"] if row.get("strict_clippy") else []))
-            add("test-" + name, ["cargo", "test", *flags, "--lib", "--tests"])
+            add("test-" + name, ["cargo", "test", *flags, *targets])
     elif profile == "metal":
         add("dependency-graphs", [python, "scripts/check_dependency_graphs.py",
                                   "--report", str(output / "dependency-graphs.json")], 180)

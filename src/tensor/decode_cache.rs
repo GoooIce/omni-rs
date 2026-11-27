@@ -8,7 +8,7 @@ pub struct DecodeCache<B: Backend> {
     dense: KvCache<B>,
     paged: bool,
     len: usize,
-    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     store: Option<Store<B>>,
 }
 impl<B: Backend> DecodeCache<B> {
@@ -17,7 +17,7 @@ impl<B: Backend> DecodeCache<B> {
             dense: KvCache::default(),
             paged,
             len: 0,
-            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(any(feature = "wgpu", feature = "metal"))]
             store: None,
         }
     }
@@ -51,7 +51,7 @@ impl<B: Backend> DecodeCache<B> {
         assert_eq!((k.dims()[0], k.dims()[2], k.dims()[3]), (b, n, d));
         assert!(h.is_multiple_of(k.dims()[1]));
         self.len = options.offset + n;
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         if self.paged
             && (self.store.is_some() || options.offset == 0)
             && options.causal
@@ -63,7 +63,7 @@ impl<B: Backend> DecodeCache<B> {
                 .get_or_insert_with(Store::default)
                 .forward(q, k, v, options);
         }
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(any(feature = "wgpu", feature = "metal"))]
         assert!(
             self.store.is_none(),
             "clear a paged history before changing its attention policy"
@@ -73,13 +73,13 @@ impl<B: Backend> DecodeCache<B> {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 struct Store<B: Backend> {
     atlas: Option<Tensor<B, 5>>,
     reader: Option<Tensor<B, 3>>,
     pages: usize,
 }
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 impl<B: Backend> Default for Store<B> {
     fn default() -> Self {
         Self {
@@ -89,7 +89,7 @@ impl<B: Backend> Default for Store<B> {
         }
     }
 }
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 impl<B: Backend> Store<B> {
     fn forward(
         &mut self,

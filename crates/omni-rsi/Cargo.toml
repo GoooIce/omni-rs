@@ -12,7 +12,8 @@ description = "Verified, idle-time chart reader adaptation for LFM3 Omni"
 default = ["native", "metal", "training"]
 native = ["dep:clap", "dep:ctrlc"]
 training = ["burn/autodiff"]
-metal = ["omni-lfm3/metal", "burn/metal", "burn/fusion"]
+wgpu = ["omni-lfm3/wgpu", "burn/wgpu", "burn/fusion"]
+metal = ["wgpu", "omni-lfm3/metal", "burn/metal"]
 cpu = ["omni-lfm3/cpu", "burn/ndarray"]
 
 [dependencies]

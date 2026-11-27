@@ -104,14 +104,9 @@ impl App {
             SignalToUI::set_ui_signal,
             self.runtime.clone(),
         ));
-        self.ui.label(cx, ids!(backend)).set_text(
-            cx,
-            if cfg!(target_os = "macos") {
-                "Metal · 本机推理"
-            } else {
-                "WGPU · 本机推理"
-            },
-        );
+        self.ui
+            .label(cx, ids!(backend))
+            .set_text(cx, crate::gpu::initial_backend_label());
         self.start_model_load(cx);
     }
 

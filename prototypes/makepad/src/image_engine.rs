@@ -1,19 +1,11 @@
-use omni_qwen_image::{
-    Config, Error, GeneratedImage, Model, ObservationRow, Options, Precision, Progress,
-};
+use crate::gpu::{self, GpuBackend as Backend};
+use omni_qwen_image::{Config, Error, GeneratedImage, Model, ObservationRow, Options, Progress};
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
-
-// The measured speech policy is independent of the new diffusion pipeline.
-// Use the existing process-wide Metal registration, with all image tensors on GPU.
-#[cfg(target_os = "macos")]
-type Backend = burn::backend::wgpu::Metal;
-#[cfg(not(target_os = "macos"))]
-type Backend = burn::backend::wgpu::WebGpu;
 
 pub enum Command {
     Load(PathBuf),
@@ -74,7 +66,7 @@ impl crate::engine_harness::Event for Update {
 pub type Engine = crate::engine_harness::Engine<Worker>;
 
 pub struct Worker {
-    device: burn::backend::wgpu::WgpuDevice,
+    device: gpu::GpuDevice,
     model: Option<Model<Backend>>,
 }
 
@@ -89,7 +81,7 @@ impl crate::engine_harness::Adapter for Worker {
     }
     fn new() -> Self {
         Self {
-            device: Default::default(),
+            device: gpu::gpu_device(),
             model: None,
         }
     }
@@ -127,7 +119,7 @@ impl crate::engine_harness::Adapter for Worker {
         let start = Instant::now();
         self.model = Some(Model::load(
             &path,
-            Precision::F16,
+            gpu::default_precision(),
             &self.device,
             &stop,
             |p| {

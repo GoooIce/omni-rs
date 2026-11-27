@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 /// official reference reproduces it). An identity CustomOp separates those
 /// graphs without a device fence, CPU readback or changing FP16 rounding.
 fn attention_residual<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
-    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if x.dtype() == burn::tensor::DType::F16 {
         use burn::tensor::{Shape, TensorPrimitive};
         if let Some(value) = omni_kernel::dispatch::<B, 1>(

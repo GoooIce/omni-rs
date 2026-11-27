@@ -8,8 +8,9 @@ description = "Local HTTP adapters for Omni Burn inference"
 
 [features]
 default = ["metal"]
-metal = ["omni-r2t2/metal", "burn/metal", "burn/fusion", "burn/autotune", "omni-hy-mt/metal", "omni-breeze-tts/metal", "omni-qwen-image/metal", "omni-music/metal", "omni-lfm3/metal"]
-cpu = ["burn/ndarray", "omni-hy-mt/cpu", "omni-breeze-tts/cpu", "omni-qwen-image/cpu", "omni-music/cpu", "omni-lfm3/cpu"]
+wgpu = ["omni-r2t2/wgpu", "burn/wgpu", "burn/fusion", "burn/autotune", "omni-hy-mt/wgpu", "omni-breeze-tts/wgpu", "omni-qwen-image/wgpu", "omni-music/wgpu", "omni-lfm3/wgpu"]
+metal = ["wgpu", "omni-r2t2/metal", "burn/metal", "omni-hy-mt/metal", "omni-breeze-tts/metal", "omni-qwen-image/metal", "omni-music/metal", "omni-lfm3/metal"]
+cpu = ["omni-r2t2/cpu", "burn/ndarray", "omni-hy-mt/cpu", "omni-breeze-tts/cpu", "omni-qwen-image/cpu", "omni-music/cpu", "omni-lfm3/cpu"]
 
 [dependencies]
 omni-lfm3 = { path = "../lfm3-omni", default-features = false }

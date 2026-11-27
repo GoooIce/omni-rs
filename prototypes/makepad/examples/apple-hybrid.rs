@@ -1,4 +1,5 @@
 //! Headless validation using the same device policy as the native application.
+#[allow(dead_code)]
 #[path = "../src/gpu.rs"]
 mod gpu;
 use std::{

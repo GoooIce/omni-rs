@@ -4,22 +4,72 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["metal", "ane"]
+wgpu = [
+    "omni-r2t2/wgpu",
+    "burn/wgpu",
+    "burn/fusion",
+    "omni-breeze-tts/wgpu",
+    "omni-qwen-image/wgpu",
+    "omni-hy-mt/wgpu",
+    "omni-music/wgpu",
+    "omni-minicpm-v/wgpu",
+    "omni-lfm3/wgpu",
+    "dep:burn-cubecl",
+    "dep:cubecl",
+]
+metal = [
+    "wgpu",
+    "omni-r2t2/metal",
+    "burn/metal",
+    "omni-breeze-tts/metal",
+    "omni-qwen-image/metal",
+    "omni-hy-mt/metal",
+    "omni-music/metal",
+    "omni-minicpm-v/metal",
+    "omni-lfm3/metal",
+]
+ane = [
+    "metal",
+    "omni-r2t2/ane",
+    "burn/ane",
+    "omni-breeze-tts/ane",
+    "dep:burn-ane",
+]
+cpu = [
+    "omni-r2t2/cpu",
+    "burn/ndarray",
+    "omni-breeze-tts/cpu",
+    "omni-qwen-image/cpu",
+    "omni-hy-mt/cpu",
+    "omni-music/cpu",
+    "omni-minicpm-v/cpu",
+    "omni-lfm3/cpu",
+]
+
+[[example]]
+name = "apple-hybrid"
+required-features = ["metal", "ane"]
+
 [dependencies]
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "711521dbfaba2d04be4d88176deef367f33d9ed3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-omni-r2t2 = { path = "../..", default-features = false, features = ["native", "metal", "ane"] }
-burn = { version = "=0.21.0", default-features = false, features = ["std", "fusion", "ane"] }
+omni-r2t2 = { path = "../..", default-features = false, features = ["native"] }
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
 hound = "3.5"
 pollster = "0.4"
 cpal = "0.16"
-omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false, features = ["metal", "ane"] }
-omni-qwen-image = { path = "../../crates/qwen-image", default-features = false, features = ["metal"] }
-omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["native", "metal"] }
-omni-music = { path = "../../crates/omni-music", default-features = false, features = ["metal"] }
-omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false, features = ["metal"] }
-omni-lfm3 = { path = "../../crates/lfm3-omni", default-features = false, features = ["metal"] }
+omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false }
+omni-qwen-image = { path = "../../crates/qwen-image", default-features = false }
+omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["native"] }
+omni-music = { path = "../../crates/omni-music", default-features = false }
+omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false }
+omni-lfm3 = { path = "../../crates/lfm3-omni", default-features = false }
 omni-hub = { path = "../../crates/omni-hub", default-features = false }
-burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"] }
-cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"] }
-burn-ane = { path = "../../crates/burn-ane", version = "=0.21.0", default-features = false, features = ["metal-shared"] }
+burn-cubecl = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "wgpu"], optional = true }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+burn-ane = { path = "../../crates/burn-ane", version = "=0.21.0", default-features = false, features = ["metal-shared"], optional = true }

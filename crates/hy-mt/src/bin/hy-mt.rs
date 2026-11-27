@@ -38,7 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     #[cfg(feature = "metal")]
     type B = burn::backend::wgpu::Metal;
-    #[cfg(all(not(feature = "metal"), feature = "cpu"))]
+    #[cfg(all(not(feature = "metal"), feature = "wgpu"))]
+    type B = burn::backend::wgpu::Wgpu;
+    #[cfg(all(not(any(feature = "metal", feature = "wgpu")), feature = "cpu"))]
     type B = burn::backend::NdArray;
     let p = match args.precision.as_str() {
         "f16" => Precision::F16,

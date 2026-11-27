@@ -71,7 +71,7 @@ pub(crate) fn write<B: Backend>(
     v: Tensor<B, 3>,
     batch: &Batch,
 ) -> Tensor<B, 5> {
-    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if crate::paged_kernel::supported::<B>(&atlas.device(), atlas.dtype()) {
         return crate::paged_kernel::write(atlas, k, v, batch);
     }
@@ -128,7 +128,7 @@ pub(crate) fn attend<B: Backend>(
     atlas: &Tensor<B, 5>,
     batch: &Batch,
 ) -> Tensor<B, 3> {
-    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(feature = "wgpu", feature = "metal"))]
     if crate::paged_kernel::supported::<B>(&q.device(), q.dtype()) {
         return crate::paged_kernel::attend(q, atlas, batch);
     }

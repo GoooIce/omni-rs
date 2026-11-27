@@ -1,10 +1,7 @@
 use crate::engine_harness::{Adapter, Context, Event, Lifecycle};
-use omni_hy_mt::{Error, Model, Precision, Request, Translator};
+use crate::gpu::{self, GpuBackend as Backend};
+use omni_hy_mt::{Error, Model, Request, Translator};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-type Backend = burn::backend::wgpu::Metal;
-#[cfg(not(target_os = "macos"))]
-type Backend = burn::backend::wgpu::WebGpu;
 
 pub enum Command {
     Load(PathBuf),
@@ -65,8 +62,8 @@ impl Adapter for Worker {
     fn load(&mut self, path: &Path, context: &Context<Update>) -> omni_hy_mt::Result<Update> {
         let model = Model::from_directory(
             path,
-            Precision::F16,
-            &Default::default(),
+            gpu::default_precision(),
+            &gpu::gpu_device(),
             &context.stop,
             |n, total| {
                 context.loading(

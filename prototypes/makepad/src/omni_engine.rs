@@ -1,9 +1,10 @@
 //! LFM3 conversation worker; the desktop harness owns admission and stopping.
 use crate::engine_harness::{Adapter, Context, Event, Lifecycle};
+use crate::gpu::{self, EagerBackend as Backend};
 use omni_lfm3::{
     generate::{EndReason, OmniEvent, OmniOptions, OutputMode},
     model::{Conversation, InputPart, OmniModel},
-    Error, Precision, Result,
+    Error, Result,
 };
 use std::{
     path::{Path, PathBuf},
@@ -12,8 +13,6 @@ use std::{
         Arc,
     },
 };
-
-type Backend = omni_lfm3::NativeGpu;
 
 #[derive(Clone)]
 pub enum Part {
@@ -112,7 +111,8 @@ impl Adapter for Worker {
     }
     fn load(&mut self, path: &Path, context: &Context<Update>) -> Result<Update> {
         context.loading(0.0, "正在载入 LFM3-Omni-2B…");
-        let model = OmniModel::<Backend>::load(path, Precision::F16, &Default::default())?;
+        let model =
+            OmniModel::<Backend>::load(path, gpu::default_precision(), &gpu::eager_device())?;
         self.conversation = Some(Conversation::new(&model));
         self.model = Some(model);
         Ok(Update::status("ready", "LFM3-Omni-2B 已就绪"))

@@ -9,7 +9,9 @@ use std::{
 };
 #[cfg(feature = "metal")]
 type Backend = burn::backend::wgpu::Metal;
-#[cfg(all(not(feature = "metal"), feature = "cpu"))]
+#[cfg(all(not(feature = "metal"), feature = "wgpu"))]
+type Backend = burn::backend::wgpu::Wgpu;
+#[cfg(all(not(any(feature = "metal", feature = "wgpu")), feature = "cpu"))]
 type Backend = burn::backend::NdArray;
 #[derive(Parser)]
 struct Args {

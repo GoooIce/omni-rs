@@ -999,7 +999,7 @@ impl crate::engine_harness::Adapter for Worker {
         *model = Some(
             Model::load_cancellable(
                 &path,
-                Precision::F16,
+                gpu::default_precision(),
                 device,
                 &context.stop,
                 |progress, message| {

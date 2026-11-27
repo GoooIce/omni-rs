@@ -5,22 +5,22 @@ pub mod config;
 pub mod doctor;
 pub mod dspark;
 pub mod dspark_batch;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 mod gdn_scan;
 pub mod generate;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 pub(crate) mod glue;
 pub mod image;
 pub mod knobs;
 pub mod latent;
 pub mod ledger;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 pub(crate) mod markov;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 pub(crate) mod metal_bridge;
 pub mod model;
 pub mod moe;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "wgpu", feature = "metal"))]
 pub(crate) mod moe_dense;
 pub mod multimodal;
 pub mod positions;

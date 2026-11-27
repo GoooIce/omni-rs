@@ -35,6 +35,7 @@ impl From<Mode> for OutputMode {
 #[derive(Clone, Copy, ValueEnum)]
 enum BackendChoice {
     Metal,
+    Wgpu,
     Cpu,
 }
 #[derive(Clone, Copy, ValueEnum)]
@@ -136,6 +137,8 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     let backend = args.backend.unwrap_or(if cfg!(feature = "metal") {
         BackendChoice::Metal
+    } else if cfg!(feature = "wgpu") {
+        BackendChoice::Wgpu
     } else {
         BackendChoice::Cpu
     });
@@ -153,6 +156,21 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(feature = "metal"))]
             {
                 Err("binary was built without the metal feature".into())
+            }
+        }
+        BackendChoice::Wgpu => {
+            #[cfg(any(feature = "wgpu", feature = "metal"))]
+            {
+                run::<omni_lfm3::NativeGpu>(
+                    &args,
+                    precision,
+                    &burn::backend::wgpu::WgpuDevice::default(),
+                    &stop,
+                )
+            }
+            #[cfg(not(any(feature = "wgpu", feature = "metal")))]
+            {
+                Err("binary was built without the wgpu feature".into())
             }
         }
         BackendChoice::Cpu => {
