@@ -4,12 +4,17 @@ use crate::{
     model_location,
     playback::{AudioSink, AudioSinkOpener, DeviceAudio, Playback, PlaybackStats},
     playback_buffer::DurationHistory,
+    resampler::NativeResampler,
+    speech_enhancer::{ExternalSpeechEnhancer, TextCompleter},
 };
 use omni_breeze_tts::{
     enhancement::{self, Consideration, Source},
     reference::{self, ReferenceEncoder},
-    Model, Precision, ReferenceAudio, ScriptBudget, ScriptEvent, ScriptOptions, SynthesisOptions,
-    SAMPLE_RATE,
+    Model, ReferenceAudio, ScriptBudget, ScriptEvent, ScriptOptions, SynthesisOptions, SAMPLE_RATE,
+};
+use omni_hub::providers::{
+    ExternalProviderTarget, ProviderError, SpeechSynthesisRequest, DEFAULT_TTS_FORMAT,
+    DEFAULT_TTS_VOICE,
 };
 use std::{
     hash::{Hash, Hasher},
@@ -398,6 +403,14 @@ mod tests {
     }
 }
 
+pub enum EnhancementTarget {
+    Local {
+        checkpoint: PathBuf,
+        prefill: enhancement::Prefill,
+    },
+    External(ExternalProviderTarget),
+}
+
 pub enum Command {
     Load(PathBuf),
     Synthesize {
@@ -407,18 +420,20 @@ pub enum Command {
         /// Capture audio without playing it. Used for a blind trio.
         hold: bool,
     },
+    SynthesizeExternal {
+        text: String,
+        target: ExternalProviderTarget,
+    },
     Enhance {
         source: Source,
         prompt: String,
         seeds: [u64; 3],
-        checkpoint: PathBuf,
-        prefill: enhancement::Prefill,
+        backend: EnhancementTarget,
     },
     Draft {
         request: enhancement::DraftRequest,
         seed: u64,
-        checkpoint: PathBuf,
-        prefill: enhancement::Prefill,
+        backend: EnhancementTarget,
     },
     Remember {
         audio: Arc<[f32]>,
@@ -921,7 +936,7 @@ pub fn check_files(directory: &Path) -> Result<(), String> {
 pub type Engine = crate::engine_harness::Engine<Worker>;
 
 pub struct Worker {
-    device: gpu::Device,
+    device: Option<gpu::Device>,
     model: Option<Model<Backend>>,
     model_path: PathBuf,
     reference_encoder: Option<ReferenceEncoder<Backend>>,
@@ -947,7 +962,7 @@ impl crate::engine_harness::Adapter for Worker {
     }
     fn new() -> Self {
         Self {
-            device: gpu::device(),
+            device: None,
             model: None,
             model_path: PathBuf::new(),
             reference_encoder: None,
@@ -978,7 +993,9 @@ impl crate::engine_harness::Adapter for Worker {
         check_files(path)
     }
     fn after_command(&self) {
-        gpu::log_stats(&self.device, "tts");
+        if let Some(device) = &self.device {
+            gpu::log_stats(device, "tts");
+        }
     }
 
     fn load(
@@ -996,11 +1013,12 @@ impl crate::engine_harness::Adapter for Worker {
         } = self;
         *model_path = path.to_owned();
         let start = Instant::now();
+        let dev = device.get_or_insert_with(gpu::device);
         *model = Some(
             Model::load_cancellable(
                 &path,
                 gpu::default_precision(),
-                device,
+                dev,
                 &context.stop,
                 |progress, message| {
                     context.loading(progress, message);
@@ -1045,26 +1063,47 @@ impl crate::engine_harness::Adapter for Worker {
                 source,
                 prompt,
                 seeds,
-                checkpoint,
-                prefill,
+                backend,
             } => {
-                enhancement::checkpoint_available(&checkpoint)?;
-                if enhancer.is_none() {
-                    sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
-                    *enhancer = Some(
-                        crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
-                            .map_err(Failure::from)?,
-                    );
-                }
                 let model = model.as_ref().ok_or("语音合成模型尚未就绪")?;
-                let samples = crate::speech_enhancer::sample_three(
-                    enhancer.as_mut().unwrap(),
-                    &prompt,
-                    &source,
-                    seeds,
-                    prefill,
-                    stop,
-                )?;
+                let samples = match backend {
+                    EnhancementTarget::Local {
+                        checkpoint,
+                        prefill,
+                    } => {
+                        enhancement::checkpoint_available(&checkpoint)?;
+                        if enhancer.is_none() {
+                            sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
+                            *enhancer = Some(
+                                crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
+                                    .map_err(Failure::from)?,
+                            );
+                        }
+                        crate::speech_enhancer::sample_three(
+                            enhancer.as_mut().unwrap(),
+                            &prompt,
+                            &source,
+                            seeds,
+                            prefill,
+                            stop,
+                        )?
+                    }
+                    EnhancementTarget::External(target) => {
+                        sender.publish(Update::status(
+                            "progress",
+                            format!("正在通过 {} 采样三份增强方案…", target.display_badge()),
+                        ));
+                        let mut external = ExternalSpeechEnhancer::from_target(&target)?;
+                        crate::speech_enhancer::sample_three(
+                            &mut external,
+                            &prompt,
+                            &source,
+                            seeds,
+                            enhancement::Prefill::Dense,
+                            stop,
+                        )?
+                    }
+                };
                 let consideration =
                     enhancement::consider(&prompt, &source, samples, |speech, instruction| {
                         model.prompt_ids(speech, instruction).is_ok()
@@ -1083,30 +1122,131 @@ impl crate::engine_harness::Adapter for Worker {
             Command::Draft {
                 request,
                 seed,
-                checkpoint,
-                prefill,
+                backend,
             } => {
-                enhancement::checkpoint_available(&checkpoint)?;
-                if enhancer.is_none() {
-                    sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
-                    *enhancer = Some(
-                        crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
-                            .map_err(Failure::from)?,
-                    );
-                }
-                let text = enhancer.as_mut().unwrap().complete(
-                    &request.system,
-                    &request.user,
-                    seed,
-                    prefill,
-                    stop,
-                )?;
+                let text = match backend {
+                    EnhancementTarget::Local {
+                        checkpoint,
+                        prefill,
+                    } => {
+                        enhancement::checkpoint_available(&checkpoint)?;
+                        if enhancer.is_none() {
+                            sender.publish(Update::status("loading", "正在载入 35B 增强模型…"));
+                            *enhancer = Some(
+                                crate::speech_enhancer::SpeechEnhancer::load(&checkpoint)
+                                    .map_err(Failure::from)?,
+                            );
+                        }
+                        enhancer.as_mut().unwrap().complete(
+                            &request.system,
+                            &request.user,
+                            seed,
+                            prefill,
+                            stop,
+                        )?
+                    }
+                    EnhancementTarget::External(target) => {
+                        sender.publish(Update::status(
+                            "progress",
+                            format!("正在通过 {} 起草增强提示…", target.display_badge()),
+                        ));
+                        let mut external = ExternalSpeechEnhancer::from_target(&target)?;
+                        external.complete(
+                            &request.system,
+                            &request.user,
+                            seed,
+                            enhancement::Prefill::Dense,
+                            stop,
+                        )?
+                    }
+                };
                 if text.trim().is_empty() {
                     return Err("起草没有得到增强提示".into());
                 }
                 let mut update = Update::status("drafted", "增强提示草稿已显示，可修改后接受");
                 update.draft_text = Some(text);
                 Ok(update)
+            }
+            Command::SynthesizeExternal { text, target } => {
+                pcm.clear();
+                *completed_design = None;
+                let start = Instant::now();
+                sender.publish(Update::status(
+                    "progress",
+                    format!("正在请求 {} 合成语音…", target.display_badge()),
+                ));
+                let client = target.client().map_err(|e| Failure::Error(e.to_string()))?;
+                let voice = target
+                    .voice
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TTS_VOICE.to_owned());
+                let response_format = target
+                    .response_format
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TTS_FORMAT.to_owned());
+                let decoded = client
+                    .synthesize_speech(
+                        &SpeechSynthesisRequest {
+                            model: target.model.clone(),
+                            input: text,
+                            voice,
+                            response_format,
+                            speed: target.speed,
+                        },
+                        stop,
+                    )
+                    .map_err(|err| match err {
+                        ProviderError::Cancelled => Failure::Cancelled,
+                        other => Failure::Error(other.to_string()),
+                    })?;
+                let samples_24k = resample_to_24k(&decoded.samples, decoded.sample_rate)
+                    .map_err(Failure::Error)?;
+                *pcm = samples_24k;
+                let elapsed = start.elapsed().as_secs_f64();
+                let audio_seconds = pcm.len() as f64 / SAMPLE_RATE as f64;
+                let audio_arc: Arc<[f32]> = Arc::from(pcm.as_slice());
+
+                let mut generated = Update::status("generated", "外部音频已解码 · 开始播放");
+                generated.audio = Some(audio_arc.clone());
+                generated.audio_seconds = audio_seconds;
+                context.release_inference();
+                sender.publish(generated);
+
+                let playback_stats = if stop.load(Ordering::Acquire) {
+                    None
+                } else {
+                    match Playback::open(stop.clone(), None) {
+                        Ok(mut output) => {
+                            for chunk in audio_arc.chunks(3840) {
+                                if stop.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let _ = output.push(chunk);
+                            }
+                            let _ = output.drain();
+                            let stats = output.stats();
+                            drop(output);
+                            stats
+                        }
+                        Err(_) => None,
+                    }
+                };
+                let mut u = Update::status(
+                    "done",
+                    if stop.load(Ordering::Acquire) {
+                        format!(
+                            "已停止播放 · 可试听或保存 WAV（{}）",
+                            target.display_badge()
+                        )
+                    } else {
+                        format!("外部合成完成 · 可保存 WAV（{}）", target.display_badge())
+                    },
+                );
+                u.audio_seconds = audio_seconds;
+                u.elapsed = elapsed;
+                u.first_audio = Some(elapsed);
+                u.playback = playback_stats;
+                Ok(u)
             }
             Command::Remember { audio, text, seed } => {
                 *pcm = audio.to_vec();
@@ -1160,10 +1300,11 @@ impl crate::engine_harness::Adapter for Worker {
                     } else {
                         if reference_encoder.is_none() {
                             sender.publish(Update::status("reference", "首次加载参考音频编码器…"));
+                            let dev = device.get_or_insert_with(gpu::device);
                             *reference_encoder = Some(
                                 ReferenceEncoder::load_cancellable(
                                     &model_path.join("audio_tokenizer"),
-                                    device,
+                                    dev,
                                     &stop,
                                 )
                                 .map_err(Failure::from)?,
@@ -1205,10 +1346,11 @@ impl crate::engine_harness::Adapter for Worker {
                 let speech_texts = prepared.texts.len();
                 if prepared.needs_voice_anchor && reference_encoder.is_none() {
                     sender.publish(Update::status("reference", "首次加载参考音频编码器…"));
+                    let dev = device.get_or_insert_with(gpu::device);
                     *reference_encoder = Some(
                         ReferenceEncoder::load_cancellable(
                             &model_path.join("audio_tokenizer"),
-                            device,
+                            dev,
                             stop,
                         )
                         .map_err(Failure::from)?,
@@ -1378,10 +1520,11 @@ impl crate::engine_harness::Adapter for Worker {
                     .ok_or("请先完整生成一个音色候选，再使用此音色")?;
                 sender.publish(Update::status("reference", "正在准备已设计音色…"));
                 if reference_encoder.is_none() && !stop.load(Ordering::Acquire) {
+                    let dev = device.get_or_insert_with(gpu::device);
                     *reference_encoder = Some(
                         ReferenceEncoder::load_cancellable(
                             &model_path.join("audio_tokenizer"),
-                            device,
+                            dev,
                             &stop,
                         )
                         .map_err(Failure::from)?,
@@ -1421,5 +1564,26 @@ impl crate::engine_harness::Adapter for Worker {
                 }
             }
         }
+    }
+}
+
+pub fn resample_to_24k(samples: &[f32], sample_rate: u32) -> Result<Vec<f32>, String> {
+    if sample_rate == SAMPLE_RATE {
+        return Ok(samples.to_vec());
+    }
+    NativeResampler::new(sample_rate, SAMPLE_RATE)
+        .and_then(|mut r| r.push(samples, true))
+        .map_err(|e| format!("外部 TTS 重采样至 24 kHz 失败：{e}"))
+}
+
+#[cfg(test)]
+mod external_tts_tests {
+    use super::*;
+
+    #[test]
+    fn resample_external_speech_converts_16k_to_24k_length() {
+        let input = vec![0.1f32; 1600]; // 100ms at 16 kHz
+        let out = resample_to_24k(&input, 16_000).unwrap();
+        assert!((out.len() as isize - 2400).abs() <= 48, "got {}", out.len());
     }
 }

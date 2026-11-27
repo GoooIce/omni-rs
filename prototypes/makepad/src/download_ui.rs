@@ -2,12 +2,14 @@
 //! workbench panels) and the unified Models & Download Settings panel.
 
 use crate::models_state::{
-    CheckpointLifecycle, FallbackPreset, ModelsController, RecoveryCardModel, RoutePreset,
+    slot_index, CheckpointLifecycle, FallbackPreset, ModelsController, RecoveryCardModel,
+    RoutePreset, SettingsTab,
 };
 use crate::{ActionButtonState, App};
 use makepad_widgets::*;
 use omni_hub::catalog::CheckpointId;
 use omni_hub::credentials::CredentialKey;
+use omni_hub::providers::{CapabilitySlot, ExternalProviderTarget};
 use std::path::{Path, PathBuf};
 
 struct RowIds {
@@ -163,6 +165,7 @@ pub struct UiState {
     pub omni_missing_shown: bool,
     last_hf_rendered: String,
     last_ms_rendered: String,
+    last_provider_key_rendered: String,
 }
 
 impl UiState {
@@ -183,6 +186,7 @@ impl UiState {
             omni_missing_shown: false,
             last_hf_rendered: String::new(),
             last_ms_rendered: String::new(),
+            last_provider_key_rendered: String::new(),
         }
     }
 }
@@ -263,8 +267,122 @@ impl App {
             .set_is_read_only(cx, ms_ro);
         state.last_ms_rendered = ms_text;
 
+        self.seed_provider_inputs_from_state(cx, &mut state);
+
         self.downloads = Some(state);
         self.refresh_download_controls(cx);
+    }
+
+    pub fn sync_transcription_download_directory(&mut self, cx: &mut Cx) {
+        if let Some(dir) = self.transcription_directory() {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.set_directory(CheckpointId::Confucius4R2t2, dir);
+            }
+            self.refresh_download_controls(cx);
+        }
+    }
+
+    fn seed_provider_inputs_from_state(&self, cx: &mut Cx, state: &mut UiState) {
+        let draft = &state.ctrl.provider_draft;
+        self.ui
+            .text_input(cx, ids!(provider_name_input))
+            .set_text(cx, &draft.name);
+        self.ui
+            .text_input(cx, ids!(provider_base_url_input))
+            .set_text(cx, &draft.base_url);
+        self.ui
+            .text_input(cx, ids!(provider_timeout_input))
+            .set_text(cx, &draft.timeout_secs);
+        self.ui
+            .text_input(cx, ids!(provider_api_key_env_input))
+            .set_text(cx, &draft.api_key_env);
+
+        let (key_text, key_ro) = state
+            .ctrl
+            .provider_api_key
+            .rendered_input(state.ctrl.credentials.as_ref());
+        self.ui
+            .text_input(cx, ids!(provider_api_key_input))
+            .set_text(cx, &key_text);
+        self.ui
+            .text_input(cx, ids!(provider_api_key_input))
+            .set_is_read_only(cx, key_ro);
+        state.last_provider_key_rendered = key_text;
+
+        self.ui.text_input(cx, ids!(slot_enhance_model)).set_text(
+            cx,
+            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::PromptEnhancement)].model,
+        );
+        self.ui.text_input(cx, ids!(slot_asr_model)).set_text(
+            cx,
+            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Asr)].model,
+        );
+        self.ui.text_input(cx, ids!(slot_tts_model)).set_text(
+            cx,
+            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Tts)].model,
+        );
+        self.ui.text_input(cx, ids!(slot_tts_voice)).set_text(
+            cx,
+            &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Tts)].voice,
+        );
+        self.ui
+            .text_input(cx, ids!(slot_translation_model))
+            .set_text(
+                cx,
+                &state.ctrl.slot_drafts[slot_index(CapabilitySlot::Translation)].model,
+            );
+    }
+
+    pub fn slot_is_external(&self, slot: CapabilitySlot) -> bool {
+        self.downloads
+            .as_ref()
+            .is_some_and(|d| d.ctrl.is_slot_external(slot))
+    }
+
+    pub fn slot_badge(&self, slot: CapabilitySlot) -> String {
+        self.downloads
+            .as_ref()
+            .map(|d| d.ctrl.slot_badge(slot))
+            .unwrap_or_else(|| "本地模型".to_owned())
+    }
+
+    pub fn resolve_slot_external(
+        &self,
+        slot: CapabilitySlot,
+    ) -> Result<Option<ExternalProviderTarget>, String> {
+        let Some(d) = self.downloads.as_ref() else {
+            return Ok(None);
+        };
+        d.ctrl
+            .resolve_slot_external(slot)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn switch_slot_to_local(&mut self, cx: &mut Cx, slot: CapabilitySlot) {
+        if let Some(d) = self.downloads.as_mut() {
+            d.ctrl.switch_slot_to_local(slot);
+        }
+        self.on_slot_routing_changed(cx, slot);
+        self.refresh_download_controls(cx);
+    }
+
+    pub fn open_providers_settings(&mut self, cx: &mut Cx) {
+        if let Some(d) = self.downloads.as_mut() {
+            d.ctrl.settings_tab = SettingsTab::ExternalProviders;
+        }
+        self.open_settings_panel(cx);
+    }
+
+    fn on_slot_routing_changed(&mut self, cx: &mut Cx, slot: CapabilitySlot) {
+        match slot {
+            CapabilitySlot::Asr => self.on_asr_provider_changed(cx),
+            CapabilitySlot::Tts => self.on_tts_provider_changed(cx),
+            CapabilitySlot::Translation => self.on_translation_provider_changed(cx),
+            CapabilitySlot::PromptEnhancement => {
+                self.on_tts_provider_changed(cx);
+                self.on_image_provider_changed(cx);
+            }
+        }
     }
 
     pub fn settings_panel_open(&self) -> bool {
@@ -297,6 +415,9 @@ impl App {
             .view(cx, ids!(settings_panel))
             .set_visible(cx, false);
         self.ui.view(cx, ids!(page_stage)).set_visible(cx, true);
+        self.ui
+            .view(cx, ids!(pages))
+            .set_scroll_pos(cx, Vec2d::default());
         self.refresh_download_controls(cx);
     }
 
@@ -770,6 +891,44 @@ impl App {
             return;
         }
 
+        // Settings sub-tab switch (Models & Download vs External Providers & Slots).
+        if self
+            .ui
+            .button(cx, ids!(settings_tab_models))
+            .clicked(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.settings_tab = SettingsTab::ModelsAndDownload;
+            }
+            self.ui
+                .view(cx, ids!(pages))
+                .set_scroll_pos(cx, Vec2d::default());
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(settings_tab_providers))
+            .clicked(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.settings_tab = SettingsTab::ExternalProviders;
+            }
+            self.ui
+                .view(cx, ids!(pages))
+                .set_scroll_pos(cx, Vec2d::default());
+            return;
+        }
+
+        let active_tab = self
+            .downloads
+            .as_ref()
+            .map(|d| d.ctrl.settings_tab)
+            .unwrap_or(SettingsTab::ModelsAndDownload);
+        if active_tab == SettingsTab::ExternalProviders {
+            self.handle_provider_settings_actions(cx, actions);
+            return;
+        }
+
         // Track unsaved edits in mirror / proxy / token inputs.
         if let Some(text) = self
             .ui
@@ -906,6 +1065,241 @@ impl App {
         }
     }
 
+    fn handle_provider_settings_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        // Provider preset buttons.
+        if self
+            .ui
+            .button(cx, ids!(provider_preset_magpie))
+            .clicked(actions)
+        {
+            if let Some(mut state) = self.downloads.take() {
+                state.ctrl.apply_magpie_preset();
+                self.seed_provider_inputs_from_state(cx, &mut state);
+                self.downloads = Some(state);
+            }
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(provider_preset_custom))
+            .clicked(actions)
+        {
+            if let Some(mut state) = self.downloads.take() {
+                state.ctrl.apply_custom_preset();
+                self.seed_provider_inputs_from_state(cx, &mut state);
+                self.downloads = Some(state);
+            }
+            return;
+        }
+
+        // Provider text inputs.
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(provider_name_input))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.provider_draft.name = text;
+                d.ctrl.provider_draft.dirty = true;
+            }
+        }
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(provider_base_url_input))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.provider_draft.base_url = text;
+                d.ctrl.provider_draft.dirty = true;
+            }
+        }
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(provider_timeout_input))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.provider_draft.timeout_secs = text;
+                d.ctrl.provider_draft.dirty = true;
+            }
+        }
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(provider_api_key_env_input))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.provider_draft.api_key_env = text;
+                d.ctrl.provider_draft.dirty = true;
+                d.ctrl.sync_provider_api_key_state();
+            }
+        }
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(provider_api_key_input))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.provider_api_key.set_draft(text.clone());
+                d.last_provider_key_rendered = text;
+            }
+        }
+
+        // Provider API key reveal / save / clear (reusing 0600 CredentialStore).
+        let toggle = self
+            .ui
+            .button(cx, ids!(provider_api_key_toggle))
+            .clicked(actions);
+        let save_key = self
+            .ui
+            .button(cx, ids!(provider_api_key_save))
+            .clicked(actions);
+        let clear_key = self
+            .ui
+            .button(cx, ids!(provider_api_key_clear))
+            .clicked(actions);
+        if toggle || save_key || clear_key {
+            let d = self.downloads.as_mut().unwrap();
+            let store = d.ctrl.credentials.clone();
+            if toggle {
+                d.ctrl.provider_api_key.toggle_reveal(store.as_ref());
+            } else if save_key {
+                match d.ctrl.provider_api_key.save(store.as_ref()) {
+                    Ok(msg) => d.ctrl.provider_feedback = msg,
+                    Err(err) => d.ctrl.provider_feedback = err,
+                }
+            } else if clear_key {
+                match d.ctrl.provider_api_key.clear(store.as_ref()) {
+                    Ok(msg) => d.ctrl.provider_feedback = msg,
+                    Err(err) => d.ctrl.provider_feedback = err,
+                }
+            }
+            let (rendered, ro) = d.ctrl.provider_api_key.rendered_input(store.as_ref());
+            self.ui
+                .text_input(cx, ids!(provider_api_key_input))
+                .set_text(cx, &rendered);
+            self.ui
+                .text_input(cx, ids!(provider_api_key_input))
+                .set_is_read_only(cx, ro);
+            d.last_provider_key_rendered = rendered;
+        }
+
+        // Save provider profile / fetch /v1/models.
+        if self.ui.button(cx, ids!(provider_save)).clicked(actions) {
+            let d = self.downloads.as_mut().unwrap();
+            if let Err(err) = d.ctrl.save_provider_draft() {
+                d.ctrl.provider_feedback = format!("保存失败：{err}");
+            }
+        }
+        if self
+            .ui
+            .button(cx, ids!(provider_fetch_models))
+            .clicked(actions)
+        {
+            let d = self.downloads.as_mut().unwrap();
+            d.ctrl.start_provider_probe();
+        }
+
+        // Per-slot model & voice text inputs.
+        for (slot, input_id) in [
+            (CapabilitySlot::PromptEnhancement, ids!(slot_enhance_model)),
+            (CapabilitySlot::Asr, ids!(slot_asr_model)),
+            (CapabilitySlot::Tts, ids!(slot_tts_model)),
+            (CapabilitySlot::Translation, ids!(slot_translation_model)),
+        ] {
+            if let Some(text) = self.ui.text_input(cx, input_id).changed(actions) {
+                if let Some(d) = self.downloads.as_mut() {
+                    d.ctrl.set_slot_model(slot, text);
+                }
+            }
+        }
+        if let Some(text) = self
+            .ui
+            .text_input(cx, ids!(slot_tts_voice))
+            .changed(actions)
+        {
+            if let Some(d) = self.downloads.as_mut() {
+                d.ctrl.set_tts_slot_voice(text);
+            }
+        }
+
+        // Per-slot Local / External toggles and quick-fill buttons.
+        let slot_rows = [
+            (
+                CapabilitySlot::PromptEnhancement,
+                ids!(slot_enhance_local),
+                ids!(slot_enhance_external),
+                ids!(slot_enhance_model),
+                ids!(slot_enhance_use_first),
+            ),
+            (
+                CapabilitySlot::Asr,
+                ids!(slot_asr_local),
+                ids!(slot_asr_external),
+                ids!(slot_asr_model),
+                ids!(slot_asr_use_first),
+            ),
+            (
+                CapabilitySlot::Tts,
+                ids!(slot_tts_local),
+                ids!(slot_tts_external),
+                ids!(slot_tts_model),
+                ids!(slot_tts_use_first),
+            ),
+            (
+                CapabilitySlot::Translation,
+                ids!(slot_translation_local),
+                ids!(slot_translation_external),
+                ids!(slot_translation_model),
+                ids!(slot_translation_use_first),
+            ),
+        ];
+        for (slot, local_btn, ext_btn, model_input, use_first_btn) in slot_rows {
+            if self.ui.button(cx, local_btn).clicked(actions) {
+                if let Some(d) = self.downloads.as_mut() {
+                    let _ = d.ctrl.set_slot_mode(slot, false);
+                }
+                self.on_slot_routing_changed(cx, slot);
+            } else if self.ui.button(cx, ext_btn).clicked(actions) {
+                let filled_model = {
+                    let d = self.downloads.as_mut().unwrap();
+                    if let Err(err) = d.ctrl.set_slot_mode(slot, true) {
+                        d.ctrl.slot_feedback = format!("切换失败：{err}");
+                        None
+                    } else {
+                        Some(d.ctrl.slot_drafts[slot_index(slot)].model.clone())
+                    }
+                };
+                if let Some(model) = filled_model {
+                    self.ui.text_input(cx, model_input).set_text(cx, &model);
+                    self.on_slot_routing_changed(cx, slot);
+                }
+            } else if self.ui.button(cx, use_first_btn).clicked(actions) {
+                let picked = self
+                    .downloads
+                    .as_mut()
+                    .and_then(|d| d.ctrl.use_first_discovered_model(slot));
+                if let Some(model) = picked {
+                    self.ui.text_input(cx, model_input).set_text(cx, &model);
+                } else if let Some(d) = self.downloads.as_mut() {
+                    d.ctrl.slot_feedback =
+                        "尚未拉取到可用模型，请先点击「拉取模型 / 测试连接」".to_owned();
+                }
+            }
+        }
+
+        if self.ui.button(cx, ids!(slot_save_all)).clicked(actions) {
+            let res = self.downloads.as_mut().unwrap().ctrl.save_all_slots();
+            if let Err(err) = res {
+                self.downloads.as_mut().unwrap().ctrl.slot_feedback = format!("保存失败：{err}");
+            } else {
+                for slot in CapabilitySlot::ALL {
+                    self.on_slot_routing_changed(cx, slot);
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_token_buttons(
         &mut self,
@@ -973,12 +1367,52 @@ impl App {
                 .set_text(cx, &summary);
         }
 
-        // Refresh all 6 inline workbench recovery cards.
-        let asr_card = d.ctrl.recovery_card_with_error(
-            CheckpointId::Confucius4R2t2,
-            d.asr_missing_shown,
-            d.asr_load_error.as_deref(),
+        // Paint active-provider badges on every workbench header.
+        let asr_badge = format!("当前提供方：{}", d.ctrl.slot_badge(CapabilitySlot::Asr));
+        self.ui
+            .label(cx, ids!(asr_provider_badge))
+            .set_text(cx, &asr_badge);
+        let tts_badge = format!("当前提供方：{}", d.ctrl.slot_badge(CapabilitySlot::Tts));
+        self.ui
+            .label(cx, ids!(tts_provider_badge))
+            .set_text(cx, &tts_badge);
+        let enhance_badge = format!(
+            "提示词增强提供方：{}",
+            d.ctrl.slot_badge(CapabilitySlot::PromptEnhancement)
         );
+        self.ui
+            .label(cx, ids!(tts_enhance_provider_badge))
+            .set_text(cx, &enhance_badge);
+        let image_enhance_badge = format!(
+            "提示词改写：{}",
+            d.ctrl.slot_badge(CapabilitySlot::PromptEnhancement)
+        );
+        self.ui
+            .label(cx, ids!(image_rewrite_badge))
+            .set_text(cx, &image_enhance_badge);
+        let tr_badge = format!(
+            "翻译提供方：{}",
+            d.ctrl.slot_badge(CapabilitySlot::Translation)
+        );
+        self.ui
+            .label(cx, ids!(translation_provider_badge))
+            .set_text(cx, &tr_badge);
+        self.ui
+            .label(cx, ids!(tts_translation_provider_badge))
+            .set_text(cx, &tr_badge);
+
+        // Refresh all 6 inline workbench recovery cards (suppressed when slot is External).
+        let asr_external = d.ctrl.is_slot_external(CapabilitySlot::Asr);
+        let mut asr_card = d.ctrl.recovery_card_with_error(
+            CheckpointId::Confucius4R2t2,
+            d.asr_missing_shown && !asr_external,
+            (!asr_external)
+                .then_some(d.asr_load_error.as_deref())
+                .flatten(),
+        );
+        if asr_external {
+            asr_card.visible = false;
+        }
         self.paint_inline_recovery(
             cx,
             &asr_card,
@@ -991,11 +1425,17 @@ impl App {
             !self.transcription.busy(),
         );
 
-        let tts_card = d.ctrl.recovery_card_with_error(
+        let tts_external = d.ctrl.is_slot_external(CapabilitySlot::Tts);
+        let mut tts_card = d.ctrl.recovery_card_with_error(
             CheckpointId::BreezeTts2,
-            d.tts_missing_shown,
-            d.tts_load_error.as_deref(),
+            d.tts_missing_shown && !tts_external,
+            (!tts_external)
+                .then_some(d.tts_load_error.as_deref())
+                .flatten(),
         );
+        if tts_external {
+            tts_card.visible = false;
+        }
         self.paint_inline_recovery(
             cx,
             &tts_card,
@@ -1008,9 +1448,14 @@ impl App {
             true,
         );
 
-        let tr_card = d
-            .ctrl
-            .recovery_card(CheckpointId::HyMt2_7b, d.translation_missing_shown);
+        let tr_external = d.ctrl.is_slot_external(CapabilitySlot::Translation);
+        let mut tr_card = d.ctrl.recovery_card(
+            CheckpointId::HyMt2_7b,
+            d.translation_missing_shown && !tr_external,
+        );
+        if tr_external {
+            tr_card.visible = false;
+        }
         self.paint_inline_recovery(
             cx,
             &tr_card,
@@ -1071,6 +1516,36 @@ impl App {
         );
 
         if !d.ctrl.settings_open {
+            return;
+        }
+
+        // Settings sub-tab visibility & labels.
+        let on_models = d.ctrl.settings_tab == SettingsTab::ModelsAndDownload;
+        self.ui.button(cx, ids!(settings_tab_models)).set_text(
+            cx,
+            if on_models {
+                "● 模型与下载"
+            } else {
+                "模型与下载"
+            },
+        );
+        self.ui.button(cx, ids!(settings_tab_providers)).set_text(
+            cx,
+            if on_models {
+                "外部提供方与槽位"
+            } else {
+                "● 外部提供方与槽位"
+            },
+        );
+        self.ui
+            .view(cx, ids!(settings_models_section))
+            .set_visible(cx, on_models);
+        self.ui
+            .view(cx, ids!(settings_providers_section))
+            .set_visible(cx, !on_models);
+
+        if !on_models {
+            self.paint_provider_settings(cx, d);
             return;
         }
 
@@ -1314,5 +1789,165 @@ impl App {
                 .button(cx, cancel)
                 .set_action_enabled(cx, card.can_cancel);
         }
+    }
+
+    fn paint_provider_settings(&self, cx: &mut Cx, d: &UiState) {
+        let draft = &d.ctrl.provider_draft;
+        let url_hint = draft.url_validation_hint().unwrap_or_else(|| {
+            "默认 Magpie 本地网关为 http://127.0.0.1:3425/v1（允许空 API Key），也可填写任意 OpenAI 兼容网关。".to_owned()
+        });
+        self.ui
+            .label(cx, ids!(provider_url_hint))
+            .set_text(cx, &url_hint);
+
+        let key_source = if d.ctrl.provider_api_key.env_override.is_none()
+            && !d.ctrl.provider_api_key.has_saved_file
+        {
+            "未配置（本地 Magpie 网关可留空）".to_owned()
+        } else {
+            d.ctrl.provider_api_key.source_badge()
+        };
+        self.ui
+            .label(cx, ids!(provider_api_key_source))
+            .set_text(cx, &key_source);
+        self.ui.button(cx, ids!(provider_api_key_toggle)).set_text(
+            cx,
+            if d.ctrl.provider_api_key.revealed {
+                "隐藏"
+            } else {
+                "显示"
+            },
+        );
+        self.ui
+            .button(cx, ids!(provider_api_key_clear))
+            .set_action_enabled(
+                cx,
+                d.ctrl.provider_api_key.has_saved_file
+                    || !d.ctrl.provider_api_key.draft_input.is_empty(),
+            );
+
+        let save_check = draft.can_save();
+        self.ui
+            .button(cx, ids!(provider_save))
+            .set_action_enabled(cx, save_check.is_ok());
+        self.ui
+            .button(cx, ids!(provider_fetch_models))
+            .set_action_enabled(cx, !d.ctrl.provider_probing && save_check.is_ok());
+        self.ui.button(cx, ids!(provider_fetch_models)).set_text(
+            cx,
+            if d.ctrl.provider_probing {
+                "查询中…"
+            } else {
+                "拉取模型 / 测试连接"
+            },
+        );
+
+        let save_status = if let Err(reason) = save_check {
+            format!("无法保存：{reason}")
+        } else if !d.ctrl.provider_feedback.is_empty() {
+            d.ctrl.provider_feedback.clone()
+        } else if draft.dirty {
+            "有未保存的网关配置 · 可先「拉取模型 / 测试连接」或「保存提供方」".to_owned()
+        } else {
+            format!(
+                "已配置 {} 个外部提供方",
+                d.ctrl.settings.providers.profiles.len()
+            )
+        };
+        self.ui
+            .label(cx, ids!(provider_save_status))
+            .set_text(cx, &save_status);
+        self.ui
+            .label(cx, ids!(provider_probe_status))
+            .set_text(cx, &d.ctrl.provider_probe_message);
+
+        let models_summary = if draft.discovered_models.is_empty() {
+            "尚未拉取模型列表 · 点击「拉取模型 / 测试连接」从 GET /v1/models 自动发现".to_owned()
+        } else {
+            let preview: Vec<&str> = draft
+                .discovered_models
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            format!(
+                "已发现 {} 个模型：{}{}",
+                draft.discovered_models.len(),
+                preview.join("、"),
+                if draft.discovered_models.len() > 8 {
+                    "…"
+                } else {
+                    ""
+                }
+            )
+        };
+        self.ui
+            .label(cx, ids!(provider_models_summary))
+            .set_text(cx, &models_summary);
+
+        let has_models = !draft.discovered_models.is_empty();
+        for (slot, badge_id, local_btn, ext_btn, use_first_btn) in [
+            (
+                CapabilitySlot::PromptEnhancement,
+                ids!(slot_enhance_badge),
+                ids!(slot_enhance_local),
+                ids!(slot_enhance_external),
+                ids!(slot_enhance_use_first),
+            ),
+            (
+                CapabilitySlot::Asr,
+                ids!(slot_asr_badge),
+                ids!(slot_asr_local),
+                ids!(slot_asr_external),
+                ids!(slot_asr_use_first),
+            ),
+            (
+                CapabilitySlot::Tts,
+                ids!(slot_tts_badge),
+                ids!(slot_tts_local),
+                ids!(slot_tts_external),
+                ids!(slot_tts_use_first),
+            ),
+            (
+                CapabilitySlot::Translation,
+                ids!(slot_translation_badge),
+                ids!(slot_translation_local),
+                ids!(slot_translation_external),
+                ids!(slot_translation_use_first),
+            ),
+        ] {
+            let ext = d.ctrl.is_slot_external(slot);
+            self.ui
+                .label(cx, badge_id)
+                .set_text(cx, &d.ctrl.slot_badge(slot));
+            self.ui.button(cx, local_btn).set_text(
+                cx,
+                if ext {
+                    "本地模型"
+                } else {
+                    "● 本地模型"
+                },
+            );
+            self.ui.button(cx, ext_btn).set_text(
+                cx,
+                if ext {
+                    "● 外部网关"
+                } else {
+                    "外部网关"
+                },
+            );
+            self.ui
+                .button(cx, use_first_btn)
+                .set_action_enabled(cx, has_models);
+        }
+
+        let slot_status = if d.ctrl.slot_feedback.is_empty() {
+            "4 个能力槽位互不干扰，修改后立即生效并保存到 app-settings.json。".to_owned()
+        } else {
+            d.ctrl.slot_feedback.clone()
+        };
+        self.ui
+            .label(cx, ids!(slot_save_status))
+            .set_text(cx, &slot_status);
     }
 }

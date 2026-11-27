@@ -23,6 +23,12 @@ use omni_hub::download::{
     clean_part_files, probe_connectivity, resolve_route, ConnectivityReport, DownloadError,
     DownloadEvent, DownloadManager, DownloadOptions, ErrorCategory,
 };
+use omni_hub::providers::{
+    CapabilitySlot, ExternalProviderTarget, OpenAiCompatibleClient, ProviderError, ProviderPreset,
+    ProviderProbeReport, ProviderProfile, SlotProvider, DEFAULT_TIMEOUT_SECS, DEFAULT_TTS_FORMAT,
+    DEFAULT_TTS_VOICE, MAGPIE_LOCAL_BASE_URL, MAGPIE_LOCAL_ID,
+};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutePreset {
@@ -41,6 +47,177 @@ pub enum FallbackPreset {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
     ModelsAndDownload,
+    ExternalProviders,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderFormDraft {
+    pub id: String,
+    pub name: String,
+    pub preset: ProviderPreset,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub timeout_secs: String,
+    pub discovered_models: Vec<String>,
+    pub dirty: bool,
+}
+
+impl ProviderFormDraft {
+    pub fn from_profile(profile: &ProviderProfile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            preset: profile.preset,
+            base_url: profile.base_url.clone(),
+            api_key_env: profile.api_key_env.clone().unwrap_or_default(),
+            timeout_secs: profile.timeout_secs.to_string(),
+            discovered_models: profile.discovered_models.clone(),
+            dirty: false,
+        }
+    }
+
+    pub fn magpie_preset() -> Self {
+        let mut draft = Self::from_profile(&ProviderProfile::magpie_local());
+        draft.dirty = true;
+        draft
+    }
+
+    pub fn custom_preset() -> Self {
+        let mut draft = Self::from_profile(&ProviderProfile::custom(
+            "custom-openai",
+            "自定义 OpenAI 兼容",
+            "https://api.openai.com/v1",
+        ));
+        draft.dirty = true;
+        draft
+    }
+
+    pub fn credential_key(&self) -> CredentialKey {
+        let env_var = {
+            let trimmed = self.api_key_env.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        CredentialKey::ProviderApiKey {
+            provider_id: if self.id.trim().is_empty() {
+                MAGPIE_LOCAL_ID.to_owned()
+            } else {
+                self.id.trim().to_owned()
+            },
+            env_var,
+        }
+    }
+
+    pub fn url_validation_hint(&self) -> Option<String> {
+        validate_http_url("网关地址（Base URL）", &self.base_url, true)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    pub fn to_profile(&self) -> Result<ProviderProfile, String> {
+        let timeout_secs: u64 = self
+            .timeout_secs
+            .trim()
+            .parse()
+            .map_err(|_| "请求超时须为 1–600 的整数秒".to_owned())?;
+        let profile = ProviderProfile {
+            id: self.id.trim().to_owned(),
+            name: self.name.trim().to_owned(),
+            preset: self.preset,
+            base_url: self.base_url.trim().trim_end_matches('/').to_owned(),
+            api_key_env: {
+                let t = self.api_key_env.trim();
+                (!t.is_empty()).then(|| t.to_owned())
+            },
+            custom_headers: BTreeMap::new(),
+            timeout_secs,
+            discovered_models: self.discovered_models.clone(),
+        };
+        profile.validate().map_err(|e| e.to_string())?;
+        Ok(profile)
+    }
+
+    pub fn can_save(&self) -> Result<(), String> {
+        self.to_profile().map(|_| ())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotFormDraft {
+    pub external: bool,
+    pub provider_id: String,
+    pub model: String,
+    pub voice: String,
+}
+
+impl SlotFormDraft {
+    pub fn from_slot(
+        slot: CapabilitySlot,
+        provider: &SlotProvider,
+        fallback_provider: &str,
+    ) -> Self {
+        match provider {
+            SlotProvider::Local => Self {
+                external: false,
+                provider_id: fallback_provider.to_owned(),
+                model: String::new(),
+                voice: if slot == CapabilitySlot::Tts {
+                    DEFAULT_TTS_VOICE.to_owned()
+                } else {
+                    String::new()
+                },
+            },
+            SlotProvider::External {
+                provider_id,
+                model,
+                voice,
+                ..
+            } => Self {
+                external: true,
+                provider_id: provider_id.clone(),
+                model: model.clone(),
+                voice: voice.clone().unwrap_or_else(|| {
+                    if slot == CapabilitySlot::Tts {
+                        DEFAULT_TTS_VOICE.to_owned()
+                    } else {
+                        String::new()
+                    }
+                }),
+            },
+        }
+    }
+
+    pub fn to_slot_provider(&self, slot: CapabilitySlot) -> SlotProvider {
+        if !self.external {
+            return SlotProvider::Local;
+        }
+        let voice = if slot == CapabilitySlot::Tts {
+            let v = self.voice.trim();
+            Some(if v.is_empty() {
+                DEFAULT_TTS_VOICE.to_owned()
+            } else {
+                v.to_owned()
+            })
+        } else {
+            None
+        };
+        let response_format = (slot == CapabilitySlot::Tts).then(|| DEFAULT_TTS_FORMAT.to_owned());
+        SlotProvider::External {
+            provider_id: self.provider_id.trim().to_owned(),
+            model: self.model.trim().to_owned(),
+            voice,
+            speed: None,
+            response_format,
+        }
+    }
+}
+
+pub fn slot_index(slot: CapabilitySlot) -> usize {
+    match slot {
+        CapabilitySlot::PromptEnhancement => 0,
+        CapabilitySlot::Asr => 1,
+        CapabilitySlot::Tts => 2,
+        CapabilitySlot::Translation => 3,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -406,7 +583,6 @@ pub struct ModelsController {
     pub notices: BTreeMap<CheckpointId, String>,
     pub route_overrides: BTreeMap<CheckpointId, DownloadRoute>,
     pub settings_open: bool,
-    #[allow(dead_code)] // Reserved for #97 external capability provider settings sub-tab.
     pub settings_tab: SettingsTab,
     pub route_draft: RouteFormDraft,
     pub route_feedback: String,
@@ -416,6 +592,14 @@ pub struct ModelsController {
     pub connectivity_testing: bool,
     pub connectivity_message: String,
     probe_rx: Option<mpsc::Receiver<ConnectivityReport>>,
+    pub provider_draft: ProviderFormDraft,
+    pub provider_api_key: TokenFieldState,
+    pub provider_feedback: String,
+    pub provider_probing: bool,
+    pub provider_probe_message: String,
+    provider_probe_rx: Option<mpsc::Receiver<(String, ProviderProbeReport)>>,
+    pub slot_drafts: [SlotFormDraft; 4],
+    pub slot_feedback: String,
 }
 
 impl ModelsController {
@@ -458,6 +642,28 @@ impl ModelsController {
         let hf_token = TokenFieldState::new(CredentialKey::HfToken, credentials.as_ref());
         let ms_token = TokenFieldState::new(CredentialKey::ModelScopeToken, credentials.as_ref());
 
+        let provider_draft = settings
+            .providers
+            .profiles
+            .first()
+            .map(ProviderFormDraft::from_profile)
+            .unwrap_or_else(|| ProviderFormDraft {
+                id: MAGPIE_LOCAL_ID.to_owned(),
+                name: "Magpie 本地网关".to_owned(),
+                preset: ProviderPreset::MagpieLocal,
+                base_url: MAGPIE_LOCAL_BASE_URL.to_owned(),
+                api_key_env: String::new(),
+                timeout_secs: DEFAULT_TIMEOUT_SECS.to_string(),
+                discovered_models: Vec::new(),
+                dirty: false,
+            });
+        let provider_api_key =
+            TokenFieldState::new(provider_draft.credential_key(), credentials.as_ref());
+        let fallback_provider = provider_draft.id.clone();
+        let slot_drafts = CapabilitySlot::ALL.map(|slot| {
+            SlotFormDraft::from_slot(slot, settings.providers.slots.get(slot), &fallback_provider)
+        });
+
         let mut ctrl = Self {
             root,
             settings_path,
@@ -481,6 +687,16 @@ impl ModelsController {
             connectivity_message: "点击「测试连接」验证当前线路与 Token（不下载模型权重）"
                 .to_owned(),
             probe_rx: None,
+            provider_draft,
+            provider_api_key,
+            provider_feedback: String::new(),
+            provider_probing: false,
+            provider_probe_message:
+                "点击「拉取模型 / 测试连接」查询 GET /v1/models（默认纯本地，不自动发起网络请求）"
+                    .to_owned(),
+            provider_probe_rx: None,
+            slot_drafts,
+            slot_feedback: String::new(),
         };
         ctrl.refresh_all_readiness();
         ctrl
@@ -705,6 +921,24 @@ impl ModelsController {
                 self.connectivity_testing = false;
                 self.connectivity_message = report.message;
                 self.probe_rx = None;
+            }
+        }
+        if let Some(rx) = &self.provider_probe_rx {
+            if let Ok((profile_id, report)) = rx.try_recv() {
+                self.provider_probing = false;
+                self.provider_probe_message = report.message.clone();
+                if report.ok {
+                    if self.provider_draft.id == profile_id {
+                        self.provider_draft.discovered_models = report.models.clone();
+                    }
+                    if let Some(profile) = self.settings.providers.profile_mut(&profile_id) {
+                        profile.discovered_models = report.models.clone();
+                        let _ = self.settings.save(&self.settings_path);
+                    }
+                    // Convenience: if any external slot has an empty model ID, keep it explicit
+                    // until the user fills or clicks quick-pick, without silently auto-enabling slots.
+                }
+                self.provider_probe_rx = None;
             }
         }
 
@@ -947,6 +1181,238 @@ impl ModelsController {
             can_cancel: lc.is_active() || matches!(lc, CheckpointLifecycle::Paused { .. }),
         }
     }
+
+    // --- External capability provider & slot routing (#97) ---
+
+    pub fn apply_magpie_preset(&mut self) {
+        self.provider_draft = ProviderFormDraft::magpie_preset();
+        self.sync_provider_api_key_state();
+        self.provider_feedback =
+            "已填入 Magpie 本地网关预设（http://127.0.0.1:3425/v1，允许空 API Key）".to_owned();
+    }
+
+    pub fn apply_custom_preset(&mut self) {
+        self.provider_draft = ProviderFormDraft::custom_preset();
+        self.sync_provider_api_key_state();
+        self.provider_feedback =
+            "已填入自定义 OpenAI 兼容模板 · 请修改名称、Base URL 并按需保存 API Key".to_owned();
+    }
+
+    #[allow(dead_code)]
+    pub fn select_provider_profile(&mut self, id: &str) -> bool {
+        let Some(profile) = self.settings.providers.profile(id).cloned() else {
+            return false;
+        };
+        self.provider_draft = ProviderFormDraft::from_profile(&profile);
+        self.sync_provider_api_key_state();
+        true
+    }
+
+    pub fn sync_provider_api_key_state(&mut self) {
+        self.provider_api_key = TokenFieldState::new(
+            self.provider_draft.credential_key(),
+            self.credentials.as_ref(),
+        );
+    }
+
+    pub fn save_provider_draft(&mut self) -> Result<ProviderProfile, String> {
+        let profile = self.provider_draft.to_profile()?;
+        self.settings.providers.upsert_profile(profile.clone());
+        self.settings
+            .save(&self.settings_path)
+            .map_err(|e| e.to_string())?;
+        self.provider_draft.dirty = false;
+        self.sync_provider_api_key_state();
+        for draft in &mut self.slot_drafts {
+            if draft.provider_id.trim().is_empty()
+                || self
+                    .settings
+                    .providers
+                    .profile(&draft.provider_id)
+                    .is_none()
+            {
+                draft.provider_id = profile.id.clone();
+            }
+        }
+        self.provider_feedback =
+            format!("已保存外部提供方：{}（{}）", profile.name, profile.base_url);
+        Ok(profile)
+    }
+
+    pub fn start_provider_probe(&mut self) -> bool {
+        if self.provider_probing {
+            return false;
+        }
+        let profile = match self.provider_draft.to_profile() {
+            Ok(p) => p,
+            Err(err) => {
+                self.provider_probe_message = format!("配置无效：{err}");
+                return false;
+            }
+        };
+        let key = profile.credential_key();
+        let resolved_key = self
+            .credentials
+            .resolve(&key)
+            .ok()
+            .and_then(|r| r.value)
+            .or_else(|| {
+                let draft = self.provider_api_key.draft_input.trim();
+                (!draft.is_empty() && draft != "••••••••").then(|| SecretString::new(draft))
+            });
+        let known_secrets = self.credentials.known_secrets();
+        let proxy_url = self.settings.download.normalized_proxy_url();
+        let client = match OpenAiCompatibleClient::new(
+            profile.clone(),
+            resolved_key,
+            proxy_url,
+            known_secrets,
+        ) {
+            Ok(c) => c,
+            Err(err) => {
+                self.provider_probe_message = err.to_string();
+                return false;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let notify = Arc::clone(&self.notify);
+        let profile_id = profile.id.clone();
+        self.provider_probing = true;
+        self.provider_probe_message = format!("正在查询 {}/models…", profile.normalized_base_url());
+        self.provider_probe_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let report = client.test_connection(&cancel);
+            let _ = tx.send((profile_id, report));
+            (notify)();
+        });
+        true
+    }
+
+    pub fn set_slot_mode(&mut self, slot: CapabilitySlot, external: bool) -> Result<(), String> {
+        let idx = slot_index(slot);
+        if external {
+            // Ensure the active provider draft is persisted if no profile exists yet.
+            let target_provider_id = if self
+                .settings
+                .providers
+                .profile(&self.slot_drafts[idx].provider_id)
+                .is_some()
+            {
+                self.slot_drafts[idx].provider_id.clone()
+            } else if let Some(first) = self.settings.providers.profiles.first() {
+                first.id.clone()
+            } else {
+                let saved = self.save_provider_draft()?;
+                saved.id
+            };
+            self.slot_drafts[idx].provider_id = target_provider_id;
+            if self.slot_drafts[idx].model.trim().is_empty() {
+                if let Some(first_model) = self.provider_draft.discovered_models.first() {
+                    self.slot_drafts[idx].model = first_model.clone();
+                }
+            }
+        }
+        self.slot_drafts[idx].external = external;
+        self.commit_slot(slot)
+    }
+
+    pub fn set_slot_model(&mut self, slot: CapabilitySlot, model: String) {
+        let idx = slot_index(slot);
+        self.slot_drafts[idx].model = model;
+        if self.slot_drafts[idx].external {
+            let _ = self.commit_slot(slot);
+        }
+    }
+
+    pub fn set_tts_slot_voice(&mut self, voice: String) {
+        let idx = slot_index(CapabilitySlot::Tts);
+        self.slot_drafts[idx].voice = voice;
+        if self.slot_drafts[idx].external {
+            let _ = self.commit_slot(CapabilitySlot::Tts);
+        }
+    }
+
+    pub fn use_first_discovered_model(&mut self, slot: CapabilitySlot) -> Option<String> {
+        let first = self
+            .provider_draft
+            .discovered_models
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.settings
+                    .providers
+                    .profiles
+                    .iter()
+                    .find_map(|p| p.discovered_models.first().cloned())
+            })?;
+        let idx = slot_index(slot);
+        self.slot_drafts[idx].model = first.clone();
+        if self.slot_drafts[idx].external {
+            let _ = self.commit_slot(slot);
+        }
+        Some(first)
+    }
+
+    pub fn switch_slot_to_local(&mut self, slot: CapabilitySlot) {
+        let idx = slot_index(slot);
+        self.slot_drafts[idx].external = false;
+        let _ = self.commit_slot(slot);
+    }
+
+    pub fn commit_slot(&mut self, slot: CapabilitySlot) -> Result<(), String> {
+        let idx = slot_index(slot);
+        let provider = self.slot_drafts[idx].to_slot_provider(slot);
+        self.settings.providers.slots.set(slot, provider);
+        self.settings
+            .save(&self.settings_path)
+            .map_err(|e| e.to_string())?;
+        self.slot_feedback = format!("{}已设为：{}", slot.display_name(), self.slot_badge(slot));
+        Ok(())
+    }
+
+    pub fn save_all_slots(&mut self) -> Result<(), String> {
+        for slot in CapabilitySlot::ALL {
+            let idx = slot_index(slot);
+            if self.slot_drafts[idx].external
+                && self
+                    .settings
+                    .providers
+                    .profile(&self.slot_drafts[idx].provider_id)
+                    .is_none()
+            {
+                let saved = self.save_provider_draft()?;
+                self.slot_drafts[idx].provider_id = saved.id;
+            }
+            let provider = self.slot_drafts[idx].to_slot_provider(slot);
+            self.settings.providers.slots.set(slot, provider);
+        }
+        self.settings
+            .save(&self.settings_path)
+            .map_err(|e| e.to_string())?;
+        self.slot_feedback = "已保存全部 4 个能力槽位路由配置".to_owned();
+        Ok(())
+    }
+
+    pub fn is_slot_external(&self, slot: CapabilitySlot) -> bool {
+        self.settings.providers.slots.get(slot).is_external()
+    }
+
+    pub fn slot_badge(&self, slot: CapabilitySlot) -> String {
+        self.settings.providers.active_badge(slot)
+    }
+
+    pub fn resolve_slot_external(
+        &self,
+        slot: CapabilitySlot,
+    ) -> Result<Option<ExternalProviderTarget>, ProviderError> {
+        self.settings.providers.resolve_external_target(
+            slot,
+            self.credentials.as_ref(),
+            self.settings.download.normalized_proxy_url(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1652,112 @@ mod tests {
         let (after_clear, ro) = ctrl.hf_token.rendered_input(store.as_ref());
         assert_eq!(after_clear, "");
         assert!(!ro);
+
+        stop.store(true, Ordering::Release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_magpie_preset_models_fetch_and_independent_slot_switching() {
+        let root = temp_workspace("providers");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_nonblocking(false);
+                    let mut reader = BufReader::new(&stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    loop {
+                        let mut hdr = String::new();
+                        if reader.read_line(&mut hdr).unwrap_or(0) == 0 || hdr.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let body = br#"{"data":[{"id":"qwen-pe"},{"id":"whisper-large"},{"id":"tts-hd"},{"id":"qwen-mt"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(body);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+
+        let store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::with_env(
+            root.join("credentials.json"),
+            MapEnv::default(),
+        ));
+        let mut ctrl = ModelsController::with_dependencies(
+            root.clone(),
+            root.join("app-settings.json"),
+            Arc::clone(&store),
+            DownloadOptions::default(),
+            || {},
+        );
+
+        // Default: all 4 slots are local.
+        for slot in CapabilitySlot::ALL {
+            assert!(!ctrl.is_slot_external(slot));
+            assert_eq!(ctrl.slot_badge(slot), "本地模型");
+            assert!(ctrl.resolve_slot_external(slot).unwrap().is_none());
+        }
+
+        // Apply Magpie preset -> populates http://127.0.0.1:3425/v1
+        ctrl.apply_magpie_preset();
+        assert_eq!(ctrl.provider_draft.base_url, "http://127.0.0.1:3425/v1");
+
+        // Point to mock server, save, and probe /v1/models
+        ctrl.provider_draft.base_url = format!("http://{addr}/v1");
+        ctrl.save_provider_draft().unwrap();
+        assert!(ctrl.start_provider_probe());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ctrl.provider_probing && Instant::now() < deadline {
+            ctrl.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!ctrl.provider_probing);
+        assert!(ctrl.provider_probe_message.contains("连接正常"));
+        assert_eq!(
+            ctrl.provider_draft.discovered_models,
+            vec!["qwen-pe", "whisper-large", "tts-hd", "qwen-mt"]
+        );
+
+        // Switch ASR independently -> only ASR becomes external; other 3 stay Local.
+        ctrl.set_slot_model(CapabilitySlot::Asr, "whisper-large".to_owned());
+        ctrl.set_slot_mode(CapabilitySlot::Asr, true).unwrap();
+        assert!(ctrl.is_slot_external(CapabilitySlot::Asr));
+        assert!(!ctrl.is_slot_external(CapabilitySlot::Tts));
+        assert!(!ctrl.is_slot_external(CapabilitySlot::Translation));
+        assert!(!ctrl.is_slot_external(CapabilitySlot::PromptEnhancement));
+        assert!(ctrl
+            .slot_badge(CapabilitySlot::Asr)
+            .contains("Magpie 本地网关 / whisper-large"));
+        assert_eq!(ctrl.slot_badge(CapabilitySlot::Tts), "本地模型");
+
+        // Switch TTS with custom voice -> verify badge & target
+        ctrl.set_slot_model(CapabilitySlot::Tts, "tts-hd".to_owned());
+        ctrl.set_tts_slot_voice("nova".to_owned());
+        ctrl.set_slot_mode(CapabilitySlot::Tts, true).unwrap();
+        let tts_target = ctrl
+            .resolve_slot_external(CapabilitySlot::Tts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tts_target.model, "tts-hd");
+        assert_eq!(tts_target.voice.as_deref(), Some("nova"));
+        assert!(ctrl.slot_badge(CapabilitySlot::Tts).contains("音色 nova"));
+
+        // Switch ASR back to local via explicit recovery helper
+        ctrl.switch_slot_to_local(CapabilitySlot::Asr);
+        assert!(!ctrl.is_slot_external(CapabilitySlot::Asr));
+        assert_eq!(ctrl.slot_badge(CapabilitySlot::Asr), "本地模型");
 
         stop.store(true, Ordering::Release);
         std::fs::remove_dir_all(root).unwrap();

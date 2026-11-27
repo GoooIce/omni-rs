@@ -62,7 +62,7 @@ hound = "3.5"
 pollster = "0.4"
 cpal = "0.16"
 omni-breeze-tts = { path = "../../crates/breeze-tts", default-features = false }
-omni-qwen-image = { path = "../../crates/qwen-image", default-features = false }
+omni-qwen-image = { path = "../../crates/qwen-image", default-features = false, features = ["rewrite"] }
 omni-hy-mt = { path = "../../crates/hy-mt", default-features = false, features = ["native"] }
 omni-music = { path = "../../crates/omni-music", default-features = false }
 omni-minicpm-v = { path = "../../crates/minicpm-v", default-features = false }

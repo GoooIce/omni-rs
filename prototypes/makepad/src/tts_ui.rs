@@ -1,10 +1,11 @@
 use crate::ActionButtonState;
 use crate::{
     model_location,
-    tts_engine::{Command, Engine, ReferenceInput},
+    tts_engine::{Command, Engine, EnhancementTarget, ReferenceInput},
     App,
 };
 use makepad_widgets::*;
+use omni_hub::providers::CapabilitySlot;
 use std::path::{Path, PathBuf};
 
 enum ReferenceSelection {
@@ -52,13 +53,14 @@ pub struct State {
     design: bool,
     reusable: bool,
     candidate: u64,
-    controls: Option<[bool; 18]>,
+    controls: Option<[bool; 20]>,
     session: omni_breeze_tts::enhancement::Session,
     checkpoint: PathBuf,
     enhancement_settings: Option<PathBuf>,
     pending: Pending,
     hearing_audio: [Option<std::sync::Arc<[f32]>>; 3],
     hearing_play: Option<usize>,
+    external_error_slot: Option<CapabilitySlot>,
 }
 impl State {
     pub fn playing(&self) -> bool {
@@ -139,10 +141,34 @@ impl State {
             pending: Pending::Idle,
             hearing_audio: [None, None, None],
             hearing_play: None,
+            external_error_slot: None,
         }
     }
 }
 impl App {
+    pub fn on_tts_provider_changed(&mut self, cx: &mut Cx) {
+        if let Some(t) = self.tts.as_mut() {
+            t.controls = None;
+            t.external_error_slot = None;
+        }
+        self.ui
+            .view(cx, ids!(tts_external_error))
+            .set_visible(cx, false);
+        if self.slot_is_external(CapabilitySlot::Tts) {
+            self.ui.view(cx, ids!(tts_recovery)).set_visible(cx, false);
+            self.tts_status(
+                cx,
+                &format!(
+                    "已切至{} · 可直接合成并播放（Breeze 本地扩展已禁用）",
+                    self.slot_badge(CapabilitySlot::Tts)
+                ),
+            );
+        } else if self.tts.as_ref().is_some_and(|t| t.ready) {
+            self.tts_status(cx, "已切回本地模型 · Breeze-TTS-2 已就绪");
+        } else {
+            self.tts_status(cx, "已切回本地模型 · 点击「载入语音模型」使用 Breeze-TTS-2");
+        }
+    }
     pub fn activate_tts(&mut self, cx: &mut Cx) {
         if self.inference_busy() || self.runtime.dialog_busy() {
             return;
@@ -296,6 +322,13 @@ impl App {
         );
     }
     fn tts_error(&mut self, cx: &mut Cx, error: &str, fatal: bool) {
+        let tts_external = self.slot_is_external(CapabilitySlot::Tts);
+        let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
+        let is_sampling_external = enhance_external
+            && self
+                .tts
+                .as_ref()
+                .is_some_and(|t| matches!(t.pending, Pending::Sampling { .. }));
         let Some(t) = self.tts.as_mut() else {
             return;
         };
@@ -307,6 +340,27 @@ impl App {
         t.stopping = false;
         t.playing = false;
         self.ui.view(cx, ids!(tts_progress)).set_visible(cx, false);
+        if tts_external || is_sampling_external {
+            let slot = if tts_external {
+                CapabilitySlot::Tts
+            } else {
+                CapabilitySlot::PromptEnhancement
+            };
+            t.external_error_slot = Some(slot);
+            self.ui.view(cx, ids!(tts_recovery)).set_visible(cx, false);
+            self.ui.label(cx, ids!(tts_ext_error_info)).set_text(
+                cx,
+                &format!(
+                    "{}外部请求失败（不会静默回退本地）：{error}",
+                    slot.display_name()
+                ),
+            );
+            self.ui
+                .view(cx, ids!(tts_external_error))
+                .set_visible(cx, true);
+            self.tts_status(cx, &format!("错误：{error}"));
+            return;
+        }
         self.ui
             .view(cx, ids!(tts_recovery))
             .set_visible(cx, !t.ready);
@@ -319,6 +373,8 @@ impl App {
     pub fn refresh_tts_controls(&mut self, cx: &mut Cx) {
         let other_busy = self.inference_busy();
         let dialog_busy = self.runtime.dialog_busy();
+        let tts_external = self.slot_is_external(CapabilitySlot::Tts);
+        let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
         let Some(t) = self.tts.as_mut() else {
             return;
         };
@@ -341,16 +397,30 @@ impl App {
             t.hearing_audio[0].is_some(),
             t.hearing_audio[1].is_some(),
             t.hearing_audio[2].is_some(),
+            tts_external,
+            enhance_external,
         ];
         if t.controls == Some(state) {
             return;
         }
         t.controls = Some(state);
         let idle = !t.busy && !other_busy && !dialog_busy;
+        let local_breeze = !tts_external;
         self.ui.button(cx, ids!(tts_load)).set_visible(cx, false);
+        self.ui
+            .view(cx, ids!(tts_external_notice_row))
+            .set_visible(cx, tts_external);
+        if tts_external {
+            self.ui.label(cx, ids!(tts_external_notice)).set_text(
+                cx,
+                "当前使用外部 TTS（/v1/audio/speech），Breeze 本地声音克隆、音色设计与行内语音事件增强已禁用。",
+            );
+        }
         self.ui.button(cx, ids!(tts_synthesize)).set_text(
             cx,
-            if t.loading {
+            if tts_external {
+                "合成并播放"
+            } else if t.loading {
                 "正在载入…"
             } else if !t.ready {
                 "载入语音模型"
@@ -362,7 +432,7 @@ impl App {
         );
         self.ui
             .button(cx, ids!(tts_synthesize))
-            .set_action_enabled(cx, idle && !t.loading);
+            .set_action_enabled(cx, idle && (tts_external || !t.loading));
         self.ui.button(cx, ids!(tts_stop)).set_visible(cx, t.busy);
         self.ui.button(cx, ids!(tts_stop)).set_action_enabled(
             cx,
@@ -374,49 +444,64 @@ impl App {
         );
         self.ui
             .button(cx, ids!(tts_choose))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_breeze);
         self.ui
             .button(cx, ids!(tts_retry))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_breeze);
         self.ui.button(cx, ids!(tts_replay)).set_action_enabled(
             cx,
             !t.busy && t.output.is_some() && !self.runtime.dialog_busy(),
         );
         self.ui
             .button(cx, ids!(tts_design_mode))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_breeze);
         self.ui
             .button(cx, ids!(tts_speech_mode))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_breeze);
         self.ui
             .button(cx, ids!(tts_design_next))
-            .set_action_enabled(cx, idle && t.ready && t.design);
-        self.ui
-            .button(cx, ids!(tts_design_use))
-            .set_action_enabled(cx, idle && t.ready && t.design && t.reusable);
+            .set_action_enabled(cx, idle && local_breeze && t.ready && t.design);
+        self.ui.button(cx, ids!(tts_design_use)).set_action_enabled(
+            cx,
+            idle && local_breeze && t.ready && t.design && t.reusable,
+        );
         for id in [
             ids!(tts_voice_gentle),
             ids!(tts_voice_warm),
             ids!(tts_voice_bright),
             ids!(tts_voice_english),
         ] {
-            self.ui.button(cx, id).set_action_enabled(cx, idle);
+            self.ui
+                .button(cx, id)
+                .set_action_enabled(cx, idle && local_breeze);
         }
         self.ui
             .button(cx, ids!(tts_reference_choose))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_breeze);
         self.ui
             .button(cx, ids!(tts_reference_clear))
-            .set_action_enabled(cx, idle && t.reference.is_some());
+            .set_action_enabled(cx, idle && local_breeze && t.reference.is_some());
+        self.ui
+            .text_input(cx, ids!(tts_instruction))
+            .set_is_read_only(cx, tts_external);
+        self.ui
+            .text_input(cx, ids!(tts_reference_text))
+            .set_is_read_only(
+                cx,
+                tts_external || matches!(t.reference, Some(ReferenceSelection::Designed)),
+            );
         self.ui.button(cx, ids!(tts_enhance)).set_text(
             cx,
-            if t.session.enabled() {
+            if tts_external {
+                "提示词增强（仅本地 Breeze 可用）"
+            } else if t.session.enabled() {
                 "● 提示词增强"
             } else {
                 "提示词增强"
             },
         );
         let latent = t.session.prefill() == omni_breeze_tts::enhancement::Prefill::Latent;
+        let local_35b_prefill = local_breeze && !enhance_external;
         self.ui
             .button(cx, ids!(tts_prefill_dense))
             .set_text(cx, if latent { "稠密 KV" } else { "● 稠密 KV" });
@@ -425,41 +510,54 @@ impl App {
             .set_text(cx, if latent { "● 隐向量" } else { "隐向量" });
         self.ui
             .button(cx, ids!(tts_prefill_dense))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_35b_prefill);
         self.ui
             .button(cx, ids!(tts_prefill_latent))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_35b_prefill);
+        self.ui.label(cx, ids!(tts_prefill_hint)).set_text(
+            cx,
+            if tts_external {
+                "外部 TTS 已禁用 Breeze 语音事件增强与本地 35B 预填充选项。"
+            } else if enhance_external {
+                "当前使用外部提示词增强网关，本地 35B 稠密 KV / 隐向量预填充选项已禁用。"
+            } else {
+                "隐向量缩短 35B 长提示的预填充，需要已拟合的因子文件。"
+            },
+        );
         self.ui
             .button(cx, ids!(tts_enhance))
-            .set_action_enabled(cx, idle);
+            .set_action_enabled(cx, idle && local_breeze);
         self.ui
             .view(cx, ids!(tts_hearing))
-            .set_visible(cx, t.session.hearing());
+            .set_visible(cx, local_breeze && t.session.hearing());
         for (index, id) in [ids!(tts_hear_0), ids!(tts_hear_1), ids!(tts_hear_2)]
             .into_iter()
             .enumerate()
         {
             self.ui
                 .button(cx, id)
-                .set_action_enabled(cx, idle && t.hearing_audio[index].is_some());
+                .set_action_enabled(cx, idle && local_breeze && t.hearing_audio[index].is_some());
         }
         for id in [ids!(tts_pick_0), ids!(tts_pick_1), ids!(tts_pick_2)] {
             self.ui
                 .button(cx, id)
-                .set_action_enabled(cx, idle && t.session.can_choose());
+                .set_action_enabled(cx, idle && local_breeze && t.session.can_choose());
         }
         self.ui
             .button(cx, ids!(tts_draft))
-            .set_action_enabled(cx, idle && !t.session.choices().is_empty());
+            .set_action_enabled(cx, idle && local_breeze && !t.session.choices().is_empty());
         self.ui
             .button(cx, ids!(tts_draft_accept))
-            .set_action_enabled(cx, idle && t.session.draft().is_some());
+            .set_action_enabled(cx, idle && local_breeze && t.session.draft().is_some());
         self.ui
             .button(cx, ids!(tts_draft_discard))
-            .set_action_enabled(cx, idle && t.session.draft().is_some());
+            .set_action_enabled(cx, idle && local_breeze && t.session.draft().is_some());
         self.ui
             .button(cx, ids!(tts_draft_restore))
-            .set_action_enabled(cx, idle && t.session.previous_prompt().is_some());
+            .set_action_enabled(
+                cx,
+                idle && local_breeze && t.session.previous_prompt().is_some(),
+            );
     }
     pub fn poll_tts(&mut self, cx: &mut Cx) {
         if let Some(t) = self.tts.as_mut() {
@@ -822,6 +920,72 @@ impl App {
         if t.busy || inference_busy || self.runtime.dialog_busy() {
             return;
         }
+        if self
+            .ui
+            .button(cx, ids!(tts_ext_switch_local))
+            .clicked(actions)
+        {
+            let slot = self
+                .tts
+                .as_ref()
+                .and_then(|t| t.external_error_slot)
+                .unwrap_or(CapabilitySlot::Tts);
+            self.switch_slot_to_local(cx, slot);
+            return;
+        }
+        if self
+            .ui
+            .button(cx, ids!(tts_ext_open_settings))
+            .clicked(actions)
+        {
+            self.open_providers_settings(cx);
+            return;
+        }
+        let ext_retry_clicked = self.ui.button(cx, ids!(tts_ext_retry)).clicked(actions);
+        let tts_external = self.slot_is_external(CapabilitySlot::Tts);
+        let enhance_external = self.slot_is_external(CapabilitySlot::PromptEnhancement);
+        if tts_external
+            && (self.ui.button(cx, ids!(tts_synthesize)).clicked(actions) || ext_retry_clicked)
+        {
+            let text = self.ui.text_input(cx, ids!(tts_text)).text();
+            if text.trim().is_empty() {
+                self.tts_status(cx, "请输入要合成的文本");
+                return;
+            }
+            let target = match self.resolve_slot_external(CapabilitySlot::Tts) {
+                Ok(Some(t)) => t,
+                Ok(None) => return,
+                Err(err) => {
+                    self.tts_error(cx, &err, false);
+                    return;
+                }
+            };
+            self.ui
+                .view(cx, ids!(tts_external_error))
+                .set_visible(cx, false);
+            if let Some(m) = &mut self.music {
+                m.stop_playback();
+            }
+            let t = self.tts.as_mut().unwrap();
+            t.external_error_slot = None;
+            t.busy = true;
+            t.reusable = false;
+            t.stopping = false;
+            t.controls = None;
+            let badge = target.display_badge();
+            let result = t
+                .engine
+                .submit(Command::SynthesizeExternal { text, target });
+            self.tts_status(cx, &format!("正在请求 {badge} 合成语音…"));
+            if let Err(error) = result {
+                self.tts_error(cx, &error.to_string(), false);
+            }
+            return;
+        }
+        if tts_external {
+            return;
+        }
+        let t = self.tts.as_mut().unwrap();
         if self.ui.button(cx, ids!(tts_design_mode)).clicked(actions) {
             self.reveal_tts_details(cx);
             self.set_tts_design_mode(cx, true);
@@ -1012,18 +1176,36 @@ impl App {
             }
         }
         if self.ui.button(cx, ids!(tts_draft)).clicked(actions) {
+            let backend = if enhance_external {
+                match self.resolve_slot_external(CapabilitySlot::PromptEnhancement) {
+                    Ok(Some(target)) => EnhancementTarget::External(target),
+                    Ok(None) => EnhancementTarget::Local {
+                        checkpoint: self.tts.as_ref().unwrap().checkpoint.clone(),
+                        prefill: self.tts.as_ref().unwrap().session.prefill(),
+                    },
+                    Err(err) => {
+                        self.tts_error(cx, &err, false);
+                        return;
+                    }
+                }
+            } else {
+                let t = self.tts.as_ref().unwrap();
+                EnhancementTarget::Local {
+                    checkpoint: t.checkpoint.clone(),
+                    prefill: t.session.prefill(),
+                }
+            };
+            let t = self.tts.as_mut().unwrap();
             match t.session.draft_request() {
                 Ok(request) => {
                     let seed = t.session.next_sample_seeds()[0];
-                    let checkpoint = t.checkpoint.clone();
                     t.busy = true;
                     t.stopping = false;
                     t.controls = None;
                     if let Err(error) = t.engine.submit(Command::Draft {
                         request,
                         seed,
-                        checkpoint,
-                        prefill: t.session.prefill(),
+                        backend,
                     }) {
                         self.tts_error(cx, &error.to_string(), false);
                     } else {
@@ -1068,7 +1250,10 @@ impl App {
         }
 
         let next_candidate = t.design && self.ui.button(cx, ids!(tts_design_next)).clicked(actions);
-        if (self.ui.button(cx, ids!(tts_synthesize)).clicked(actions) || next_candidate) && t.ready
+        if (self.ui.button(cx, ids!(tts_synthesize)).clicked(actions)
+            || next_candidate
+            || ext_retry_clicked)
+            && t.ready
         {
             let text = self.ui.text_input(cx, ids!(tts_text)).text();
             if text.trim().is_empty() {
@@ -1137,10 +1322,37 @@ impl App {
             if let Some(m) = &mut self.music {
                 m.stop_playback();
             }
-            let result = if enhance {
+            let enhance_backend = if enhance {
+                if enhance_external {
+                    match self.resolve_slot_external(CapabilitySlot::PromptEnhancement) {
+                        Ok(Some(target)) => Some(EnhancementTarget::External(target)),
+                        Ok(None) => Some(EnhancementTarget::Local {
+                            checkpoint: self.tts.as_ref().unwrap().checkpoint.clone(),
+                            prefill: self.tts.as_ref().unwrap().session.prefill(),
+                        }),
+                        Err(err) => {
+                            self.tts_error(cx, &err, false);
+                            return;
+                        }
+                    }
+                } else {
+                    let t = self.tts.as_ref().unwrap();
+                    Some(EnhancementTarget::Local {
+                        checkpoint: t.checkpoint.clone(),
+                        prefill: t.session.prefill(),
+                    })
+                }
+            } else {
+                None
+            };
+            self.ui
+                .view(cx, ids!(tts_external_error))
+                .set_visible(cx, false);
+            let enhance_badge = self.slot_badge(CapabilitySlot::PromptEnhancement);
+            let t = self.tts.as_mut().unwrap();
+            let result = if let Some(backend) = enhance_backend {
                 let seeds = t.session.next_sample_seeds();
                 let prompt = t.session.enhancer_prompt().to_string();
-                let checkpoint = t.checkpoint.clone();
                 t.engine.submit(Command::Enhance {
                     source: omni_breeze_tts::enhancement::Source {
                         speech_text: text,
@@ -1148,8 +1360,7 @@ impl App {
                     },
                     prompt,
                     seeds,
-                    checkpoint,
-                    prefill: t.session.prefill(),
+                    backend,
                 })
             } else {
                 t.engine.submit(Command::Synthesize {
@@ -1169,10 +1380,10 @@ impl App {
             };
             self.tts_status(
                 cx,
-                if enhance {
-                    "正在用 35B 增强朗读文字和声音描述"
+                &if enhance {
+                    format!("正在用 {enhance_badge} 增强朗读文字和声音描述")
                 } else {
-                    "正在生成首段音频 · 自动缓冲，优先保持播放连贯"
+                    "正在生成首段音频 · 自动缓冲，优先保持播放连贯".to_owned()
                 },
             );
             if let Err(error) = result {

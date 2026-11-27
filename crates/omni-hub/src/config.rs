@@ -202,8 +202,9 @@ pub struct AppSettings {
     pub download: DownloadSettings,
     #[serde(default)]
     pub model_directories: BTreeMap<String, PathBuf>,
-    /// Forward-compatible preservation of unknown top-level fields (such as
-    /// external capability provider profiles added in #97).
+    #[serde(default)]
+    pub providers: crate::providers::ProviderSettings,
+    /// Forward-compatible preservation of unknown top-level fields.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -218,6 +219,7 @@ impl Default for AppSettings {
             schema_version: default_schema_version(),
             download: DownloadSettings::default(),
             model_directories: BTreeMap::new(),
+            providers: crate::providers::ProviderSettings::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -255,6 +257,7 @@ impl AppSettings {
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         self.download.validate()?;
+        self.providers.validate()?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(|e| ConfigError::Write {
                 path: path.to_path_buf(),

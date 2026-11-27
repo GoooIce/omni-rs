@@ -4965,6 +4965,8 @@ dependencies = [
 name = "omni-hub"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "hound",
  "libc",
  "percent-encoding",
  "serde",
@@ -5079,6 +5081,7 @@ dependencies = [
 name = "omni-qwen-image"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "burn",
  "burn-cubecl",
  "clap",
@@ -5090,6 +5093,7 @@ dependencies = [
  "half",
  "image",
  "objc2-metal",
+ "omni-hub",
  "omni-kernel",
  "omni-minicpm-v",
  "omni-r2t2",

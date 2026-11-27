@@ -1,4 +1,9 @@
 use crate::gpu::{self, GpuBackend as Backend};
+use omni_hub::providers::ExternalProviderTarget;
+use omni_qwen_image::rewrite::{
+    minicpm::MinicpmRewriter, openai::OpenAiRewriter, resolve_canvas, RewriteOutcome, Rewriter,
+    TaskProfile,
+};
 use omni_qwen_image::{Config, Error, GeneratedImage, Model, ObservationRow, Options, Progress};
 use std::{
     cell::RefCell,
@@ -7,10 +12,20 @@ use std::{
     time::Instant,
 };
 
+pub enum RewriteTarget {
+    Local { checkpoint: PathBuf },
+    External(ExternalProviderTarget),
+}
+
 pub enum Command {
     Load(PathBuf),
     References(Vec<PathBuf>),
     Generate(Options),
+    Rewrite {
+        prompt: String,
+        images: Vec<PathBuf>,
+        target: RewriteTarget,
+    },
 }
 
 pub struct ReferencePreview {
@@ -39,6 +54,10 @@ pub struct Update {
     pub reference: Option<Arc<ReferencePreview>>,
     #[serde(skip)]
     pub observation: Option<ObservationPreview>,
+    #[serde(skip)]
+    pub rewrite: Option<RewriteOutcome>,
+    #[serde(skip)]
+    pub rewrite_canvas: Option<(usize, usize)>,
 }
 impl Update {
     fn status(kind: &'static str, message: impl Into<String>) -> Self {
@@ -49,6 +68,8 @@ impl Update {
             image: None,
             reference: None,
             observation: None,
+            rewrite: None,
+            rewrite_canvas: None,
         }
     }
 }
@@ -66,8 +87,12 @@ impl crate::engine_harness::Event for Update {
 pub type Engine = crate::engine_harness::Engine<Worker>;
 
 pub struct Worker {
-    device: gpu::GpuDevice,
+    device: Option<gpu::GpuDevice>,
     model: Option<Model<Backend>>,
+    local_rewriter: Option<(
+        PathBuf,
+        MinicpmRewriter<omni_qwen_image::rewrite::minicpm::Native>,
+    )>,
 }
 
 impl crate::engine_harness::Adapter for Worker {
@@ -81,12 +106,14 @@ impl crate::engine_harness::Adapter for Worker {
     }
     fn new() -> Self {
         Self {
-            device: gpu::gpu_device(),
+            device: None,
             model: None,
+            local_rewriter: None,
         }
     }
     fn unload(&mut self) {
         self.model = None;
+        self.local_rewriter = None;
     }
     fn load_path(command: &Command) -> Option<&Path> {
         if let Command::Load(path) = command {
@@ -117,10 +144,11 @@ impl crate::engine_harness::Adapter for Worker {
     ) -> omni_qwen_image::Result<Update> {
         let stop = &context.stop;
         let start = Instant::now();
+        let device = self.device.get_or_insert_with(gpu::gpu_device);
         self.model = Some(Model::load(
             &path,
             gpu::default_precision(),
-            &self.device,
+            device,
             &stop,
             |p| {
                 let (offset, weight, label) = match p.stage {
@@ -222,6 +250,70 @@ impl crate::engine_harness::Adapter for Worker {
                 );
                 update.progress = 1.0;
                 update.image = Some(generated.clone());
+                Ok(update)
+            }
+            Command::Rewrite {
+                prompt,
+                images,
+                target,
+            } => {
+                let profile = TaskProfile::select(!images.is_empty());
+                let start = Instant::now();
+                let (outcome, source_label) = match target {
+                    RewriteTarget::External(external) => {
+                        let label = external.display_badge();
+                        context.updates.publish(Update::status(
+                            "progress",
+                            format!("正在通过 {label} 改写提示词…"),
+                        ));
+                        let mut rewriter = OpenAiRewriter::from_target(&external)?;
+                        let outcome =
+                            rewriter.rewrite_cancellable(profile, &prompt, &images, stop)?;
+                        (outcome, label)
+                    }
+                    RewriteTarget::Local { checkpoint } => {
+                        let needs_load = self
+                            .local_rewriter
+                            .as_ref()
+                            .is_none_or(|(dir, _)| dir != &checkpoint);
+                        if needs_load {
+                            context.updates.publish(Update::status(
+                                "progress",
+                                "正在载入本地 MiniCPM-V 改写模型…",
+                            ));
+                            let device = gpu::eager_device();
+                            let loaded = MinicpmRewriter::load(
+                                &checkpoint,
+                                gpu::default_precision(),
+                                &device,
+                            )?;
+                            self.local_rewriter = Some((checkpoint, loaded));
+                        }
+                        context.updates.publish(Update::status(
+                            "progress",
+                            "正在用本地 MiniCPM-V 改写提示词…",
+                        ));
+                        let (_, rewriter) = self.local_rewriter.as_mut().unwrap();
+                        let outcome =
+                            rewriter.rewrite_cancellable(profile, &prompt, &images, stop)?;
+                        (outcome, "本地模型".to_owned())
+                    }
+                };
+                let canvas = resolve_canvas(&outcome, &images, false)?;
+                let mut msg = format!(
+                    "提示词改写完成（{source_label} · {:.1} s）",
+                    start.elapsed().as_secs_f64()
+                );
+                if let Some((w, h)) = canvas {
+                    msg.push_str(&format!(" · 推荐画布 {w} × {h}"));
+                }
+                if !outcome.parse_ok {
+                    msg.push_str(" · JSON 未完全匹配，已保留原始回答");
+                }
+                let mut update = Update::status("rewritten", msg);
+                update.progress = 1.0;
+                update.rewrite = Some(outcome);
+                update.rewrite_canvas = canvas;
                 Ok(update)
             }
         }
