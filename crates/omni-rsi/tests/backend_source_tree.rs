@@ -66,9 +66,13 @@ fn independent_self_reading_implementation_identity_is_unchanged() {
     // `idle_supervisor.rs` and unifying cooperative file leases across
     // `omni-lfm3::lease` and `omni-rsi::lease` (`O_NONBLOCK` FIFO guard in
     // `ForegroundLease`); no training, loss, or checkpoint algorithm changed.
+    // Repinned on 2026-11-27 after #95/#96/#97 decoupled portable compute
+    // features (`wgpu`/`cpu`) across `omni-lfm3`, `omni-rsi`, and root
+    // workspace manifests (`Cargo.toml`, `Cargo.lock`, `omni-hub`); no
+    // training, loss, or checkpoint algorithm changed.
     assert_eq!(
         omni_rsi::speech_checkpoint::implementation_hash(),
-        "82beea6d3df1e990b35f576a0498e99ec19d169d30f1c2c86970da24fb9d345a"
+        "652398d9e879c8e11c8e9acb062be3ff4987b46cf53ca7c5cfc8b21cbbe61a6d"
     );
 }
 
